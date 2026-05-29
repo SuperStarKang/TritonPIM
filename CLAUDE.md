@@ -7,8 +7,8 @@ Claude는 코드를 작성·수정하기 전에 이 문서의 원칙을 우선�
 
 ## 프로젝트 개요
 
-- /Users/kangmlee/Desktop/Research/Project/Triton_PIM/DESIGN.md 파일을 참고하여 프로젝트 개요를 파악합니다.
-- /Users/kangmlee/Desktop/Research/Project/Triton_PIM/IMPLEMENT.md 파일을 참고하여 프로젝트 진행사항을 파악하고, 진행한 내용을 체크합니다.
+- /home/dlrkdals/TritonPIM/triton_shared/DESIGN.md 파일을 참고하여 프로젝트 개요를 파악합니다.
+- /home/dlrkdals/TritonPIM/triton_shared/IMPLEMENT.md 파일을 참고하여 프로젝트 진행사항을 파악하고, 진행한 내용을 체크합니다.
 
 ---
 
