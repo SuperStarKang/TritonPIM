@@ -4,7 +4,13 @@
 
 Triton PIMBackend는 Triton 내부에서 PIM을 정식 backend로 인식하고, `device="pim"`을 통해 PIM device를 대상으로 kernel을 compile하고 실행할 수 있도록 하는 backend이다.
 
-PIMBackend는 `triton-shared` repository 안에 `CPUBackend`와 동일한 방식으로 추가된다. 즉 Python측 backend(`triton-shared/backend/compiler.py`)는 `triton-shared-opt` 도구를 subprocess로 호출하는 thin dispatcher 역할만 수행하며, 모든 dialect/conversion/transform 코드는 `triton-shared/include/triton-shared/`, `triton-shared/lib/`에 C++로 구현된다.
+PIMBackend는 `triton-shared` repository 안에 **별도 backend 패키지(`pim_backend/`)**로 추가된다. 이는 Triton의 표준 backend 등록 방식이다.
+
+Triton은 모든 backend를 `triton/python/triton/backends/<name>/` 디렉토리(symlink)로 등록한다. 실제로 `nvidia/`, `amd/`, `triton_shared/`(=CPU)가 모두 각자의 `compiler.py` + `driver.py` + `name.conf`를 가진 독립 디렉토리이다. `backends/compiler.py`와 `backends/driver.py`는 **공유 구현이 아니라 추상 base class**(`BaseBackend`, `DriverBase`)이며, 각 backend는 이를 상속한 자신만의 구현을 자기 디렉토리에 둔다.
+
+backend discovery(`backends/__init__.py`의 `_find_concrete_subclasses`)는 각 backend 디렉토리의 `compiler.py`에 `BaseBackend` 서브클래스가 **정확히 하나**만 있을 것을 요구한다. 따라서 PIMBackend도 nvidia/amd/cpu와 똑같이 자신만의 `pim_backend/` 디렉토리를 갖는다. CPUBackend(`triton-shared/backend/`)에 PIMBackend를 추가로 넣는 것은 이 규약 위반이므로 불가능하다.
+
+Python측 `pim_backend/compiler.py`는 `triton-shared-opt` 도구를 subprocess로 호출하는 thin dispatcher 역할만 수행하며, 모든 dialect/conversion/transform 코드는 `triton-shared/include/triton-shared/`, `triton-shared/lib/`에 C++로 구현된다.
 
 PIMBackend는 Triton Python DSL에서 생성된 TTIR을 TTSharedIR로 lowering한 뒤, hardware-specific 정보가 제거된 TTSharedIR을 기반으로 PIM Common IR을 생성한다. 이후 PIM Common IR에서 공통 최적화를 수행하고, 최종적으로 UPMEM IR 또는 AiMX IR로 vendor-specific lowering을 진행한다.
 
@@ -39,7 +45,7 @@ matmul_kernel[grid](
 
 ```python
 from triton.backends.compiler import GPUTarget
-from triton_shared.backend.compiler import PIMBackend
+from triton_shared.pim_backend.compiler import PIMBackend
 
 target = GPUTarget(backend="pim", arch="dpu_v1", warp_size=0)
 backend = PIMBackend(target)
@@ -140,111 +146,123 @@ UPMEM, AiMX, future PIM vendor들은 PIM Common IR 이후의 lowering만 구현�
 
 ## 5. Directory Structure
 
-PIMBackend는 `triton-shared` repository 안에 추가된다. 따라서 dialect/conversion 코드의 root namespace는 `triton/Dialect/...`가 아니라 `triton-shared/Dialect/...`이며, Python backend 코드는 `triton-shared/backend/` 아래 단일 파일들로 구성한다 (CPUBackend와 동일한 구조).
+PIMBackend는 `triton-shared` repository 안에 추가된다. dialect/conversion 코드의 root namespace는 `triton/Dialect/...`가 아니라 `triton-shared/Dialect/...`이다.
+
+Python backend 코드는 `triton-shared/pim_backend/`에 독립 패키지로 구성한다. nvidia/amd/cpu가 각자 별도 디렉토리인 것과 동일한 표준 방식이며, CPUBackend(`triton-shared/backend/`)와 물리적으로 분리되어 "디렉토리당 BaseBackend 서브클래스 1개" 규약을 만족시킨다. 빌드 시 `TRITON_PLUGIN_DIRS`에 두 경로를 모두 등록한다:
+
+```bash
+export TRITON_PLUGIN_DIRS="/path/to/triton-shared;/path/to/triton-shared/pim_backend"
+```
+
+각 파일의 역할은 다음과 같다.
 
 ```text
 triton-shared/
-  backend/
-    compiler.py              # PIMBackend, PIMOptions 추가
-    driver.py                # PIMDriver, PIMLauncher 추가
-    name.conf                # backend 이름 등록
+  backend/                          # 기존 CPUBackend 패키지 (변경 없음)
+    compiler.py                     #   CPUBackend / CPUOptions — PIM이 _ttir_to_ttsharedir 등을 import해서 재사용
+    driver.py                       #   CPUDriver / CPULauncher
+    name.conf                       #   "triton_shared" — 이 디렉토리가 등록될 backend 이름
+
+  pim_backend/                      # PIMBackend 전용 독립 패키지 (nvidia/amd와 동일 구조)
+    backend/
+      compiler.py                   #   PIMOptions(vendor 등 옵션) + PIMBackend(add_stages로 pim pass 파이프라인 정의)
+      driver.py                     #   PIMDriver(GPUTarget("pim",...) 반환) + PIMLauncher(pim runtime 호출)
+      name.conf                     #   "pim" — device="pim" 라우팅 키
     include/
-      ExecutionEngine/       # 기존 (CPU와 공유)
+      ExecutionEngine/              #   launcher가 쓰는 C 런타임 헤더 (CPU와 공유, symlink)
 
   include/
     triton-shared/
       Dialect/
-        TPtr/                # 기존
-        TritonStructured/    # 기존
-        TritonTilingExt/     # 기존
-        PIM/
+        TPtr/                       # 기존 dialect
+        TritonStructured/           # 기존 dialect (TTSharedIR의 tts.* op 정의)
+        TritonTilingExt/            # 기존 dialect
+        PIM/                        # ── PIM Common Dialect (vendor-neutral) 선언부 ──
           IR/
-            PIMDialect.h
-            PIMOps.h
-            PIMTypes.h
-            PIMAttrs.h
+            PIMDialect.h            #   "pim" dialect 등록 선언
+            PIMOps.h                #   pim.compute / pim.tile_plan / pim.transfer 등 op 선언
+            PIMTypes.h              #   MemoryRegionType, MemorySpaceType 등 타입
+            PIMAttrs.h              #   Layout/Residency/Role/MappingPolicy/CapabilityRef enum attr
           Transforms/
-            Passes.h
+            Passes.h                #   PIM Common pass(plan 생성/최적화) 선언
           Interfaces/
-            PIMVendorExtension.h
-            PIMTargetInterface.h
-            PIMMemoryInterface.h
-            PIMExecutionInterface.h
+            PIMVendorExtension.h    #   vendor 공통 인터페이스 (lowering/codegen/capability 훅)
+            PIMTargetInterface.h    #   target(arch/device) 추상 인터페이스
+            PIMMemoryInterface.h    #   memory space 매핑 인터페이스
+            PIMExecutionInterface.h #   execution unit 매핑 인터페이스
 
-        PIMVendor/
+        PIMVendor/                  # ── vendor-specific dialect 선언부 ──
           UPMEM/
             IR/
-              UPMEMDialect.h
-              UPMEMOps.h
-              UPMEMTypes.h
-              UPMEMAttrs.h
+              UPMEMDialect.h        #   "upmem" dialect 등록
+              UPMEMOps.h            #   upmem.host_func / device_func / copy_to_global 등
+              UPMEMTypes.h          #   MRAM/WRAM 버퍼 타입
+              UPMEMAttrs.h          #   DPU/tasklet 관련 attr
             Transforms/
-              UPMEMPasses.h
+              UPMEMPasses.h         #   legalize/codegen pass 선언
             Runtime/
-              UPMEMRuntime.h
+              UPMEMRuntime.h        #   UPMEM SDK 런타임 wrapper 선언
 
           AiMX/
             IR/
-              AiMXDialect.h
-              AiMXOps.h
-              AiMXTypes.h
-              AiMXAttrs.h
+              AiMXDialect.h         #   "aimx" dialect 등록
+              AiMXOps.h             #   aimx.dma_h2d / compute_gemm / descriptor_chain 등
+              AiMXTypes.h           #   device buffer / channel 타입
+              AiMXAttrs.h           #   bank/channel mapping attr
             Transforms/
-              AiMXPasses.h
+              AiMXPasses.h          #   legalize/descriptor codegen pass 선언
             Runtime/
-              AiMXRuntime.h
+              AiMXRuntime.h         #   AiMX 런타임 wrapper 선언
 
-      Conversion/
-        TTSharedToPIM/
-          Passes.h
-        PIMToUPMEM/
-          Passes.h
-        PIMToAiMX/
-          Passes.h
+      Conversion/                   # ── IR 계층 간 변환 pass 선언 ──
+        TTSharedToPIR/Passes.h      #   TTSharedIR → PIM Common IR
+        PIMToUPMEM/Passes.h         #   PIM Common IR → UPMEM IR
+        PIMToAiMX/Passes.h          #   PIM Common IR → AiMX IR
 
-  lib/
+  lib/                              # ── 위 선언들의 실제 C++ 구현 ──
     Dialect/
       PIM/
         IR/
-          PIMDialect.cpp
-          PIMOps.cpp
-          PIMTypes.cpp
-          PIMAttrs.cpp
+          PIMDialect.cpp            #   dialect 초기화
+          PIMOps.cpp                #   op verifier + custom assembly format
+          PIMTypes.cpp              #   타입 parse/print
+          PIMAttrs.cpp              #   attr parse/print
 
-        Transforms/
-          DetectPIMCandidate.cpp
-          ExtractTileMetadata.cpp
-          RecognizePIMPrimitive.cpp
-          BuildPIMMemoryPlan.cpp
-          BuildPIMTilePlan.cpp
-          BuildPIMTransferPlan.cpp
-          BuildPIMExecutionPlan.cpp
-          BuildPIMPlacementPlan.cpp
-          BuildPIMResidencyPlan.cpp
-          PIMLayoutNormalize.cpp
-          PIMDataPlacement.cpp
-          PIMChunkPlanning.cpp
-          PIMTransferHoisting.cpp
-          PIMPersistentData.cpp
-          PIMPartialResultPlanning.cpp
-          PIMPipelineOverlap.cpp
-          PIMAutotuneAnnotation.cpp
+        Transforms/                 #   TTSharedIR을 분석해 PIM Common IR을 "채워가는" plan pass들
+          DetectPIMCandidate.cpp        #     PIM으로 내릴 수 있는 region 탐지
+          ExtractTileMetadata.cpp       #     BLOCK_M/N/K, grid, shape, dtype 추출
+          RecognizePIMPrimitive.cpp     #     gemm/gemv/attention 패턴 인식
+          BuildPIMMemoryPlan.cpp        #     host/device memory_region 생성
+          BuildPIMTilePlan.cpp          #     tile_plan(BLOCK·SPLIT) 생성
+          BuildPIMTransferPlan.cpp      #     host↔device transfer 삽입
+          BuildPIMExecutionPlan.cpp     #     execution_group 매핑
+          BuildPIMPlacementPlan.cpp     #     interleave/replicate placement
+          BuildPIMResidencyPlan.cpp     #     persistent/ephemeral 결정
+          PIMLayoutNormalize.cpp        #     layout을 vendor-neutral form으로 정규화
+          PIMDataPlacement.cpp          #     reuse 고려 placement 최적화
+          PIMChunkPlanning.cpp          #     K축 chunk 분할 계획
+          PIMTransferHoisting.cpp       #     반복 transfer를 loop 밖으로
+          PIMPersistentData.cpp         #     weight/KV 등 상주 데이터 표시
+          PIMPartialResultPlanning.cpp  #     partial result 저장/reduce 계획
+          PIMPipelineOverlap.cpp        #     transfer/compute/store overlap
+          # autotune 값(SPLIT_*/NUM_UNITS 등)은 BuildPIMTilePlan/BuildPIMExecutionPlan이
+          # option에서 직접 읽으므로 별도 annotation pass를 두지 않는다 (17.0 참고)
 
       PIMVendor/
         UPMEM/
           IR/
-            UPMEMDialect.cpp
-            UPMEMOps.cpp
+            UPMEMDialect.cpp        #   dialect 구현
+            UPMEMOps.cpp            #   op 구현
             UPMEMTypes.cpp
             UPMEMAttrs.cpp
           Transforms/
-            LegalizePIMToUPMEM.cpp
-            UPMEMMemoryPlacement.cpp
-            UPMEMExecutionMapping.cpp
-            UPMEMTransferLowering.cpp
-            UPMEMHostDeviceSplit.cpp
-            UPMEMCodegen.cpp
-            UPMEMRuntimeStub.cpp
+            LegalizePIMToUPMEM.cpp      #   pim.* → upmem.* 변환 (execution_unit→DPU 등)
+            UPMEMMemoryPlacement.cpp    #   device_global→MRAM, device_local→WRAM 배치
+            UPMEMExecutionMapping.cpp   #   tile → DPU/tasklet 배정
+            UPMEMTransferLowering.cpp   #   pim.transfer → host↔MRAM copy
+            UPMEMHostDeviceSplit.cpp    #   host_func / device_func 분리
+            UPMEMCodegen.cpp            #   IR → host.cpp + device.c 텍스트 생성
+            UPMEMRuntimeStub.cpp        #   pim runtime이 호출할 host wrapper 생성
 
         AiMX/
           IR/
@@ -253,50 +271,49 @@ triton-shared/
             AiMXTypes.cpp
             AiMXAttrs.cpp
           Transforms/
-            LegalizePIMToAiMX.cpp
-            AiMXMemoryBankMapping.cpp
-            AiMXExecutionMapping.cpp
-            AiMXDescriptorSelection.cpp
-            AiMXDMAScheduling.cpp
-            AiMXCommandStreamCodegen.cpp
-            AiMXRuntimeStub.cpp
+            LegalizePIMToAiMX.cpp       #   pim.* → aimx.* 변환
+            AiMXMemoryBankMapping.cpp   #   region → bank/channel 매핑
+            AiMXExecutionMapping.cpp    #   tile → compute unit 배정
+            AiMXDescriptorSelection.cpp #   compute/dma descriptor 선택
+            AiMXDMAScheduling.cpp       #   DMA 순서/overlap 스케줄
+            AiMXCommandStreamCodegen.cpp#   descriptor binary stream 생성
+            AiMXRuntimeStub.cpp         #   command queue submit wrapper 생성
 
-    Conversion/
-      TTSharedToPIM/
-        ...
-      PIMToUPMEM/
-        ...
-      PIMToAiMX/
-        ...
+    Conversion/                     # 변환 pass 구현체 (위 Conversion 헤더 대응)
+      TTSharedToPIR/ ...
+      PIMToUPMEM/ ...
+      PIMToAiMX/ ...
 
   tools/
     triton-shared-opt/
-      RegisterTritonSharedDialects.h   # PIM dialect/pass 등록 추가
+      RegisterTritonSharedDialects.h  # 모든 PIM/UPMEM/AiMX dialect·pass를 triton-shared-opt에 등록
 
-  runtime/
+  runtime/                          # ── 생성된 artifact를 실제 장치에서 실행하는 런타임 ──
     pim/
       include/
-        pim_runtime.h
-        pim_device.h
-        pim_launch.h
-        pim_executable.h
-        pim_memory.h
+        pim_runtime.h               #   vendor-neutral C API (pim_device_open/launch/...)
+        pim_device.h                #   device 핸들
+        pim_launch.h                #   launch 파라미터(grid, BLOCK, SPLIT 등)
+        pim_executable.h            #   load된 artifact 핸들
+        pim_memory.h                #   host buffer import/release
       lib/
-        PIMRuntime.cpp
+        PIMRuntime.cpp              #   vendor 이름 보고 적절한 VendorRuntime으로 dispatch
         PIMDevice.cpp
         PIMExecutable.cpp
         PIMLaunch.cpp
         PIMMemory.cpp
       vendors/
         upmem/
-          UPMEMRuntime.cpp
-          UPMEMLauncher.cpp
+          UPMEMRuntime.cpp          #   dpu_alloc/dpu_load 등 SDK 호출
+          UPMEMLauncher.cpp         #   dpu_copy_to/dpu_launch/dpu_copy_from 시퀀스
         aimx/
           AiMXRuntime.cpp
-          AiMXLauncher.cpp
+          AiMXLauncher.cpp          #   descriptor stream submit + wait
 ```
 
 CPUBackend와 동일하게 IR 변환은 Python이 아니라 `triton-shared-opt` 실행 파일을 subprocess로 호출하여 수행한다. 따라서 새 PIM dialect/pass는 모두 `tools/triton-shared-opt/RegisterTritonSharedDialects.h`에 등록되어야 한다.
+
+`pim_backend/backend/compiler.py`는 `triton-shared/backend/compiler.py`의 공유 유틸리티(`_ttir_to_ttsharedir`, `_get_triton_shared_opt_path` 등)를 import해서 재사용한다.
 
 ---
 
@@ -400,7 +417,7 @@ class PIMBackend(BaseBackend):
     # 동일한 형태로 구현한다 (생략).
 ```
 
-각 `_*` helper는 CPUBackend의 `_ttir_to_ttsharedir` / `_ttsharedir_to_llir`과 동일하게 `triton-shared-opt` 또는 `mlir-opt`를 subprocess로 호출하는 thin wrapper이다. Pass 목록은 다음과 같다.
+`_ttir_to_ttsharedir`는 `triton-shared/backend/compiler.py`에서 import해서 재사용한다. 나머지 `_*` helper는 CPUBackend의 `_ttsharedir_to_llir`과 동일하게 `triton-shared-opt` 또는 `mlir-opt`를 subprocess로 호출하는 thin wrapper이다. Pass 목록은 다음과 같다.
 
 **TTShared → PIM Common** (`_ttsharedir_to_pim_common`):
 
@@ -429,7 +446,6 @@ pim-transfer-hoisting
 pim-persistent-data
 pim-partial-result-planning
 pim-pipeline-overlap
-pim-autotune-annotation
 canonicalize
 cse
 ```
@@ -760,13 +776,52 @@ capacity_hint
 }
 ```
 
-의미:
+### 11.5.1 BLOCK vs SPLIT — 헷갈리지 않게
+
+**행렬 규약**: 이 문서 전체에서 GEMM은 `A(M,K) × B(K,N) → C(M,N)` 이다. row-major 기준.
+
+`tile_plan`에는 성격이 전혀 다른 두 종류의 정보가 들어간다. 절대 섞어 쓰면 안 된다.
 
 ```text
-BLOCK_M → output tile row size
-BLOCK_N → output tile column size
-BLOCK_K → reduction chunk size
+전체 (M,N,K) 문제
+   │
+   ① SPLIT  ── 유닛 "간" 분배 (inter-unit, 바깥 레벨)
+   │           전체 출력 grid를 여러 execution_unit(DPU)에 어떻게 나눠줄까
+   ▼
+각 유닛이 맡은 부분 행렬
+   │
+   ② BLOCK  ── 유닛 "내부" 처리 (intra-unit, 안쪽 레벨)
+   │           그 부분을 local memory(WRAM/GBuf)에 맞는 타일로 끊어 계산
+   ▼
+BLOCK_M × BLOCK_N 출력 타일 한 조각
 ```
+
+| 파라미터 | 레벨 | 의미 | 무엇을 결정하나 | 값의 출처 |
+| --- | --- | --- | --- | --- |
+| `BLOCK_M` | intra-unit (안쪽) | 출력 타일 행 수 (= A에서 읽는 행 수) | 한 유닛이 한 번에 다루는 타일 크기 | 커널 `tl.constexpr` → IR |
+| `BLOCK_N` | intra-unit (안쪽) | 출력 타일 열 수 (= B에서 읽는 열 수) | 〃 | 커널 `tl.constexpr` → IR |
+| `BLOCK_K` | intra-unit (안쪽) | reduction chunk 크기 | local memory에 한 번에 올릴 K 조각 | 커널 `tl.constexpr` → IR |
+| `SPLIT_M` | inter-unit (바깥) | M축을 몇 partition으로 나눌까 | 출력 grid → 유닛 분배 | compile option / autotune |
+| `SPLIT_N` | inter-unit (바깥) | N축을 몇 partition으로 나눌까 | 〃 | compile option / autotune |
+| `SPLIT_K` | inter-unit (바깥) | K축을 몇 partition으로 나눌까 (>1이면 partial result + reduce 필요) | 〃 | compile option / autotune |
+
+핵심 구분:
+
+- **BLOCK = "각 bank(WRAM/GBuf/register)를 최대한 채우는 지역 타일 크기"** — 한 유닛 내부 작업 단위.
+- **SPLIT = "그 바깥에서, 일을 여러 유닛에 어떻게 쪼개 분배할까"** — 병렬도/매핑 결정.
+
+즉 **SPLIT이 먼저 바깥에서 유닛에 분배하고, BLOCK이 그 안에서 local memory에 맞춰 타일링**한다. (SPLIT은 "BLOCK 안에서 쪼개는 것"이 아니다 — 방향이 반대다.)
+
+메모리 계층과의 대응 (UPMEM / AiMX):
+
+| 정보 | 대응 memory_space | UPMEM | AiMX |
+| --- | --- | --- | --- |
+| `BLOCK_K` load tile | `device_local` | WRAM | GBuf |
+| `BLOCK_M×BLOCK_N` accumulator | `device_register` / `device_local` | DPU register / WRAM | OutReg / local buffer |
+| 전체 A,B,C 상주 | `device_global` | MRAM | device memory |
+| `SPLIT_*` 분배 | `execution_group` | DPU 개수·배정 | compute unit 배정 |
+
+`BuildPIMTilePlan`은 IR에서 `BLOCK_*`를, option에서 `SPLIT_*`를 읽어 위 `tile_plan`을 채운다. `BuildPIMExecutionPlan`은 `SPLIT_*`와 capability(NUM_UNITS 등)를 보고 실제 유닛 매핑(`execution_group`)을 만든다.
 
 ---
 
@@ -1107,6 +1162,35 @@ pim.func @matmul(%A, %B, %C, %M, %N, %K) attributes {
 
 # 13. PIM Common Pass Pipeline
 
+## 13.0 공통 pass의 경계 (가장 중요)
+
+공통(PIM Common) pass는 **값을 최적화하지 않는다.** 오직 다음 세 가지만 한다.
+
+```text
+1. 구조 생성 (neutral structure)
+     주어진 값(constexpr/option)을 IR에 기록만 한다. "무엇이 최적인가"를 결정하지 않는다.
+     예: build-pim-tile-plan은 block/split을 "고르지" 않고, 주어진 값을 적는다.
+
+2. intent 표현 (policy enum)
+     분산/매핑/잔류를 vendor-neutral enum으로 표현한다. 구체 산술은 하지 않는다.
+     예: placement="interleave"는 "의도"일 뿐, 실제 bank 오프셋은 vendor가 정한다.
+
+3. capability-gated 결정
+     vendor 사실이 필요하면 그 vendor의 PIMCapability를 query한다.
+     (컴파일 시점에 vendor는 이미 하나로 정해져 있으므로 vendor-aware하게 동작 가능.)
+     예: pim-pipeline-overlap은 supports_pipeline_overlap일 때만 동작한다.
+```
+
+따라서 다음은 공통 pass의 일이 **아니다.**
+
+```text
+- 최적값 선택 (어느 block/split/placement가 빠른가)  → autotune이 실측으로 가린다 (17장)
+- 구체 실현 (실제 bank/channel/register 산술)         → vendor lowering이 한다 (14·15장)
+- 적법성 판단 (block_k가 WRAM에 들어가나)              → PIMConstraints 기반 적법성 필터 (13.4)
+```
+
+한 줄 요약: **공통 = "구조 + 의도 + (필요시) capability gate"**, **autotune = "값 선택"**, **vendor = "구체 실현"**.
+
 ## 13.1 TTSharedIR to PIM Common IR
 
 ```text
@@ -1134,32 +1218,145 @@ pim-transfer-hoisting
 pim-persistent-data
 pim-partial-result-planning
 pim-pipeline-overlap
-pim-autotune-annotation
 canonicalize
 cse
 ```
 
 ## 13.3 Pass Responsibilities
 
-| Pass                          | 역할                                                       |
-| ----------------------------- | -------------------------------------------------------- |
-| `detect-pim-candidate`        | TTSharedIR에서 PIM으로 lowering 가능한 region 탐지                |
-| `extract-tile-metadata`       | `BLOCK_M`, `BLOCK_N`, `BLOCK_K`, grid, shape, dtype 추출   |
-| `recognize-pim-primitive`     | GEMM, GEMV, attention-like pattern, reduction pattern 인식 |
-| `build-pim-memory-plan`       | host/device memory region 생성                             |
-| `build-pim-tile-plan`         | Triton block 정보를 PIM tile plan으로 변환                      |
-| `build-pim-transfer-plan`     | explicit transfer 계획 생성                                  |
-| `build-pim-execution-plan`    | execution unit/group mapping 계획 생성                       |
-| `build-pim-placement-plan`    | data placement, interleaving, replication 계획 생성          |
-| `build-pim-residency-plan`    | persistent/ephemeral/streaming data residency 결정         |
-| `pim-layout-normalize`        | layout 표현을 vendor-neutral layout으로 정규화                   |
-| `pim-data-placement`          | data locality와 reuse를 고려한 placement 최적화                  |
-| `pim-chunk-planning`          | reduction axis chunking 계획 생성                            |
-| `pim-transfer-hoisting`       | 반복 transfer를 상위 scope로 이동                                |
-| `pim-persistent-data`         | weight/KV cache 등 persistent data 지정                     |
-| `pim-partial-result-planning` | partial result 저장 및 reduce 계획                            |
-| `pim-pipeline-overlap`        | transfer/compute/store overlap 구성                        |
-| `pim-autotune-annotation`     | `@triton.autotune` config를 PIM IR metadata로 연결           |
+꼬리표 의미 (13.0 기준):
+- **[구조]** — 주어진 값/패턴을 기록·표현만. 결정/최적화 없음.
+- **[intent]** — vendor-neutral policy enum만 표현. 구체 산술은 vendor가.
+- **[gate]** — vendor capability를 query해 동작 여부/형태를 결정 (vendor-aware).
+- **[vendor가 실현]** — 이 공통 pass가 만든 intent를 실제 산술로 바꾸는 책임은 vendor lowering에 있음.
+
+| Pass                          | 분류 | 역할 (공통 layer 한정) | vendor가 실현하는 부분 |
+| ----------------------------- | --- | ------------------- | ------------------- |
+| `detect-pim-candidate`        | [구조] | PIM lowering 가능 region 탐지·표시 | — |
+| `extract-tile-metadata`       | [구조] | `BLOCK_M/N/K`, grid, shape, dtype 추출(기록) | — |
+| `recognize-pim-primitive`     | [구조] | gemm/gemv/attention/reduction 패턴 분류 | — |
+| `build-pim-memory-plan`       | [구조] | host/device memory_region 생성 | — |
+| `build-pim-tile-plan`         | [구조] | 주어진 block/split을 tile_plan에 **기록** (최적화 X) | 실제 타일 micro-fit |
+| `build-pim-transfer-plan`     | [구조] | transfer **골격** 삽입 | 실제 copy 방식(DMA/dpu_copy) |
+| `build-pim-execution-plan`    | [intent] | mapping_policy **enum**만 표현 | 실제 DPU/channel 배정 |
+| `build-pim-placement-plan`    | [intent] | placement policy **enum**만 표현 | bank/channel 오프셋 산술 (`UPMEMMemoryPlacement` / `AiMXMemoryBankMapping`) |
+| `build-pim-residency-plan`    | [intent] | residency enum 표현 | 실제 상주 버퍼 관리 |
+| `pim-layout-normalize`        | [구조] | layout **표현 정규화만** (중복 transpose 제거, 단일 canonical form) | 물리 layout 변환(`pack_by_*`) |
+| `pim-data-placement`          | [intent] | reuse 고려 placement **의도** 갱신 | 구체 분산 |
+| `pim-chunk-planning`          | [구조] | `num_chunks=ceildiv(K,BLOCK_K)` **산술만** | register/WRAM fitting |
+| `pim-transfer-hoisting`       | [구조] | 반복 transfer를 상위 scope로 이동 | — |
+| `pim-persistent-data`         | [intent] | weight/KV를 persistent로 **표시** | 실제 상주 구현 |
+| `pim-partial-result-planning` | [구조] | partial/reduce **구조** 생성 (split_k>1일 때) | 실제 reduce 구현 |
+| `pim-pipeline-overlap`        | [gate] | `supports_pipeline_overlap`일 때만 `pim.pipeline` 삽입 | 실제 async/double-buffer |
+
+> 적법성("BLOCK_K가 WRAM에 들어가나" 등)은 이 표의 어느 pass도 판단하지 않는다. `PIMConstraints` 기반 적법성 필터(13.4.5)가 담당한다.
+
+---
+
+## 13.4 Execution Strategy Selection (plan dispatch)
+
+> **전제**: Phase 2~5에서는 단일 전략(no-split)만 구현하고, 이 절의 다중 전략 선택은 Phase 8 이후 확장으로 도입한다. 처음부터 일반화하지 않는다 (premature abstraction 회피).
+
+### 13.4.1 동기 — PGEMM의 분기 패턴
+
+UPMEM용 손수 작성 라이브러리(PGEMM `pgemm_float.c`)는 `(splitM, splitK, splitN)` 조합에 따라 서로 다른 커널 구현으로 분기한다.
+
+```c
+if      (splitK==1 && splitM==1 && splitN==1)  basic(...);     // 분할 없음
+else if (splitK>1  && splitM==1)               basic_k(...);   // K-split → partial reduce
+else if (splitN>1)                             basic_n(...);   // N-split
+else if (splitM>1) { SWAP(M,N); SWAP(splitM,splitN);           // M-split = N-split + 전치
+                     basic_n(B,A,...); transpose_C(...); }
+```
+
+각 분기는 **데이터 layout, DPU 매핑, reduction 방식이 다른 별개의 실행 전략**이다. 즉 "맞는 plan"은 split factor와 hardware에 따라 달라진다.
+
+### 13.4.2 전략의 IR 표현
+
+이 분기 로직을 if-else로 코드에 박지 않고, **전략을 선택해 vendor-neutral attribute로 표현**한다. 한 전략 = 다음 3개의 묶음이다.
+
+```text
+strategy = {
+  mapping_policy   :  output_n_partitioned | output_m_partitioned | reduction_k_partitioned | none
+  reduction        :  none | host_reduce | device_reduce | tree_reduce
+  placement        :  blocked | interleave | replicated | output_tile_interleaved
+}
+```
+
+| PGEMM 분기 | PIM 전략 (mapping_policy / reduction) |
+| --- | --- |
+| `basic` (no split) | `none` / `none` |
+| `basic_n` (N-split) | `output_n_partitioned` / `none` |
+| `basic_k` (K-split) | `reduction_k_partitioned` / `device_reduce` 또는 `host_reduce` |
+| `M-split` (전치 후 N-split) | `output_m_partitioned` / `none` (layout 전치 포함) |
+
+### 13.4.3 어디서 결정하고 어디서 구체화하나 — 선택은 Common, 실현은 Vendor
+
+전략은 **선택(WHAT)** 과 **실현(HOW)** 으로 나뉜다.
+
+| 단계 | 위치 | 하는 일 |
+| --- | --- | --- |
+| 전략 **선택 + 표현** | **PIM Common IR** | "K-split + device_reduce, N-partitioned로 간다"를 결정하고 `mapping_policy`/`reduction`/`placement` attribute로 박음 |
+| 전략 **구체화(legalize)** | **vendor IR (UPMEM/AiMX)** | 그 전략을 실제로 실현: DPU 개수·MRAM 오프셋·reduce 구현 (UPMEM) / channel·OutReg 누적·descriptor (AiMX) |
+
+```text
+[Common IR]  pim.execution_group { mapping_policy="reduction_k_partitioned" }
+             pim.reduce { method="device_reduce" }
+                  │
+     ┌────────────┴────────────┐
+     ▼ UPMEM lowering           ▼ AiMX lowering
+ "K를 4 DPU에 나누고            "K를 4 channel에 나누고
+  partial을 MRAM에,             partial을 OutReg에 누적,
+  host_reduce로 합산"           descriptor_chain accumulate로 합산"
+```
+
+**선택을 Common에 두는 이유**: ① `mapping_policy`/`reduction`/`placement`는 이미 vendor-neutral 개념이다(11.7/11.13/11.8). ② 같은 TTSharedIR이 어느 vendor로도 갈 수 있으므로 선택 로직을 vendor마다 중복하면 안 된다. ③ Common 최적화 pass(transfer-hoisting, pipeline-overlap)가 단일 표현 위에서 동작해야 한다.
+
+### 13.4.4 "일찍 고르면 어떤 vendor엔 손해" 문제 — vendor-aware 선택으로 해결
+
+vendor마다 유리/가능한 전략이 다르다. 그렇다고 Common에서 고르는 것이 손해는 아니다. **결정의 위치(Common)와 결정을 좌우하는 정보(vendor)는 별개**이기 때문이다.
+
+핵심 사실: **컴파일 시점에 vendor는 이미 하나로 정해져 있다.** `options.vendor`를 `_ttsharedir_to_pim_common`이 알고 있으므로, 선택 pass가 그 vendor의 정보를 보고 고른다. 한 번의 컴파일은 항상 한 vendor만 대상으로 한다.
+
+따라서 `SelectPIMExecutionStrategy`는 **Common 레벨 pass이지만 vendor-aware**하다. 입력으로 그 vendor의 `PIMCapability`/`PIMConstraints`를 query한다.
+
+```text
+PIMVendorExtension
+  └── queryCapability() / queryConstraints()   # supports_device_reduce, max_num_units, WRAM 크기, alignment 등
+```
+
+→ 로직은 공통 한 곳, 그 로직을 움직이는 데이터는 vendor별. vendor 차이가 **코드 중복이 아니라 capability 데이터로** 들어온다.
+
+### 13.4.5 선택 방법 — 적법성 필터 + autotune (cost model 없음)
+
+**(1) 적법성 필터 (deterministic, vendor-aware)** — PGEMM의 if-else에 해당.
+`SelectPIMExecutionStrategy`가 `tile_plan`의 split factor + vendor의 `PIMCapability`/`PIMConstraints`를 보고 **적용 가능한 전략만** 추린다.
+
+- `SPLIT_K==1` → K-split 전략 제외
+- `block_k`가 WRAM 초과 → 해당 BLOCK 조합 제외
+- `supports_device_reduce=false` (UPMEM) → `device_reduce` 전략 제외 (단, `host_reduce` K-split은 여전히 적법)
+
+**(2) 적법한 전략 중 best 결정**
+
+- **`@triton.autotune` 사용 시**: 적법한 전략들을 각각 별도 config로 컴파일·실행·**벤치마크하여 empirical best**를 고른다(17.0 표준 autotuner 경로). **미리 추정하지 않고 측정**한다 — 그래서 cost model이 필요 없다.
+  - 예: UPMEM에서 N-split과 host_reduce K-split이 둘 다 적법하면, autotuner가 둘 다 돌려보고 빠른 쪽을 택한다.
+- **autotune 미사용 시**: 단순 기본 규칙으로 적법 전략 하나를 확정한다 (예: "no-split이 적법하면 no-split, 아니면 N-split"). 이는 휴리스틱 default일 뿐이며, 실제 최적화는 autotune이 담당한다.
+
+> **cost model은 두지 않는다.** 전략 간 우열은 정적 비용 추정이 아니라 autotune 실측으로 가린다. 정적으로는 "적법한가"만 판단한다.
+
+초기 구현은 (1)의 필터 + 단일 default 전략만으로 시작하고, autotune 다중 전략은 나중에 얹는다.
+
+### 13.4.6 확장성
+
+새 전략 추가 = "전략 레지스트리에 항목 하나 + 그 전략의 lowering 한 벌" 추가이며, 기존 전략 코드를 건드리지 않는다 (PGEMM처럼 if-else를 늘려가는 대신).
+
+```text
+PIMExecutionStrategy (interface, vendor-neutral)
+  ├── isApplicable(tile_plan, capability, constraints) -> bool   // 적법성만 판단 (cost 추정 없음)
+  └── applyToIR(builder)                                         // execution_group/reduce/placement attribute 확정
+```
+
+전략 목록은 vendor-neutral하다. vendor IR은 확정된 전략 attribute를 자기 방식으로 legalize만 한다 (예: `reduction_k_partitioned` → UPMEM은 host_reduce, AiMX는 descriptor accumulate). "WHAT"만 Common에서 vendor-aware하게 고르고, "HOW"는 vendor lowering이 맡는다.
 
 ---
 
@@ -1525,9 +1722,31 @@ newvendor-runtime-stub
 
 # 17. Autotune Integration
 
-PIMBackend는 별도 환경변수로 autotune을 켜지 않는다.
+## 17.0 동작 모델 (중요)
 
-`@triton.autotune`이 존재하면 PIMBackend는 자동으로 PIM autotune path를 사용한다.
+`@triton.autotune`은 별도의 PIM 전용 메커니즘이 아니다. Triton 표준 autotuner(`runtime/autotuner.py`)는 다음과 같이 동작한다.
+
+```text
+configs = [Config(BLOCK_M=32, ...), Config(BLOCK_M=64, ...), ...]
+for config in configs:
+    # config.kwargs(BLOCK_M 등)를 constexpr meta-param으로 주입하여
+    # 각 config마다 독립적으로 컴파일 → 실행 → 시간 측정
+    timing = bench(kernel.run(*args, **config.all_kwargs()))
+best_config = argmin(timing)   # 가장 빠른 config 선택
+# 이후 호출은 best_config로 한 번만 컴파일된 커널을 사용
+```
+
+즉 **하나의 IR에 모든 config를 metadata로 박는 것이 아니라, config마다 별도의 IR/artifact를 만들어 각각 실행·벤치마크한 뒤 가장 빠른 것을 고른다.** `BLOCK_M`/`BLOCK_N`/`BLOCK_K` 등이 `tl.constexpr`이므로, 값이 바뀌면 TTIR 단계부터 서로 다른 IR이 생성된다.
+
+PIM에서 autotune이 적용되는 지점은 다음과 같다.
+
+1. config 값이 `tl.constexpr`로 들어오는 경우(`BLOCK_M/N/K`): **TTIR → TTSharedIR → PIM Common IR** 각 단계에서 자연스럽게 서로 다른 IR로 specialize된다. `BuildPIMTilePlan`이 이 값을 읽어 `pim.tile_plan.block_*`에 박는다.
+2. config 값이 커널 본문에서 참조되지 않는 PIM 전용 노브인 경우(`SPLIT_M/N/K`, `NUM_UNITS`, `LOCAL_LANES`): `tl.constexpr`이 아니라 compile option/metadata로 전달되며, `BuildPIMTilePlan`(SPLIT_*) / `BuildPIMExecutionPlan`(NUM_UNITS·LOCAL_LANES)이 option에서 직접 읽어 IR attribute로 확정한다.
+3. 여러 config 중 best를 고르는 탐색 루프는 전적으로 Python autotuner가 담당하며, PIMBackend는 매 config를 평범한 단일 컴파일로 처리할 뿐이다.
+
+> **별도 `pim-autotune-annotation` pass는 두지 않는다.** autotune 값을 IR에 반영하는 일은 이미 `BuildPIMTilePlan` / `BuildPIMExecutionPlan`이 수행하므로, 같은 option을 다시 읽어 attribute를 덮어쓰는 전용 pass는 불필요한 중복이다.
+
+`@triton.autotune`이 존재하면 PIMBackend가 자동으로 이 경로를 타며, 별도 환경변수로 켜지 않는다.
 
 ```python
 @triton.autotune(
@@ -1936,7 +2155,6 @@ PIM Common IR
     |     - residency planning
     |     - chunk planning
     |     - pipeline overlap
-    |     - autotune annotation
     |
     v
 Vendor Extension IR
@@ -1971,4 +2189,75 @@ PIMBackend is a Triton backend selected by device="pim". It lowers TTSharedIR in
 
 ```text
 PIMBackend는 device="pim"으로 선택되는 Triton backend이다. TTSharedIR을 입력으로 받아 vendor-neutral PIM Common IR을 생성하고, PIM에 필요한 memory plan, transfer plan, tile plan, chunk plan, data placement, residency, execution mapping 최적화를 수행한 뒤, 등록된 Vendor Extension으로 전달한다. UPMEM과 AiMX는 각각 PIM Common IR을 자신들의 vendor-specific IR로 lowering하고, 실제 장치에서 실행 가능한 artifact와 runtime launch stub을 생성한다.
+```
+
+---
+
+# 25. CPU+PIM 동시 실행 (HybridDriver)
+
+> **전제**: Phase 5 (UPMEM E2E) 완료 후 추가한다.
+
+## 25.1 설계 원칙
+
+TTSharedIR은 `program_id`(tile 좌표) 기반으로 tile을 표현하며, GEMM의 경우 타일 간 data dependency가 없다. 따라서 동일한 TTSharedIR에서 CPU binary와 PIM binary를 각각 컴파일한 뒤, 런타임에 tile grid를 분할하여 두 하드웨어에 동시에 실행할 수 있다.
+
+이 구조는 Cinnamon의 공통 IR 계층 + NeuPIMs의 runtime scheduler dual-program 방식을 결합한 것이다.
+
+## 25.2 컴파일 타임
+
+```text
+Triton Python DSL
+    ↓
+TTIR
+    ↓
+TTSharedIR  ←── heterogeneous dispatch 경계선
+    ├── [CPUBackend]  → CPU binary  (grid 전체를 처리할 수 있는 코드)
+    └── [PIMBackend]  → PIM binary  (grid 전체를 처리할 수 있는 코드)
+```
+
+두 backend는 동일한 TTSharedIR 텍스트를 입력으로 받아 독립적으로 lowering한다. TTSharedIR 생성(`_ttir_to_ttsharedir`)은 한 번만 수행하고 결과를 두 pipeline에 전달한다.
+
+## 25.3 런타임
+
+```text
+HybridDriver.launch(grid=(M_tiles, N_tiles), ...)
+    │
+    ├── partition_policy(grid, cpu_cap, pim_cap)
+    │     → cpu_range: pid_m ∈ [0, split_m)
+    │     → pim_range: pid_m ∈ [split_m, M_tiles)
+    │
+    ├── Thread 1: cpu_launcher(cpu_range, ...)
+    └── Thread 2: pim_launcher(pim_range, ...)
+                  → DPU kernel에 tile_offset, tile_count 파라미터 전달
+```
+
+출력 buffer `C`는 pid_m 기준으로 disjoint하게 분할되므로 동기화 없이 안전하다.
+
+## 25.4 PIM kernel 요건
+
+HybridDriver를 지원하려면 DPU kernel이 `tile_offset`, `tile_count` 파라미터를 받아야 한다. `UPMEMCodegen` pass에서 이 파라미터를 생성한다.
+
+## 25.5 Python API
+
+```python
+matmul_kernel[grid](
+    A, B, C,
+    M, N, K,
+    BLOCK_M=32, BLOCK_N=64, BLOCK_K=256,
+    device="hybrid",          # HybridDriver 선택
+    pim_vendor="upmem",
+    split_policy="half",      # "half" | "pim_ratio:0.75" | "auto"
+)
+```
+
+`device="hybrid"`는 별도 `HybridBackend`로 구현하거나, 런타임 wrapper로 구현한다.
+
+## 25.6 구현 파일
+
+```text
+triton-shared/
+  hybrid/
+    HybridDriver.py           # Python launcher: cpu + pim 동시 실행
+    HybridPartitionPolicy.py  # tile grid 분할 정책
+    HybridBackend.py          # Triton BaseBackend wrapper (optional)
 ```
