@@ -24,7 +24,7 @@
 | 단계 | 제목 | 상태 | 진행률 |
 |------|------|:----:|:------:|
 | **Part I — Minimal Executable (MVP)** | | | |
-| M0 | Skeleton: pim_backend 디렉토리 + PIMBackend / PIMDriver | `[ ]` | 0 / 8 |
+| M0 | Skeleton: pim_backend 디렉토리 + PIMBackend / PIMDriver | `[x]` | 8 / 8 |
 | M1 | 최소 PIM Common Dialect (6 ops) | `[ ]` | 0 / 8 |
 | M2 | Debug / IR Dump (변환 확인용, 먼저 구축) | `[ ]` | 0 / 3 |
 | M3 | TTShared→PIM 단일 변환 (no-split GEMM) | `[ ]` | 0 / 4 |
@@ -66,14 +66,14 @@
 
 **작업 단위**:
 
-- [ ] **M0.1** `pim_backend/backend/` 디렉토리 생성, `name.conf`에 `pim` 기재
-- [ ] **M0.2** `PIMOptions` dataclass (CPUOptions 기반, `vendor`/`device_id`/`dump_*` 추가, `__post_init__`에서 `vendor` 누락 시 `ValueError`)
-- [ ] **M0.3** `PIMBackend(BaseBackend)`: `binary_ext='pimobj'`, `supports_target`=`backend=='pim'`, `parse_options`, 빈 `load_dialects`, `add_stages`(M0에서는 `triton-shared/backend/compiler.py`의 CPU 4-stage import해 차용), `pack_metadata`/`get_codegen_implementation`/`hash`/`get_module_map`
-- [ ] **M0.4** `PIMDriver(DriverBase)` (CPUDriver 복제, `get_current_target`→`GPUTarget("pim",0,0)`, `is_active()` False)
-- [ ] **M0.5** `PIMLauncher`/`PIMUtils` (M0에서는 CPULauncher 코드 복사/import)
-- [ ] **M0.6** 빌드 등록: `TRITON_PLUGIN_DIRS`에 `pim_backend` 경로 추가 후 `pip install -e .`, entry_points에 `pim` 확인
-- [ ] **M0.7** `include/ExecutionEngine/` symlink (→ `backend/include/ExecutionEngine`)
-- [ ] **M0.8** smoke test: `pim_backend/examples/test_pim_dispatch.py` — `device="pim"` 라우팅 확인
+- [x] **M0.1** `pim_backend/backend/` 디렉토리 생성, `name.conf`에 `pim` 기재
+- [x] **M0.2** `PIMOptions` dataclass (CPUOptions 기반, `vendor`/`device_id`/`dump_*` 추가, `__post_init__`에서 `vendor` 누락 시 `ValueError`)
+- [x] **M0.3** `PIMBackend(BaseBackend)`: `binary_ext='pimobj'`, `supports_target`=`backend=='pim'`, `parse_options`, 빈 `load_dialects`, `add_stages`(M0에서는 `triton-shared/backend/compiler.py`의 CPU 4-stage import해 차용), `pack_metadata`/`get_codegen_implementation`/`hash`/`get_module_map`
+- [x] **M0.4** `PIMDriver(DriverBase)` (CPUDriver 복제, `get_current_target`→`GPUTarget("pim",0,0)`, `is_active()` False)
+- [x] **M0.5** `PIMLauncher`/`PIMUtils` (M0에서는 CPULauncher 코드 복사/import)
+- [x] **M0.6** 빌드 등록: `TRITON_PLUGIN_DIRS`에 `pim_backend` 경로 추가 후 `pip install -e .`, entry_points에 `pim` 확인
+- [x] **M0.7** `include/ExecutionEngine/` symlink (→ `backend/include/ExecutionEngine`)
+- [x] **M0.8** smoke test: `pim_backend/examples/test_pim_dispatch.py` — `device="pim"` 라우팅 확인
 
 ---
 
@@ -358,4 +358,4 @@ M6 E2E 검증  ← ✅ "돈다"
 
 현재 다음 작업을 시작하면 됩니다:
 
-- [ ] **M0.1** — `triton-shared/pim_backend/backend/` 디렉토리 생성 및 `name.conf` 작성
+- [x] **M0.1** — `triton-shared/pim_backend/backend/` 디렉토리 생성 및 `name.conf` 작성
