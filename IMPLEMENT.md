@@ -26,8 +26,8 @@
 | **Part I — Minimal Executable (MVP)** | | | |
 | M0 | Skeleton: pim_backend 디렉토리 + PIMBackend / PIMDriver | `[x]` | 8 / 8 |
 | M1 | 최소 PIM Common Dialect (6 ops) | `[x]` | 8 / 8 |
-| M2 | Debug / IR Dump (변환 확인용, 먼저 구축) | `[ ]` | 0 / 3 |
-| M3 | TTShared→PIM 단일 변환 (no-split GEMM) | `[ ]` | 0 / 4 |
+| M2 | Debug / IR Dump (변환 확인용, 먼저 구축) | `[~]` | 2 / 3 |
+| M3 | TTShared→PIM 단일 변환 (no-split GEMM) | `[x]` | 4 / 4 |
 | M4 | 최소 UPMEM lowering + codegen (no-split) | `[ ]` | 0 / 7 |
 | M5 | Runtime & Launcher | `[ ]` | 0 / 5 |
 | M6 | End-to-end: MatMul 실행 + 검증 | `[ ]` | 0 / 4 |
@@ -117,8 +117,8 @@ pim.launch
 
 **작업 단위**:
 
-- [ ] **M2.1** 내장 dump 동작 확인: `TRITON_KERNEL_DUMP=1 TRITON_DUMP_DIR=/tmp/triton_pim`로 smoke test 실행 → 커널 hash 폴더에 `*.ttir`, `*.ttsharedir`, `*.llir`, `*.pimobj` 생성 확인
-- [ ] **M2.2** `PIMOptions`에서 미사용 dump 필드 제거(내장 knobs로 대체), DESIGN 21장을 내장 dump 기준으로 정정
+- [x] **M2.1** 내장 dump 동작 확인: `TRITON_KERNEL_DUMP=1 TRITON_DUMP_DIR=/tmp/triton_pim`로 smoke test 실행 → 커널 hash 폴더에 `*.ttir`, `*.ttsharedir`, `*.llir`, `*.pimobj` 생성 확인
+- [x] **M2.2** `PIMOptions`에서 미사용 dump 필드 제거(내장 knobs로 대체), DESIGN 21장을 내장 dump 기준으로 정정
 - [ ] **M2.3** (M3/M4 이후) `pim_common`/`vendor_ir`/codegen artifact가 같은 메커니즘으로 자동 dump되는지 확인
 
 ---
@@ -131,10 +131,10 @@ pim.launch
 
 **작업 단위**:
 
-- [ ] **M3.1** `convert-ttshared-to-pim` 단일 pass: `linalg.matmul` 인식 → `pim.compute @gemm`
-- [ ] **M3.2** BLOCK_M/N/K를 읽어 `pim.tile_plan {block_*, split_m=1, split_n=1, split_k=1}` 하드코딩 생성
-- [ ] **M3.3** A/B/C를 `pim.memory_region`(host/device_global)으로 감싸고 `pim.transfer`(host↔device) 삽입 — placement/residency/chunk/reduce 없음
-- [ ] **M3.4** pass를 `triton-shared-opt`에 등록 + lit test (`pim.compute` 존재 확인)
+- [x] **M3.1** `convert-ttshared-to-pim` 단일 pass: `linalg.matmul` 인식 → `pim.compute @gemm`
+- [x] **M3.2** BLOCK_M/N/K를 읽어 `pim.tile_plan {block_*, split_m=1, split_n=1, split_k=1}` 하드코딩 생성
+- [x] **M3.3** A/B/C를 `pim.memory_region`(host/device_global)으로 감싸고 `pim.transfer`(host↔device) 삽입 — placement/residency/chunk/reduce 없음
+- [x] **M3.4** pass를 `triton-shared-opt`에 등록 + lit test (`pim.compute` 존재 확인)
 
 ---
 
