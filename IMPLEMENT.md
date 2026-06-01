@@ -25,7 +25,7 @@
 |------|------|:----:|:------:|
 | **Part I — Minimal Executable (MVP)** | | | |
 | M0 | Skeleton: pim_backend 디렉토리 + PIMBackend / PIMDriver | `[x]` | 8 / 8 |
-| M1 | 최소 PIM Common Dialect (6 ops) | `[ ]` | 0 / 8 |
+| M1 | 최소 PIM Common Dialect (6 ops) | `[x]` | 8 / 8 |
 | M2 | Debug / IR Dump (변환 확인용, 먼저 구축) | `[ ]` | 0 / 3 |
 | M3 | TTShared→PIM 단일 변환 (no-split GEMM) | `[ ]` | 0 / 4 |
 | M4 | 최소 UPMEM lowering + codegen (no-split) | `[ ]` | 0 / 7 |
@@ -96,14 +96,14 @@ pim.launch
 
 **작업 단위**:
 
-- [ ] **M1.1** `PIMDialect.td` (name "pim", namespace `mlir::triton::pim`)
-- [ ] **M1.2** `PIMTypes.td` — `MemorySpaceType`, `MemoryRegionType`
-- [ ] **M1.3** `PIMAttrs.td` — `LayoutAttr`, `ResidencyAttr`, `RoleAttr`, `MappingPolicyAttr`, `CapabilityRefAttr` 등
-- [ ] **M1.4** `PIMOps.td` — 위 6 ops (operand/result/attr/verifier)
-- [ ] **M1.5** `lib/Dialect/PIM/IR/PIMDialect.cpp`, `PIMOps.cpp` (verifier, custom assembly)
-- [ ] **M1.6** `RegisterTritonSharedDialects.h`에 `mlir::triton::pim::PIMDialect` 등록
-- [ ] **M1.7** `CMakeLists.txt` 업데이트 (`include/`, `lib/Dialect/PIM/`)
-- [ ] **M1.8** roundtrip test: `test/Dialect/PIM/ops.mlir`, `-verify-diagnostics` 통과
+- [x] **M1.1** `PIMDialect.td` (name "pim", namespace `mlir::triton::pim`)
+- [x] **M1.2** `PIMTypes.td` — `MemorySpaceType`, `MemoryRegionType`
+- [x] **M1.3** `PIMAttrs.td` — `LayoutAttr`, `ResidencyAttr`, `RoleAttr`, `MappingPolicyAttr`, `CapabilityRefAttr` 등
+- [x] **M1.4** `PIMOps.td` — 위 6 ops (operand/result/attr/verifier)
+- [x] **M1.5** `lib/Dialect/PIM/IR/PIMDialect.cpp`, `PIMOps.cpp` (verifier, custom assembly)
+- [x] **M1.6** `RegisterTritonSharedDialects.h`에 `mlir::triton::pim::PIMDialect` 등록
+- [x] **M1.7** `CMakeLists.txt` 업데이트 (`include/`, `lib/Dialect/PIM/`)
+- [x] **M1.8** roundtrip test: `test/Dialect/PIM/ops.mlir`, `-verify-diagnostics` 통과
 
 ---
 
