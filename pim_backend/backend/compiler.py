@@ -13,6 +13,7 @@
 # TTShared 생성부(_ttir_to_ttsharedir)를 복사하지 않고 import하는 이유:
 # CPU·PIM·hybrid가 동일한 TTSharedIR을 만들어야 하며(특히 hybrid는 같은 IR을 grid 분할해
 # 나눠 실행), 복사본은 시간이 지나며 CPU 쪽과 drift날 수 있다. import는 단일 소스를 보장한다.
+#
 
 from triton.backends.compiler import BaseBackend, GPUTarget
 from dataclasses import dataclass
@@ -23,7 +24,6 @@ import functools
 
 # CPU backend의 IR 변환 helper / make_ttir을 재사용한다 (클래스가 아닌 모듈로 참조).
 import triton.backends.triton_shared.compiler as cpu_compiler
-
 
 @dataclass(frozen=True)
 class PIMOptions:
@@ -46,9 +46,6 @@ class PIMOptions:
     # --- PIM 고유 옵션 ---
     vendor: str = None           # "upmem" | "aimx" — 누락 시 아래에서 즉시 에러 (fallback 없음)
     device_id: int = 0
-    dump_ir: bool = False
-    dump_artifacts: bool = False
-    dump_dir: str = ""
 
     def __post_init__(self):
         # vendor 없이 PIM을 쓰는 것은 의도된 사용이 아니므로 기본값으로 때우지 않고 바로 터뜨린다.

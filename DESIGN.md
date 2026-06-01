@@ -1994,40 +1994,28 @@ else:
 
 # 21. Debug and Artifact Dump
 
-환경변수 대신 Python compile option으로 제어한다.
+PIM 전용 dump 코드를 두지 않고 **Triton 내장 dump**를 그대로 사용한다. `compile()`의 stage 루프가 등록된 모든 stage 결과를 자동으로 떨구므로, PIM이 추가하는 stage(`pim_common`, `vendor_ir`, `pimobj` 등)도 별도 코드 없이 같이 dump된다.
 
-```python
-matmul_kernel[grid](
-    A, B, C,
-    M, N, K,
-    BLOCK_M=32,
-    BLOCK_N=64,
-    BLOCK_K=256,
-    device="pim",
-    vendor="aimx",
-    debug_options={
-        "dump_ir": True,
-        "dump_artifacts": True,
-        "dump_dir": "/tmp/triton_pim/matmul",
-    },
-)
+```bash
+export TRITON_KERNEL_DUMP=1                 # knobs.compilation.dump_ir
+export TRITON_DUMP_DIR=/tmp/triton_pim       # knobs.cache.dump_dir (기본: ~/.triton/dump)
+python my_kernel.py
 ```
 
-생성 파일:
+(환경변수 대신 Python에서 `knobs.compilation.dump_ir = True` / `knobs.cache.dump_dir = ...`로도 켤 수 있다.)
+
+생성 파일: 커널 hash별 하위 폴더에 `{kernel}.{stage_ext}` 형식으로 stage마다 하나씩.
 
 ```text
-/tmp/triton_pim/matmul/
-  00_ttir.mlir
-  01_ttshared.mlir
-  02_pim_common.mlir
-  03_pim_common_opt.mlir
-  04_vendor.mlir
-  05_vendor_opt.mlir
-  06_codegen/
-    artifact.bin
-    runtime_stub.cpp
-    metadata.json
+$TRITON_DUMP_DIR/<kernel_hash>/
+  matmul.ttir
+  matmul.ttsharedir
+  matmul.pim_common      # M3 이후 stage 추가 시 자동 포함
+  matmul.vendor_ir       # M4 이후
+  matmul.pimobj          # 최종 artifact
 ```
+
+> `PIMOptions`에는 dump 관련 필드를 두지 않는다 (내장 knobs가 전역으로 제어).
 
 ---
 

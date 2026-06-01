@@ -107,19 +107,19 @@ pim.launch
 
 ---
 
-## M2 — Debug / IR Dump (변환 확인용, 먼저 구축)
+## M2 — Debug / IR Dump (변환 확인용, 먼저 확인)
 
-**목표**: 변환 파이프라인을 만들기 **전에** dump 인프라를 먼저 깐다. 이후 M3(변환)·M4(codegen)을 개발할 때 각 단계 IR/artifact를 파일로 떨궈 **실제로 잘 변환되는지 눈으로 확인**하며 진행한다. DESIGN.md 21장.
+**목표**: 변환 파이프라인을 만들기 **전에** 각 단계 IR을 파일로 볼 수 있는 수단을 확보한다. 이후 M3(변환)·M4(codegen) 개발 시 **실제로 잘 변환되는지 눈으로 확인**하며 진행한다.
 
-**왜 여기인가**: dump는 `add_stages`의 stage 루프에 훅을 거는 범용 기능이라 M0(add_stages) 직후면 동작한다. M3/M4에서 stage가 추가되면 dump가 자동으로 그 결과까지 캡처하므로, 변환을 만들자마자 결과를 검증할 수 있다.
+**핵심**: Triton에 **내장 dump가 이미 있다.** `compile()`의 stage 루프(`compiler/compiler.py`)가 등록된 모든 stage 결과를 `fn_dump_manager`로 자동 저장한다. 따라서 backend에 dump 코드를 새로 짜지 않고 내장 메커니즘을 그대로 쓴다. M3/M4에서 stage(`pim_common`, `vendor_ir`)가 늘면 자동으로 같이 dump된다. (DESIGN.md 21장)
 
-**완료 조건**: `dump_ir=True`로 호출 시 현재 존재하는 모든 stage IR이 `dump_dir`에 저장됨.
+**완료 조건**: `TRITON_KERNEL_DUMP=1`로 실행 시 현재 stage들(`ttir`/`ttsharedir`/`llir`/`pimobj`)이 `TRITON_DUMP_DIR`에 저장됨을 확인.
 
 **작업 단위**:
 
-- [ ] **M2.1** `PIMOptions.dump_ir`/`dump_artifacts`/`dump_dir` 지원 + `add_stages` stage 루프에 dump 훅
-- [ ] **M2.2** 각 stage IR 저장: `00_ttir.mlir`, `01_ttshared.mlir`, (M3 후) `02_pim_common.mlir`, (M4 후) `03_vendor.mlir` ... — stage가 늘면 자동 포함
-- [ ] **M2.3** codegen artifact 저장: (M4 이후) `host.cpp`, `device.c`, `metadata.json`
+- [ ] **M2.1** 내장 dump 동작 확인: `TRITON_KERNEL_DUMP=1 TRITON_DUMP_DIR=/tmp/triton_pim`로 smoke test 실행 → 커널 hash 폴더에 `*.ttir`, `*.ttsharedir`, `*.llir`, `*.pimobj` 생성 확인
+- [ ] **M2.2** `PIMOptions`에서 미사용 dump 필드 제거(내장 knobs로 대체), DESIGN 21장을 내장 dump 기준으로 정정
+- [ ] **M2.3** (M3/M4 이후) `pim_common`/`vendor_ir`/codegen artifact가 같은 메커니즘으로 자동 dump되는지 확인
 
 ---
 
