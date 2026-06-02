@@ -194,6 +194,15 @@ pim.launch
 
 > 규칙: 각 항목은 **독립 toggle 가능**, **OFF 시 M6가 그대로 통과**, **각 pass는 lit test + e2e 재검증**. DESIGN.md 13.0 경계 원칙(구조/intent/gate만) 준수. (Debug/dump는 M2에서 이미 구축됨.)
 
+> **공통 vs vendor 구분 태그** (DESIGN 13.0/13.3): 각 항목 앞에 계층을 표시한다.
+> - `[공통·구조]` — PIM Common IR에서 값/패턴을 **기록·표현만** (결정/최적화 없음, vendor-neutral)
+> - `[공통·intent]` — vendor-neutral **policy enum**만 표현 (구체 산술은 vendor)
+> - `[공통·gate]` — vendor **capability를 query**해 동작 여부 결정 (vendor-aware하지만 pass 자체는 공통)
+> - `[vendor]` — 위 intent/전략을 특정 하드웨어 산술·코드로 **실현(HOW)**. UPMEM/AiMX별 구현
+> - `[검증]` — lit/e2e 테스트 (벤더 중립 도구)
+>
+> 원칙: **WHAT(선택·표현)은 공통, HOW(실현·legalize·codegen)는 vendor.** 같은 O-그룹 안에서도 항목마다 계층이 다를 수 있으니 구현 시 디렉토리(`lib/Conversion/*` vs `lib/Conversion/PIMToUPMEM`·`lib/Target/UPMEM`)도 그에 맞춰 둔다.
+
 > **전제 ① — 전체 문제(full-problem) 정보 복원**: MVP의 M3 변환은 single-tile만 가정해 **grid·program_id·K-loop을 버리고** "타일 하나 = 전체 gemm"으로 취급한다. 실제 multi-tile matmul(grid>1, K-loop)에서 tiling/SPLIT 최적화를 하려면, **전체 M/N/K·grid·program_id→tile 매핑을 복원**해 `tile_plan`(BLOCK/SPLIT)과 `chunk_plan`(BLOCK_K)으로 표현해야 한다. 이 복원이 O3.3(chunk-planning)·O4(strategy)의 전제이며, **O1 변환 일반화 시 함께 수행**한다 (MVP는 BLOCK=전체라 이 정보가 비어 있어도 동작).
 
 > **전제 ② — codegen이 IR 값을 받아 생성**: plan/strategy pass는 IR에 intent/구조(`num_units`·tile offset·`chunk_plan`·tasklet 수 등)를 표현한다 (DESIGN 13.0 경계). 그러나 현재 translate(`UPMEMToHost`/`UPMEMToDevice`)는 이 값들을 **읽지 않고 고정 템플릿**을 emit한다: `dpu_alloc(1,...)`(항상 DPU 1개), `local_gemm{m,n,k}`를 상수로 박음, device는 `if(me()!=0) return`(tasklet 1개)로 전체를 혼자 계산. 따라서 SPLIT(여러 DPU)·chunk(큰 K)·multi-tasklet은 IR 표현만으론 실행되지 않고, **translate·launcher가 그 IR 값을 읽어 parameterized code를 생성**하도록 일반화해야 한다 (O4.6). "IR에 박힘"과 "여러 DPU에서 실제로 돔"은 다른 단계임에 주의.
@@ -204,14 +213,14 @@ pim.launch
 
 **작업 단위**:
 
-- [ ] **O1.1** `build-pim-memory-plan` (host/device memory_region 생성) 분리
-- [ ] **O1.2** `build-pim-tile-plan` (주어진 block/split **기록만**, 최적화 X)
-- [ ] **O1.3** `build-pim-transfer-plan` (transfer 골격 삽입)
-- [ ] **O1.4** `build-pim-execution-plan` (mapping_policy **enum**만)
-- [ ] **O1.5** `build-pim-placement-plan` (placement policy **enum**만; 구체 산술은 vendor)
-- [ ] **O1.6** `build-pim-residency-plan` (residency enum)
-- [ ] **O1.7** 동치 검증: no-split에 대해 분해 파이프라인 출력 == M3 출력(M2 dump로 비교), M6 재통과
-- [ ] **O1.8** multi-tile 일반화: TTSharedIR의 grid·program_id·K-loop에서 전체 M/N/K를 복원해 `tile_plan`(BLOCK/SPLIT)·`chunk_plan`(BLOCK_K)에 반영 (MVP single-tile 가정 제거). O3.3·O4의 전제
+- [ ] **O1.1** `[공통·구조]` `build-pim-memory-plan` (host/device memory_region 생성) 분리
+- [ ] **O1.2** `[공통·구조]` `build-pim-tile-plan` (주어진 block/split **기록만**, 최적화 X) — 실제 타일 micro-fit은 vendor
+- [ ] **O1.3** `[공통·구조]` `build-pim-transfer-plan` (transfer 골격 삽입) — 실제 copy 방식(DMA/dpu_copy)은 vendor
+- [ ] **O1.4** `[공통·intent]` `build-pim-execution-plan` (mapping_policy **enum**만) — 실제 DPU/channel 배정은 vendor
+- [ ] **O1.5** `[공통·intent]` `build-pim-placement-plan` (placement policy **enum**만) — bank/channel 오프셋 산술은 vendor(`UPMEMMemoryPlacement`)
+- [ ] **O1.6** `[공통·intent]` `build-pim-residency-plan` (residency enum) — 실제 상주 버퍼 관리는 vendor
+- [ ] **O1.7** `[검증]` 동치 검증: no-split에 대해 분해 파이프라인 출력 == M3 출력(M2 dump로 비교), M6 재통과
+- [ ] **O1.8** `[공통·구조]` multi-tile 일반화: TTSharedIR의 grid·program_id·K-loop에서 전체 M/N/K를 복원해 `tile_plan`(BLOCK/SPLIT)·`chunk_plan`(BLOCK_K)에 반영 (MVP single-tile 가정 제거). O3.3·O4의 전제
 
 ---
 
@@ -221,9 +230,9 @@ pim.launch
 
 **작업 단위**:
 
-- [ ] **O2.1** `PIMCapability`, `PIMConstraints` dataclass (DESIGN.md 19장)
-- [ ] **O2.2** UPMEM `queryCapability`/`queryConstraints` C++ 구현 (실제 DPU 수치)
-- [ ] **O2.3** `#pim.capability_ref<...>` attribute가 lowering 시 capability 값으로 구체화
+- [ ] **O2.1** `[공통]` `PIMCapability`, `PIMConstraints` dataclass — vendor-neutral 스키마/인터페이스 (DESIGN.md 19장)
+- [ ] **O2.2** `[vendor]` UPMEM `queryCapability`/`queryConstraints` C++ 구현 (실제 DPU 수치)
+- [ ] **O2.3** `[공통→vendor]` `#pim.capability_ref<...>` attribute는 공통 표현, **lowering 시 vendor가** capability 값으로 구체화
 
 ---
 
@@ -233,14 +242,14 @@ pim.launch
 
 **작업 단위** (각 pass별 lit test 포함):
 
-- [ ] **O3.1** `pim-layout-normalize` — 표현 정규화만 (중복 transpose 제거·단일 canonical form). 물리 layout은 건드리지 않음
-- [ ] **O3.2** `pim-data-placement` — placement **intent enum**만 갱신
-- [ ] **O3.3** `pim-chunk-planning` — `num_chunks=ceildiv(K,BLOCK_K)` **산술만**
-- [ ] **O3.4** `pim-transfer-hoisting` — 반복 transfer를 상위 scope로
-- [ ] **O3.5** `pim-persistent-data` — weight/KV를 persistent로 **표시**
-- [ ] **O3.6** `pim-partial-result-planning` — partial/reduce **구조**만 (split_k>1일 때)
-- [ ] **O3.7** `pim-pipeline-overlap` — **capability-gated**: `supports_pipeline_overlap`일 때만 `pim.pipeline` 삽입
-- [ ] **O3.8** end-to-end matmul로 baseline(MVP) 대비 성능 개선 측정
+- [ ] **O3.1** `[공통·구조]` `pim-layout-normalize` — 표현 정규화만 (중복 transpose 제거·단일 canonical form). 물리 layout(`pack_by_*`)은 vendor
+- [ ] **O3.2** `[공통·intent]` `pim-data-placement` — placement **intent enum**만 갱신. 구체 분산은 vendor
+- [ ] **O3.3** `[공통·구조]` `pim-chunk-planning` — `num_chunks=ceildiv(K,BLOCK_K)` **산술만**. register/WRAM fitting은 vendor(O4.6 codegen)
+- [ ] **O3.4** `[공통·구조]` `pim-transfer-hoisting` — 반복 transfer를 상위 scope로
+- [ ] **O3.5** `[공통·intent]` `pim-persistent-data` — weight/KV를 persistent로 **표시**. 실제 상주는 vendor
+- [ ] **O3.6** `[공통·구조]` `pim-partial-result-planning` — partial/reduce **구조**만 (split_k>1일 때). 실제 reduce는 vendor
+- [ ] **O3.7** `[공통·gate]` `pim-pipeline-overlap` — `supports_pipeline_overlap`일 때만 `pim.pipeline` 삽입. 실제 async/double-buffer는 vendor
+- [ ] **O3.8** `[검증]` end-to-end matmul로 baseline(MVP) 대비 성능 개선 측정
 
 ---
 
@@ -252,12 +261,12 @@ pim.launch
 
 **작업 단위**:
 
-- [ ] **O4.1** `PIMExecutionStrategy` interface (vendor-neutral): `isApplicable(tile_plan, capability, constraints)` + `applyToIR(builder)` (cost 메서드 없음)
-- [ ] **O4.2** 전략 구현 + 레지스트리 등록: `no-split`, `n-split`(output_n_partitioned), `k-split`(reduction_k_partitioned), `m-split`(output_m_partitioned, 전치 포함)
-- [ ] **O4.3** `SelectPIMExecutionStrategy` Common pass — split factor + vendor capability/constraints로 적법 전략 필터, autotune 미사용 시 단순 기본 규칙(no-split 우선)
-- [ ] **O4.4** vendor lowering이 전략 attribute legalize (`reduction_k_partitioned` → UPMEM host_reduce) + lit test
-- [ ] **O4.5** e2e: SPLIT에 따라 다른 `mapping_policy`/`reduction`이 IR에 박히는지 검증
-- [ ] **O4.6** translate·launcher가 IR 값을 받아 생성(전제 ②): host.cpp는 `alloc_units{num_units}`→`dpu_alloc(NUM_UNITS)`·`execution_group` tile 매핑→DPU별 offset push/gather, device.c는 `NR_TASKLETS`개 tasklet이 tile_offset/tile_count·`chunk_plan`(BLOCK_K)만큼만 계산, PIMLauncher는 NUM_UNITS DPU alloc·실행 (k-split이면 `host_reduce`). ← 여러 DPU에서 "실제로 도는" 단계
+- [ ] **O4.1** `[공통]` `PIMExecutionStrategy` interface (vendor-neutral): `isApplicable(tile_plan, capability, constraints)` + `applyToIR(builder)` (cost 메서드 없음)
+- [ ] **O4.2** `[공통]` 전략 구현 + 레지스트리 등록 (전략 목록은 vendor-neutral): `no-split`, `n-split`(output_n_partitioned), `k-split`(reduction_k_partitioned), `m-split`(output_m_partitioned, 전치 포함)
+- [ ] **O4.3** `[공통·gate]` `SelectPIMExecutionStrategy` Common pass — split factor + vendor capability/constraints로 적법 전략 필터, autotune 미사용 시 단순 기본 규칙(no-split 우선)
+- [ ] **O4.4** `[vendor]` UPMEM lowering이 전략 attribute legalize (`reduction_k_partitioned` → UPMEM `host_reduce`) + lit test
+- [ ] **O4.5** `[검증]` e2e: SPLIT에 따라 다른 `mapping_policy`/`reduction`이 IR에 박히는지 검증
+- [ ] **O4.6** `[vendor]` translate·launcher가 IR 값을 받아 생성(전제 ②): host.cpp는 `alloc_units{num_units}`→`dpu_alloc(NUM_UNITS)`·`execution_group` tile 매핑→DPU별 offset push/gather, device.c는 `NR_TASKLETS`개 tasklet이 tile_offset/tile_count·`chunk_plan`(BLOCK_K)만큼만 계산, PIMLauncher는 NUM_UNITS DPU alloc·실행 (k-split이면 `host_reduce`). ← 여러 DPU에서 "실제로 도는" 단계
 
 ---
 
@@ -267,9 +276,9 @@ pim.launch
 
 **작업 단위**:
 
-- [ ] **O5.1** PIM 전용 노브를 compile option으로 받아 `build-pim-tile-plan`(SPLIT_*) / `build-pim-execution-plan`(NUM_UNITS·LOCAL_LANES)이 IR attr로 반영
-- [ ] **O5.2** autotune config별 독립 IR/artifact 생성·실측이 동작하는지 검증 (config N개 → N벌 컴파일)
-- [ ] **O5.3** O4 전략 후보를 autotune이 실측 선택하는 통합 (vendor별 best가 달라지는지 확인)
+- [ ] **O5.1** `[공통]` PIM 전용 노브를 compile option으로 받아 `build-pim-tile-plan`(SPLIT_*) / `build-pim-execution-plan`(NUM_UNITS·LOCAL_LANES)이 IR attr로 반영
+- [ ] **O5.2** `[검증]` autotune config별 독립 IR/artifact 생성·실측이 동작하는지 검증 (config N개 → N벌 컴파일)
+- [ ] **O5.3** `[공통+vendor]` O4 전략 후보를 autotune이 실측 선택하는 통합 — 후보 선택은 공통, 각 후보의 실측 대상 artifact는 vendor codegen(O4.6) (vendor별 best가 달라지는지 확인)
 
 ---
 
@@ -281,12 +290,12 @@ pim.launch
 
 **작업 단위**:
 
-- [ ] **B1.1** AiMX dialect 최소셋 (`aimx.dma_h2d`, `dma_d2h`, `compute_gemm`, `descriptor_chain`, `submit`, `wait`)
-- [ ] **B1.2** `LegalizePIMToAiMX` conversion
-- [ ] **B1.3** `AiMXMemoryBankMapping` + `AiMXExecutionMapping`
-- [ ] **B1.4** `AiMXCommandStreamCodegen` (descriptor binary emission)
-- [ ] **B1.5** `runtime/pim/vendors/aimx/AiMXLauncher.cpp`
-- [ ] **B1.6** `pim_backend/examples/test_pim_matmul_aimx.py` 실행 + 검증
+- [ ] **B1.1** `[vendor]` AiMX dialect 최소셋 (`aimx.dma_h2d`, `dma_d2h`, `compute_gemm`, `descriptor_chain`, `submit`, `wait`)
+- [ ] **B1.2** `[vendor]` `LegalizePIMToAiMX` conversion (공통 PIM IR → AiMX IR)
+- [ ] **B1.3** `[vendor]` `AiMXMemoryBankMapping` + `AiMXExecutionMapping`
+- [ ] **B1.4** `[vendor]` `AiMXCommandStreamCodegen` (descriptor binary emission)
+- [ ] **B1.5** `[vendor]` `runtime/pim/vendors/aimx/AiMXLauncher.cpp`
+- [ ] **B1.6** `[검증]` `pim_backend/examples/test_pim_matmul_aimx.py` 실행 + 검증
 
 ---
 
@@ -296,9 +305,9 @@ pim.launch
 
 **작업 단위**:
 
-- [ ] **B2.1** Python측 `VendorExtensionRegistry` (DESIGN.md 7장)
-- [ ] **B2.2** C++측 `PIMVendorExtension` interface (DESIGN.md 8장) + UPMEM/AiMX 등록
-- [ ] **B2.3** `PIMBackend.add_stages`를 `self.vendor_extension.build_*_pipeline(options)` 형태로 리팩토링
+- [ ] **B2.1** `[공통]` Python측 `VendorExtensionRegistry` (DESIGN.md 7장)
+- [ ] **B2.2** `[공통 interface + vendor 등록]` C++측 `PIMVendorExtension` interface (DESIGN.md 8장) + UPMEM/AiMX 어댑터 등록
+- [ ] **B2.3** `[공통]` `PIMBackend.add_stages`를 `self.vendor_extension.build_*_pipeline(options)` 형태로 리팩토링
 
 ---
 
@@ -310,11 +319,11 @@ pim.launch
 
 **작업 단위**:
 
-- [ ] **B3.1** `UPMEMCodegen`에 `tile_offset`/`tile_count` 파라미터 추가 (DPU kernel이 grid 일부만 처리)
-- [ ] **B3.2** `HybridPartitionPolicy` — grid를 cpu_range/pim_range로 분할 (half/pim_ratio/auto)
-- [ ] **B3.3** `HybridDriver` — cpu_launcher + pim_launcher를 Thread로 동시 실행, 동기화
-- [ ] **B3.4** `device="hybrid"` 라우팅 — CPUBackend + PIMBackend 각각 컴파일 후 HybridDriver에 전달
-- [ ] **B3.5** `pim_backend/examples/test_hybrid_matmul.py` — small shape 정답 + 시간 출력
+- [ ] **B3.1** `[vendor]` `UPMEMCodegen`에 `tile_offset`/`tile_count` 파라미터 추가 (DPU kernel이 grid 일부만 처리) — O4.6의 parameterization 재사용
+- [ ] **B3.2** `[공통]` `HybridPartitionPolicy` — grid를 cpu_range/pim_range로 분할 (half/pim_ratio/auto)
+- [ ] **B3.3** `[공통]` `HybridDriver` — cpu_launcher + pim_launcher를 Thread로 동시 실행, 동기화
+- [ ] **B3.4** `[공통]` `device="hybrid"` 라우팅 — CPUBackend + PIMBackend 각각 컴파일 후 HybridDriver에 전달
+- [ ] **B3.5** `[검증]` `pim_backend/examples/test_hybrid_matmul.py` — small shape 정답 + 시간 출력
 
 ---
 
