@@ -21,6 +21,6 @@ func.func @matmul_kernel(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>
 // CHECK: pim.memory_region %arg2 {layout = "row_major", role = "output", space = "host"}
 // CHECK: pim.tile_plan {block_k = 256 : i64, block_m = 32 : i64, block_n = 64 : i64, split_k = 1 : i64, split_m = 1 : i64, split_n = 1 : i64}
 // CHECK: pim.transfer
-// CHECK: pim.compute(%{{.*}}, %{{.*}}, %{{.*}}) using %{{.*}} {op = "gemm"}
+// CHECK: pim.compute(%{{.*}}, %{{.*}}, %{{.*}}) using %{{.*}} extent(%{{.*}}, %{{.*}}, %{{.*}}) {op = "gemm"}
 // CHECK: pim.launch @matmul_kernel {device_id = 0 : i64, vendor = "upmem"}
 // CHECK-NOT: linalg.matmul

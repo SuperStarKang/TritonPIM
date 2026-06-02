@@ -29,9 +29,8 @@ static LogicalResult translateUPMEMToHost(ModuleOp module, raw_ostream &os) {
     return module.emitError(
         "upmem-to-host: expected upmem.local_gemm, upmem.device_func, and a host func");
 
-  uint64_t M = gemm.getM();
-  uint64_t N = gemm.getN();
-  uint64_t K = gemm.getK();
+  // M/N/K는 전체 문제 크기(런타임 값)라 baked 상수가 아니라 host 함수 파라미터로 받는다.
+  // (local_gemm의 m/n/k는 block 크기로 device WRAM 타일링용 — host extent와 별개다.)
   std::string hostName = (host.getName() + "_host").str();
   std::string binary = (dev.getSymName() + ".elf").str();
 
@@ -41,8 +40,8 @@ static LogicalResult translateUPMEMToHost(ModuleOp module, raw_ostream &os) {
   // dpu.h는 C API라, C++로 컴파일할 때 이름 mangling을 막으려면 extern "C"로 감싼다.
   os << "extern \"C\" {\n#include <dpu.h>\n}\n\n";
   os << "#ifndef DPU_BINARY\n#define DPU_BINARY \"" << binary << "\"\n#endif\n\n";
-  os << "extern \"C\" void " << hostName << "(float* A, float* B, float* C) {\n";
-  os << "  uint32_t M = " << M << ", N = " << N << ", K = " << K << ";\n";
+  os << "extern \"C\" void " << hostName
+     << "(float* A, float* B, float* C, uint32_t M, uint32_t N, uint32_t K) {\n";
   os << "  struct dpu_set_t set;\n";
   os << "  DPU_ASSERT(dpu_alloc(1, NULL, &set));\n";
   os << "  DPU_ASSERT(dpu_load(set, DPU_BINARY, NULL));\n";

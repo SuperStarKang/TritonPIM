@@ -2,7 +2,8 @@
 // RUN: triton-shared-opt %s | triton-shared-opt | FileCheck %s
 
 // CHECK-LABEL: func.func @matmul
-func.func @matmul(%A: memref<256x512xf32>, %B: memref<512x512xf32>, %C: memref<256x512xf32>) {
+func.func @matmul(%A: memref<256x512xf32>, %B: memref<512x512xf32>, %C: memref<256x512xf32>,
+                  %M: i32, %N: i32, %K: i32) {
   // CHECK: pim.memory_region {{.*}} {layout = "row_major", role = "input_activation", space = "host"}
   %a = pim.memory_region %A {space = "host", layout = "row_major", role = "input_activation"}
       : (memref<256x512xf32>) -> !pim.region
@@ -20,9 +21,9 @@ func.func @matmul(%A: memref<256x512xf32>, %B: memref<512x512xf32>, %C: memref<2
   pim.transfer %a {src = "host", dst = "device_global"} : !pim.region
   pim.transfer %b {src = "host", dst = "device_global"} : !pim.region
 
-  // CHECK: pim.compute(%{{.*}}, %{{.*}}, %{{.*}}) using %{{.*}} {op = "gemm"}
-  %partial = pim.compute(%a, %b, %c) using %tp {op = "gemm"}
-      : (!pim.region, !pim.region, !pim.region, !pim.tile_plan) -> !pim.region
+  // CHECK: pim.compute(%{{.*}}, %{{.*}}, %{{.*}}) using %{{.*}} extent(%{{.*}}, %{{.*}}, %{{.*}}) {op = "gemm"}
+  %partial = pim.compute(%a, %b, %c) using %tp extent(%M, %N, %K) {op = "gemm"}
+      : (!pim.region, !pim.region, !pim.region, !pim.tile_plan, i32, i32, i32) -> !pim.region
 
   pim.transfer %c {src = "device_global", dst = "host"} : !pim.region
 

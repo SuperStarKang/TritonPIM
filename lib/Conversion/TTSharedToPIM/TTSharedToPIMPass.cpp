@@ -41,11 +41,15 @@ struct ConvertTTSharedToPIMPass
     });
   }
 
-  // no-split 단일 tile 변환:
-  // - BLOCK_M/N/K는 matmul operand/result shape에서 직접 읽는다.
+  // tiled gemm 변환 (grid-as-SPLIT):
+  // - BLOCK_M/N/K는 matmul operand/result shape에서 읽는다 (한 program이 처리하는 타일 크기).
   //   (operand0 = A tile [BLOCK_M, BLOCK_K], result = C tile [BLOCK_M, BLOCK_N])
-  // - A/B/C는 함수 인자 앞 3개로 본다 (MVP 가정: grid=(1,1), 인자 순서 A,B,C).
-  // - 함수 본문 전체를 DESIGN 12장 형태의 pim 시퀀스로 교체한다.
+  // - 전체 M/N/K는 런타임 인자다. Triton 커널 시그니처 (A,B,C,M,N,K,...) 규약상 인자 3,4,5.
+  //   Triton은 program_id로 타일을 나누지만(SPMD) 전체 크기는 dynamic이라 IR에서 상수로 못 읽는다.
+  // - A/B/C는 함수 인자 앞 3개.
+  // - 함수 본문 전체를 pim 시퀀스로 교체한다. grid/program_id/K-loop는 여기서 버리되,
+  //   BLOCK(tile_plan)+전체 M/N/K(compute operand)를 남겨 두면 grid=ceildiv(전체,BLOCK)로
+  //   복원 가능하다 (SPLIT은 O4에서 이 정보로 타일을 유닛에 배정).
   void rewriteToGemm(func::FuncOp func, linalg::MatmulOp matmul) {
     auto lhsTy = cast<RankedTensorType>(matmul->getOperand(0).getType());
     auto resTy = cast<RankedTensorType>(matmul->getResult(0).getType());
@@ -56,6 +60,10 @@ struct ConvertTTSharedToPIMPass
     Value A = func.getArgument(0);
     Value B = func.getArgument(1);
     Value C = func.getArgument(2);
+    // 전체 문제 크기 (dynamic): matmul(A,B,C,M,N,K) 규약상 i32 인자 3,4,5.
+    Value fullM = func.getArgument(3);
+    Value fullN = func.getArgument(4);
+    Value fullK = func.getArgument(5);
 
     // 기존 본문을 뒤에서부터 모두 지운다 (사용처를 먼저 지워 use-def 위반 방지).
     // block 인자(A,B,C,...)는 유지된다.
@@ -80,7 +88,8 @@ struct ConvertTTSharedToPIMPass
 
     b.create<pim::TransferOp>(loc, aReg, "host", "device_global");
     b.create<pim::TransferOp>(loc, bReg, "host", "device_global");
-    b.create<pim::ComputeOp>(loc, regionTy, aReg, bReg, cReg, tp, "gemm");
+    b.create<pim::ComputeOp>(loc, regionTy, aReg, bReg, cReg, tp, fullM, fullN,
+                             fullK, "gemm");
     b.create<pim::TransferOp>(loc, cReg, "device_global", "host");
     b.create<pim::LaunchOp>(loc, func.getName(), vendor, /*device_id=*/0);
 

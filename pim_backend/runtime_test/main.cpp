@@ -4,12 +4,14 @@
 // 빌드/실행은 build_and_test.sh 참고.
 
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
 
-// 생성된 host.cpp가 제공하는 진입점.
-extern "C" void matmul_kernel_host(float *A, float *B, float *C);
+// 생성된 host.cpp가 제공하는 진입점. M/N/K는 런타임 파라미터다.
+extern "C" void matmul_kernel_host(float *A, float *B, float *C,
+                                   uint32_t M, uint32_t N, uint32_t K);
 
 int main() {
   // test/Target/UPMEM/matmul.mlir의 local_gemm{m=32,n=64,k=256}과 일치해야 한다.
@@ -27,7 +29,7 @@ int main() {
       ref[i * N + j] = acc;
     }
 
-  matmul_kernel_host(A.data(), B.data(), C.data());
+  matmul_kernel_host(A.data(), B.data(), C.data(), (uint32_t)M, (uint32_t)N, (uint32_t)K);
 
   int errors = 0;
   float max_diff = 0.0f;

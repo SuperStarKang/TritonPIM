@@ -81,13 +81,18 @@ def PIM_TransferOp : PIM_Op<"transfer"> {
 }
 
 // PIM 연산. op="gemm"부터. a,b,c 영역과 tile_plan을 받아 결과 영역(partial C)을 낸다.
+// full_m/n/k는 전체 문제 크기(dynamic). Triton 커널이 SPMD(타일 1개)라 IR의 BLOCK은
+// tile_plan에 들어가지만 전체 M/N/K는 런타임 인자다. codegen이 전체를 돌려면 이 값이 필요하다.
 def PIM_ComputeOp : PIM_Op<"compute"> {
   let summary = "PIM compute primitive (gemm, ...)";
   let arguments = (ins PIM_RegionType:$a, PIM_RegionType:$b, PIM_RegionType:$c,
-                       PIM_TilePlanType:$tile_plan, StrAttr:$op);
+                       PIM_TilePlanType:$tile_plan,
+                       I32:$full_m, I32:$full_n, I32:$full_k,
+                       StrAttr:$op);
   let results = (outs PIM_RegionType:$result);
   let assemblyFormat = [{
-    `(` $a `,` $b `,` $c `)` `using` $tile_plan attr-dict
+    `(` $a `,` $b `,` $c `)` `using` $tile_plan
+    `extent` `(` $full_m `,` $full_n `,` $full_k `)` attr-dict
     `:` functional-type(operands, results)
   }];
 }

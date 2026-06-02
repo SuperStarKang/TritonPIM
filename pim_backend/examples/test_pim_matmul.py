@@ -53,5 +53,5 @@ def run(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K):
 
 if __name__ == "__main__":
     # 단일 tile (grid=(1,1)): BLOCK이 전체 M,N,K를 덮는다.
-    # run(M=32, N=64, K=256, BLOCK_M=32, BLOCK_N=64, BLOCK_K=256)
-    run(M=256, N=512, K=512, BLOCK_M=256, BLOCK_N=512, BLOCK_K=512) # Medium size
+    run(M=32, N=64, K=256, BLOCK_M=32, BLOCK_N=64, BLOCK_K=256)
+    # run(M=256, N=512, K=512, BLOCK_M=256, BLOCK_N=512, BLOCK_K=512) # Medium size

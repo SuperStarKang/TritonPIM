@@ -79,6 +79,9 @@ class PIMLauncher(object):
         cst_key = lambda i: src.fn.arg_names.index(i) if isinstance(i, str) else i
         signature = {cst_key(k): v for k, v in src.signature.items()}
         self.pointer_indices = [i for i, ty in sorted(signature.items()) if ty[0] == "*"]
+        # 전체 M/N/K(런타임)는 matmul(A,B,C,M,N,K) 규약상 포인터 다음 i32 인자 3,4,5.
+        # host 함수가 baked 상수가 아니라 런타임 M/N/K를 파라미터로 받으므로 여기서 꺼내 넘긴다.
+        self.extent_indices = [3, 4, 5]
 
     def __call__(self, gridX, gridY, gridZ, stream, cu_function,
                  kernel_metadata, launch_metadata,
@@ -91,14 +94,16 @@ class PIMLauncher(object):
         entry = kernel_metadata[6]
         lib = ctypes.CDLL(so_path)
         fn = getattr(lib, entry)
-        fn.argtypes = [ctypes.c_void_p] * len(self.pointer_indices)
+        # host 시그니처 = (float* A, B, C, uint32_t M, N, K)
+        fn.argtypes = [ctypes.c_void_p] * len(self.pointer_indices) + [ctypes.c_uint32] * 3
         fn.restype = None
 
         if launch_enter_hook is not None:
             launch_enter_hook(launch_metadata)
 
         ptrs = [ctypes.c_void_p(args[i].data_ptr()) for i in self.pointer_indices]
-        fn(*ptrs)
+        extent = [ctypes.c_uint32(int(args[i])) for i in self.extent_indices]
+        fn(*ptrs, *extent)
 
         if launch_exit_hook is not None:
             launch_exit_hook(launch_metadata)

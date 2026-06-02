@@ -32,7 +32,7 @@
 | M5 | Runtime & Launcher | `[x]` | 4 / 4 |
 | M6 | End-to-end: MatMul 실행 + 검증 | `[x]` | 4 / 4 |
 | **Part II — Incremental Optimization** | | | |
-| O1 | 단일 변환을 granular plan pass로 분해 + multi-tile 일반화 | `[ ]` | 0 / 8 |
+| O1 | 단일 변환을 granular plan pass로 분해 + multi-tile 일반화 | `[~]` | 1 / 8 |
 | O2 | Capability / Constraints | `[ ]` | 0 / 3 |
 | O3 | Common Optimization Passes (하나씩) | `[ ]` | 0 / 8 |
 | O4 | Execution Strategy Selection | `[ ]` | 0 / 6 |
@@ -42,7 +42,7 @@
 | B2 | Vendor Extension Registry 리팩토링 | `[ ]` | 0 / 3 |
 | B3 | CPU+PIM HybridDriver | `[ ]` | 0 / 5 |
 
-총 진행률: **36 / 78** (Part I MVP 완료)
+총 진행률: **37 / 78** (Part I MVP 완료, O1.8 multi-tile 1-DPU 정답)
 
 ---
 
@@ -220,7 +220,7 @@ pim.launch
 - [ ] **O1.5** `[공통·intent]` `build-pim-placement-plan` (placement policy **enum**만) — bank/channel 오프셋 산술은 vendor(`UPMEMMemoryPlacement`)
 - [ ] **O1.6** `[공통·intent]` `build-pim-residency-plan` (residency enum) — 실제 상주 버퍼 관리는 vendor
 - [ ] **O1.7** `[검증]` 동치 검증: no-split에 대해 분해 파이프라인 출력 == M3 출력(M2 dump로 비교), M6 재통과
-- [ ] **O1.8** `[공통·구조]` multi-tile 일반화: TTSharedIR의 grid·program_id·K-loop에서 전체 M/N/K를 복원해 `tile_plan`(BLOCK/SPLIT)·`chunk_plan`(BLOCK_K)에 반영 (MVP single-tile 가정 제거). O3.3·O4의 전제
+- [x] **O1.8** `[공통·구조]` 전체 M/N/K 복원: 변환이 tiled-gemm(scf.for+matmul+accumulate) 인식, 전체 M/N/K(`%arg3/4/5`)를 `pim.compute extent`로 운반(BLOCK은 tile_plan에 기록). codegen(UPMEMToHost·launcher)이 baked 상수 대신 런타임 M/N/K로 동작 → **multi-tile이 1 DPU에서 정답**(128×128×256, grid=(2,2) 검증). `chunk_plan`(BLOCK_K streaming)은 O3.3, grid→유닛 SPLIT은 O4에서.
 
 ---
 
@@ -372,4 +372,4 @@ M6 E2E 검증  ← ✅ "돈다"
 
 ## 다음 액션
 
-Part I(MVP) 완료. 다음은 Part II 진입 — 사용자 목표(큰 행렬·실제 block 정보·여러 DPU 분산)의 토대인 **O1.8(전체 문제 정보 복원)** 부터 시작한다. 그 전에 현재 TTSharedIR에 grid·program_id·K-loop이 어떤 형태로 들어오는지 dump로 확인한 뒤 복원 설계를 잡는다.
+O1.8(전체 M/N/K 복원 → multi-tile 1-DPU 정답)까지 완료. 다음은 사용자 목표(여러 DPU 분산)의 본체인 **O4 (Execution Strategy: n-split → grid 블록을 여러 DPU로) + O4.6 (multi-DPU codegen/launcher)**. 큰 K(>WRAM)는 **O3.3 + O4.6의 BLOCK_K chunk**가 필요. O1.1~O1.7(granular 분해)은 순수 리팩터라 후순위.

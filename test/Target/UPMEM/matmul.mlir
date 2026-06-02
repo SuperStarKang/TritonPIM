@@ -15,13 +15,13 @@ upmem.device_func "matmul_kernel_device" {
   upmem.local_gemm {m = 32 : i64, n = 64 : i64, k = 256 : i64, accumulation = "fp32"}
 }
 
-// HOST: extern "C" void matmul_kernel_host(float* A, float* B, float* C)
-// HOST: uint32_t M = 32, N = 64, K = 256;
+// HOST: extern "C" void matmul_kernel_host(float* A, float* B, float* C, uint32_t M, uint32_t N, uint32_t K)
 // HOST: dpu_alloc(1, NULL, &set)
 // HOST: dpu_load(set, DPU_BINARY, NULL)
-// HOST: dpu_copy_to(set, "A_mram"
+// HOST: dpu_broadcast_to(set, "M"
+// HOST: dpu_push_xfer(set, DPU_XFER_TO_DPU, "A_mram"
 // HOST: dpu_launch(set, DPU_SYNCHRONOUS)
-// HOST: dpu_copy_from(set, "C_mram"
+// HOST: dpu_push_xfer(set, DPU_XFER_FROM_DPU, "C_mram"
 
 // DEVICE: __host uint32_t M;
 // DEVICE: __mram_noinit float A_mram
