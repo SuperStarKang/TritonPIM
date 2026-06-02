@@ -28,11 +28,11 @@
 | M1 | 최소 PIM Common Dialect (6 ops) | `[x]` | 8 / 8 |
 | M2 | Debug / IR Dump (변환 확인용, 먼저 구축) | `[~]` | 2 / 3 |
 | M3 | TTShared→PIM 단일 변환 (no-split GEMM) | `[x]` | 4 / 4 |
-| M4 | 최소 UPMEM lowering + codegen (no-split) | `[ ]` | 0 / 7 |
+| M4 | 최소 UPMEM lowering + codegen (no-split) | `[x]` | 5 / 5 |
 | M5 | Runtime & Launcher | `[ ]` | 0 / 5 |
 | M6 | End-to-end: MatMul 실행 + 검증 | `[ ]` | 0 / 4 |
 | **Part II — Incremental Optimization** | | | |
-| O1 | 단일 변환을 granular plan pass로 분해 | `[ ]` | 0 / 7 |
+| O1 | 단일 변환을 granular plan pass로 분해 + multi-tile 일반화 | `[ ]` | 0 / 8 |
 | O2 | Capability / Constraints | `[ ]` | 0 / 3 |
 | O3 | Common Optimization Passes (하나씩) | `[ ]` | 0 / 8 |
 | O4 | Execution Strategy Selection | `[ ]` | 0 / 5 |
@@ -140,19 +140,19 @@ pim.launch
 
 ## M4 — 최소 UPMEM lowering + codegen (no-split)
 
-**목표**: PIM Common IR → UPMEM IR → host.cpp + device.c 생성. **no-split만** (모든 DPU에 동일 매핑, K-split/N-split 없음).
+**목표**: PIM Common IR → UPMEM IR → host.cpp + device.c **생성**. **no-split만** (DPU 1개가 단일 tile 계산). device 커널은 prebuilt를 링크하지 않고 **IR에서 생성**한다 (block 정보를 활용·확장 가능하게). PGEMM은 SDK 관용구 참고용.
 
-**완료 조건**: `triton-shared-opt --legalize-pim-to-upmem --upmem-codegen`으로 host/device 소스 생성. (M2 dump로 `03_vendor.mlir`·`host.cpp`·`device.c` 확인.)
+**codegen 메커니즘**: MLIR에서 IR→소스 텍스트는 pass가 아니라 **translate**의 일이다. 새 도구 `triton-shared-translate`를 만들고, `--upmem-to-host` / `--upmem-to-device` 번역을 등록해 UPMEM IR을 walk하며 host.cpp / device.c를 emit한다.
+
+**완료 조건**: `triton-shared-opt --convert-ttshared-to-pim --legalize-pim-to-upmem` → `triton-shared-translate --upmem-to-host`(host.cpp) / `--upmem-to-device`(device.c) 생성. (실제 컴파일·실행은 M5.)
 
 **작업 단위**:
 
-- [ ] **M4.1** UPMEM dialect 최소 ops (`upmem.host_func`, `device_func`, `alloc_units`, `copy_to_global`, `copy_from_global`, `launch`, `local_gemm`)
-- [ ] **M4.2** `LegalizePIMToUPMEM` (no-split: execution_unit→DPU 1:1, device_global→MRAM, device_local→WRAM)
-- [ ] **M4.3** `UPMEMHostDeviceSplit` (host_func / device_func 분리)
-- [ ] **M4.4** `UPMEMCodegen` — IR → host.cpp + device.c 텍스트 (string emission)
-- [ ] **M4.5** `UPMEMRuntimeStub` — host wrapper
-- [ ] **M4.6** `triton-shared-opt`에 UPMEM dialect/passes 등록
-- [ ] **M4.7** lit test: 작은 matmul로 host.cpp + device.c 생성 확인 (실제 컴파일은 M5)
+- [x] **M4.1** UPMEM dialect 최소 ops (`upmem.host_func`, `device_func`, `alloc_units`, `copy_to_global`, `copy_from_global`, `launch`, `local_gemm`)
+- [x] **M4.2** `LegalizePIMToUPMEM` (no-split: func(host 시퀀스) + device_func(local_gemm)로 분리)
+- [x] **M4.3** `triton-shared-translate` 도구 + `--upmem-to-host`/`--upmem-to-device` 번역: UPMEM IR을 walk해 host.cpp + device.c 생성. MVP device.c = 최소 gemm(single tasklet, host가 B 전치)
+- [x] **M4.4** `triton-shared-opt`에 UPMEM dialect/passes 등록
+- [x] **M4.5** test: `test/Target/UPMEM/matmul.mlir` — `triton-shared-translate`가 host.cpp/device.c 생성 확인 (실제 컴파일은 M5)
 
 ---
 
@@ -193,6 +193,8 @@ pim.launch
 
 > 규칙: 각 항목은 **독립 toggle 가능**, **OFF 시 M6가 그대로 통과**, **각 pass는 lit test + e2e 재검증**. DESIGN.md 13.0 경계 원칙(구조/intent/gate만) 준수. (Debug/dump는 M2에서 이미 구축됨.)
 
+> **전제 — 전체 문제(full-problem) 정보 복원**: MVP의 M3 변환은 single-tile만 가정해 **grid·program_id·K-loop을 버리고** "타일 하나 = 전체 gemm"으로 취급한다. 실제 multi-tile matmul(grid>1, K-loop)에서 tiling/SPLIT 최적화를 하려면, **전체 M/N/K·grid·program_id→tile 매핑을 복원**해 `tile_plan`(BLOCK/SPLIT)과 `chunk_plan`(BLOCK_K)으로 표현해야 한다. 이 복원이 O3.3(chunk-planning)·O4(strategy)의 전제이며, **O1 변환 일반화 시 함께 수행**한다 (MVP는 BLOCK=전체라 이 정보가 비어 있어도 동작).
+
 ## O1 — 단일 변환을 granular plan pass로 분해
 
 **목표**: M3의 단일 `convert-ttshared-to-pim`을 DESIGN.md 13.1의 granular plan pass들로 분해한다. **behavior-preserving 리팩터** — no-split 입력에 대해 분해 전후 출력 IR(및 최종 vendor artifact)이 동일해야 한다. 이 분해가 이후 per-pass 최적화의 토대가 된다.
@@ -206,6 +208,7 @@ pim.launch
 - [ ] **O1.5** `build-pim-placement-plan` (placement policy **enum**만; 구체 산술은 vendor)
 - [ ] **O1.6** `build-pim-residency-plan` (residency enum)
 - [ ] **O1.7** 동치 검증: no-split에 대해 분해 파이프라인 출력 == M3 출력(M2 dump로 비교), M6 재통과
+- [ ] **O1.8** multi-tile 일반화: TTSharedIR의 grid·program_id·K-loop에서 전체 M/N/K를 복원해 `tile_plan`(BLOCK/SPLIT)·`chunk_plan`(BLOCK_K)에 반영 (MVP single-tile 가정 제거). O3.3·O4의 전제
 
 ---
 

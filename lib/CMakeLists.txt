@@ -2,6 +2,7 @@ add_subdirectory(Analysis)
 add_subdirectory(AnalysisStructured)
 add_subdirectory(Conversion)
 add_subdirectory(Dialect)
+add_subdirectory(Target)
 
 if(TRITON_SHARED_BUILD_TRITON_SAN)
   add_subdirectory(Sanitizer)

@@ -1,0 +1,113 @@
+#ifndef UPMEM_DIALECT
+#define UPMEM_DIALECT
+
+include "mlir/IR/OpBase.td"
+include "mlir/IR/AttrTypeBase.td"
+include "mlir/Interfaces/SideEffectInterfaces.td"
+
+//===----------------------------------------------------------------------===//
+// UPMEM dialect — UPMEM DPU 실행 모델.
+// host_func / device_func로 host-device를 나누고, host는 DPU alloc/load/copy/launch,
+// device는 per-DPU gemm을 표현한다. host C++ / DPU C codegen의 입력이다.
+//===----------------------------------------------------------------------===//
+
+def UPMEM_Dialect : Dialect {
+  let name = "upmem";
+  let cppNamespace = "::mlir::upmem";
+
+  let summary = "UPMEM DPU execution dialect";
+
+  let useDefaultTypePrinterParser = 1;
+  let usePropertiesForAttributes = 1;
+}
+
+class UPMEM_Op<string mnemonic, list<Trait> traits = []>
+    : Op<UPMEM_Dialect, mnemonic, traits>;
+
+class UPMEM_Type<string name, string _mnemonic, list<Trait> traits = []>
+    : TypeDef<UPMEM_Dialect, name, traits> {
+  // 파라미터 이름이 TypeDef의 mnemonic 필드와 충돌하지 않도록 _mnemonic 사용.
+  let mnemonic = _mnemonic;
+}
+
+//===----------------------------------------------------------------------===//
+// Types
+//===----------------------------------------------------------------------===//
+
+// 할당된 DPU 집합 핸들. alloc_units가 만들고 copy/launch가 참조한다.
+def UPMEM_DPUSetType : UPMEM_Type<"DPUSet", "dpu_set"> {
+  let summary = "Handle to an allocated set of DPUs";
+}
+
+//===----------------------------------------------------------------------===//
+// Region ops
+//===----------------------------------------------------------------------===//
+
+// host 측 실행 시퀀스(alloc/load/copy/launch)를 담는 region. host C++로 codegen된다.
+def UPMEM_HostFuncOp : UPMEM_Op<"host_func", [NoTerminator]> {
+  let summary = "Host-side launch sequence";
+  let arguments = (ins StrAttr:$sym_name);
+  let regions = (region AnyRegion:$body);
+  let assemblyFormat = "$sym_name attr-dict-with-keyword $body";
+}
+
+// device 측 커널 본문(local_gemm 등)을 담는 region. DPU C 커널로 codegen된다.
+def UPMEM_DeviceFuncOp : UPMEM_Op<"device_func", [NoTerminator]> {
+  let summary = "Device-side DPU kernel body";
+  let arguments = (ins StrAttr:$sym_name);
+  let regions = (region AnyRegion:$body);
+  let assemblyFormat = "$sym_name attr-dict-with-keyword $body";
+}
+
+//===----------------------------------------------------------------------===//
+// Host-side leaf ops
+//===----------------------------------------------------------------------===//
+
+// dpu_alloc(num_units). 결과 dpu_set 핸들을 반환.
+def UPMEM_AllocUnitsOp : UPMEM_Op<"alloc_units"> {
+  let summary = "Allocate a set of DPUs";
+  let arguments = (ins I64Attr:$num_units);
+  let results = (outs UPMEM_DPUSetType:$result);
+  let assemblyFormat = "attr-dict `:` type($result)";
+}
+
+// dpu_load(set, kernel). kernel은 device_func 심볼 이름.
+def UPMEM_LoadProgramOp : UPMEM_Op<"load_program"> {
+  let summary = "Load a DPU program";
+  let arguments = (ins UPMEM_DPUSetType:$dpu_set, FlatSymbolRefAttr:$kernel);
+  let assemblyFormat = "$dpu_set `,` $kernel attr-dict `:` type($dpu_set)";
+}
+
+// host buffer를 MRAM으로 복사. dst는 MRAM 심볼 이름.
+def UPMEM_CopyToGlobalOp : UPMEM_Op<"copy_to_global"> {
+  let summary = "Copy a host buffer into MRAM";
+  let arguments = (ins UPMEM_DPUSetType:$dpu_set, AnyType:$buffer, StrAttr:$dst);
+  let assemblyFormat = "$dpu_set `,` $buffer attr-dict `:` type($dpu_set) `,` type($buffer)";
+}
+
+// MRAM에서 host buffer로 복사. src는 MRAM 심볼 이름.
+def UPMEM_CopyFromGlobalOp : UPMEM_Op<"copy_from_global"> {
+  let summary = "Copy MRAM back to a host buffer";
+  let arguments = (ins UPMEM_DPUSetType:$dpu_set, AnyType:$buffer, StrAttr:$src);
+  let assemblyFormat = "$dpu_set `,` $buffer attr-dict `:` type($dpu_set) `,` type($buffer)";
+}
+
+// dpu_launch.
+def UPMEM_LaunchOp : UPMEM_Op<"launch"> {
+  let summary = "Launch the loaded DPU program";
+  let arguments = (ins UPMEM_DPUSetType:$dpu_set);
+  let assemblyFormat = "$dpu_set attr-dict `:` type($dpu_set)";
+}
+
+//===----------------------------------------------------------------------===//
+// Device-side op
+//===----------------------------------------------------------------------===//
+
+// device_func 안에서 per-DPU gemm을 표현. codegen이 이 attr로 DPU C gemm 루프를 만든다.
+def UPMEM_LocalGemmOp : UPMEM_Op<"local_gemm"> {
+  let summary = "Per-DPU GEMM (device-side)";
+  let arguments = (ins I64Attr:$m, I64Attr:$n, I64Attr:$k, StrAttr:$accumulation);
+  let assemblyFormat = "attr-dict";
+}
+
+#endif // UPMEM_DIALECT
