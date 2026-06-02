@@ -19,15 +19,13 @@ namespace triton {
 
 namespace {
 
-// tt.dot에서 내려온 gemm은 linalg.matmul에 triton.dot_origin attribute로 표시되어 있다.
-static linalg::MatmulOp findDotMatmul(func::FuncOp func) {
+// tt.dot은 triton-to-linalg가 linalg.matmul로 낮춘다(별도 marker attribute는 붙지 않는다).
+// MVP는 커널당 dot 1개(단일 tile)를 가정하므로 첫 linalg.matmul을 그대로 집는다.
+static linalg::MatmulOp findMatmul(func::FuncOp func) {
   linalg::MatmulOp found;
   func.walk([&](linalg::MatmulOp op) {
-    if (op->hasAttr("triton.dot_origin")) {
-      found = op;
-      return WalkResult::interrupt();
-    }
-    return WalkResult::advance();
+    found = op;
+    return WalkResult::interrupt();
   });
   return found;
 }
@@ -38,7 +36,7 @@ struct ConvertTTSharedToPIMPass
 
   void runOnOperation() override {
     getOperation().walk([&](func::FuncOp func) {
-      if (linalg::MatmulOp matmul = findDotMatmul(func))
+      if (linalg::MatmulOp matmul = findMatmul(func))
         rewriteToGemm(func, matmul);
     });
   }

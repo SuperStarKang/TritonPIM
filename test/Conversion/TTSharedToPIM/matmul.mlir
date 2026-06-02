@@ -1,4 +1,5 @@
-// triton.dot_origin이 붙은 linalg.matmul을 가진 함수가 PIM Common IR로 교체되는지 확인.
+// linalg.matmul을 가진 함수가 PIM Common IR로 교체되는지 확인.
+// (triton-to-linalg는 별도 marker attribute 없이 linalg.matmul을 emit한다.)
 // RUN: triton-shared-opt --convert-ttshared-to-pim %s | FileCheck %s
 
 // CHECK-LABEL: func.func @matmul_kernel
@@ -8,7 +9,7 @@ func.func @matmul_kernel(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>
   %b = tensor.empty() : tensor<256x64xf32>
   %z = tensor.empty() : tensor<32x64xf32>
   // BLOCK_M=32, BLOCK_K=256 (lhs), BLOCK_N=64 (result)
-  %r = linalg.matmul {triton.dot_origin}
+  %r = linalg.matmul
        ins(%a, %b : tensor<32x256xf32>, tensor<256x64xf32>)
        outs(%z : tensor<32x64xf32>) -> tensor<32x64xf32>
   return

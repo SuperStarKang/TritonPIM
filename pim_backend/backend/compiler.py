@@ -19,11 +19,65 @@ from triton.backends.compiler import BaseBackend, GPUTarget
 from dataclasses import dataclass
 from typing import Tuple, Dict
 from types import ModuleType
+from pathlib import Path
 import hashlib
 import functools
+import os
+import re
+import json
+import tempfile
+import subprocess
 
 # CPU backend의 IR 변환 helper / make_ttir을 재사용한다 (클래스가 아닌 모듈로 참조).
 import triton.backends.triton_shared.compiler as cpu_compiler
+
+
+def _translate_path() -> str:
+    # triton-shared-translate는 triton-shared-opt와 같은 빌드 트리의 형제 도구다.
+    # 별도 env 없이 기존 opt 경로(TRITON_SHARED_OPT_PATH)에서 이름만 바꿔 유도한다.
+    opt = cpu_compiler._get_triton_shared_opt_path()
+    return opt.replace("triton-shared-opt", "triton-shared-translate")
+
+
+def _run_opt(mlir_text: str, passes: list) -> str:
+    # triton-shared-opt로 PIM/UPMEM 변환 pass를 적용한다.
+    opt = cpu_compiler._get_triton_shared_opt_path()
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "in.mlir")
+        dst = os.path.join(tmp, "out.mlir")
+        Path(src).write_text(mlir_text)
+        subprocess.check_call([opt, src, *passes, "-o", dst])
+        return Path(dst).read_text()
+
+
+def _run_translate(mlir_text: str, which: str) -> str:
+    # triton-shared-translate로 UPMEM IR을 host/device 소스로 번역한다.
+    tr = _translate_path()
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "in.mlir")
+        Path(src).write_text(mlir_text)
+        return subprocess.check_output([tr, which, src]).decode("utf-8")
+
+
+def _ttsharedir_to_pim_common(ttshared: str) -> str:
+    return _run_opt(ttshared, ["--convert-ttshared-to-pim"])
+
+
+def _pim_common_to_upmem(pim_common: str) -> str:
+    return _run_opt(pim_common, ["--legalize-pim-to-upmem"])
+
+
+def _upmem_to_artifact(upmem_ir: str, metadata) -> bytes:
+    # UPMEM IR → host.cpp / device.c 소스를 생성해 번들로 묶는다. 컴파일은 launcher가 한다.
+    host_src = _run_translate(upmem_ir, "--upmem-to-host")
+    device_src = _run_translate(upmem_ir, "--upmem-to-device")
+    # launcher가 호출할 host 진입 함수 이름을 metadata.name으로 넘긴다.
+    # (Triton은 name을 기본 설정하지 않으므로 backend가 채워야 한다 — CPU의 _llir_to_bin과 동일.)
+    match = re.search(r'extern "C" void (\w+)\(', host_src)
+    if not match:
+        raise RuntimeError("generated host.cpp에서 진입 함수를 찾지 못함")
+    metadata["name"] = match.group(1)
+    return json.dumps({"host": host_src, "device": device_src}).encode("utf-8")
 
 @dataclass(frozen=True)
 class PIMOptions:
@@ -96,12 +150,14 @@ class PIMBackend(BaseBackend):
         return
 
     def add_stages(self, stages, options, language):
-        # CPU lowering 4-stage를 그대로 차용한다.
+        # PIM 파이프라인: TTIR → TTSharedIR → PIM Common IR → UPMEM IR → host.cpp/device.c 번들.
+        # ttir/ttsharedir 생성부는 CPU와 동일한 단일 소스를 재사용한다(hybrid 일관성).
         # 마지막 stage 이름은 binary_ext('pimobj')와 일치해야 CompiledKernel이 kernel을 찾는다.
         stages["ttir"] = lambda src, metadata: cpu_compiler.CPUBackend.make_ttir(src, metadata, options)
-        stages["ttsharedir"] = lambda src, metadata: cpu_compiler._optimize_ttsharedir(cpu_compiler._ttir_to_ttsharedir(src))
-        stages["llir"] = lambda src, metadata: cpu_compiler._optimize_llir(cpu_compiler._ttsharedir_to_llir(src))
-        stages["pimobj"] = lambda src, metadata: cpu_compiler._llir_to_bin(src, metadata)
+        stages["ttsharedir"] = lambda src, metadata: cpu_compiler._ttir_to_ttsharedir(src)
+        stages["pim_common"] = lambda src, metadata: _ttsharedir_to_pim_common(src)
+        stages["vendor_ir"] = lambda src, metadata: _pim_common_to_upmem(src)
+        stages["pimobj"] = lambda src, metadata: _upmem_to_artifact(src, metadata)
 
     @functools.lru_cache()
     def hash(self):

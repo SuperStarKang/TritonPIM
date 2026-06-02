@@ -26,23 +26,23 @@
 | **Part I — Minimal Executable (MVP)** | | | |
 | M0 | Skeleton: pim_backend 디렉토리 + PIMBackend / PIMDriver | `[x]` | 8 / 8 |
 | M1 | 최소 PIM Common Dialect (6 ops) | `[x]` | 8 / 8 |
-| M2 | Debug / IR Dump (변환 확인용, 먼저 구축) | `[~]` | 2 / 3 |
+| M2 | Debug / IR Dump (변환 확인용, 먼저 구축) | `[x]` | 3 / 3 |
 | M3 | TTShared→PIM 단일 변환 (no-split GEMM) | `[x]` | 4 / 4 |
 | M4 | 최소 UPMEM lowering + codegen (no-split) | `[x]` | 5 / 5 |
-| M5 | Runtime & Launcher | `[ ]` | 0 / 5 |
-| M6 | End-to-end: MatMul 실행 + 검증 | `[ ]` | 0 / 4 |
+| M5 | Runtime & Launcher | `[x]` | 4 / 4 |
+| M6 | End-to-end: MatMul 실행 + 검증 | `[x]` | 4 / 4 |
 | **Part II — Incremental Optimization** | | | |
 | O1 | 단일 변환을 granular plan pass로 분해 + multi-tile 일반화 | `[ ]` | 0 / 8 |
 | O2 | Capability / Constraints | `[ ]` | 0 / 3 |
 | O3 | Common Optimization Passes (하나씩) | `[ ]` | 0 / 8 |
-| O4 | Execution Strategy Selection | `[ ]` | 0 / 5 |
+| O4 | Execution Strategy Selection | `[ ]` | 0 / 6 |
 | O5 | Autotune Integration | `[ ]` | 0 / 3 |
 | **Part III — Breadth** | | | |
 | B1 | AiMX Vendor Extension | `[ ]` | 0 / 6 |
 | B2 | Vendor Extension Registry 리팩토링 | `[ ]` | 0 / 3 |
 | B3 | CPU+PIM HybridDriver | `[ ]` | 0 / 5 |
 
-총 진행률: **0 / 79**
+총 진행률: **36 / 78** (Part I MVP 완료)
 
 ---
 
@@ -119,7 +119,7 @@ pim.launch
 
 - [x] **M2.1** 내장 dump 동작 확인: `TRITON_KERNEL_DUMP=1 TRITON_DUMP_DIR=/tmp/triton_pim`로 smoke test 실행 → 커널 hash 폴더에 `*.ttir`, `*.ttsharedir`, `*.llir`, `*.pimobj` 생성 확인
 - [x] **M2.2** `PIMOptions`에서 미사용 dump 필드 제거(내장 knobs로 대체), DESIGN 21장을 내장 dump 기준으로 정정
-- [ ] **M2.3** (M3/M4 이후) `pim_common`/`vendor_ir`/codegen artifact가 같은 메커니즘으로 자동 dump되는지 확인
+- [x] **M2.3** `pim_common`/`vendor_ir`/codegen artifact가 같은 메커니즘으로 자동 dump됨 확인 (dump 디렉토리에 `matmul_kernel.pim_common`·`.vendor_ir` 생성 확인)
 
 ---
 
@@ -158,17 +158,18 @@ pim.launch
 
 ## M5 — Runtime & Launcher
 
-**목표**: 생성된 UPMEM artifact를 실제 PIM device(또는 functional simulator)에서 실행.
+**목표**: 생성된 host.cpp/device.c를 컴파일해 실제 DPU에서 실행한다. **생성된 host.cpp가 dpu_alloc/load/copy/launch를 직접 수행하므로(=런타임 glue), 별도 `pim_runtime.h` C API 계층은 두지 않는다** (DESIGN 18은 MVP 미사용). CPULauncher가 launcher .so를 컴파일·dlopen하는 패턴을 그대로 따른다.
 
-**완료 조건**: `pim_executable_load` → `pim_launch` → `pim_synchronize` 시퀀스로 device 실행 호출 성공.
+**환경**: DPU 컴파일러 `dpu-upmem-dpurte-clang`(/usr/bin), host 헤더 `/usr/include/dpu`, host는 `libdpu` 링크.
+
+**완료 조건**: `matmul_kernel_host(A,B,C)` 호출로 DPU에서 gemm 실행 성공.
 
 **작업 단위**:
 
-- [ ] **M5.1** `runtime/pim/include/pim_runtime.h` C API (DESIGN.md 18.2)
-- [ ] **M5.2** `runtime/pim/lib/PIMRuntime.cpp` 등 기본 구현 (UPMEM SDK)
-- [ ] **M5.3** `runtime/pim/vendors/upmem/UPMEMLauncher.cpp` — `dpu_alloc`/`dpu_load`/`dpu_copy_to`/`dpu_launch`/`dpu_copy_from` wrapping
-- [ ] **M5.4** M0의 `PIMLauncher`를 갱신: CPU launcher 대신 PIM runtime을 dlopen해 호출
-- [ ] **M5.5** `CMakeLists.txt` 업데이트 (UPMEM SDK include/link)
+- [x] **M5.1** device.c → device.elf 컴파일 (`dpu-upmem-dpurte-clang -DNR_TASKLETS=1`) — runtime_test에서 검증
+- [x] **M5.2** host.cpp → 컴파일·실행 (`g++ + libdpu`, `dpu_broadcast_to`/`dpu_push_xfer` 패턴, WRAM `__dma_aligned`) — runtime_test `max_diff=0` 통과
+- [x] **M5.3** `PIMLauncher` 갱신: artifact(생성 소스)를 device.elf+host.so로 컴파일·캐시하고 dlopen, `<kernel>_host(A,B,C)`를 ctypes 호출 — `test_pim_matmul.py`로 검증
+- [x] **M5.4** UPMEM SDK 경로/플래그 확인 (`dpu-upmem-dpurte-clang`, `/usr/include/dpu`, `-ldpu`, `UPMEM_PROFILE=chipId=0x42`)
 
 ---
 
@@ -180,10 +181,10 @@ pim.launch
 
 **작업 단위**:
 
-- [ ] **M6.1** `pim_backend/examples/test_pim_matmul.py` (DESIGN.md 22장 기준, `A(M,K)×B(K,N)`)
-- [ ] **M6.2** M0의 `add_stages`를 실제 PIM 파이프라인으로 교체 (CPU lowering 제거, M3~M4 pass 사용)
-- [ ] **M6.3** small shape (M=32, N=64, K=256) 실행 + 검증 (실패 시 M2 dump로 단계별 IR 추적)
-- [ ] **M6.4** medium shape (M=256, N=512, K=512) 실행 + 검증
+- [x] **M6.1** `pim_backend/examples/test_pim_matmul.py` (`A(M,K)×B(K,N)`, 단일 tile)
+- [x] **M6.2** `add_stages`를 실제 PIM 파이프라인으로 교체 (ttir→ttsharedir→pim_common→vendor_ir→pimobj; CPU lowering 제거)
+- [x] **M6.3** small shape (M=32, N=64, K=256) 실행 + 검증 통과 (`assert_close(C, A@B)`)
+- [x] **M6.4** medium shape (M=256, N=512, K=512) 실행 + 검증 통과
 
 > ✅ **여기까지가 MVP.** 이후 Part II는 전부 이 상태를 baseline으로 유지하며 additive하게 진행한다.
 
@@ -193,7 +194,9 @@ pim.launch
 
 > 규칙: 각 항목은 **독립 toggle 가능**, **OFF 시 M6가 그대로 통과**, **각 pass는 lit test + e2e 재검증**. DESIGN.md 13.0 경계 원칙(구조/intent/gate만) 준수. (Debug/dump는 M2에서 이미 구축됨.)
 
-> **전제 — 전체 문제(full-problem) 정보 복원**: MVP의 M3 변환은 single-tile만 가정해 **grid·program_id·K-loop을 버리고** "타일 하나 = 전체 gemm"으로 취급한다. 실제 multi-tile matmul(grid>1, K-loop)에서 tiling/SPLIT 최적화를 하려면, **전체 M/N/K·grid·program_id→tile 매핑을 복원**해 `tile_plan`(BLOCK/SPLIT)과 `chunk_plan`(BLOCK_K)으로 표현해야 한다. 이 복원이 O3.3(chunk-planning)·O4(strategy)의 전제이며, **O1 변환 일반화 시 함께 수행**한다 (MVP는 BLOCK=전체라 이 정보가 비어 있어도 동작).
+> **전제 ① — 전체 문제(full-problem) 정보 복원**: MVP의 M3 변환은 single-tile만 가정해 **grid·program_id·K-loop을 버리고** "타일 하나 = 전체 gemm"으로 취급한다. 실제 multi-tile matmul(grid>1, K-loop)에서 tiling/SPLIT 최적화를 하려면, **전체 M/N/K·grid·program_id→tile 매핑을 복원**해 `tile_plan`(BLOCK/SPLIT)과 `chunk_plan`(BLOCK_K)으로 표현해야 한다. 이 복원이 O3.3(chunk-planning)·O4(strategy)의 전제이며, **O1 변환 일반화 시 함께 수행**한다 (MVP는 BLOCK=전체라 이 정보가 비어 있어도 동작).
+
+> **전제 ② — codegen이 IR 값을 받아 생성**: plan/strategy pass는 IR에 intent/구조(`num_units`·tile offset·`chunk_plan`·tasklet 수 등)를 표현한다 (DESIGN 13.0 경계). 그러나 현재 translate(`UPMEMToHost`/`UPMEMToDevice`)는 이 값들을 **읽지 않고 고정 템플릿**을 emit한다: `dpu_alloc(1,...)`(항상 DPU 1개), `local_gemm{m,n,k}`를 상수로 박음, device는 `if(me()!=0) return`(tasklet 1개)로 전체를 혼자 계산. 따라서 SPLIT(여러 DPU)·chunk(큰 K)·multi-tasklet은 IR 표현만으론 실행되지 않고, **translate·launcher가 그 IR 값을 읽어 parameterized code를 생성**하도록 일반화해야 한다 (O4.6). "IR에 박힘"과 "여러 DPU에서 실제로 돔"은 다른 단계임에 주의.
 
 ## O1 — 단일 변환을 granular plan pass로 분해
 
@@ -254,6 +257,7 @@ pim.launch
 - [ ] **O4.3** `SelectPIMExecutionStrategy` Common pass — split factor + vendor capability/constraints로 적법 전략 필터, autotune 미사용 시 단순 기본 규칙(no-split 우선)
 - [ ] **O4.4** vendor lowering이 전략 attribute legalize (`reduction_k_partitioned` → UPMEM host_reduce) + lit test
 - [ ] **O4.5** e2e: SPLIT에 따라 다른 `mapping_policy`/`reduction`이 IR에 박히는지 검증
+- [ ] **O4.6** translate·launcher가 IR 값을 받아 생성(전제 ②): host.cpp는 `alloc_units{num_units}`→`dpu_alloc(NUM_UNITS)`·`execution_group` tile 매핑→DPU별 offset push/gather, device.c는 `NR_TASKLETS`개 tasklet이 tile_offset/tile_count·`chunk_plan`(BLOCK_K)만큼만 계산, PIMLauncher는 NUM_UNITS DPU alloc·실행 (k-split이면 `host_reduce`). ← 여러 DPU에서 "실제로 도는" 단계
 
 ---
 
@@ -359,6 +363,4 @@ M6 E2E 검증  ← ✅ "돈다"
 
 ## 다음 액션
 
-현재 다음 작업을 시작하면 됩니다:
-
-- [x] **M0.1** — `triton-shared/pim_backend/backend/` 디렉토리 생성 및 `name.conf` 작성
+Part I(MVP) 완료. 다음은 Part II 진입 — 사용자 목표(큰 행렬·실제 block 정보·여러 DPU 분산)의 토대인 **O1.8(전체 문제 정보 복원)** 부터 시작한다. 그 전에 현재 TTSharedIR에 grid·program_id·K-loop이 어떤 형태로 들어오는지 dump로 확인한 뒤 복원 설계를 잡는다.

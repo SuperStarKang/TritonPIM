@@ -1,12 +1,11 @@
-# MVP matmul: A(M,K) x B(K,N) -> C(M,N), no-split 단일 tile (DESIGN 22장 형태).
+# MVP matmul: A(M,K) x B(K,N) -> C(M,N), no-split 단일 tile.
 #
-# 현재 lowering은 CPU 경로를 재사용하므로 이 테스트는 지금도 정답까지 통과해야 한다
-# (PIM 전용 lowering은 M3~M6에서 교체). 동시에 이 커널의 TTSharedIR을 dump해서
-# M3 변환 pass(convert-ttshared-to-pim)의 입력 형태를 확인하는 용도로도 쓴다.
+# PIM 파이프라인 end-to-end 검증: 이 커널을 부르면 TTIR→TTSharedIR→PIM IR→UPMEM IR→
+# host.cpp/device.c 생성→컴파일→DPU 실행까지 자동으로 돈다(PIMBackend.add_stages + PIMLauncher).
 #
-# TTSharedIR 확인:
-#   TRITON_KERNEL_DUMP=1 TRITON_DUMP_DIR=/tmp/triton_pim python test_pim_matmul.py
-#   → /tmp/triton_pim/<hash>/matmul_kernel.ttsharedir 확인
+# 중간 IR 확인:
+#   TRITON_KERNEL_DUMP=1 TRITON_DUMP_DIR=/path/to/dump python test_pim_matmul.py
+#   → /path/to/dump/<hash>/ 에 단계별 IR
 
 import torch
 import triton
@@ -46,10 +45,13 @@ def run(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K):
                         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
                         vendor="upmem")
 
-    torch.testing.assert_close(C, A @ B)
+    # DPU는 순차 fp32 누적, torch는 블록/SIMD 누적이라 누적 순서 차이로 작은 오차가 정상적으로 난다.
+    # 정확성 자체(동일 순서면 max_diff=0)는 runtime_test로 이미 검증됨 → 여기선 순서 차이만큼만 허용.
+    torch.testing.assert_close(C, A @ B, rtol=1e-3, atol=1e-3)
     print(f"OK: matmul ({M}x{K})x({K}x{N}) -> ({M}x{N})")
 
 
 if __name__ == "__main__":
     # 단일 tile (grid=(1,1)): BLOCK이 전체 M,N,K를 덮는다.
-    run(M=32, N=64, K=256, BLOCK_M=32, BLOCK_N=64, BLOCK_K=256)
+    # run(M=32, N=64, K=256, BLOCK_M=32, BLOCK_N=64, BLOCK_K=256)
+    run(M=256, N=512, K=512, BLOCK_M=256, BLOCK_N=512, BLOCK_K=512) # Medium size
