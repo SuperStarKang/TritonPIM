@@ -1498,6 +1498,23 @@ generated/
     pim_runtime_stub.cpp
 ```
 
+## 14.6 SPLIT / LOCAL_LANES 실현 (inter-DPU vs intra-DPU)
+
+공통 IR이 정한 두 병렬 축을 UPMEM이 실제 코드로 푸는 방식. **둘은 "값이 어디에 박히는가"가 다르다.**
+
+### `NUM_UNITS`(=SPLIT) — host.cpp 소스에 박힘
+`alloc_units{num_units=U}` → `UPMEMToHost`가 `U`를 **C 상수로** host.cpp에 박는다: `dpu_alloc(U)`, A는 `dpu_broadcast_to`(모든 유닛), B/C는 `DPU_FOREACH`로 per-DPU `prepare_xfer`+`push_xfer`(scatter/gather). host는 g++로 컴파일되는 일반 코드라 상수면 충분 → **소스 번들만으로 완결**.
+
+### `LOCAL_LANES`(=NR_TASKLETS) — device 컴파일 플래그로 전달
+DPU 런타임은 tasklet 개수를 **`-DNR_TASKLETS` 컴파일 플래그로만** 안다 (device.c에 `#define`을 박아도 런타임 startup이 못 봄). 따라서:
+- `UPMEMToDevice`는 device.c를 **`NR_TASKLETS` 매크로로 generic하게** emit한다 (소스 텍스트는 lane 수와 무관):
+  - `BARRIER_INIT(b, NR_TASKLETS)` + 초기화 시 `me()==0`이 `mem_reset()` 후 `barrier_wait`.
+  - tasklet마다 자기 WRAM 캐시(`mem_alloc`, 8B 정렬).
+  - **일 분배는 SPMD로 명시**: `for (i = me(); i < M; i += NR_TASKLETS)` — 각 tasklet이 출력 **행**을 round-robin으로 가져감(행 disjoint → 끝 barrier 불필요). 행 단위라 Triton BLOCK 2D 기하를 보존(추후 2D lane 분배·WRAM 재사용으로 확장).
+- 실제 값은 launcher가 `metadata.local_lanes`를 읽어 `dpu-upmem-dpurte-clang -DNR_TASKLETS=L`로 컴파일한다. **IR 구조를 바꾸지 않는 device 빌드 파라미터라 IR/소스가 아닌 metadata 채널로 흐른다.**
+
+> 이득: DPU의 fine-grained multithreading이 한 tasklet의 `mram_read` 지연을 다른 tasklet 연산으로 숨긴다 → lane 수가 늘수록 throughput 증가(보통 11+ tasklet 권장). 제약: per-tasklet WRAM × NR_TASKLETS ≤ 64KB (`NR_TASKLETS·(2K+N)·4B`). 초과 시 `BLOCK_K` chunk(O3.3) 필요.
+
 ---
 
 # 15. AiMX Vendor Extension

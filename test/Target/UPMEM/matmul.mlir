@@ -26,7 +26,9 @@ upmem.device_func "matmul_kernel_device" {
 
 // DEVICE: __host uint32_t M;
 // DEVICE: __mram_noinit float A_mram
+// DEVICE: BARRIER_INIT(my_barrier, NR_TASKLETS)
 // DEVICE: int main()
-// DEVICE: mram_read(&A_mram[i * K], a_row, K * sizeof(float))
+// DEVICE: uint32_t t = me();
+// DEVICE: for (uint32_t i = t; i < M; i += NR_TASKLETS)
 // DEVICE: acc += a_row[l] * b_row[l]
 // DEVICE: mram_write(c_row, &C_mram[i * N], N * sizeof(float))

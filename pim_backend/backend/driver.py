@@ -40,10 +40,11 @@ def _dpu_host_flags():
     return ["-I/usr/include/dpu", "-ldpu"]
 
 
-def _build_pim_so(host_src: str, device_src: str) -> str:
+def _build_pim_so(host_src: str, device_src: str, local_lanes: int) -> str:
     # 소스 번들을 device.elf + host.so로 컴파일하고 host.so 경로를 돌려준다.
     # 소스 해시를 키로 캐시해 같은 커널은 한 번만 컴파일한다(CPULauncher와 동일한 발상).
-    key = hashlib.sha256((host_src + device_src).encode("utf-8")).hexdigest()
+    # local_lanes는 소스에 안 박히고 -DNR_TASKLETS 플래그로만 들어가므로 키에 따로 포함한다.
+    key = hashlib.sha256((host_src + device_src + f"|L={local_lanes}").encode("utf-8")).hexdigest()
     cache = get_cache_manager(key)
     so_name = "pim_host.so"
     so_path = cache.get_file(so_name)
@@ -56,9 +57,10 @@ def _build_pim_so(host_src: str, device_src: str) -> str:
         Path(device_c).write_text(device_src)
         Path(host_cpp).write_text(host_src)
 
-        # device.c → device.elf (MVP: tasklet 1개)
+        # device.c → device.elf. NR_TASKLETS = local_lanes (DPU 내부 tasklet 수).
         elf_tmp = os.path.join(tmp, "device.elf")
-        subprocess.check_call(["dpu-upmem-dpurte-clang", "-DNR_TASKLETS=1", device_c, "-o", elf_tmp])
+        subprocess.check_call(["dpu-upmem-dpurte-clang", f"-DNR_TASKLETS={local_lanes}",
+                               device_c, "-o", elf_tmp])
         # host.so는 실행 중 dpu_load(DPU_BINARY)로 elf를 연다 → 캐시에 박아 안정 경로를 확보한다.
         elf_path = cache.put(Path(elf_tmp).read_bytes(), "device.elf", binary=True)
 
@@ -82,13 +84,15 @@ class PIMLauncher(object):
         # 전체 M/N/K(런타임)는 matmul(A,B,C,M,N,K) 규약상 포인터 다음 i32 인자 3,4,5.
         # host 함수가 baked 상수가 아니라 런타임 M/N/K를 파라미터로 받으므로 여기서 꺼내 넘긴다.
         self.extent_indices = [3, 4, 5]
+        # local_lanes(=NR_TASKLETS): device 빌드 파라미터. PIMOptions 필드라 metadata에 들어온다.
+        self.local_lanes = metadata.local_lanes
 
     def __call__(self, gridX, gridY, gridZ, stream, cu_function,
                  kernel_metadata, launch_metadata,
                  launch_enter_hook, launch_exit_hook, *args):
         # cu_function = load_binary가 돌려준 소스 번들 bytes (PIMUtils.load_binary 참고).
         bundle = json.loads(bytes(cu_function).decode("utf-8"))
-        so_path = _build_pim_so(bundle["host"], bundle["device"])
+        so_path = _build_pim_so(bundle["host"], bundle["device"], self.local_lanes)
 
         # host 진입 함수 이름 = metadata.name (compiler가 host.cpp에서 파싱해 채운 값). index 6.
         entry = kernel_metadata[6]

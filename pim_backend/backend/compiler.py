@@ -70,6 +70,8 @@ def _pim_common_to_upmem(pim_common: str) -> str:
 
 def _upmem_to_artifact(upmem_ir: str, metadata) -> bytes:
     # UPMEM IR → host.cpp / device.c 소스를 생성해 번들로 묶는다. 컴파일은 launcher가 한다.
+    # local_lanes(=NR_TASKLETS)는 device 빌드 파라미터라 번들에 넣지 않는다 — PIMOptions 필드라
+    # 자동으로 metadata에 포함되고, launcher가 metadata.local_lanes를 읽어 -DNR_TASKLETS로 쓴다.
     host_src = _run_translate(upmem_ir, "--upmem-to-host")
     device_src = _run_translate(upmem_ir, "--upmem-to-device")
     # launcher가 호출할 host 진입 함수 이름을 metadata.name으로 넘긴다.
@@ -102,6 +104,7 @@ class PIMOptions:
     vendor: str = None           # "upmem" | "aimx" — 누락 시 아래에서 즉시 에러 (fallback 없음)
     device_id: int = 0
     split_n: int = 1             # N축 inter-unit SPLIT 수(=DPU 개수). 1이면 단일 유닛(기존 동작).
+    local_lanes: int = 1         # DPU 내부 intra-unit 병렬 수(=NR_TASKLETS). 1이면 단일 tasklet.
 
     def __post_init__(self):
         # vendor 없이 PIM을 쓰는 것은 의도된 사용이 아니므로 기본값으로 때우지 않고 바로 터뜨린다.

@@ -11,7 +11,9 @@ using namespace mlir;
 
 // UPMEM IR을 walk해 DPU C 커널을 emit한다.
 // gemm 커널은 크기를 __host 인자로 받는 범용 코드라 매 matmul마다 동일하다.
-// MVP: tasklet 1개가 한 행씩 streaming (A행·Bt행을 WRAM으로 읽어 dot).
+// 여러 tasklet이 출력 행을 round-robin(me() + NR_TASKLETS stride)으로 나눠 처리한다.
+// NR_TASKLETS는 launcher가 -DNR_TASKLETS=local_lanes로 주입한다(소스는 매크로로 generic).
+// A행·Bt행을 WRAM으로 읽어 dot. 행이 disjoint라 끝 barrier는 불필요.
 static LogicalResult translateUPMEMToDevice(ModuleOp module, raw_ostream &os) {
   upmem::LocalGemmOp gemm;
   module.walk([&](upmem::LocalGemmOp g) { gemm = g; });
@@ -22,25 +24,28 @@ static LogicalResult translateUPMEMToDevice(ModuleOp module, raw_ostream &os) {
   os << "#include <stdint.h>\n";
   os << "#include <mram.h>\n";
   os << "#include <defs.h>\n";
-  os << "#include <alloc.h>\n\n";
-  os << "// host가 dpu_copy_to로 채우는 크기 인자\n";
+  os << "#include <alloc.h>\n";
+  os << "#include <barrier.h>\n\n";
+  os << "// host가 broadcast로 채우는 크기 인자 (N은 이 DPU가 맡은 열 수 = Nu)\n";
   os << "__host uint32_t M;\n";
   os << "__host uint32_t N;\n";
   os << "__host uint32_t K;\n\n";
-  os << "// WRAM staging 버퍼의 컴파일 타임 최대치 (MVP shape이 들어가는 범위)\n";
-  os << "#define MAX_K 1024\n";
-  os << "#define MAX_N 1024\n\n";
-  os << "// host가 copy_to로 채우는 MRAM 버퍼\n";
+  os << "// host가 채우는 MRAM 버퍼\n";
   os << "__mram_noinit float A_mram[1u << 22];   // (M,K) row-major\n";
   os << "__mram_noinit float Bt_mram[1u << 22];  // (N,K) row-major (host가 전치)\n";
   os << "__mram_noinit float C_mram[1u << 22];   // (M,N) row-major\n\n";
-  os << "// WRAM staging: mram_read/write는 8바이트 정렬 필요 → __dma_aligned, 전역(스택 회피)\n";
-  os << "__dma_aligned float a_row[MAX_K];\n";
-  os << "__dma_aligned float b_row[MAX_K];\n";
-  os << "__dma_aligned float c_row[MAX_N];\n\n";
+  os << "// NR_TASKLETS는 -DNR_TASKLETS로 주입됨 (launcher가 local_lanes로 컴파일)\n";
+  os << "BARRIER_INIT(my_barrier, NR_TASKLETS);\n\n";
   os << "int main() {\n";
-  os << "  if (me() != 0) return 0;  // MVP: tasklet 1개만\n";
-  os << "  for (uint32_t i = 0; i < M; ++i) {\n";
+  os << "  uint32_t t = me();\n";
+  os << "  if (t == 0) mem_reset();  // WRAM heap 리셋(전체 tasklet 공유 heap, 한 번만)\n";
+  os << "  barrier_wait(&my_barrier);\n";
+  os << "  // tasklet마다 자기 WRAM 캐시. mem_alloc은 8바이트 정렬 보장 (K,N 짝수 가정).\n";
+  os << "  float* a_row = (float*)mem_alloc(K * sizeof(float));\n";
+  os << "  float* b_row = (float*)mem_alloc(K * sizeof(float));\n";
+  os << "  float* c_row = (float*)mem_alloc(N * sizeof(float));\n";
+  os << "  // 출력 행을 tasklet들이 round-robin으로 분배 (행 disjoint → 동기화 불필요)\n";
+  os << "  for (uint32_t i = t; i < M; i += NR_TASKLETS) {\n";
   os << "    mram_read(&A_mram[i * K], a_row, K * sizeof(float));\n";
   os << "    for (uint32_t j = 0; j < N; ++j) {\n";
   os << "      mram_read(&Bt_mram[j * K], b_row, K * sizeof(float));\n";
