@@ -35,14 +35,14 @@
 | O1 | 단일 변환을 granular plan pass로 분해 + multi-tile 일반화 | `[~]` | 1 / 8 |
 | O2 | Capability / Constraints | `[ ]` | 0 / 3 |
 | O3 | Common Optimization Passes (하나씩) | `[ ]` | 0 / 8 |
-| O4 | Execution Strategy Selection | `[ ]` | 0 / 6 |
+| O4 | Execution Strategy Selection | `[~]` | 1 / 6 |
 | O5 | Autotune Integration | `[ ]` | 0 / 3 |
 | **Part III — Breadth** | | | |
 | B1 | AiMX Vendor Extension | `[ ]` | 0 / 6 |
 | B2 | Vendor Extension Registry 리팩토링 | `[ ]` | 0 / 3 |
 | B3 | CPU+PIM HybridDriver | `[ ]` | 0 / 5 |
 
-총 진행률: **37 / 78** (Part I MVP 완료, O1.8 multi-tile 1-DPU 정답)
+총 진행률: **38 / 78** (Part I MVP 완료, O1.8 multi-tile 1-DPU, O4 n-split(split_n) 수직 슬라이스)
 
 ---
 
@@ -265,8 +265,10 @@ pim.launch
 - [ ] **O4.2** `[공통]` 전략 구현 + 레지스트리 등록 (전략 목록은 vendor-neutral): `no-split`, `n-split`(output_n_partitioned), `k-split`(reduction_k_partitioned), `m-split`(output_m_partitioned, 전치 포함)
 - [ ] **O4.3** `[공통·gate]` `SelectPIMExecutionStrategy` Common pass — split factor + vendor capability/constraints로 적법 전략 필터, autotune 미사용 시 단순 기본 규칙(no-split 우선)
 - [ ] **O4.4** `[vendor]` UPMEM lowering이 전략 attribute legalize (`reduction_k_partitioned` → UPMEM `host_reduce`) + lit test
-- [ ] **O4.5** `[검증]` e2e: SPLIT에 따라 다른 `mapping_policy`/`reduction`이 IR에 박히는지 검증
-- [ ] **O4.6** `[vendor]` translate·launcher가 IR 값을 받아 생성(전제 ②): host.cpp는 `alloc_units{num_units}`→`dpu_alloc(NUM_UNITS)`·`execution_group` tile 매핑→DPU별 offset push/gather, device.c는 `NR_TASKLETS`개 tasklet이 tile_offset/tile_count·`chunk_plan`(BLOCK_K)만큼만 계산, PIMLauncher는 NUM_UNITS DPU alloc·실행 (k-split이면 `host_reduce`). ← 여러 DPU에서 "실제로 도는" 단계
+- [~] **O4.5** `[검증]` e2e: SPLIT에 따라 동작 검증 — **n-split `split_n=2` 정답 통과**(`test_pim_matmul_tiled.py`). k/m-split·reduce 검증은 이후.
+- [~] **O4.6** `[vendor]` translate·launcher가 IR 값을 받아 생성(전제 ②). **완료**: n-split host codegen — `alloc_units{num_units}`→`dpu_alloc(U)`, A broadcast / B 열슬라이스 scatter / C gather·재배치 (`UPMEMToHost`, split_n=2 검증). **남음**: device.c `NR_TASKLETS` multi-tasklet, `chunk_plan`(BLOCK_K)로 WRAM 자르기(큰 K), k-split `host_reduce`.
+
+> **n-split 수직 슬라이스 (완료)**: 전략 프레임워크(O4.1~O4.4)를 건너뛰고 `split_n` 옵션 하나로 끝까지 관통 — `PIMOptions.split_n`(kwarg) → `convert-ttshared-to-pim=split-n=U` → `tile_plan.split_n` → `alloc_units{num_units=U}` → `UPMEMToHost`가 U-DPU broadcast/scatter/gather 생성. `split_n=1`이면 단일 DPU와 동일. **다음**: ① device.c multi-tasklet(`LOCAL_LANES`/`NR_TASKLETS`)로 DPU 내부 병렬, 그다음 ② O4.1~O4.4 전략 프레임워크로 일반화(k/m-split), ③ grid-as-SPLIT으로 전 DPU 활용·BLOCK 정렬.
 
 ---
 
@@ -372,4 +374,8 @@ M6 E2E 검증  ← ✅ "돈다"
 
 ## 다음 액션
 
-O1.8(전체 M/N/K 복원 → multi-tile 1-DPU 정답)까지 완료. 다음은 사용자 목표(여러 DPU 분산)의 본체인 **O4 (Execution Strategy: n-split → grid 블록을 여러 DPU로) + O4.6 (multi-DPU codegen/launcher)**. 큰 K(>WRAM)는 **O3.3 + O4.6의 BLOCK_K chunk**가 필요. O1.1~O1.7(granular 분해)은 순수 리팩터라 후순위.
+O1.8(전체 M/N/K 복원, multi-tile 1-DPU) + O4 n-split 수직 슬라이스(`split_n`, 여러 DPU) 완료.
+
+다음 목표 = **더 빠르게**: ① **device.c multi-tasklet**(`local_lanes`/`NR_TASKLETS`) — 한 DPU 안에서 행을 tasklet들이 나눠 병렬(UPMEM `UPMEMToDevice` + 빌드 플래그). ② 그다음 grid-as-SPLIT(③)으로 전 DPU 활용·BLOCK 정렬·A 복제 제거. 큰 K(>WRAM)는 O3.3 + O4.6 BLOCK_K chunk.
+
+계층: SPLIT/LOCAL_LANES **knob·intent는 공통**(`tile_plan`/option), **실현(dpu_alloc·DPU_FOREACH·NR_TASKLETS·me())은 UPMEM(`lib/Target/UPMEM`)**.

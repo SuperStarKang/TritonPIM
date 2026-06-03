@@ -16,10 +16,11 @@ upmem.device_func "matmul_kernel_device" {
 }
 
 // HOST: extern "C" void matmul_kernel_host(float* A, float* B, float* C, uint32_t M, uint32_t N, uint32_t K)
-// HOST: dpu_alloc(1, NULL, &set)
+// HOST: const uint32_t NUM_UNITS = 1;
+// HOST: dpu_alloc(NUM_UNITS, NULL, &set)
 // HOST: dpu_load(set, DPU_BINARY, NULL)
-// HOST: dpu_broadcast_to(set, "M"
-// HOST: dpu_push_xfer(set, DPU_XFER_TO_DPU, "A_mram"
+// HOST: dpu_broadcast_to(set, "A_mram"
+// HOST: dpu_push_xfer(set, DPU_XFER_TO_DPU, "Bt_mram"
 // HOST: dpu_launch(set, DPU_SYNCHRONOUS)
 // HOST: dpu_push_xfer(set, DPU_XFER_FROM_DPU, "C_mram"
 

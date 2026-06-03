@@ -43,20 +43,22 @@ def matmul_kernel_tiled(A, B, C, M, N, K,
     tl.store(C + offs_m[:, None] * N + offs_n[None, :], acc)
 
 
-def run(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K):
+def run(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, split_n=1):
     A = torch.rand((M, K), dtype=torch.float32)
     B = torch.rand((K, N), dtype=torch.float32)
     C = torch.empty((M, N), dtype=torch.float32)
 
+    # split_n>1이면 N축을 split_n개 DPU에 나눠 실행한다(n-split). split_n은 PIM backend 옵션.
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
     matmul_kernel_tiled[grid](A, B, C, M, N, K,
                               BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-                              vendor="upmem")
+                              vendor="upmem", split_n=split_n)
 
     torch.testing.assert_close(C, A @ B, rtol=1e-3, atol=1e-3)
-    print(f"OK: tiled matmul ({M}x{K})x({K}x{N}) -> ({M}x{N}), grid={grid}")
+    print(f"OK: tiled matmul ({M}x{K})x({K}x{N}) -> ({M}x{N}), grid={grid}, split_n={split_n}")
 
 
 if __name__ == "__main__":
     # grid=(2,2), K-loop 4회 — multi-tile + K-chunk를 모두 자극
-    run(M=128, N=128, K=256, BLOCK_M=64, BLOCK_N=64, BLOCK_K=64)
+    # run(M=128, N=128, K=256, BLOCK_M=64, BLOCK_N=64, BLOCK_K=64, split_n=1)  # 회귀: 단일 DPU
+    run(M=128, N=128, K=256, BLOCK_M=64, BLOCK_N=64, BLOCK_K=64, split_n=4)  # n-split: n DPU

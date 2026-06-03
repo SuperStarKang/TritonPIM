@@ -37,7 +37,9 @@ struct LegalizePIMToUPMEMPass
       legalize(f, module);
   }
 
-  // no-split 단일 tile: A/B는 MRAM으로 올리고, DPU 1개가 gemm을 수행한 뒤 C를 내린다.
+  // A/B를 MRAM으로 올리고, split_n개 DPU가 gemm을 수행한 뒤 C를 내린다.
+  // split_n=1이면 단일 유닛(기존 동작). >1이면 출력 N축을 유닛에 분배(n-split) —
+  // 실제 per-DPU 분배·gather는 vendor codegen(UPMEMToHost)이 num_units를 보고 생성한다.
   void legalize(func::FuncOp func, ModuleOp module) {
     pim::MemoryRegionOp aReg, bReg, cReg;
     func.walk([&](pim::MemoryRegionOp r) {
@@ -59,6 +61,7 @@ struct LegalizePIMToUPMEMPass
     uint64_t bm = tp.getBlockM();
     uint64_t bn = tp.getBlockN();
     uint64_t bk = tp.getBlockK();
+    uint64_t splitN = tp.getSplitN();  // = 사용할 DPU 개수 (N축 분배)
     std::string devName = (func.getName() + "_device").str();
 
     Block &entry = func.getBody().front();
@@ -69,7 +72,7 @@ struct LegalizePIMToUPMEMPass
     Location loc = func.getLoc();
     auto setTy = upmem::DPUSetType::get(b.getContext());
 
-    Value units = b.create<upmem::AllocUnitsOp>(loc, setTy, /*num_units=*/(uint64_t)1);
+    Value units = b.create<upmem::AllocUnitsOp>(loc, setTy, /*num_units=*/splitN);
     b.create<upmem::LoadProgramOp>(loc, units, devName);
     b.create<upmem::CopyToGlobalOp>(loc, units, A, "mram_a");
     b.create<upmem::CopyToGlobalOp>(loc, units, B, "mram_b");
