@@ -29,10 +29,12 @@ upmem.device_func "matmul_kernel_device" {
 // DEVICE: #define BLOCK_N 64
 // DEVICE: #define BLOCK_K 64
 // DEVICE: __host uint32_t M;
-// DEVICE: __mram_noinit float A_mram
 // DEVICE: __dma_aligned float aW[BLOCK_M * BLOCK_K]
+// DEVICE: BARRIER_INIT(my_barrier, NR_TASKLETS)
 // DEVICE: int main()
+// DEVICE: uint32_t t = me();
 // DEVICE: for (uint32_t tm = 0; tm < M; tm += BLOCK_M)
-// DEVICE: for (uint32_t kc = 0; kc < K; kc += BLOCK_K)
+// DEVICE: for (uint32_t r = t; r < BLOCK_M; r += NR_TASKLETS)
+// DEVICE: barrier_wait(&my_barrier)
 // DEVICE: acc[r * BLOCK_N + c] += s
 // DEVICE: mram_write(&acc[r * BLOCK_N], &C_mram[(tm + r) * N + tn], BLOCK_N * sizeof(float))

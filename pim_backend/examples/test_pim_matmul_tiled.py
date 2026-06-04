@@ -13,6 +13,8 @@
 #     python pim_backend/examples/test_pim_matmul_tiled.py
 #   → dump/<hash>/matmul_kernel_tiled.ttsharedir
 
+import time
+
 import torch
 import triton
 import triton.language as tl
@@ -51,17 +53,24 @@ def run(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, split_n=1, local_lanes=1):
     # split_n>1: N축을 split_n개 DPU에 분배(inter-DPU). local_lanes>1: 한 DPU 안에서
     # 출력 행을 local_lanes개 tasklet이 나눠 병렬(intra-DPU). 둘 다 PIM backend 옵션.
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    # warmup: 첫 호출의 컴파일·HW 백엔드 초기화를 타이밍에서 제외
     matmul_kernel_tiled[grid](A, B, C, M, N, K,
                               BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
                               vendor="upmem", split_n=split_n, local_lanes=local_lanes)
+    t0 = time.perf_counter()
+    matmul_kernel_tiled[grid](A, B, C, M, N, K,
+                              BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+                              vendor="upmem", split_n=split_n, local_lanes=local_lanes)
+    ms = (time.perf_counter() - t0) * 1e3  # warmup 이후라 compile/init 제외 (alloc/load/transfer/compute 포함)
 
     torch.testing.assert_close(C, A @ B, rtol=1e-3, atol=1e-3)
     print(f"OK: tiled matmul ({M}x{K})x({K}x{N}) -> ({M}x{N}), "
-          f"grid={grid}, split_n={split_n}, local_lanes={local_lanes}")
+          f"grid={grid}, split_n={split_n}, local_lanes={local_lanes}  |  {ms:.3f} ms")
 
 
 if __name__ == "__main__":
-    # ①a: device가 자기 부분행렬을 BLOCK_M×BLOCK_N 타일로 순회, BLOCK_K로 WRAM 누적.
-    # 단일 tasklet(local_lanes=1) — cooperative 다중 tasklet은 다음 단계(①b).
-    run(M=128, N=128, K=256, BLOCK_M=64, BLOCK_N=64, BLOCK_K=64, split_n=1, local_lanes=1)  # 1 DPU
-    run(M=128, N=128, K=256, BLOCK_M=64, BLOCK_N=64, BLOCK_K=64, split_n=2, local_lanes=1)  # 2 DPU (n-split)
+    # ①b: cooperative 다중 tasklet — 한 BLOCK 타일을 tasklet들이 협력 계산 (WRAM 공유, 행 분할).
+    # WRAM = aW+bW+acc(공유, BLOCK=64³ → 48KB) + NR_TASKLETS개 스택. local_lanes는 (64KB-48KB)에
+    # 스택이 들어가는 선에서. overflow 나면 local_lanes를 줄인다.
+    run(M=128, N=128, K=256, BLOCK_M=64, BLOCK_N=64, BLOCK_K=32, split_n=2, local_lanes=8)  # 1 DPU × 8 tasklet
+    run(M=128, N=128, K=256, BLOCK_M=64, BLOCK_N=64, BLOCK_K=32, split_n=2, local_lanes=16)  # 2 DPU × 8 tasklet

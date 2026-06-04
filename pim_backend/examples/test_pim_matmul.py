@@ -7,6 +7,8 @@
 #   TRITON_KERNEL_DUMP=1 TRITON_DUMP_DIR=/path/to/dump python test_pim_matmul.py
 #   → /path/to/dump/<hash>/ 에 단계별 IR
 
+import time
+
 import torch
 import triton
 import triton.language as tl
@@ -41,14 +43,20 @@ def run(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K):
     C = torch.empty((M, N), dtype=torch.float32)
 
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    # warmup: 첫 호출의 컴파일·HW 백엔드 초기화를 타이밍에서 제외
     matmul_kernel[grid](A, B, C, M, N, K,
                         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
                         vendor="upmem")
+    t0 = time.perf_counter()
+    matmul_kernel[grid](A, B, C, M, N, K,
+                        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+                        vendor="upmem")
+    ms = (time.perf_counter() - t0) * 1e3  # warmup 이후라 compile/init 제외
 
     # DPU는 순차 fp32 누적, torch는 블록/SIMD 누적이라 누적 순서 차이로 작은 오차가 정상적으로 난다.
     # 정확성 자체(동일 순서면 max_diff=0)는 runtime_test로 이미 검증됨 → 여기선 순서 차이만큼만 허용.
     torch.testing.assert_close(C, A @ B, rtol=1e-3, atol=1e-3)
-    print(f"OK: matmul ({M}x{K})x({K}x{N}) -> ({M}x{N})")
+    print(f"OK: matmul ({M}x{K})x({K}x{N}) -> ({M}x{N})  |  {ms:.3f} ms")
 
 
 if __name__ == "__main__":
