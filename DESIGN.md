@@ -825,6 +825,39 @@ BLOCK_M × BLOCK_N 출력 타일 한 조각
 
 ---
 
+### 11.5.2 실행 모델 — SPLIT(굵게) → BLOCK(잘게) → BLOCK_K(WRAM)
+
+GEMM이 DPU들에서 실행되는 3중 중첩 구조. SPLIT은 유닛 "간" 굵은 분배, BLOCK은 유닛 "내부" 잔 타일링이다 (둘은 다른 레벨에서 동시에 쓰인다).
+
+```text
+전체 C[M,N]
+  │ ① SPLIT (inter-unit, option/autotune)   — 출력을 DPU들에 굵게 분배 (BLOCK 정렬)
+  ▼
+DPU의 부분행렬 (M/SPLIT_M × N/SPLIT_N)
+  │ ② BLOCK_M×BLOCK_N (intra-unit, Triton constexpr) — 부분행렬을 출력 타일로 루프
+  ▼
+BLOCK 타일 (BLOCK_M × BLOCK_N)
+  │ ③ BLOCK_K (intra-unit) — 타일의 K를 WRAM 청크로 누적 (A/B subtile 재사용)
+  ▼
+WRAM micro-gemm
+```
+
+- **SPLIT_M/N** = 출력을 몇 DPU가 나눠 갖나 → DPU 부분행렬 크기 `M/SPLIT_M × N/SPLIT_N`. 분배 granularity는 BLOCK 타일(정렬).
+- **BLOCK_M/N** = 각 DPU가 자기 부분행렬을 도는 출력 타일 크기(= WRAM 누산기). DPU당 타일 수 = `(M/SPLIT_M/BLOCK_M) × (N/SPLIT_N/BLOCK_N)`.
+- **BLOCK_K** = 타일의 K를 WRAM에 올리는 청크. A/B subtile을 한 번 올려 `BLOCK_M×BLOCK_N` MAC에 **재사용**.
+
+두 regime (출력 타일 수 `Gm×Gn = (M/BLOCK_M)×(N/BLOCK_N)` vs `NUM_DPUS`):
+
+| | 타일 ≥ DPU | 타일 < DPU |
+| --- | --- | --- |
+| 분배 | `SPLIT_M/N`로 출력 분할, DPU당 여러 BLOCK 타일 | `SPLIT_K`로 한 타일의 K를 여러 DPU가 분담 |
+| reduce | 없음 | 있음 (`reduction_k_partitioned` → host_reduce, 13.4) |
+| 쓰임 | 큰 행렬 | 작은 행렬 + 많은 DPU |
+
+> **PGEMM 대비**: `basic_n`도 같은 2D 출력분배(`splitN × dpus_per_Ntile`)를 쓴다. 그러나 PGEMM은 **BLOCK 개념이 없어 device가 출력 원소마다 K를 스트리밍**(A/B 재사용 X, WRAM 고정버퍼 ≤1024B). 본 설계는 **Triton `BLOCK_M/N/K`로 DPU 내부를 타일링해 A/B를 WRAM에서 재사용**(MRAM 트래픽↓)하는 것이 핵심 차이이자 이점. 또 PGEMM은 hand-written 커널 + M-split 전치 트릭이지만 본 설계는 codegen이 IR에서 M/N/K 대칭으로 생성한다.
+
+---
+
 ## 11.6 `pim.chunk_plan`
 
 ```mlir

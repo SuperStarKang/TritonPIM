@@ -61,6 +61,7 @@ def run(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, split_n=1, local_lanes=1):
 
 
 if __name__ == "__main__":
-    # grid=(2,2), K-loop 4회 — multi-tile + K-chunk를 모두 자극
-    # run(M=128, N=128, K=256, BLOCK_M=64, BLOCK_N=64, BLOCK_K=64, split_n=1, local_lanes=1)   # 회귀
-    run(M=128, N=128, K=256, BLOCK_M=64, BLOCK_N=64, BLOCK_K=64, split_n=2, local_lanes=16)  # 2 DPU × 16 tasklet
+    # ①a: device가 자기 부분행렬을 BLOCK_M×BLOCK_N 타일로 순회, BLOCK_K로 WRAM 누적.
+    # 단일 tasklet(local_lanes=1) — cooperative 다중 tasklet은 다음 단계(①b).
+    run(M=128, N=128, K=256, BLOCK_M=64, BLOCK_N=64, BLOCK_K=64, split_n=1, local_lanes=1)  # 1 DPU
+    run(M=128, N=128, K=256, BLOCK_M=64, BLOCK_N=64, BLOCK_K=64, split_n=2, local_lanes=1)  # 2 DPU (n-split)

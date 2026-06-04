@@ -266,10 +266,10 @@ pim.launch
 - [ ] **O4.3** `[공통·gate]` `SelectPIMExecutionStrategy` Common pass — split factor + vendor capability/constraints로 적법 전략 필터, autotune 미사용 시 단순 기본 규칙(no-split 우선)
 - [ ] **O4.4** `[vendor]` UPMEM lowering이 전략 attribute legalize (`reduction_k_partitioned` → UPMEM `host_reduce`) + lit test
 - [~] **O4.5** `[검증]` e2e: SPLIT에 따라 동작 검증 — **n-split `split_n=2` 정답 통과**(`test_pim_matmul_tiled.py`). k/m-split·reduce 검증은 이후.
-- [~] **O4.6** `[vendor]` translate·launcher가 IR 값을 받아 생성(전제 ②). **완료**: n-split host codegen — `alloc_units{num_units}`→`dpu_alloc(U)`, A broadcast / B 열슬라이스 scatter / C gather·재배치 (`UPMEMToHost`, split_n=2 검증). **남음**: `chunk_plan`(BLOCK_K)로 WRAM 자르기(큰 K), k-split `host_reduce`. (multi-tasklet은 O4.7로 분리.)
+- [~] **O4.6** `[vendor]` translate·launcher가 IR 값을 받아 생성(전제 ②). **완료**: (a) n-split host codegen(`alloc_units{num_units}`→`dpu_alloc(U)`, A broadcast/B 열scatter/C gather, split_n=2 검증). (b) **device BLOCK 타일링** — `UPMEMToDevice`가 `local_gemm`의 BLOCK_M/N/K를 bake, 부분행렬을 `BLOCK_M×BLOCK_N` 타일로 순회하며 `BLOCK_K`를 WRAM(aW/bW/acc)에 올려 누적·재사용 (GPU shared-mem blocking; **①a 단일 tasklet** 검증, BLOCK_K로 WRAM bound). **남음**: ①b cooperative 다중 tasklet(WRAM 타일 공유+행분할+barrier), k-split `host_reduce`.
 - [x] **O4.7** `[공통 knob + vendor]` multi-tasklet (intra-DPU 병렬, `local_lanes`=`NR_TASKLETS`): `PIMOptions.local_lanes`(공통 knob, default 1) → `metadata` → launcher가 `-DNR_TASKLETS=L`로 device.c 컴파일. `UPMEMToDevice`가 `NR_TASKLETS` 매크로 기반 device.c 생성 — `BARRIER_INIT` + `me()==0`이 `mem_reset` 후 barrier, tasklet별 `mem_alloc` WRAM, `for(i=me();i<M;i+=NR_TASKLETS)` 행 round-robin(행 disjoint→끝 barrier 불필요). **검증: `split_n=2, local_lanes=16` (2 DPU × 16 tasklet) 정답 통과.** (DESIGN 14.6)
 
-> **n-split + multi-tasklet 수직 슬라이스 (완료)**: 전략 프레임워크(O4.1~O4.4)를 건너뛰고 옵션으로 끝까지 관통 — `split_n`(inter-DPU): `tile_plan.split_n`→`alloc_units{U}`→`UPMEMToHost` U-DPU broadcast/scatter/gather; `local_lanes`(intra-DPU): `metadata`→launcher `-DNR_TASKLETS`→`UPMEMToDevice` `me()`+stride tasklet 분배. `split_n=2, local_lanes=16` (2 DPU × 16 tasklet) 정답. **다음**: ① 큰 K(>WRAM): O3.3 `chunk_plan`(BLOCK_K) + O4.6 device.c BLOCK_K streaming, ② O4.1~O4.4 전략 프레임워크로 일반화(k/m-split), ③ grid-as-SPLIT으로 전 DPU 활용·BLOCK 정렬·A 복제 제거.
+> **n-split + multi-tasklet 수직 슬라이스 (완료)**: 전략 프레임워크(O4.1~O4.4)를 건너뛰고 옵션으로 끝까지 관통 — `split_n`(inter-DPU): `tile_plan.split_n`→`alloc_units{U}`→`UPMEMToHost` U-DPU broadcast/scatter/gather; `local_lanes`(intra-DPU): `metadata`→launcher `-DNR_TASKLETS`→`UPMEMToDevice` `me()`+stride tasklet 분배. `split_n=2, local_lanes=16` (2 DPU × 16 tasklet) 정답. **다음** (DESIGN 11.5.2, SPLIT→BLOCK→BLOCK_K): ① device BLOCK 타일 루프(intra-DPU, `BLOCK_M/N` 타일 + `BLOCK_K` WRAM 청크·재사용), ② 2D SPLIT(`split_m` 추가, A 행밴드·전 DPU), ③ SPLIT_K + `host_reduce`(타일<DPU) + O4.1~O4.4 전략 프레임워크.
 
 ---
 
@@ -377,6 +377,11 @@ M6 E2E 검증  ← ✅ "돈다"
 
 O1.8(multi-tile 1-DPU) + O4 n-split(`split_n`, 여러 DPU) + multi-tasklet(`local_lanes`, DPU 내부 병렬) 완료. 현재 `split_n=2, local_lanes=16` (2 DPU × 16 tasklet) 정답.
 
-다음 후보: ① **큰 K(>WRAM)** — O3.3 `chunk_plan`(BLOCK_K) + O4.6 device.c BLOCK_K streaming(현재 K행 전체를 WRAM에 올려 K≤~수백 제한). ② **grid-as-SPLIT** — Triton grid 블록을 전 DPU에 배정(BLOCK 정렬·A 복제 제거). ③ O4.1~O4.4 전략 프레임워크(k/m-split·reduce).
+**실행 모델 확정 (DESIGN 11.5.2): SPLIT(굵게, 유닛 간) → BLOCK(잘게, 유닛 내부 타일) → BLOCK_K(WRAM 청크, A/B 재사용).** "1 BLOCK = 1 DPU"는 폐기 — BLOCK은 DPU 분배 단위가 아니라 DPU 내부 타일이다. PGEMM `basic_n`과 분배(2D 출력분배)는 동일하나, **BLOCK 타일링으로 WRAM 재사용**하는 게 차이·이점.
 
-계층: SPLIT/LOCAL_LANES **knob·intent는 공통**(option/`tile_plan`/metadata), **실현(dpu_alloc·DPU_FOREACH·NR_TASKLETS·me())은 UPMEM(`lib/Target/UPMEM`)**.
+다음 후보 (순서):
+① **device BLOCK 타일 루프** (intra-DPU, O4.6) — **①a 단일 tasklet 완료** (BLOCK_M/N/K 타일 + BLOCK_K WRAM 재사용, split_n=1·2 검증). **①b cooperative 다중 tasklet** 남음(WRAM 타일 공유+행분할+barrier).
+② **2D SPLIT (`split_m` 추가)** — `SPLIT_M×SPLIT_N` BLOCK-정렬 출력분배, A 행밴드(전체 복제 해소). 현재 split_n은 SPLIT_M=1 특수형.
+③ **SPLIT_K + reduce** — 타일 < DPU일 때 한 타일을 여러 DPU가 K분담(`host_reduce`). (O4.1~O4.4 전략 프레임워크와 함께.)
+
+계층: SPLIT/BLOCK/LOCAL_LANES **knob·intent는 공통**(option/`tile_plan`/metadata), **실현(dpu_alloc·DPU_FOREACH·NR_TASKLETS·me()·BLOCK_K WRAM)은 UPMEM(`lib/Target/UPMEM`)**.

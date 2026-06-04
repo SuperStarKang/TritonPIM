@@ -12,7 +12,8 @@ func.func @matmul_kernel(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>
   return
 }
 upmem.device_func "matmul_kernel_device" {
-  upmem.local_gemm {m = 32 : i64, n = 64 : i64, k = 256 : i64, accumulation = "fp32"}
+  // m/n/k = BLOCK (DPU 내부 타일). BLOCK_K는 WRAM에 맞게 작게.
+  upmem.local_gemm {m = 32 : i64, n = 64 : i64, k = 64 : i64, accumulation = "fp32"}
 }
 
 // HOST: extern "C" void matmul_kernel_host(float* A, float* B, float* C, uint32_t M, uint32_t N, uint32_t K)
@@ -24,11 +25,14 @@ upmem.device_func "matmul_kernel_device" {
 // HOST: dpu_launch(set, DPU_SYNCHRONOUS)
 // HOST: dpu_push_xfer(set, DPU_XFER_FROM_DPU, "C_mram"
 
+// DEVICE: #define BLOCK_M 32
+// DEVICE: #define BLOCK_N 64
+// DEVICE: #define BLOCK_K 64
 // DEVICE: __host uint32_t M;
 // DEVICE: __mram_noinit float A_mram
-// DEVICE: BARRIER_INIT(my_barrier, NR_TASKLETS)
+// DEVICE: __dma_aligned float aW[BLOCK_M * BLOCK_K]
 // DEVICE: int main()
-// DEVICE: uint32_t t = me();
-// DEVICE: for (uint32_t i = t; i < M; i += NR_TASKLETS)
-// DEVICE: acc += a_row[l] * b_row[l]
-// DEVICE: mram_write(c_row, &C_mram[i * N], N * sizeof(float))
+// DEVICE: for (uint32_t tm = 0; tm < M; tm += BLOCK_M)
+// DEVICE: for (uint32_t kc = 0; kc < K; kc += BLOCK_K)
+// DEVICE: acc[r * BLOCK_N + c] += s
+// DEVICE: mram_write(&acc[r * BLOCK_N], &C_mram[(tm + r) * N + tn], BLOCK_N * sizeof(float))

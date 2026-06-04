@@ -52,6 +52,6 @@ def run(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K):
 
 
 if __name__ == "__main__":
-    # 단일 tile (grid=(1,1)): BLOCK이 전체 M,N,K를 덮는다.
-    run(M=32, N=64, K=256, BLOCK_M=32, BLOCK_N=64, BLOCK_K=256)
-    # run(M=256, N=512, K=512, BLOCK_M=256, BLOCK_N=512, BLOCK_K=512) # Medium size
+    # 단일 tile (grid=(1,1)). BLOCK-타일 device는 aW+bW+acc가 WRAM(64KB)에 들어가야 하므로
+    # BLOCK_K를 작게(=K) 둔다. (BLOCK_K=256은 64KB 초과 → WRAM overflow.)
+    run(M=32, N=64, K=64, BLOCK_M=32, BLOCK_N=64, BLOCK_K=64)
