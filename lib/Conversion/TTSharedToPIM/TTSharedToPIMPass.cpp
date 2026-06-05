@@ -83,10 +83,10 @@ struct ConvertTTSharedToPIMPass
     Value cReg = b.create<pim::MemoryRegionOp>(loc, regionTy, C, "host", "row_major",
                                                "output");
 
-    // split_n은 pass 옵션(=compile option). >1이면 vendor가 N축을 유닛에 분배한다.
+    // split_m/n은 pass 옵션(=compile option). >1이면 vendor가 M/N축을 유닛에 분배한다.
     Value tp = b.create<pim::TilePlanOp>(loc, tpTy, blockM, blockN, blockK,
-                                         /*split_m=*/1, /*split_n=*/(uint64_t)splitN,
-                                         /*split_k=*/1);
+                                         /*split_m=*/(uint64_t)splitM,
+                                         /*split_n=*/(uint64_t)splitN, /*split_k=*/1);
 
     b.create<pim::TransferOp>(loc, aReg, "host", "device_global");
     b.create<pim::TransferOp>(loc, bReg, "host", "device_global");

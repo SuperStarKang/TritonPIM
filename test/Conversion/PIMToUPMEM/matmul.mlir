@@ -16,7 +16,7 @@ func.func @matmul_kernel(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>
 }
 
 // host 시퀀스가 함수 본문으로 들어간다.
-// CHECK: upmem.alloc_units {num_units = 1 : i64} : !upmem.dpu_set
+// CHECK: upmem.alloc_units {num_units = 1 : i64, split_m = 1 : i64, split_n = 1 : i64} : !upmem.dpu_set
 // CHECK: upmem.load_program %{{.*}}, @matmul_kernel_device : !upmem.dpu_set
 // CHECK: upmem.copy_to_global %{{.*}}, %arg0 {dst = "mram_a"}
 // CHECK: upmem.copy_to_global %{{.*}}, %arg1 {dst = "mram_b"}

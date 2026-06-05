@@ -269,7 +269,12 @@ pim.launch
 - [~] **O4.6** `[vendor]` translate·launcher가 IR 값을 받아 생성(전제 ②). **완료**: (a) n-split host codegen(`alloc_units{num_units}`→`dpu_alloc(U)`, A broadcast/B 열scatter/C gather, split_n=2 검증). (b) **device BLOCK 타일링** — `UPMEMToDevice`가 `local_gemm`의 BLOCK_M/N/K를 bake, 부분행렬을 `BLOCK_M×BLOCK_N` 타일로 순회하며 `BLOCK_K`를 WRAM(aW/bW/acc)에 올려 누적·재사용. **①a 단일 tasklet** + **①b cooperative 다중 tasklet**(WRAM 타일 공유 + BLOCK_M 행 tasklet 분할 + barrier) 모두 HW에서 검증 (split_n=2 × local_lanes=8/16). **남음**: k-split `host_reduce`. **제약**: WRAM = aW+bW+acc+tasklet 스택 ≤ 64KB → BLOCK/local_lanes 균형(autotune), per-call `dpu_alloc/load`는 persistent set으로 개선 여지.
 - [x] **O4.7** `[공통 knob + vendor]` multi-tasklet (intra-DPU 병렬, `local_lanes`=`NR_TASKLETS`): `PIMOptions.local_lanes`(공통 knob, default 1) → `metadata` → launcher가 `-DNR_TASKLETS=L`로 device.c 컴파일. `UPMEMToDevice`가 `NR_TASKLETS` 매크로 기반 device.c 생성 — `BARRIER_INIT` + `me()==0`이 `mem_reset` 후 barrier, tasklet별 `mem_alloc` WRAM, `for(i=me();i<M;i+=NR_TASKLETS)` 행 round-robin(행 disjoint→끝 barrier 불필요). **검증: `split_n=2, local_lanes=16` (2 DPU × 16 tasklet) 정답 통과.** (DESIGN 14.6)
 
-> **n-split + multi-tasklet 수직 슬라이스 (완료)**: 전략 프레임워크(O4.1~O4.4)를 건너뛰고 옵션으로 끝까지 관통 — `split_n`(inter-DPU): `tile_plan.split_n`→`alloc_units{U}`→`UPMEMToHost` U-DPU broadcast/scatter/gather; `local_lanes`(intra-DPU): `metadata`→launcher `-DNR_TASKLETS`→`UPMEMToDevice` `me()`+stride tasklet 분배. `split_n=2, local_lanes=16` (2 DPU × 16 tasklet) 정답. **다음** (DESIGN 11.5.2, SPLIT→BLOCK→BLOCK_K): ① device BLOCK 타일 루프(intra-DPU, `BLOCK_M/N` 타일 + `BLOCK_K` WRAM 청크·재사용), ② 2D SPLIT(`split_m` 추가, A 행밴드·전 DPU), ③ SPLIT_K + `host_reduce`(타일<DPU) + O4.1~O4.4 전략 프레임워크.
+> **수직 슬라이스 (완료)**: 전략 프레임워크(O4.1~O4.4)를 건너뛰고 옵션으로 끝까지 관통 —
+> - `split_m`/`split_n` (inter-DPU 2D 분배): `tile_plan.split_m/n` → `alloc_units{num_units,split_m,split_n}` → `UPMEMToHost` 2D scatter/gather (A 행밴드·B 열밴드·C 2D). **HW 선형 스케일링 검증**(1→4 DPU ~3.8×).
+> - `BLOCK_M/N/K` (intra-DPU 타일): `UPMEMToDevice`가 BLOCK 타일 순회 + `BLOCK_K` WRAM 청크 재사용 (cooperative 다중 tasklet).
+> - `local_lanes` (intra-DPU 병렬): `metadata`→launcher `-DNR_TASKLETS`→ tasklet이 BLOCK_M 행 분할.
+>
+> **다음 후보**: ③ SPLIT_K + `host_reduce`(타일<DPU), ④ persistent DPU set(per-call alloc/load 제거), O4.1~O4.4 전략 프레임워크.
 
 ---
 
@@ -379,9 +384,9 @@ O1.8(multi-tile 1-DPU) + O4 n-split(`split_n`, 여러 DPU) + multi-tasklet(`loca
 
 **실행 모델 확정 (DESIGN 11.5.2): SPLIT(굵게, 유닛 간) → BLOCK(잘게, 유닛 내부 타일) → BLOCK_K(WRAM 청크, A/B 재사용).** "1 BLOCK = 1 DPU"는 폐기 — BLOCK은 DPU 분배 단위가 아니라 DPU 내부 타일이다. PGEMM `basic_n`과 분배(2D 출력분배)는 동일하나, **BLOCK 타일링으로 WRAM 재사용**하는 게 차이·이점.
 
-① **device BLOCK 타일 루프** (intra-DPU, O4.6) — **완료**: ①a 단일 tasklet + ①b cooperative 다중 tasklet (BLOCK_M/N/K 타일 + BLOCK_K WRAM 재사용 + tasklet 행분할, HW 검증). 실행 환경은 시뮬레이터→HW(`UPMEM_BACKEND=hw`+upmem-override lib)로 확인.
-② **2D SPLIT (`split_m` 추가)** — `SPLIT_M×SPLIT_N` BLOCK-정렬 출력분배, A 행밴드(전체 복제 해소). 현재 split_n은 SPLIT_M=1 특수형. ← 다음
-③ **SPLIT_K + reduce** — 타일 < DPU일 때 한 타일을 여러 DPU가 K분담(`host_reduce`). (O4.1~O4.4 전략 프레임워크와 함께.)
-④ **persistent DPU set** — 매 호출 `dpu_alloc/load/free` 대신 1회 alloc/load 재사용 (per-call 오버헤드 제거, 런타임 최적화).
+① **device BLOCK 타일 루프** (intra-DPU, O4.6) — **완료**: ①a 단일 + ①b cooperative 다중 tasklet (BLOCK_M/N/K 타일 + BLOCK_K WRAM 재사용 + tasklet 행분할, HW 검증). 환경: 시뮬레이터→HW(`UPMEM_BACKEND=hw`+upmem-override lib).
+② **2D SPLIT (`split_m` 추가)** — **완료**: `SPLIT_M×SPLIT_N` DPU에 출력 2D 분배, **A 행밴드 scatter(전체 복제 해소)** + B 열밴드 + C 2D gather. `tile_plan.split_m` → `alloc_units{num_units,split_m,split_n}` → `UPMEMToHost` 2D. **HW 검증 + 선형 스케일링**(1→2→4 DPU = 3833→1949→1008 ms, ~3.8×). split_n은 SPLIT_M=1 특수형.
+③ **SPLIT_K + reduce** — 타일 < DPU일 때 한 타일을 여러 DPU가 K분담(`host_reduce`). (O4.1~O4.4 전략 프레임워크와 함께.) ← 다음 후보
+④ **persistent DPU set** — 매 호출 `dpu_alloc/load/free` 대신 1회 alloc/load 재사용 (per-call 오버헤드 제거; 작은 행렬 절대 시간 개선). ← 다음 후보
 
 계층: SPLIT/BLOCK/LOCAL_LANES **knob·intent는 공통**(option/`tile_plan`/metadata), **실현(dpu_alloc·DPU_FOREACH·NR_TASKLETS·me()·BLOCK_K WRAM)은 UPMEM(`lib/Target/UPMEM`)**.

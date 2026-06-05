@@ -59,9 +59,10 @@ def _run_translate(mlir_text: str, which: str) -> str:
         return subprocess.check_output([tr, which, src]).decode("utf-8")
 
 
-def _ttsharedir_to_pim_common(ttshared: str, split_n: int) -> str:
-    # split_n은 pass 옵션으로 전달 → tile_plan.split_n에 기록된다.
-    return _run_opt(ttshared, [f"--convert-ttshared-to-pim=split-n={split_n}"])
+def _ttsharedir_to_pim_common(ttshared: str, split_m: int, split_n: int) -> str:
+    # split_m/n은 pass 옵션으로 전달 → tile_plan.split_m/split_n에 기록된다.
+    # (한 argv에 공백으로 두 옵션 — mlir pass option 파서가 공백 구분.)
+    return _run_opt(ttshared, [f"--convert-ttshared-to-pim=split-m={split_m} split-n={split_n}"])
 
 
 def _pim_common_to_upmem(pim_common: str) -> str:
@@ -103,7 +104,8 @@ class PIMOptions:
     # --- PIM 고유 옵션 ---
     vendor: str = None           # "upmem" | "aimx" — 누락 시 아래에서 즉시 에러 (fallback 없음)
     device_id: int = 0
-    split_n: int = 1             # N축 inter-unit SPLIT 수(=DPU 개수). 1이면 단일 유닛(기존 동작).
+    split_m: int = 1             # M축 inter-unit SPLIT 수. split_m×split_n = DPU 개수.
+    split_n: int = 1             # N축 inter-unit SPLIT 수. 1이면 해당 축 미분배(기존 동작).
     local_lanes: int = 1         # DPU 내부 intra-unit 병렬 수(=NR_TASKLETS). 1이면 단일 tasklet.
 
     def __post_init__(self):
@@ -160,7 +162,7 @@ class PIMBackend(BaseBackend):
         # 마지막 stage 이름은 binary_ext('pimobj')와 일치해야 CompiledKernel이 kernel을 찾는다.
         stages["ttir"] = lambda src, metadata: cpu_compiler.CPUBackend.make_ttir(src, metadata, options)
         stages["ttsharedir"] = lambda src, metadata: cpu_compiler._ttir_to_ttsharedir(src)
-        stages["pim_common"] = lambda src, metadata: _ttsharedir_to_pim_common(src, options.split_n)
+        stages["pim_common"] = lambda src, metadata: _ttsharedir_to_pim_common(src, options.split_m, options.split_n)
         stages["vendor_ir"] = lambda src, metadata: _pim_common_to_upmem(src)
         stages["pimobj"] = lambda src, metadata: _upmem_to_artifact(src, metadata)
 

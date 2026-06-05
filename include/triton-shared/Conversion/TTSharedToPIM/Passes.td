@@ -16,8 +16,10 @@ def ConvertTTSharedToPIM : Pass<"convert-ttshared-to-pim", "mlir::ModuleOp"> {
   let options = [
     Option<"vendor", "vendor", "std::string", /*default*/"\"upmem\"",
            "pim.launch에 기록할 target PIM vendor 이름">,
+    Option<"splitM", "split-m", "unsigned", /*default*/"1",
+           "M축 inter-unit SPLIT 수. >1이면 출력 M(행)을 여러 유닛에 분배(output_m_partitioned).">,
     Option<"splitN", "split-n", "unsigned", /*default*/"1",
-           "N축 inter-unit SPLIT 수. >1이면 출력 N을 여러 유닛에 분배(output_n_partitioned).">,
+           "N축 inter-unit SPLIT 수. >1이면 출력 N(열)을 여러 유닛에 분배(output_n_partitioned).">,
   ];
 }
 

@@ -10,12 +10,13 @@
 using namespace mlir;
 
 // UPMEM IR을 walk해 host C++를 emit한다.
-// - alloc_units{num_units}에서 사용할 DPU 개수 U를 읽는다.
-// - device_func 심볼명으로 로드할 .elf 이름을, host 함수 이름은 <func 이름>_host로 정한다.
-// - n-split(U>1): N축을 U개로 나눠 각 DPU가 C의 N/U 열을 계산한다.
-//   A는 전체 broadcast(모든 DPU가 필요), B는 열 슬라이스를 전치해 per-DPU scatter,
-//   C는 per-DPU gather 후 host가 C[:, slice]로 재배치. (U=1이면 단일 DPU와 동일.)
-// - M/N/K는 전체 문제 크기(런타임 값)라 baked 상수가 아니라 host 함수 파라미터로 받는다.
+// - alloc_units{num_units, split_m, split_n}에서 2D 분배 정보를 읽는다.
+// - 2D SPLIT: 출력 C를 SPLIT_M×SPLIT_N 블록으로 나눠 각 DPU가 (Mu×Nu) 부분행렬 담당.
+//   DPU index → (pm,pn) = (idx/SPLIT_N, idx%SPLIT_N). Mu=M/SPLIT_M, Nu=N/SPLIT_N.
+//   A는 행밴드[pm*Mu:+Mu]만 per-DPU scatter (전체 복제 아님), B는 열밴드[pn*Nu:+Nu] 전치 scatter,
+//   C는 per-DPU C_local[Mu,Nu] gather 후 host가 C[pm*Mu:, pn*Nu:] 2D 위치로 재배치.
+//   (SPLIT_M=1, SPLIT_N=U면 기존 n-split과 동일: A 행밴드=전체 M.)
+// - device는 자기 부분행렬 크기 M=Mu, N=Nu, K=full을 broadcast로 받아 BLOCK 타일링한다.
 static LogicalResult translateUPMEMToHost(ModuleOp module, raw_ostream &os) {
   upmem::LocalGemmOp gemm;
   module.walk([&](upmem::LocalGemmOp g) { gemm = g; });
@@ -33,7 +34,10 @@ static LogicalResult translateUPMEMToHost(ModuleOp module, raw_ostream &os) {
     return module.emitError("upmem-to-host: expected upmem.local_gemm, "
                             "upmem.device_func, upmem.alloc_units, and a host func");
 
-  uint64_t numUnits = alloc.getNumUnits();  // = split_n (사용할 DPU 개수)
+  uint64_t splitM = alloc.getSplitM();
+  uint64_t splitN = alloc.getSplitN();
+  // device가 BLOCK 단위로 타일링하므로 Mu/Nu/K가 BLOCK의 배수여야 한다 (검사용).
+  uint64_t blockM = gemm.getM(), blockN = gemm.getN(), blockK = gemm.getK();
   std::string hostName = (host.getName() + "_host").str();
   std::string binary = (dev.getSymName() + ".elf").str();
 
@@ -46,38 +50,52 @@ static LogicalResult translateUPMEMToHost(ModuleOp module, raw_ostream &os) {
   os << "#ifndef DPU_BINARY\n#define DPU_BINARY \"" << binary << "\"\n#endif\n\n";
   os << "extern \"C\" void " << hostName
      << "(float* A, float* B, float* C, uint32_t M, uint32_t N, uint32_t K) {\n";
-  os << "  const uint32_t NUM_UNITS = " << numUnits << ";  // = split_n\n";
-  os << "  if (N % NUM_UNITS != 0) { fprintf(stderr, \"n-split: N must be divisible by NUM_UNITS\\n\"); abort(); }\n";
-  os << "  uint32_t Nu = N / NUM_UNITS;  // DPU당 담당 N 열 수\n";
+  os << "  const uint32_t SPLIT_M = " << splitM << ", SPLIT_N = " << splitN << ";\n";
+  os << "  const uint32_t NUM_UNITS = SPLIT_M * SPLIT_N;\n";
+  os << "  if (M % SPLIT_M || N % SPLIT_N) { fprintf(stderr, \"2D-split: M(%u)/N(%u) must divide by SPLIT(%u,%u)\\n\", M, N, SPLIT_M, SPLIT_N); abort(); }\n";
+  os << "  uint32_t Mu = M / SPLIT_M, Nu = N / SPLIT_N;  // DPU당 부분행렬 (행 Mu × 열 Nu)\n";
+  os << "  if (Mu % " << blockM << " || Nu % " << blockN << " || K % " << blockK << ") {\n";
+  os << "    fprintf(stderr, \"2D-split: Mu(%u)/Nu(%u)/K(%u) must divide by BLOCK(" << blockM << "," << blockN << "," << blockK << ")\\n\", Mu, Nu, K); abort();\n";
+  os << "  }\n";
   os << "  struct dpu_set_t set, dpu;\n";
   os << "  uint32_t idx;\n";
   os << "  DPU_ASSERT(dpu_alloc(NUM_UNITS, NULL, &set));\n";
   os << "  DPU_ASSERT(dpu_load(set, DPU_BINARY, NULL));\n";
-  os << "  // A는 모든 DPU가 전체 필요 → broadcast. device의 N에는 Nu를 넘긴다.\n";
-  os << "  DPU_ASSERT(dpu_broadcast_to(set, \"A_mram\", 0, A, (size_t)M * K * sizeof(float), DPU_XFER_DEFAULT));\n";
-  os << "  DPU_ASSERT(dpu_broadcast_to(set, \"M\", 0, &M, sizeof(uint32_t), DPU_XFER_DEFAULT));\n";
+  os << "  // device가 받는 부분행렬 크기 (M=Mu, N=Nu, K=full)\n";
+  os << "  DPU_ASSERT(dpu_broadcast_to(set, \"M\", 0, &Mu, sizeof(uint32_t), DPU_XFER_DEFAULT));\n";
   os << "  DPU_ASSERT(dpu_broadcast_to(set, \"N\", 0, &Nu, sizeof(uint32_t), DPU_XFER_DEFAULT));\n";
   os << "  DPU_ASSERT(dpu_broadcast_to(set, \"K\", 0, &K, sizeof(uint32_t), DPU_XFER_DEFAULT));\n";
-  os << "  // B: DPU u의 열 슬라이스 [u*Nu,(u+1)*Nu)를 Bt(Nu x K)로 전치해 per-DPU로 보낸다.\n";
+  os << "  // A: DPU(pm,pn)는 행밴드 A[pm*Mu:+Mu, :] (Mu×K, A에 연속)만 받는다 (pm=idx/SPLIT_N).\n";
+  os << "  idx = 0;\n";
+  os << "  DPU_FOREACH(set, dpu, idx) {\n";
+  os << "    uint32_t pm = idx / SPLIT_N;\n";
+  os << "    DPU_ASSERT(dpu_prepare_xfer(dpu, A + (size_t)pm * Mu * K));\n";
+  os << "  }\n";
+  os << "  DPU_ASSERT(dpu_push_xfer(set, DPU_XFER_TO_DPU, \"A_mram\", 0, (size_t)Mu * K * sizeof(float), DPU_XFER_DEFAULT));\n";
+  os << "  // B: DPU(pm,pn)는 열밴드 B[:, pn*Nu:+Nu]를 Bt(Nu×K)로 전치해 받는다 (pn=idx%SPLIT_N).\n";
   os << "  float** Bt = (float**)malloc(NUM_UNITS * sizeof(float*));\n";
   os << "  for (uint32_t u = 0; u < NUM_UNITS; ++u) {\n";
+  os << "    uint32_t pn = u % SPLIT_N;\n";
   os << "    Bt[u] = (float*)malloc((size_t)Nu * K * sizeof(float));\n";
   os << "    for (uint32_t k = 0; k < K; ++k)\n";
-  os << "      for (uint32_t j = 0; j < Nu; ++j) Bt[u][j * K + k] = B[k * N + (u * Nu + j)];\n";
+  os << "      for (uint32_t j = 0; j < Nu; ++j) Bt[u][j * K + k] = B[k * N + (pn * Nu + j)];\n";
   os << "  }\n";
   os << "  idx = 0;\n";
   os << "  DPU_FOREACH(set, dpu, idx) { DPU_ASSERT(dpu_prepare_xfer(dpu, Bt[idx])); }\n";
   os << "  DPU_ASSERT(dpu_push_xfer(set, DPU_XFER_TO_DPU, \"Bt_mram\", 0, (size_t)Nu * K * sizeof(float), DPU_XFER_DEFAULT));\n";
   os << "  DPU_ASSERT(dpu_launch(set, DPU_SYNCHRONOUS));\n";
-  os << "  // C: 각 DPU의 C_local[M, Nu]를 gather한 뒤 C[:, u*Nu:(u+1)*Nu]로 재배치.\n";
+  os << "  // C: 각 DPU의 C_local[Mu,Nu]를 gather 후 C[pm*Mu:+Mu, pn*Nu:+Nu] 2D 위치로 재배치.\n";
   os << "  float** Cl = (float**)malloc(NUM_UNITS * sizeof(float*));\n";
-  os << "  for (uint32_t u = 0; u < NUM_UNITS; ++u) Cl[u] = (float*)malloc((size_t)M * Nu * sizeof(float));\n";
+  os << "  for (uint32_t u = 0; u < NUM_UNITS; ++u) Cl[u] = (float*)malloc((size_t)Mu * Nu * sizeof(float));\n";
   os << "  idx = 0;\n";
   os << "  DPU_FOREACH(set, dpu, idx) { DPU_ASSERT(dpu_prepare_xfer(dpu, Cl[idx])); }\n";
-  os << "  DPU_ASSERT(dpu_push_xfer(set, DPU_XFER_FROM_DPU, \"C_mram\", 0, (size_t)M * Nu * sizeof(float), DPU_XFER_DEFAULT));\n";
-  os << "  for (uint32_t u = 0; u < NUM_UNITS; ++u)\n";
-  os << "    for (uint32_t i = 0; i < M; ++i)\n";
-  os << "      for (uint32_t j = 0; j < Nu; ++j) C[i * N + (u * Nu + j)] = Cl[u][i * Nu + j];\n";
+  os << "  DPU_ASSERT(dpu_push_xfer(set, DPU_XFER_FROM_DPU, \"C_mram\", 0, (size_t)Mu * Nu * sizeof(float), DPU_XFER_DEFAULT));\n";
+  os << "  for (uint32_t u = 0; u < NUM_UNITS; ++u) {\n";
+  os << "    uint32_t pm = u / SPLIT_N, pn = u % SPLIT_N;\n";
+  os << "    for (uint32_t i = 0; i < Mu; ++i)\n";
+  os << "      for (uint32_t j = 0; j < Nu; ++j)\n";
+  os << "        C[(size_t)(pm * Mu + i) * N + (pn * Nu + j)] = Cl[u][i * Nu + j];\n";
+  os << "  }\n";
   os << "  for (uint32_t u = 0; u < NUM_UNITS; ++u) { free(Bt[u]); free(Cl[u]); }\n";
   os << "  free(Bt); free(Cl);\n";
   os << "  DPU_ASSERT(dpu_free(set));\n";
