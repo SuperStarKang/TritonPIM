@@ -25,6 +25,8 @@ def BuildPIMOffload : Pass<"build-pim-offload", "mlir::ModuleOp"> {
            "M축 inter-unit SPLIT 수. >1이면 출력 M(행)을 여러 유닛에 분배(output_m_partitioned).">,
     Option<"splitN", "split-n", "unsigned", /*default*/"1",
            "N축 inter-unit SPLIT 수. >1이면 출력 N(열)을 여러 유닛에 분배(output_n_partitioned).">,
+    Option<"splitK", "split-k", "unsigned", /*default*/"1",
+           "K축 inter-unit SPLIT 수. >1이면 한 출력 타일을 여러 유닛이 K분담(reduction_k_partitioned, host reduce).">,
     Option<"localLanes", "local-lanes", "unsigned", /*default*/"1",
            "유닛 내부 병렬 lane 수(=NR_TASKLETS). execution_group.local_lanes에 기록(DESIGN 16).">,
   ];

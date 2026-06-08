@@ -104,9 +104,11 @@ static void buildGemmBody(OpBuilder &b, Location loc, Block *body, int64_t block
       });
 }
 
-// split factor로부터 vendor-neutral mapping_policy를 정한다(DESIGN 11.4). split_k는 아직
-// 옵션이 없어 reduction_k_partitioned는 미사용(어휘만 문서화).
-static std::string mappingPolicy(unsigned splitM, unsigned splitN) {
+// split factor로부터 vendor-neutral mapping_policy를 정한다(DESIGN 11.4). split_k>1이면
+// reduction(reduce 존재)이 특징이라 reduction_k_partitioned로 표기한다(출력 분배와 병행 가능).
+static std::string mappingPolicy(unsigned splitM, unsigned splitN, unsigned splitK) {
+  if (splitK > 1)
+    return "reduction_k_partitioned";
   if (splitM > 1 && splitN > 1)
     return "output_2d_partitioned";
   if (splitM > 1)
@@ -174,12 +176,13 @@ struct BuildPIMOffloadPass
 
     Value tp = b.create<pim::TilePlanOp>(loc, tpTy, blockM, blockN, blockK,
                                          /*split_m=*/(uint64_t)splitM,
-                                         /*split_n=*/(uint64_t)splitN, /*split_k=*/1);
-    // 유닛 분배 정책(DESIGN 10.2): split로 mapping_policy 결정, num_units=split_m*split_n,
+                                         /*split_n=*/(uint64_t)splitN,
+                                         /*split_k=*/(uint64_t)splitK);
+    // 유닛 분배 정책(DESIGN 10.2): split로 mapping_policy 결정, num_units=split_m*split_n*split_k,
     // local_lanes는 option(DESIGN 16). gemm은 weight(B)가 상주 입력.
     Value eg = b.create<pim::ExecutionGroupOp>(
-        loc, egTy, mappingPolicy(splitM, splitN),
-        /*num_units=*/(uint64_t)splitM * (uint64_t)splitN,
+        loc, egTy, mappingPolicy(splitM, splitN, splitK),
+        /*num_units=*/(uint64_t)splitM * (uint64_t)splitN * (uint64_t)splitK,
         /*local_lanes=*/(uint64_t)localLanes, /*stationary_data=*/"B");
 
     b.create<pim::TransferOp>(loc, aReg, "host", "device_global");

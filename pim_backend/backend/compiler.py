@@ -59,10 +59,10 @@ def _run_translate(mlir_text: str, which: str) -> str:
         return subprocess.check_output([tr, which, src]).decode("utf-8")
 
 
-def _ttsharedir_to_pim_common(ttshared: str, split_m: int, split_n: int, local_lanes: int) -> str:
+def _ttsharedir_to_pim_common(ttshared: str, split_m: int, split_n: int, split_k: int, local_lanes: int) -> str:
     # SPLIT/LOCAL_LANES는 build-pim-offload 옵션으로 전달 → tile_plan.split_*·execution_group에 기록(DESIGN 16).
     # (한 argv에 공백으로 여러 옵션 — mlir pass option 파서가 공백 구분.)
-    return _run_opt(ttshared, [f"--build-pim-offload=split-m={split_m} split-n={split_n} local-lanes={local_lanes}"])
+    return _run_opt(ttshared, [f"--build-pim-offload=split-m={split_m} split-n={split_n} split-k={split_k} local-lanes={local_lanes}"])
 
 
 def _pim_common_to_upmem(pim_common: str) -> str:
@@ -104,8 +104,9 @@ class PIMOptions:
     # --- PIM 고유 옵션 ---
     vendor: str = None           # "upmem" | "aimx" — 누락 시 아래에서 즉시 에러 (fallback 없음)
     device_id: int = 0
-    split_m: int = 1             # M축 inter-unit SPLIT 수. split_m×split_n = DPU 개수.
+    split_m: int = 1             # M축 inter-unit SPLIT 수. split_m×split_n×split_k = DPU 개수.
     split_n: int = 1             # N축 inter-unit SPLIT 수. 1이면 해당 축 미분배(기존 동작).
+    split_k: int = 1             # K축 inter-unit SPLIT 수. >1이면 한 출력 타일을 여러 DPU가 K분담 → host reduce.
     local_lanes: int = 1         # DPU 내부 intra-unit 병렬 수(=NR_TASKLETS). 1이면 단일 tasklet.
 
     def __post_init__(self):
@@ -162,7 +163,7 @@ class PIMBackend(BaseBackend):
         # 마지막 stage 이름은 binary_ext('pimobj')와 일치해야 CompiledKernel이 kernel을 찾는다.
         stages["ttir"] = lambda src, metadata: cpu_compiler.CPUBackend.make_ttir(src, metadata, options)
         stages["ttsharedir"] = lambda src, metadata: cpu_compiler._ttir_to_ttsharedir(src)
-        stages["pim_common"] = lambda src, metadata: _ttsharedir_to_pim_common(src, options.split_m, options.split_n, options.local_lanes)
+        stages["pim_common"] = lambda src, metadata: _ttsharedir_to_pim_common(src, options.split_m, options.split_n, options.split_k, options.local_lanes)
         stages["vendor_ir"] = lambda src, metadata: _pim_common_to_upmem(src)
         stages["pimobj"] = lambda src, metadata: _upmem_to_artifact(src, metadata)
 

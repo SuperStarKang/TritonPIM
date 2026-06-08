@@ -65,11 +65,11 @@ def UPMEM_DeviceFuncOp : UPMEM_Op<"device_func", [NoTerminator]> {
 //===----------------------------------------------------------------------===//
 
 // dpu_alloc(num_units). 결과 dpu_set 핸들을 반환.
-// num_units = split_m * split_n (= 총 DPU 수). split_m/split_n은 출력 2D 분배 인자로,
-// host가 DPU index를 (pm,pn)으로 매핑해 A 행밴드·B 열밴드·C 2D 위치를 정하는 데 쓴다.
+// num_units = split_m * split_n * split_k (= 총 DPU 수). split_m/n은 출력 2D 분배, split_k는 K분담.
+// host가 DPU index를 (pm,pn,kj)로 매핑해 A/B 슬라이스·C 위치·K-reduce 그룹을 정하는 데 쓴다.
 def UPMEM_AllocUnitsOp : UPMEM_Op<"alloc_units"> {
   let summary = "Allocate a set of DPUs";
-  let arguments = (ins I64Attr:$num_units, I64Attr:$split_m, I64Attr:$split_n);
+  let arguments = (ins I64Attr:$num_units, I64Attr:$split_m, I64Attr:$split_n, I64Attr:$split_k);
   let results = (outs UPMEM_DPUSetType:$result);
   let assemblyFormat = "attr-dict `:` type($result)";
 }

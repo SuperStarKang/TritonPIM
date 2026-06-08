@@ -65,9 +65,10 @@ def _build_pim_so(host_src: str, device_src: str, local_lanes: int) -> str:
         elf_path = cache.put(Path(elf_tmp).read_bytes(), "device.elf", binary=True)
 
         # host.cpp → host.so : DPU_BINARY 매크로를 캐시의 device.elf 절대경로로 덮어쓴다.
+        # -fopenmp: split_k>1일 때 host reduce(tree)의 `#pragma omp parallel for`용. 없으면 pragma 무시되어 순차 실행.
         so_tmp = os.path.join(tmp, so_name)
         subprocess.check_call(
-            ["g++", "-O2", "-std=c++17", "-fPIC", "-shared",
+            ["g++", "-O2", "-std=c++17", "-fPIC", "-shared", "-fopenmp",
              f'-DDPU_BINARY="{elf_path}"', host_cpp, *_dpu_host_flags(), "-o", so_tmp])
         so_path = cache.put(Path(so_tmp).read_bytes(), so_name, binary=True)
 

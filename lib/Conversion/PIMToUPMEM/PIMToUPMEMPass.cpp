@@ -63,7 +63,8 @@ struct LegalizePIMToUPMEMPass
     Value C = cReg.getBuffer();
     uint64_t splitM = tp.getSplitM();
     uint64_t splitN = tp.getSplitN();
-    uint64_t numUnits = splitM * splitN;  // 총 DPU 수 (2D 출력 분배)
+    uint64_t splitK = tp.getSplitK();
+    uint64_t numUnits = splitM * splitN * splitK;  // 총 DPU 수 (2D 출력 분배 × K 분담)
     std::string devName = (func.getName() + "_device").str();
     Location loc = func.getLoc();
 
@@ -83,7 +84,8 @@ struct LegalizePIMToUPMEMPass
     auto setTy = upmem::DPUSetType::get(b.getContext());
 
     Value units = b.create<upmem::AllocUnitsOp>(loc, setTy, /*num_units=*/numUnits,
-                                                /*split_m=*/splitM, /*split_n=*/splitN);
+                                                /*split_m=*/splitM, /*split_n=*/splitN,
+                                                /*split_k=*/splitK);
     b.create<upmem::LoadProgramOp>(loc, units, devName);
     b.create<upmem::CopyToGlobalOp>(loc, units, A, "mram_a");
     b.create<upmem::CopyToGlobalOp>(loc, units, B, "mram_b");

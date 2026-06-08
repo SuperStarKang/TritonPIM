@@ -3,8 +3,8 @@
 
 // CHECK-LABEL: upmem.host_func "matmul_host"
 upmem.host_func "matmul_host" {
-  // CHECK: upmem.alloc_units {num_units = 2048 : i64, split_m = 1 : i64, split_n = 2048 : i64} : !upmem.dpu_set
-  %units = upmem.alloc_units {num_units = 2048 : i64, split_m = 1 : i64, split_n = 2048 : i64} : !upmem.dpu_set
+  // CHECK: upmem.alloc_units {num_units = 2048 : i64, split_k = 1 : i64, split_m = 1 : i64, split_n = 2048 : i64} : !upmem.dpu_set
+  %units = upmem.alloc_units {num_units = 2048 : i64, split_m = 1 : i64, split_n = 2048 : i64, split_k = 1 : i64} : !upmem.dpu_set
   // CHECK: upmem.load_program %{{.*}}, @matmul_device : !upmem.dpu_set
   upmem.load_program %units, @matmul_device : !upmem.dpu_set
 }

@@ -3,7 +3,7 @@
 // RUN: triton-shared-translate --upmem-to-device %s | FileCheck %s --check-prefix=DEVICE
 
 func.func @matmul_kernel(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>) {
-  %0 = upmem.alloc_units {num_units = 1 : i64, split_m = 1 : i64, split_n = 1 : i64} : !upmem.dpu_set
+  %0 = upmem.alloc_units {num_units = 1 : i64, split_m = 1 : i64, split_n = 1 : i64, split_k = 1 : i64} : !upmem.dpu_set
   upmem.load_program %0, @matmul_kernel_device : !upmem.dpu_set
   upmem.copy_to_global %0, %A {dst = "mram_a"} : !upmem.dpu_set, memref<*xf32>
   upmem.copy_to_global %0, %B {dst = "mram_b"} : !upmem.dpu_set, memref<*xf32>
@@ -39,7 +39,7 @@ upmem.device_func "matmul_kernel_device" {
 }
 
 // HOST: extern "C" void matmul_kernel_host(float* A, float* B, float* C, uint32_t M, uint32_t N, uint32_t K)
-// HOST: const uint32_t SPLIT_M = 1, SPLIT_N = 1;
+// HOST: const uint32_t SPLIT_M = 1, SPLIT_N = 1, SPLIT_K = 1;
 // HOST: dpu_alloc(NUM_UNITS, NULL, &set)
 // HOST: dpu_load(set, DPU_BINARY, NULL)
 // HOST: dpu_push_xfer(set, DPU_XFER_TO_DPU, "A_mram"

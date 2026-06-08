@@ -35,14 +35,14 @@
 | O1 | faithful-body 전환 (본문 보존 + build-pim-offload 통합) + multi-tile | `[~]` | 5 / 6 |
 | O2 | Capability / Constraints | `[ ]` | 0 / 3 |
 | O3 | Common Optimization Passes (하나씩, opt-in) | `[ ]` | 0 / 7 |
-| O4 | Execution Strategy Selection | `[~]` | 2 / 7 |
+| O4 | Execution Strategy Selection | `[~]` | 3 / 7 |
 | O5 | Autotune Integration | `[ ]` | 0 / 3 |
 | **Part III — Breadth** | | | |
 | B1 | AiMX Vendor Extension | `[ ]` | 0 / 6 |
 | B2 | Vendor Extension Registry 리팩토링 | `[ ]` | 0 / 3 |
 | B3 | CPU+PIM HybridDriver | `[ ]` | 0 / 5 |
 
-총 진행률: **42 / 76** (Part I MVP 완료. O1.1/O1.2/O1.3/O1.5 **faithful-body IR 변환 + build-pim-offload·execution_group 완료**(`pim.compute` region-carrying, 본문 보존 + program_id 로컬화, `build-pim-offload`가 `execution_group` 합성, e2e 동치 검증). O1.4a(device가 본문 gemm nest에서 BLOCK 읽어 device.c 구동, `local_gemm` 제거, e2e 동치). O1.8 multi-tile, O4 2D SPLIT + BLOCK 타일 + multi-tasklet HW 검증. **O1 남음: O1.4b(비-gemm op-by-op 번역)**)
+총 진행률: **43 / 76** (Part I MVP 완료. O1.1/O1.2/O1.3/O1.5 **faithful-body IR 변환 + build-pim-offload·execution_group 완료**(`pim.compute` region-carrying, 본문 보존 + program_id 로컬화, `build-pim-offload`가 `execution_group` 합성, e2e 동치 검증). O1.4a(device가 본문 gemm nest에서 BLOCK 읽어 device.c 구동, `local_gemm` 제거, e2e 동치). O1.8 multi-tile, O4 2D SPLIT + **SPLIT_K(host tree-reduce)** + BLOCK 타일 + multi-tasklet HW 검증(2→4→8 DPU 선형 스케일). **O1 남음: O1.4b(비-gemm op-by-op 번역)**)
 
 ---
 
@@ -269,8 +269,8 @@ pim.launch            (callee, vendor, device_id)
 - [ ] **O4.2** `[공통]` 전략 구현 + 레지스트리 등록 (전략 목록은 vendor-neutral): `no-split`, `n-split`(output_n_partitioned), `k-split`(reduction_k_partitioned), `m-split`(output_m_partitioned, 전치 포함)
 - [ ] **O4.3** `[공통·gate]` `SelectPIMExecutionStrategy` Common pass — split factor + vendor capability/constraints로 적법 전략 필터, autotune 미사용 시 단순 기본 규칙(no-split 우선)
 - [ ] **O4.4** `[vendor]` UPMEM lowering이 전략 attribute legalize (`reduction_k_partitioned` → UPMEM `host_reduce`) + lit test
-- [~] **O4.5** `[검증]` e2e: SPLIT에 따라 동작 검증 — **n-split `split_n=2` 정답 통과**(`test_pim_matmul_tiled.py`). k/m-split·reduce 검증은 이후.
-- [x] **O4.6** `[vendor]` translate·launcher가 IR 값을 받아 생성(전제 ②). **완료**: (a) n-split host codegen(`alloc_units{num_units}`→`dpu_alloc(U)`, A broadcast/B 열scatter/C gather, split_n=2 검증). (b) **device BLOCK 타일링** — `UPMEMToDevice`가 `local_gemm`의 BLOCK_M/N/K를 bake, 부분행렬을 `BLOCK_M×BLOCK_N` 타일로 순회하며 `BLOCK_K`를 WRAM(aW/bW/acc)에 올려 누적·재사용. **①a 단일 tasklet** + **①b cooperative 다중 tasklet**(WRAM 타일 공유 + BLOCK_M 행 tasklet 분할 + barrier) 모두 HW에서 검증 (split_n=2 × local_lanes=8/16). **남음**: k-split `host_reduce`. **제약**: WRAM = aW+bW+acc+tasklet 스택 ≤ 64KB → BLOCK/local_lanes 균형(autotune), per-call `dpu_alloc/load`는 persistent set으로 개선 여지.
+- [x] **O4.5** `[검증]` e2e: SPLIT에 따라 동작 검증 — `test_pim_matmul_tiled.py`에서 **m-split(`split_m=2`)·n-split(`split_n=2`)·k-split(`split_k=2`)·2D+K(8 DPU) 모두 정답**. DPU 2→4→8에서 시간 ≈2×씩 감소(선형 스케일). k-split은 host tree-reduce(OpenMP) 동작 확인.
+- [x] **O4.6** `[vendor]` translate·launcher가 IR 값을 받아 생성(전제 ②). **완료**: (a) n-split host codegen(`alloc_units{num_units}`→`dpu_alloc(U)`, A broadcast/B 열scatter/C gather, split_n=2 검증). (b) **device BLOCK 타일링** — `UPMEMToDevice`가 `local_gemm`의 BLOCK_M/N/K를 bake, 부분행렬을 `BLOCK_M×BLOCK_N` 타일로 순회하며 `BLOCK_K`를 WRAM(aW/bW/acc)에 올려 누적·재사용. **①a 단일 tasklet** + **①b cooperative 다중 tasklet**(WRAM 타일 공유 + BLOCK_M 행 tasklet 분할 + barrier) 모두 HW에서 검증 (split_n=2 × local_lanes=8/16). (c) **split_k host_reduce 완료**: `alloc_units{...,split_k}` → `UPMEMToHost`가 idx→(pm,pn,kj) 3D 분배(A strided staging·B Ku-슬라이스 전치·K=Ku broadcast) + 그룹별 host **tree-reduce(OpenMP)**, device는 K=Ku만 받아 부분곱(불변). 8 DPU(2D+K) HW 정답·선형 스케일. **제약**: WRAM = aW+bW+acc+tasklet 스택 ≤ 64KB → BLOCK/local_lanes 균형(autotune), per-call `dpu_alloc/load`는 persistent set으로 개선 여지.
 - [x] **O4.7** `[공통 knob + vendor]` multi-tasklet (intra-DPU 병렬, `local_lanes`=`NR_TASKLETS`): `PIMOptions.local_lanes`(공통 knob, default 1) → `metadata` → launcher가 `-DNR_TASKLETS=L`로 device.c 컴파일. `UPMEMToDevice`가 `NR_TASKLETS` 매크로 기반 device.c 생성 — `BARRIER_INIT` + `me()==0`이 `mem_reset` 후 barrier, tasklet별 `mem_alloc` WRAM, `for(i=me();i<M;i+=NR_TASKLETS)` 행 round-robin(행 disjoint→끝 barrier 불필요). **검증: `split_n=2, local_lanes=16` (2 DPU × 16 tasklet) 정답 통과.** (DESIGN 14.6)
 
 > **수직 슬라이스 (완료)**: 전략 프레임워크(O4.1~O4.4)를 건너뛰고 옵션으로 끝까지 관통 —
@@ -278,7 +278,7 @@ pim.launch            (callee, vendor, device_id)
 > - `BLOCK_M/N/K` (intra-DPU 타일): `UPMEMToDevice`가 BLOCK 타일 순회 + `BLOCK_K` WRAM 청크 재사용 (cooperative 다중 tasklet).
 > - `local_lanes` (intra-DPU 병렬): `metadata`→launcher `-DNR_TASKLETS`→ tasklet이 BLOCK_M 행 분할.
 >
-> **다음 후보**: ③ SPLIT_K + `host_reduce`(타일<DPU), ④ persistent DPU set(per-call alloc/load 제거), O4.1~O4.4 전략 프레임워크.
+> **다음 후보**: ✅ ③ SPLIT_K + `host_reduce` **완료**(idx→(pm,pn,kj) 3D 분배 + host tree-reduce(OpenMP), 8 DPU 정답·선형 스케일). ④ persistent DPU set(per-call alloc/load 제거), O4.1~O4.4 전략 프레임워크.
 
 ---
 
@@ -392,7 +392,7 @@ O1.8(multi-tile 1-DPU) + O4 n-split(`split_n`, 여러 DPU) + multi-tasklet(`loca
 
 ① **device BLOCK 타일 루프** (intra-DPU, O4.6) — **완료**: ①a 단일 + ①b cooperative 다중 tasklet (BLOCK_M/N/K 타일 + BLOCK_K WRAM 재사용 + tasklet 행분할, HW 검증). 환경: 시뮬레이터→HW(`UPMEM_BACKEND=hw`+upmem-override lib).
 ② **2D SPLIT (`split_m` 추가)** — **완료**: `SPLIT_M×SPLIT_N` DPU에 출력 2D 분배, **A 행밴드 scatter(전체 복제 해소)** + B 열밴드 + C 2D gather. `tile_plan.split_m` → `alloc_units{num_units,split_m,split_n}` → `UPMEMToHost` 2D. **HW 검증 + 선형 스케일링**(1→2→4 DPU = 3833→1949→1008 ms, ~3.8×). split_n은 SPLIT_M=1 특수형.
-③ **SPLIT_K + reduce** — 타일 < DPU일 때 한 타일을 여러 DPU가 K분담(`host_reduce`). (O4.1~O4.4 전략 프레임워크와 함께.) ← 다음 후보
+③ **SPLIT_K + reduce** — **완료**: 한 출력을 여러 DPU가 K분담 → `UPMEMToHost`가 idx→(pm,pn,kj) 3D 분배(A strided staging·B Ku-슬라이스 전치·K=Ku broadcast) + 그룹별 host **tree-reduce(OpenMP, `-fopenmp`)**. device는 K=Ku만 받아 부분곱(불변). 공통은 `tile_plan.split_k`+`mapping_policy=reduction_k_partitioned` intent만(명시 `pim.reduce` op은 O3.5로 보류). HW: 8 DPU(2D+K) 정답, 4→8 DPU ≈2× 가속.
 ④ **persistent DPU set** — 매 호출 `dpu_alloc/load/free` 대신 1회 alloc/load 재사용 (per-call 오버헤드 제거; 작은 행렬 절대 시간 개선). ← 다음 후보
 
 계층: SPLIT/BLOCK/LOCAL_LANES **knob·intent는 공통**(option/`tile_plan`/metadata), **실현(dpu_alloc·DPU_FOREACH·NR_TASKLETS·me()·BLOCK_K WRAM)은 UPMEM(`lib/Target/UPMEM`)**.
