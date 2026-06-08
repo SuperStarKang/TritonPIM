@@ -8,7 +8,7 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 //===----------------------------------------------------------------------===//
 // UPMEM dialect — UPMEM DPU 실행 모델.
 // host_func / device_func로 host-device를 나누고, host는 DPU alloc/load/copy/launch,
-// device는 per-DPU gemm을 표현한다. host C++ / DPU C codegen의 입력이다.
+// device_func는 본문(scf/linalg/memref, faithful-body)을 담는다. host C++ / DPU C codegen의 입력이다.
 //===----------------------------------------------------------------------===//
 
 def UPMEM_Dialect : Dialect {
@@ -51,9 +51,10 @@ def UPMEM_HostFuncOp : UPMEM_Op<"host_func", [NoTerminator]> {
   let assemblyFormat = "$sym_name attr-dict-with-keyword $body";
 }
 
-// device 측 커널 본문(local_gemm 등)을 담는 region. DPU C 커널로 codegen된다.
+// device 측 커널 본문(scf/linalg/memref, faithful-body)을 담는 region. region block arg는
+// 유닛이 보는 로컬 MRAM 슬라이스(A/B/C). UPMEMToDevice가 이 본문에서 BLOCK·구조를 읽어 DPU C로 번역한다.
 def UPMEM_DeviceFuncOp : UPMEM_Op<"device_func", [NoTerminator]> {
-  let summary = "Device-side DPU kernel body";
+  let summary = "Device-side DPU kernel body (faithful-body region)";
   let arguments = (ins StrAttr:$sym_name);
   let regions = (region AnyRegion:$body);
   let assemblyFormat = "$sym_name attr-dict-with-keyword $body";
@@ -99,17 +100,6 @@ def UPMEM_LaunchOp : UPMEM_Op<"launch"> {
   let summary = "Launch the loaded DPU program";
   let arguments = (ins UPMEM_DPUSetType:$dpu_set);
   let assemblyFormat = "$dpu_set attr-dict `:` type($dpu_set)";
-}
-
-//===----------------------------------------------------------------------===//
-// Device-side op
-//===----------------------------------------------------------------------===//
-
-// device_func 안에서 per-DPU gemm을 표현. codegen이 이 attr로 DPU C gemm 루프를 만든다.
-def UPMEM_LocalGemmOp : UPMEM_Op<"local_gemm"> {
-  let summary = "Per-DPU GEMM (device-side)";
-  let arguments = (ins I64Attr:$m, I64Attr:$n, I64Attr:$k, StrAttr:$accumulation);
-  let assemblyFormat = "attr-dict";
 }
 
 #endif // UPMEM_DIALECT

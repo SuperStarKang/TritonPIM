@@ -10,7 +10,7 @@ func.func @matmul_kernel(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>
   %4 = pim.execution_group {mapping_policy = "none", num_units = 1 : i64, local_lanes = 1 : i64, stationary_data = "B"} : !pim.exec_group
   pim.transfer %0 {src = "host", dst = "device_global"} : !pim.region
   pim.transfer %1 {src = "host", dst = "device_global"} : !pim.region
-  // faithful-body: region을 들고 있지만 legalize는 본문을 읽지 않고 tile_plan→local_gemm으로 간다.
+  // faithful-body: legalize는 이 본문(region)을 device_func로 옮긴다(O1.4). 여기선 빈 본문으로 이동만 확인.
   pim.compute ins(%0, %1) outs(%2) using %4, %3 {primitive = "gemm"}
       : (!pim.region, !pim.region, !pim.region, !pim.exec_group, !pim.tile_plan) {
   ^unit(%a: memref<?x?xf32>, %b: memref<?x?xf32>, %c: memref<?x?xf32>):
@@ -29,6 +29,6 @@ func.func @matmul_kernel(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>
 // CHECK: upmem.copy_from_global %{{.*}}, %arg2 {src = "mram_c"}
 // CHECK-NOT: pim.compute
 
-// device_func가 module 레벨에 생성된다.
+// device_func가 module 레벨에 생성되고 pim.compute 본문(block arg)이 그대로 옮겨진다.
 // CHECK: upmem.device_func "matmul_kernel_device"
-// CHECK: upmem.local_gemm {accumulation = "fp32", k = 256 : i64, m = 32 : i64, n = 64 : i64}
+// CHECK: ^{{.*}}(%{{.*}}: memref<?x?xf32>, %{{.*}}: memref<?x?xf32>, %{{.*}}: memref<?x?xf32>):

@@ -42,7 +42,7 @@
 | B2 | Vendor Extension Registry 리팩토링 | `[ ]` | 0 / 3 |
 | B3 | CPU+PIM HybridDriver | `[ ]` | 0 / 5 |
 
-총 진행률: **42 / 76** (Part I MVP 완료. O1.1/O1.2/O1.3/O1.5 **faithful-body IR 변환 + build-pim-offload·execution_group 완료**(`pim.compute` region-carrying, 본문 보존 + program_id 로컬화, `build-pim-offload`가 `execution_group` 합성, e2e 동치 검증). O1.8 multi-tile, O4 2D SPLIT + BLOCK 타일 + multi-tasklet HW 검증. **O1 남음: O1.4 device 충실 번역**)
+총 진행률: **42 / 76** (Part I MVP 완료. O1.1/O1.2/O1.3/O1.5 **faithful-body IR 변환 + build-pim-offload·execution_group 완료**(`pim.compute` region-carrying, 본문 보존 + program_id 로컬화, `build-pim-offload`가 `execution_group` 합성, e2e 동치 검증). O1.4a(device가 본문 gemm nest에서 BLOCK 읽어 device.c 구동, `local_gemm` 제거, e2e 동치). O1.8 multi-tile, O4 2D SPLIT + BLOCK 타일 + multi-tasklet HW 검증. **O1 남음: O1.4b(비-gemm op-by-op 번역)**)
 
 ---
 
@@ -219,7 +219,7 @@ pim.launch            (callee, vendor, device_id)
 - [x] **O1.1** `[공통·구조]` faithful-body 변환: 본문을 `pim.compute` **region에 보존**(gemm 패턴 인식 후 유닛-로컬 nest로 재구성), `primitive="gemm"`은 속성으로만 기록. dialect `pim.compute`를 **region-carrying**으로 변경(`op`→`primitive`, `full_m/n/k`·result 제거, `[NoTerminator]`). **검증: ops.mlir roundtrip + tiled 커널 변환 출력 확인.**
 - [x] **O1.2** `[공통·구조]` 패스 `convert-ttshared-to-pim` → **`build-pim-offload`** 개명 + `execution_group` 합성: split→`mapping_policy`, `num_units=split_m*split_n`, `local_lanes`(option, DESIGN 16), `stationary_data="B"`. `pim.compute`가 `using %eg, %tp`로 참조. **검증: roundtrip + build-pim-offload 출력 + legalize 무영향 + e2e(split 2D) 정답.** (파일 위치는 `Conversion/TTSharedToPIM/` 유지 — DESIGN 6의 `Dialect/PIM/Transforms/` 이동은 조직적 후속. execution_group은 **기록만** — 소비는 O4, `num_units`의 `#pim.capability_ref` 형태는 O2.)
 - [x] **O1.3** `[공통·구조]` `program_id` 전역 오프셋을 분배층으로 이동 — region 본문은 유닛-로컬 슬라이스 기준(`tm/tn` 루프 = 복원된 grid, `Mu/Nu/K`는 block-arg `memref.dim` 런타임). **O1.1과 같은 패스에서 함께 수행.**
-- [ ] **O1.4** `[vendor]` `UPMEMToDevice` 충실 번역: `local_gemm` 템플릿 대신 본문(`linalg`→loops, `memref`→`mram_read`/WRAM/`mram_write`)을 번역 (DESIGN 14.8). `local_gemm`은 gemm 단축 경로로 유지 가능. → gemv/relu/fused 일반화의 토대.
+- [~] **O1.4** `[vendor]` `UPMEMToDevice` 충실 번역. **O1.4a 완료**: legalize가 `pim.compute` 본문을 `device_func` region으로 옮기고(`takeBody`), `UPMEMToDevice`/`UPMEMToHost`가 본문 gemm nest(`linalg.matmul` + 3중 `scf.for`)에서 BLOCK을 읽어 device.c/host.cpp 생성. `upmem.local_gemm` 제거. **검증: translate 출력(BLOCK 32/64/64) + e2e(split 2D) 동치.** **O1.4b 남음**: device.c emission을 gemm 템플릿 → op-by-op 충실 번역으로 일반화(`linalg.matvec`→gemv, `linalg.generic`→relu/fused). 현재는 BLOCK·gemm 구조만 body에서 읽는다.
 - [x] **O1.5** `[검증]` 동치: faithful-body 전환 후 e2e 재통과 — `test_pim_matmul_tiled.py` 3 config(`split_m/n=1` no-split 포함) 정답, `pim_common` dump가 faithful-body 확인. device.c는 gemm shortcut(`local_gemm`) 유지라 결과 동일(M6 green).
 - [x] **O1.8** `[공통·구조]` 전체 M/N/K 복원: 변환이 tiled-gemm(scf.for+matmul+accumulate) 인식, 전체 M/N/K(`%arg3/4/5`)를 운반(BLOCK은 tile_plan에 기록). codegen(UPMEMToHost·launcher)이 런타임 M/N/K로 동작 → **multi-tile 정답**(128×128×256, grid=(2,2)). faithful-body에선 이 복원이 O1.3(분배층 이동)과 합쳐진다.
 
@@ -386,7 +386,7 @@ M6 E2E 검증  ← ✅ "돈다"
 
 O1.8(multi-tile 1-DPU) + O4 n-split(`split_n`, 여러 DPU) + multi-tasklet(`local_lanes`, DPU 내부 병렬) 완료. 현재 `split_n=2, local_lanes=16` (2 DPU × 16 tasklet) 정답.
 
-**⓪ DESIGN faithful-body 전환 (O1) — 구조 우선순위**: **IR 변환·구조 합성 완료**(O1.1/O1.2/O1.3/O1.5). `build-pim-offload`가 본문을 `pim.compute` region에 유닛-로컬 nest로 보존하고(program_id는 `tm/tn` 복원된 grid로 흡수), `memory_region`/`transfer`/`tile_plan`/`execution_group`을 합성한다. 단 **다운스트림은 아직 gemm shortcut**(`tile_plan`→`local_gemm`)이라 보존된 본문·execution_group은 codegen에서 무시된다(gemm 결과 동일). **O1 남은 일: O1.4** — `UPMEMToDevice`가 region 본문을 충실 번역(14.8)하면 보존된 본문이 실제로 쓰이고 gemv/relu/fused가 같은 경로로 열린다. 성능 작업 ①~④와 독립.
+**⓪ DESIGN faithful-body 전환 (O1) — 구조 우선순위**: **IR 변환·구조 합성 + device가 본문 구동까지 완료**(O1.1/O1.2/O1.3/O1.4a/O1.5). `build-pim-offload`가 본문을 `pim.compute` region에 보존하고(program_id는 `tm/tn` 복원된 grid로 흡수), legalize가 그 본문을 `device_func`로 옮기며, `UPMEMToDevice`가 본문 gemm nest에서 BLOCK을 읽어 device.c를 만든다(`local_gemm` 제거). **O1 남은 일: O1.4b** — device.c emission을 gemm 템플릿 → op-by-op 충실 번역으로 일반화하면 gemv/relu/fused가 같은 경로로 열린다(현재는 gemm 본문만). `execution_group`은 여전히 기록만(O4 소비). 성능 작업 ①~④와 독립.
 
 **실행 모델 확정 (DESIGN 11.5.2): SPLIT(굵게, 유닛 간) → BLOCK(잘게, 유닛 내부 타일) → BLOCK_K(WRAM 청크, A/B 재사용).** "1 BLOCK = 1 DPU"는 폐기 — BLOCK은 DPU 분배 단위가 아니라 DPU 내부 타일이다. PGEMM `basic_n`과 분배(2D 출력분배)는 동일하나, **BLOCK 타일링으로 WRAM 재사용**하는 게 차이·이점.
 

@@ -1,13 +1,42 @@
 #include "triton-shared/Target/UPMEM/UPMEMTranslations.h"
 #include "triton-shared/Dialect/PIMVendor/UPMEM/IR/UPMEMDialect.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Tools/mlir-translate/Translation.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace mlir;
+
+// device_func 본문의 gemm nest(scf.for tm/tn/kc + linalg.matmul)에서 BLOCK_M/N/K를 읽는다.
+// host는 Mu/Nu/K가 BLOCK의 배수인지 검사하는 데만 BLOCK을 쓴다(faithful-body, O1.4a).
+// BLOCK은 Triton constexpr이라 scf.for step이 항상 상수다 — 아니면 IR 불변식 위반(fail-fast).
+static LogicalResult extractGemmBlocks(ModuleOp module, upmem::DeviceFuncOp dev,
+                                       uint64_t &blockM, uint64_t &blockN,
+                                       uint64_t &blockK) {
+  linalg::MatmulOp mm;
+  dev.walk([&](linalg::MatmulOp m) { mm = m; });
+  if (!mm)
+    return module.emitError("device_func body must contain linalg.matmul (gemm)");
+  scf::ForOp kcFor = mm->getParentOfType<scf::ForOp>();
+  scf::ForOp tnFor = kcFor ? kcFor->getParentOfType<scf::ForOp>() : nullptr;
+  scf::ForOp tmFor = tnFor ? tnFor->getParentOfType<scf::ForOp>() : nullptr;
+  if (!kcFor || !tnFor || !tmFor)
+    return module.emitError("gemm 본문은 3중 scf.for(tm/tn/kc) nest여야 한다");
+  auto step = [](scf::ForOp f) {
+    return cast<IntegerAttr>(
+               f.getStep().getDefiningOp<arith::ConstantOp>().getValue())
+        .getInt();
+  };
+  blockM = step(tmFor);
+  blockN = step(tnFor);
+  blockK = step(kcFor);
+  return success();
+}
 
 // UPMEM IR을 walk해 host C++를 emit한다.
 // - alloc_units{num_units, split_m, split_n}에서 2D 분배 정보를 읽는다.
@@ -18,8 +47,6 @@ using namespace mlir;
 //   (SPLIT_M=1, SPLIT_N=U면 기존 n-split과 동일: A 행밴드=전체 M.)
 // - device는 자기 부분행렬 크기 M=Mu, N=Nu, K=full을 broadcast로 받아 BLOCK 타일링한다.
 static LogicalResult translateUPMEMToHost(ModuleOp module, raw_ostream &os) {
-  upmem::LocalGemmOp gemm;
-  module.walk([&](upmem::LocalGemmOp g) { gemm = g; });
   upmem::DeviceFuncOp dev;
   module.walk([&](upmem::DeviceFuncOp d) { dev = d; });
   upmem::AllocUnitsOp alloc;
@@ -30,14 +57,17 @@ static LogicalResult translateUPMEMToHost(ModuleOp module, raw_ostream &os) {
       host = f;
   });
 
-  if (!gemm || !dev || !host || !alloc)
-    return module.emitError("upmem-to-host: expected upmem.local_gemm, "
-                            "upmem.device_func, upmem.alloc_units, and a host func");
+  if (!dev || !host || !alloc)
+    return module.emitError("upmem-to-host: expected upmem.device_func, "
+                            "upmem.alloc_units, and a host func");
 
   uint64_t splitM = alloc.getSplitM();
   uint64_t splitN = alloc.getSplitN();
   // device가 BLOCK 단위로 타일링하므로 Mu/Nu/K가 BLOCK의 배수여야 한다 (검사용).
-  uint64_t blockM = gemm.getM(), blockN = gemm.getN(), blockK = gemm.getK();
+  // BLOCK은 device_func 본문의 gemm nest에서 읽는다(faithful-body).
+  uint64_t blockM, blockN, blockK;
+  if (failed(extractGemmBlocks(module, dev, blockM, blockN, blockK)))
+    return failure();
   std::string hostName = (host.getName() + "_host").str();
   std::string binary = (dev.getSymName() + ".elf").str();
 
@@ -107,7 +137,9 @@ void mlir::triton::registerUPMEMToHostTranslation() {
   TranslateFromMLIRRegistration reg(
       "upmem-to-host", "emit UPMEM host C++ from UPMEM IR",
       translateUPMEMToHost, [](DialectRegistry &registry) {
-        registry.insert<func::FuncDialect, memref::MemRefDialect,
-                        upmem::UPMEMDialect>();
+        // device_func 본문(faithful-body)이 arith/scf/linalg op을 담으므로 파싱에 필요하다.
+        registry.insert<arith::ArithDialect, func::FuncDialect,
+                        linalg::LinalgDialect, memref::MemRefDialect,
+                        scf::SCFDialect, upmem::UPMEMDialect>();
       });
 }

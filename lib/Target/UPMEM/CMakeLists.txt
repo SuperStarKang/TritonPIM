@@ -9,7 +9,10 @@ add_triton_library(UPMEMTranslation
   MLIRIR
   MLIRSupport
   MLIRTranslateLib
+  MLIRArithDialect
   MLIRFuncDialect
+  MLIRLinalgDialect
   MLIRMemRefDialect
+  MLIRSCFDialect
   UPMEMIR
 )

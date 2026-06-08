@@ -14,7 +14,7 @@ extern "C" void matmul_kernel_host(float *A, float *B, float *C,
                                    uint32_t M, uint32_t N, uint32_t K);
 
 int main() {
-  // test/Target/UPMEM/matmul.mlir의 local_gemm{m=32,n=64,k=256}과 일치해야 한다.
+  // 이 standalone harness의 고정 차원 (단일 tile gemm 수동 검증용; 옆 device.c/host.cpp와 한 쌍).
   const int M = 32, N = 64, K = 256;
 
   std::vector<float> A(M * K), B(K * N), C(M * N, 0.0f), ref(M * N, 0.0f);

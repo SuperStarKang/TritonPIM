@@ -53,25 +53,33 @@ struct LegalizePIMToUPMEMPass
     });
     pim::TilePlanOp tp;
     func.walk([&](pim::TilePlanOp t) { tp = t; });
+    // faithful-body(O1.4): pim.compute의 본문(scf/linalg/memref)을 device_func로 옮긴다.
+    pim::ComputeOp compute;
+    func.walk([&](pim::ComputeOp c) { compute = c; });
 
     // memory_region의 buffer는 함수 인자(block arg)라 본문을 지워도 유효하다.
     Value A = aReg.getBuffer();
     Value B = bReg.getBuffer();
     Value C = cReg.getBuffer();
-    uint64_t bm = tp.getBlockM();
-    uint64_t bn = tp.getBlockN();
-    uint64_t bk = tp.getBlockK();
     uint64_t splitM = tp.getSplitM();
     uint64_t splitN = tp.getSplitN();
     uint64_t numUnits = splitM * splitN;  // 총 DPU 수 (2D 출력 분배)
     std::string devName = (func.getName() + "_device").str();
+    Location loc = func.getLoc();
 
+    // device_func를 만들고 pim.compute 본문을 그대로 옮긴다(BLOCK·계산 구조 보존).
+    // device codegen(UPMEMToDevice)이 이 본문에서 BLOCK·gemm 구조를 읽어 device.c를 생성한다.
+    // 본문을 옮긴 뒤 entry를 지워야 하므로 erase보다 먼저 수행한다(takeBody는 compute의 region을 비운다).
+    OpBuilder mb(module.getBody(), module.getBody()->end());
+    auto dev = mb.create<upmem::DeviceFuncOp>(loc, devName);
+    dev.getBody().takeBody(compute.getBody());
+
+    // host 시퀀스로 함수 본문 교체 (compute 포함 entry op 전부 제거; 본문은 이미 device_func로 이동됨).
     Block &entry = func.getBody().front();
     while (!entry.empty())
       entry.back().erase();
 
     OpBuilder b = OpBuilder::atBlockBegin(&entry);
-    Location loc = func.getLoc();
     auto setTy = upmem::DPUSetType::get(b.getContext());
 
     Value units = b.create<upmem::AllocUnitsOp>(loc, setTy, /*num_units=*/numUnits,
@@ -82,13 +90,6 @@ struct LegalizePIMToUPMEMPass
     b.create<upmem::LaunchOp>(loc, units);
     b.create<upmem::CopyFromGlobalOp>(loc, units, C, "mram_c");
     b.create<func::ReturnOp>(loc);
-
-    // 같은 module에 device_func를 추가하고 그 안에 per-DPU gemm을 둔다.
-    OpBuilder mb(module.getBody(), module.getBody()->end());
-    auto dev = mb.create<upmem::DeviceFuncOp>(loc, devName);
-    Block *deviceBlock = mb.createBlock(&dev.getBody());
-    mb.setInsertionPointToStart(deviceBlock);
-    mb.create<upmem::LocalGemmOp>(loc, bm, bn, bk, "fp32");
   }
 };
 

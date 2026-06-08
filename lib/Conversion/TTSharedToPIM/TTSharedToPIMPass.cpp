@@ -136,8 +136,9 @@ struct BuildPIMOffloadPass
   // - A/B/C는 함수 인자 앞 3개로 가정.
   // - split_m/n은 pass 옵션(=compile option). vendor가 M/N축을 유닛에 분배할 때 쓴다.
   //
-  // gemm shortcut: 다운스트림(legalize/codegen)은 아직 tile_plan→local_gemm 경로로 동작하므로
-  // 이 보존된 본문은 무시되고 gemm 결과는 동일하다(M6 유지). 본문을 충실 번역하는 device codegen은 후속(O1.4).
+  // faithful-body: legalize가 이 본문을 device_func로 옮기고, UPMEMToDevice가 본문의 gemm nest에서
+  // BLOCK을 읽어 device.c를 생성한다(O1.4a). device.c emission은 아직 gemm 템플릿이라 비-gemm 본문
+  // 충실 번역은 O1.4b. gemm 결과는 동일(M6 유지).
   void rewriteToFaithfulGemm(func::FuncOp func, linalg::MatmulOp matmul) {
     auto lhsTy = cast<RankedTensorType>(matmul->getOperand(0).getType());
     auto resTy = cast<RankedTensorType>(matmul->getResult(0).getType());
