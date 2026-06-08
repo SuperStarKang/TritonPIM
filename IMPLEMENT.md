@@ -25,16 +25,16 @@
 |------|------|:----:|:------:|
 | **Part I — Minimal Executable (MVP)** | | | |
 | M0 | Skeleton: pim_backend 디렉토리 + PIMBackend / PIMDriver | `[x]` | 8 / 8 |
-| M1 | 최소 PIM Common Dialect (6 ops) | `[x]` | 8 / 8 |
+| M1 | 최소 PIM Common Dialect (coarse 5 ops · StrAttr) | `[x]` | 7 / 8 |
 | M2 | Debug / IR Dump (변환 확인용, 먼저 구축) | `[x]` | 3 / 3 |
 | M3 | TTShared→PIM 단일 변환 (no-split GEMM) | `[x]` | 4 / 4 |
 | M4 | 최소 UPMEM lowering + codegen (no-split) | `[x]` | 5 / 5 |
 | M5 | Runtime & Launcher | `[x]` | 4 / 4 |
 | M6 | End-to-end: MatMul 실행 + 검증 | `[x]` | 4 / 4 |
 | **Part II — Incremental Optimization** | | | |
-| O1 | 단일 변환을 granular plan pass로 분해 + multi-tile 일반화 | `[~]` | 1 / 8 |
+| O1 | faithful-body 전환 (본문 보존 + build-pim-offload 통합) + multi-tile | `[~]` | 1 / 6 |
 | O2 | Capability / Constraints | `[ ]` | 0 / 3 |
-| O3 | Common Optimization Passes (하나씩) | `[ ]` | 0 / 8 |
+| O3 | Common Optimization Passes (하나씩, opt-in) | `[ ]` | 0 / 7 |
 | O4 | Execution Strategy Selection | `[~]` | 2 / 7 |
 | O5 | Autotune Integration | `[ ]` | 0 / 3 |
 | **Part III — Breadth** | | | |
@@ -42,7 +42,7 @@
 | B2 | Vendor Extension Registry 리팩토링 | `[ ]` | 0 / 3 |
 | B3 | CPU+PIM HybridDriver | `[ ]` | 0 / 5 |
 
-총 진행률: **39 / 79** (Part I MVP 완료, O1.8 multi-tile 1-DPU, O4 n-split(split_n) + multi-tasklet(local_lanes))
+총 진행률: **38 / 76** (Part I MVP 완료 — 단 M1 dialect는 coarse 5-op·StrAttr 최소셋이고, DESIGN의 enum attr·`pim.func`·region-carrying `pim.compute`는 미구현(O1/O2로 이동). O1.8 multi-tile, O4 2D SPLIT + BLOCK 타일 + multi-tasklet HW 검증. **DESIGN faithful-body 전환 반영 — O1 참고**)
 
 ---
 
@@ -77,31 +77,32 @@
 
 ---
 
-## M1 — 최소 PIM Common Dialect (6 ops)
+## M1 — 최소 PIM Common Dialect (coarse, 5 ops · StrAttr)
 
-**목표**: vendor-neutral PIM dialect 최소셋 정의. DESIGN.md 11장의 전체가 아니라 no-split GEMM 1개에 필요한 6 ops만.
+**목표**: vendor-neutral PIM dialect 최소셋 정의. DESIGN.md 10장 전체가 아니라 no-split GEMM 1개에 필요한 최소 op만. **실제 구현은 5 ops + 2 types를 단일 `PIMDialect.td`에 담았고, 모든 attribute는 StrAttr/I64/I32다** (DESIGN의 enum attr·region-carrying compute·`pim.func`는 미도입 — O1/O2에서 확장).
 
-**대상 6 ops** (나머지는 attribute로):
+**구현된 5 ops** (`pim.func`는 미도입 — `func.func` 사용):
 
 ```
-pim.func              (or func.func + attrs)
-pim.memory_region
-pim.tile_plan
-pim.transfer
-pim.compute           (op="gemm")
-pim.launch
+pim.memory_region     (buffer + space/layout/role — 모두 StrAttr)
+pim.tile_plan         (block_m/n/k, split_m/n/k — I64Attr)
+pim.transfer          (region, src/dst — StrAttr)
+pim.compute           (coarse: a,b,c + tile_plan + full_m/n/k:I32 + op="gemm":StrAttr, region 없음)
+pim.launch            (callee, vendor, device_id)
 ```
 
-**완료 조건**: `triton-shared-opt --verify-roundtrip`로 PIM Common IR parse/print 가능.
+> coarse `pim.compute`는 본문(scf/linalg/memref)을 버리고 `op="gemm"`으로 치환한다. DESIGN 4.1/10.2의 region-carrying(본문 보존) compute로의 전환은 **O1.1**에서 한다.
+
+**완료 조건**: `triton-shared-opt`로 PIM Common IR parse/print(roundtrip) 가능.
 
 **작업 단위**:
 
-- [x] **M1.1** `PIMDialect.td` (name "pim", namespace `mlir::triton::pim`)
-- [x] **M1.2** `PIMTypes.td` — `MemorySpaceType`, `MemoryRegionType`
-- [x] **M1.3** `PIMAttrs.td` — `LayoutAttr`, `ResidencyAttr`, `RoleAttr`, `MappingPolicyAttr`, `CapabilityRefAttr` 등
-- [x] **M1.4** `PIMOps.td` — 위 6 ops (operand/result/attr/verifier)
-- [x] **M1.5** `lib/Dialect/PIM/IR/PIMDialect.cpp`, `PIMOps.cpp` (verifier, custom assembly)
-- [x] **M1.6** `RegisterTritonSharedDialects.h`에 `mlir::triton::pim::PIMDialect` 등록
+- [x] **M1.1** `PIMDialect.td` (name "pim", namespace `::mlir::pim`) — types·ops를 이 한 파일에 통합 (계획의 분리 파일 `PIMTypes.td`/`PIMAttrs.td`/`PIMOps.td`는 만들지 않음)
+- [x] **M1.2** types: `RegionType`(region), `TilePlanType`(tile_plan) — 파라미터 없는 opaque 핸들 (계획의 `MemorySpaceType`는 미구현 — space는 StrAttr로 표현)
+- [-] **M1.3** enum attrs(`LayoutAttr`/`ResidencyAttr`/`RoleAttr`/`MappingPolicyAttr`/`CapabilityRefAttr`) **미구현** — 현재 전부 StrAttr. faithful-body/capability 도입 시 추가 (O1/O2로 이동)
+- [x] **M1.4** ops: 위 5 ops를 `PIMDialect.td`에 정의 (operand/result/attr + declarative `assemblyFormat`; 별도 verifier 없음). `pim.func` 미도입
+- [x] **M1.5** `lib/Dialect/PIM/IR/PIMDialect.cpp`만 (op은 tablegen 자동 생성 + declarative assembly라 `PIMOps.cpp`·custom verifier 없음)
+- [x] **M1.6** `RegisterTritonSharedDialects.h`에 `mlir::pim::PIMDialect` 등록
 - [x] **M1.7** `CMakeLists.txt` 업데이트 (`include/`, `lib/Dialect/PIM/`)
 - [x] **M1.8** roundtrip test: `test/Dialect/PIM/ops.mlir`, `-verify-diagnostics` 통과
 
@@ -125,14 +126,14 @@ pim.launch
 
 ## M3 — TTShared→PIM 단일 변환 (no-split GEMM)
 
-**목표**: `linalg.matmul`을 `pim.compute @gemm`으로 바꾸는 **단일 변환 pass**. no-split 고정 — `split=1` 하드코딩, placement/execution_group/residency/chunk/reduce **만들지 않음**. (granular plan pass 분해는 O1에서.)
+**목표**: `linalg.matmul`을 `pim.compute @gemm`으로 바꾸는 **단일 변환 pass** (interim coarse 모델). no-split 고정 — `split=1` 하드코딩, placement/execution_group/residency/chunk/reduce **만들지 않음**. (faithful-body 전환 = 본문 보존은 O1에서.)
 
 **완료 조건**: matmul TTSharedIR → `triton-shared-opt --convert-ttshared-to-pim` → `pim.compute @gemm` 포함 IR 생성. (M2 dump로 `02_pim_common.mlir` 눈으로 확인.)
 
 **작업 단위**:
 
 - [x] **M3.1** `convert-ttshared-to-pim` 단일 pass: `linalg.matmul` 인식 → `pim.compute @gemm`
-- [x] **M3.2** BLOCK_M/N/K를 읽어 `pim.tile_plan {block_*, split_m=1, split_n=1, split_k=1}` 하드코딩 생성
+- [x] **M3.2** BLOCK_M/N/K를 읽어 `pim.tile_plan {block_*, split_*}` 생성 (M3 당시 split_*=1 하드코딩 → **O4에서 split_m/n은 compile option으로 승격**; split_k는 여전히 1 고정)
 - [x] **M3.3** A/B/C를 `pim.memory_region`(host/device_global)으로 감싸고 `pim.transfer`(host↔device) 삽입 — placement/residency/chunk/reduce 없음
 - [x] **M3.4** pass를 `triton-shared-opt`에 등록 + lit test (`pim.compute` 존재 확인)
 
@@ -203,24 +204,26 @@ pim.launch
 >
 > 원칙: **WHAT(선택·표현)은 공통, HOW(실현·legalize·codegen)는 vendor.** 같은 O-그룹 안에서도 항목마다 계층이 다를 수 있으니 구현 시 디렉토리(`lib/Conversion/*` vs `lib/Conversion/PIMToUPMEM`·`lib/Target/UPMEM`)도 그에 맞춰 둔다.
 
-> **전제 ① — 전체 문제(full-problem) 정보 복원**: MVP의 M3 변환은 single-tile만 가정해 **grid·program_id·K-loop을 버리고** "타일 하나 = 전체 gemm"으로 취급한다. 실제 multi-tile matmul(grid>1, K-loop)에서 tiling/SPLIT 최적화를 하려면, **전체 M/N/K·grid·program_id→tile 매핑을 복원**해 `tile_plan`(BLOCK/SPLIT)과 `chunk_plan`(BLOCK_K)으로 표현해야 한다. 이 복원이 O3.3(chunk-planning)·O4(strategy)의 전제이며, **O1 변환 일반화 시 함께 수행**한다 (MVP는 BLOCK=전체라 이 정보가 비어 있어도 동작).
+> **전제 ① — 전체 문제(full-problem) 정보 복원**: MVP의 M3 변환은 single-tile만 가정해 **grid·program_id·K-loop을 버리고** "타일 하나 = 전체 gemm"으로 취급한다. 실제 multi-tile matmul(grid>1, K-loop)에서 tiling/SPLIT 최적화를 하려면, **전체 M/N/K·grid·program_id→tile 매핑을 복원**해 `tile_plan`(grid·SPLIT)으로 표현하고 **K-loop은 본문 `scf.for`에 보존**해야 한다 (별도 `chunk_plan` 없음 — DESIGN 11.6). 이 복원이 O4(strategy)의 전제이며, **O1 faithful-body 전환 시 함께 수행**한다 (MVP는 BLOCK=전체라 이 정보가 비어 있어도 동작). **현황**: O1.8이 전체 M/N/K를 런타임 인자로 복원해 multi-tile은 이미 동작한다. 남은 건 `program_id` 전역 오프셋을 분배층으로 옮겨 본문을 로컬 슬라이스 기준으로 단순화(O1.3)하고 K-loop을 본문 `scf.for`로 보존(O1.1)하는 부분이다.
 
-> **전제 ② — codegen이 IR 값을 받아 생성**: plan/strategy pass는 IR에 intent/구조(`num_units`·tile offset·`chunk_plan`·tasklet 수 등)를 표현한다 (DESIGN 13.0 경계). 그러나 현재 translate(`UPMEMToHost`/`UPMEMToDevice`)는 이 값들을 **읽지 않고 고정 템플릿**을 emit한다: `dpu_alloc(1,...)`(항상 DPU 1개), `local_gemm{m,n,k}`를 상수로 박음, device는 `if(me()!=0) return`(tasklet 1개)로 전체를 혼자 계산. 따라서 SPLIT(여러 DPU)·chunk(큰 K)·multi-tasklet은 IR 표현만으론 실행되지 않고, **translate·launcher가 그 IR 값을 읽어 parameterized code를 생성**하도록 일반화해야 한다 (O4.6). "IR에 박힘"과 "여러 DPU에서 실제로 돔"은 다른 단계임에 주의.
+> **전제 ② — codegen이 IR 값을 받아 생성 (O4.6에서 해소됨)**: plan/strategy pass는 IR에 intent/구조(`num_units`·split·BLOCK·tasklet 수 등)를 표현한다 (DESIGN 13.0 경계). 초기 translate는 이 값을 읽지 않고 고정 템플릿(`dpu_alloc(1)`·single tasklet)을 emit했으나, **O4.6에서 일반화 완료**: `UPMEMToHost`가 `alloc_units{num_units,split_m,split_n}`를 읽어 `dpu_alloc(NUM_UNITS)` + 2D scatter/gather를, `UPMEMToDevice`가 `local_gemm`의 BLOCK_*를 bake + `NR_TASKLETS` round-robin을 생성한다. launcher는 `metadata.local_lanes`로 `-DNR_TASKLETS`를 넘긴다. **남은 일반화**: split_k(여러 DPU가 한 타일을 K분담) + `host_reduce` (O4.4/O3.5). "IR에 박힘"과 "여러 DPU에서 실제로 돔"은 다른 단계임에 주의.
 
-## O1 — 단일 변환을 granular plan pass로 분해
+## O1 — faithful-body 전환 (본문 보존 + build-pim-offload 통합)
 
-**목표**: M3의 단일 `convert-ttshared-to-pim`을 DESIGN.md 13.1의 granular plan pass들로 분해한다. **behavior-preserving 리팩터** — no-split 입력에 대해 분해 전후 출력 IR(및 최종 vendor artifact)이 동일해야 한다. 이 분해가 이후 per-pass 최적화의 토대가 된다.
+**목표**: M3의 coarse `pim.compute @gemm`(본문 치환)을 DESIGN 11.0의 **faithful-body**로 전환한다. 본문(`scf`/`linalg`/`memref`)을 보존하고, 변환은 granular 분해 대신 **단일 `build-pim-offload`**로 통합한다. (이전 계획의 "10개 granular 패스 분해"는 과설계로 폐기 — DESIGN 13.1.)
+
+> **현재 구현과의 격차**: M3/M4/O4는 interim coarse 모델(`pim.compute @gemm` + `local_gemm` 템플릿)로 빌드돼 gemm은 HW 검증까지 통과했다. O1은 이를 faithful-body로 옮겨 **임의 커널(gemv/relu/fused)** 까지 같은 경로로 처리하게 만든다. gemm 결과는 전환 전후 동일해야 한다.
 
 **작업 단위**:
 
-- [ ] **O1.1** `[공통·구조]` `build-pim-memory-plan` (host/device memory_region 생성) 분리
-- [ ] **O1.2** `[공통·구조]` `build-pim-tile-plan` (주어진 block/split **기록만**, 최적화 X) — 실제 타일 micro-fit은 vendor
-- [ ] **O1.3** `[공통·구조]` `build-pim-transfer-plan` (transfer 골격 삽입) — 실제 copy 방식(DMA/dpu_copy)은 vendor
-- [ ] **O1.4** `[공통·intent]` `build-pim-execution-plan` (mapping_policy **enum**만) — 실제 DPU/channel 배정은 vendor
-- [ ] **O1.5** `[공통·intent]` `build-pim-placement-plan` (placement policy **enum**만) — bank/channel 오프셋 산술은 vendor(`UPMEMMemoryPlacement`)
-- [ ] **O1.6** `[공통·intent]` `build-pim-residency-plan` (residency enum) — 실제 상주 버퍼 관리는 vendor
-- [ ] **O1.7** `[검증]` 동치 검증: no-split에 대해 분해 파이프라인 출력 == M3 출력(M2 dump로 비교), M6 재통과
-- [x] **O1.8** `[공통·구조]` 전체 M/N/K 복원: 변환이 tiled-gemm(scf.for+matmul+accumulate) 인식, 전체 M/N/K(`%arg3/4/5`)를 `pim.compute extent`로 운반(BLOCK은 tile_plan에 기록). codegen(UPMEMToHost·launcher)이 baked 상수 대신 런타임 M/N/K로 동작 → **multi-tile이 1 DPU에서 정답**(128×128×256, grid=(2,2) 검증). `chunk_plan`(BLOCK_K streaming)은 O3.3, grid→유닛 SPLIT은 O4에서.
+- [ ] **O1.1** `[공통·구조]` faithful-body 변환: `linalg.matmul`을 `@gemm`으로 치환하지 말고, `scf`/`linalg`/`memref` 본문을 `pim.compute` **region에 보존**. `primitive="gemm"`은 속성으로만 기록 (DESIGN 11.0/11.11).
+- [ ] **O1.2** `[공통·구조]` `build-pim-offload` 단일 패스: `memory_region`/`transfer`/`tile_plan`(grid·SPLIT)/`execution_group`(mapping enum)을 본문 주위에 합성 (이전 detect/extract/recognize/build-*-plan/convert를 흡수).
+- [ ] **O1.3** `[공통·구조]` `program_id` 전역 오프셋을 분배층(`tile_plan` grid + host scatter)으로 이동 — region 본문은 로컬 슬라이스 기준으로 단순화.
+- [ ] **O1.4** `[vendor]` `UPMEMToDevice` 충실 번역: `local_gemm` 템플릿 대신 본문(`linalg`→loops, `memref`→`mram_read`/WRAM/`mram_write`)을 번역 (DESIGN 14.8). `local_gemm`은 gemm 단축 경로로 유지 가능. → gemv/relu/fused 일반화의 토대.
+- [ ] **O1.5** `[검증]` 동치: faithful-body 전환 후 M6 재통과 (gemm 결과 동일, M2 dump로 `pim_common`·device.c 확인).
+- [x] **O1.8** `[공통·구조]` 전체 M/N/K 복원: 변환이 tiled-gemm(scf.for+matmul+accumulate) 인식, 전체 M/N/K(`%arg3/4/5`)를 운반(BLOCK은 tile_plan에 기록). codegen(UPMEMToHost·launcher)이 런타임 M/N/K로 동작 → **multi-tile 정답**(128×128×256, grid=(2,2)). faithful-body에선 이 복원이 O1.3(분배층 이동)과 합쳐진다.
+
+> O1.6/O1.7(옛 granular 분해·동치 항목)은 build-pim-offload 통합으로 폐기.
 
 ---
 
@@ -236,20 +239,21 @@ pim.launch
 
 ---
 
-## O3 — Common Optimization Passes (하나씩)
+## O3 — Common Optimization Passes (하나씩, 전부 opt-in)
 
-**목표**: DESIGN.md 13.2 최적화 pass를 **하나씩** 추가. 각 pass는 13.0 경계 준수(intent/gate/구조만), toggle 가능, lit test + e2e 재검증.
+**목표**: DESIGN.md 13.2 최적화 pass를 **하나씩** 추가. 각 pass는 13.0 경계 준수(intent/gate/구조만), toggle 가능, **OFF 시 O1 결과가 그대로 통과**, lit test + e2e 재검증.
 
 **작업 단위** (각 pass별 lit test 포함):
 
 - [ ] **O3.1** `[공통·구조]` `pim-layout-normalize` — 표현 정규화만 (중복 transpose 제거·단일 canonical form). 물리 layout(`pack_by_*`)은 vendor
 - [ ] **O3.2** `[공통·intent]` `pim-data-placement` — placement **intent enum**만 갱신. 구체 분산은 vendor
-- [ ] **O3.3** `[공통·구조]` `pim-chunk-planning` — `num_chunks=ceildiv(K,BLOCK_K)` **산술만**. register/WRAM fitting은 vendor(O4.6 codegen)
-- [ ] **O3.4** `[공통·구조]` `pim-transfer-hoisting` — 반복 transfer를 상위 scope로
-- [ ] **O3.5** `[공통·intent]` `pim-persistent-data` — weight/KV를 persistent로 **표시**. 실제 상주는 vendor
-- [ ] **O3.6** `[공통·구조]` `pim-partial-result-planning` — partial/reduce **구조**만 (split_k>1일 때). 실제 reduce는 vendor
-- [ ] **O3.7** `[공통·gate]` `pim-pipeline-overlap` — `supports_pipeline_overlap`일 때만 `pim.pipeline` 삽입. 실제 async/double-buffer는 vendor
-- [ ] **O3.8** `[검증]` end-to-end matmul로 baseline(MVP) 대비 성능 개선 측정
+- [ ] **O3.3** `[공통·구조]` `pim-transfer-hoisting` — 반복 transfer를 상위 scope로
+- [ ] **O3.4** `[공통·intent]` `pim-persistent-data` — weight/KV를 persistent로 **표시**. 실제 상주는 vendor
+- [ ] **O3.5** `[공통·구조]` `pim-partial-result-planning` — partial/reduce **구조**만 (split_k>1일 때). 실제 reduce는 vendor
+- [ ] **O3.6** `[공통·gate]` `pim-pipeline-overlap` — `supports_pipeline_overlap`일 때만 `pim.pipeline` 삽입. 실제 async/double-buffer는 vendor
+- [ ] **O3.7** `[검증]` end-to-end matmul로 baseline(MVP) 대비 성능 개선 측정
+
+> `pim-chunk-planning`은 제거 — K-loop이 본문 `scf.for`에 보존되므로 chunk는 파생(DESIGN 11.6). WRAM fitting은 vendor device codegen(O1.4/O4.6)이 담당.
 
 ---
 
@@ -266,7 +270,7 @@ pim.launch
 - [ ] **O4.3** `[공통·gate]` `SelectPIMExecutionStrategy` Common pass — split factor + vendor capability/constraints로 적법 전략 필터, autotune 미사용 시 단순 기본 규칙(no-split 우선)
 - [ ] **O4.4** `[vendor]` UPMEM lowering이 전략 attribute legalize (`reduction_k_partitioned` → UPMEM `host_reduce`) + lit test
 - [~] **O4.5** `[검증]` e2e: SPLIT에 따라 동작 검증 — **n-split `split_n=2` 정답 통과**(`test_pim_matmul_tiled.py`). k/m-split·reduce 검증은 이후.
-- [~] **O4.6** `[vendor]` translate·launcher가 IR 값을 받아 생성(전제 ②). **완료**: (a) n-split host codegen(`alloc_units{num_units}`→`dpu_alloc(U)`, A broadcast/B 열scatter/C gather, split_n=2 검증). (b) **device BLOCK 타일링** — `UPMEMToDevice`가 `local_gemm`의 BLOCK_M/N/K를 bake, 부분행렬을 `BLOCK_M×BLOCK_N` 타일로 순회하며 `BLOCK_K`를 WRAM(aW/bW/acc)에 올려 누적·재사용. **①a 단일 tasklet** + **①b cooperative 다중 tasklet**(WRAM 타일 공유 + BLOCK_M 행 tasklet 분할 + barrier) 모두 HW에서 검증 (split_n=2 × local_lanes=8/16). **남음**: k-split `host_reduce`. **제약**: WRAM = aW+bW+acc+tasklet 스택 ≤ 64KB → BLOCK/local_lanes 균형(autotune), per-call `dpu_alloc/load`는 persistent set으로 개선 여지.
+- [x] **O4.6** `[vendor]` translate·launcher가 IR 값을 받아 생성(전제 ②). **완료**: (a) n-split host codegen(`alloc_units{num_units}`→`dpu_alloc(U)`, A broadcast/B 열scatter/C gather, split_n=2 검증). (b) **device BLOCK 타일링** — `UPMEMToDevice`가 `local_gemm`의 BLOCK_M/N/K를 bake, 부분행렬을 `BLOCK_M×BLOCK_N` 타일로 순회하며 `BLOCK_K`를 WRAM(aW/bW/acc)에 올려 누적·재사용. **①a 단일 tasklet** + **①b cooperative 다중 tasklet**(WRAM 타일 공유 + BLOCK_M 행 tasklet 분할 + barrier) 모두 HW에서 검증 (split_n=2 × local_lanes=8/16). **남음**: k-split `host_reduce`. **제약**: WRAM = aW+bW+acc+tasklet 스택 ≤ 64KB → BLOCK/local_lanes 균형(autotune), per-call `dpu_alloc/load`는 persistent set으로 개선 여지.
 - [x] **O4.7** `[공통 knob + vendor]` multi-tasklet (intra-DPU 병렬, `local_lanes`=`NR_TASKLETS`): `PIMOptions.local_lanes`(공통 knob, default 1) → `metadata` → launcher가 `-DNR_TASKLETS=L`로 device.c 컴파일. `UPMEMToDevice`가 `NR_TASKLETS` 매크로 기반 device.c 생성 — `BARRIER_INIT` + `me()==0`이 `mem_reset` 후 barrier, tasklet별 `mem_alloc` WRAM, `for(i=me();i<M;i+=NR_TASKLETS)` 행 round-robin(행 disjoint→끝 barrier 불필요). **검증: `split_n=2, local_lanes=16` (2 DPU × 16 tasklet) 정답 통과.** (DESIGN 14.6)
 
 > **수직 슬라이스 (완료)**: 전략 프레임워크(O4.1~O4.4)를 건너뛰고 옵션으로 끝까지 관통 —
@@ -284,7 +288,7 @@ pim.launch
 
 **작업 단위**:
 
-- [ ] **O5.1** `[공통]` PIM 전용 노브를 compile option으로 받아 `build-pim-tile-plan`(SPLIT_*) / `build-pim-execution-plan`(NUM_UNITS·LOCAL_LANES)이 IR attr로 반영
+- [ ] **O5.1** `[공통]` PIM 전용 노브를 compile option으로 받아 `build-pim-offload`가 `tile_plan`(SPLIT_*)·`execution_group`(NUM_UNITS·LOCAL_LANES) attr로 반영 (별도 annotation pass 없음, DESIGN 17.0). split의 런타임 default vs autotune config 우선순위는 DESIGN 26.4(config 우선)
 - [ ] **O5.2** `[검증]` autotune config별 독립 IR/artifact 생성·실측이 동작하는지 검증 (config N개 → N벌 컴파일)
 - [ ] **O5.3** `[공통+vendor]` O4 전략 후보를 autotune이 실측 선택하는 통합 — 후보 선택은 공통, 각 후보의 실측 대상 artifact는 vendor codegen(O4.6) (vendor별 best가 달라지는지 확인)
 
@@ -354,7 +358,7 @@ M5 runtime
 M6 E2E 검증  ← ✅ "돈다"
   │
 ── Part II (최적화, additive) ─────────────
-  ├─ O1 granular 분해 ──┐
+  ├─ O1 faithful-body 전환 ──┐
   │                     ↓
   │                  O2 capability ──┐
   │                                  ↓
@@ -381,6 +385,8 @@ M6 E2E 검증  ← ✅ "돈다"
 ## 다음 액션
 
 O1.8(multi-tile 1-DPU) + O4 n-split(`split_n`, 여러 DPU) + multi-tasklet(`local_lanes`, DPU 내부 병렬) 완료. 현재 `split_n=2, local_lanes=16` (2 DPU × 16 tasklet) 정답.
+
+**⓪ DESIGN faithful-body 전환 (O1) — 구조 우선순위**: 현재 변환은 coarse `pim.compute @gemm` + `local_gemm` 템플릿(gemm 전용)이다. DESIGN이 faithful-body로 바뀌었으므로, 본문(`scf`/`linalg`/`memref`) 보존 + `build-pim-offload` 통합 + `UPMEMToDevice` 충실 번역(14.8)으로 옮긴다. gemm 결과는 동일 유지하되 **gemv/relu/fused로 확장 가능**해진다. 성능 작업 ①~④와 독립적으로 진행 가능.
 
 **실행 모델 확정 (DESIGN 11.5.2): SPLIT(굵게, 유닛 간) → BLOCK(잘게, 유닛 내부 타일) → BLOCK_K(WRAM 청크, A/B 재사용).** "1 BLOCK = 1 DPU"는 폐기 — BLOCK은 DPU 분배 단위가 아니라 DPU 내부 타일이다. PGEMM `basic_n`과 분배(2D 출력분배)는 동일하나, **BLOCK 타일링으로 WRAM 재사용**하는 게 차이·이점.
 
