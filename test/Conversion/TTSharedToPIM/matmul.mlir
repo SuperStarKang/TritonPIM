@@ -1,6 +1,6 @@
-// linalg.matmul을 가진 함수가 PIM Common IR로 교체되는지 확인.
+// linalg.matmul을 가진 함수가 faithful-body PIM Common IR로 변환되는지 확인.
 // (triton-to-linalg는 별도 marker attribute 없이 linalg.matmul을 emit한다.)
-// RUN: triton-shared-opt --convert-ttshared-to-pim %s | FileCheck %s
+// RUN: triton-shared-opt --build-pim-offload %s | FileCheck %s
 
 // CHECK-LABEL: func.func @matmul_kernel
 func.func @matmul_kernel(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
@@ -15,12 +15,22 @@ func.func @matmul_kernel(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>
   return
 }
 
-// 변환 후 함수 본문은 pim 시퀀스로 교체된다.
+// 변환 후: 분배 구조(memory_region/tile_plan/transfer/launch)는 합성되고,
+// 계산 본문은 pim.compute region에 유닛-로컬 nest로 보존된다.
 // CHECK: pim.memory_region %arg0 {layout = "row_major", role = "input_activation", space = "host"}
-// CHECK: pim.memory_region %arg1 {layout = "row_major", role = "weight", space = "device_global"}
+// CHECK: pim.memory_region %arg1 {layout = "row_major", role = "weight", space = "host"}
 // CHECK: pim.memory_region %arg2 {layout = "row_major", role = "output", space = "host"}
 // CHECK: pim.tile_plan {block_k = 256 : i64, block_m = 32 : i64, block_n = 64 : i64, split_k = 1 : i64, split_m = 1 : i64, split_n = 1 : i64}
+// CHECK: pim.execution_group {local_lanes = 1 : i64, mapping_policy = "none", num_units = 1 : i64, stationary_data = "B"}
 // CHECK: pim.transfer
-// CHECK: pim.compute(%{{.*}}, %{{.*}}, %{{.*}}) using %{{.*}} extent(%{{.*}}, %{{.*}}, %{{.*}}) {op = "gemm"}
+// CHECK: pim.compute ins(%{{.*}}, %{{.*}}) outs(%{{.*}}) using %{{.*}}, %{{.*}} {primitive = "gemm"}
+// faithful-body: tm/tn(복원된 grid) + K-loop + 보존된 linalg.matmul(memref form).
+// CHECK: ^{{.*}}(%[[A:.*]]: memref<?x?xf32>, %[[B:.*]]: memref<?x?xf32>, %[[C:.*]]: memref<?x?xf32>):
+// CHECK: scf.for
+// CHECK: scf.for
+// CHECK: linalg.fill
+// CHECK: scf.for
+// CHECK: memref.subview
+// CHECK: linalg.matmul ins({{.*}} : memref<32x256xf32{{.*}}>, memref<256x64xf32{{.*}}>) outs({{.*}} : memref<32x64xf32>)
+// CHECK: memref.copy
 // CHECK: pim.launch @matmul_kernel {device_id = 0 : i64, vendor = "upmem"}
-// CHECK-NOT: linalg.matmul

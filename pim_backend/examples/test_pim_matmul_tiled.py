@@ -1,17 +1,14 @@
 # Multi-tile matmul: grid>1 + K-loop을 가진 표준 Triton matmul.
 #
-# 목적(O1.8): 단일 타일 가정을 제거하기 위해, 실제 multi-tile 커널의 TTSharedIR에서
-# program_id·grid·K-loop이 어떤 형태로 나타나는지 확인한다. 이 IR을 보고 전체 M/N/K와
-# grid→tile 매핑을 복원하는 로직(O1.8)을 설계한다.
+# 현재 상태: build-pim-offload가 이 커널을 faithful-body PIM Common IR로 변환하고(본문을
+# pim.compute region에 보존 + program_id 전역 오프셋을 tm/tn 분배층으로 이동), 2D SPLIT
+# (split_m/n) + multi-tasklet(local_lanes)로 실제 DPU에서 정답까지 통과한다.
+# (전체 M/N/K는 런타임 인자로 흐르고, BLOCK_M/N/K는 컴파일타임 상수.)
 #
-# 주의: 현재 PIM 변환(convert-ttshared-to-pim)은 single-tile만 가정하므로 이 커널에 대해서는
-# 잘못 변환되거나 이후 단계에서 실패할 수 있다. 지금은 ttsharedir(=PIM 변환 이전 단계)을
-# 확인하는 것이 목적이므로, dump로 ttsharedir만 보면 된다.
-#
-# ttsharedir 확인:
+# 단계별 IR 확인:
 #   TRITON_KERNEL_DUMP=1 TRITON_DUMP_DIR=/home/dlrkdals/TritonPIM/dump TRITON_ALWAYS_COMPILE=1 \
 #     python pim_backend/examples/test_pim_matmul_tiled.py
-#   → dump/<hash>/matmul_kernel_tiled.ttsharedir
+#   → dump/<hash>/matmul_kernel_tiled.{ttsharedir,pim_common,vendor_ir}
 
 import time
 
@@ -72,6 +69,6 @@ if __name__ == "__main__":
     # 2D SPLIT: M·N을 split_m×split_n개 DPU에 분배. 각 DPU = M/split_m × N/split_n.
     #   유효: M%split_m==0, N%split_n==0, 그리고 Mu/Nu가 BLOCK_M/N의 배수.
     #   (M=N=128, BLOCK=64 → split_m,split_n ≤ 2.)
-    run(M=128, N=128, K=256, BLOCK_M=64, BLOCK_N=64, BLOCK_K=32, split_m=1, split_n=1, local_lanes=8)  # 1 DPU
+    # run(M=128, N=128, K=256, BLOCK_M=64, BLOCK_N=64, BLOCK_K=32, split_m=1, split_n=1, local_lanes=8)  # 1 DPU
     run(M=128, N=128, K=256, BLOCK_M=64, BLOCK_N=64, BLOCK_K=32, split_m=2, split_n=1, local_lanes=8)  # 2 DPU (M분할)
     run(M=128, N=128, K=256, BLOCK_M=64, BLOCK_N=64, BLOCK_K=32, split_m=2, split_n=2, local_lanes=8)  # 4 DPU (2D)

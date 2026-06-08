@@ -9,6 +9,9 @@ add_triton_library(TTSharedToPIM
   MLIRIR
   MLIRPass
   MLIRTransforms
+  MLIRArithDialect
+  MLIRSCFDialect
+  MLIRMemRefDialect
   MLIRLinalgDialect
   MLIRFuncDialect
   PIMIR

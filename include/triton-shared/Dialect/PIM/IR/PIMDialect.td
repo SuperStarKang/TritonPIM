@@ -48,6 +48,11 @@ def PIM_TilePlanType : PIM_Type<"TilePlan", "tile_plan"> {
   let summary = "Handle to a PIM tile plan";
 }
 
+// 실행 그룹 핸들. pim.execution_group이 만든 유닛 분배 정책을 compute가 참조한다.
+def PIM_ExecGroupType : PIM_Type<"ExecGroup", "exec_group"> {
+  let summary = "Handle to a PIM execution group (unit assignment policy)";
+}
+
 //===----------------------------------------------------------------------===//
 // Ops
 //===----------------------------------------------------------------------===//
@@ -73,6 +78,19 @@ def PIM_TilePlanOp : PIM_Op<"tile_plan", [Pure]> {
   let assemblyFormat = "attr-dict `:` type($result)";
 }
 
+// 유닛 분배 정책 (DESIGN 10.2). mapping_policy는 split로부터 결정한 vendor-neutral enum 문자열
+// (none / output_n_partitioned / output_m_partitioned / output_2d_partitioned /
+//  reduction_k_partitioned). num_units/local_lanes는 option·autotune 값(O2에서 capability_ref로
+// 대체 가능). stationary_data는 상주 입력(gemm은 weight "B"). 실제 유닛 배정·reduce 실현은 vendor
+// lowering이 하고, 이 공통 op은 intent만 기록한다(DESIGN 11.0 경계).
+def PIM_ExecutionGroupOp : PIM_Op<"execution_group", [Pure]> {
+  let summary = "Unit assignment policy (mapping_policy / num_units / local_lanes)";
+  let arguments = (ins StrAttr:$mapping_policy, I64Attr:$num_units,
+                       I64Attr:$local_lanes, StrAttr:$stationary_data);
+  let results = (outs PIM_ExecGroupType:$result);
+  let assemblyFormat = "attr-dict `:` type($result)";
+}
+
 // host↔device 명시적 전송. src/dst는 memory space 이름 문자열.
 def PIM_TransferOp : PIM_Op<"transfer"> {
   let summary = "Explicit transfer of a region between memory spaces";
@@ -80,20 +98,22 @@ def PIM_TransferOp : PIM_Op<"transfer"> {
   let assemblyFormat = "$region attr-dict `:` type($region)";
 }
 
-// PIM 연산. op="gemm"부터. a,b,c 영역과 tile_plan을 받아 결과 영역(partial C)을 낸다.
-// full_m/n/k는 전체 문제 크기(dynamic). Triton 커널이 SPMD(타일 1개)라 IR의 BLOCK은
-// tile_plan에 들어가지만 전체 M/N/K는 런타임 인자다. codegen이 전체를 돌려면 이 값이 필요하다.
-def PIM_ComputeOp : PIM_Op<"compute"> {
-  let summary = "PIM compute primitive (gemm, ...)";
+// PIM 연산 (faithful-body). a/b/c는 memory_region 핸들(전체 buffer), tile_plan은 grid·SPLIT.
+// 본문(scf/linalg/memref)은 치환하지 않고 region에 그대로 보존한다(DESIGN 4.1/10.2).
+// region block arg(%a,%b,%c)는 한 execution_unit이 맡은 로컬 슬라이스 memref다 — operand의
+// 전체 region 핸들과는 별개다. primitive("gemm" 등)는 전략 힌트 속성일 뿐 본문을 대체하지 않는다.
+// 전체 M/N/K는 IR에 박지 않는다: 본문은 block arg의 런타임 dim(Mu/Nu/K)을 쓰고, host codegen은
+// launcher가 넘기는 런타임 M/N/K를 쓴다. NoTerminator: 본문 끝에 별도 종결 op를 요구하지 않는다.
+def PIM_ComputeOp : PIM_Op<"compute", [NoTerminator]> {
+  let summary = "PIM compute: per-unit body in a region (faithful-body)";
   let arguments = (ins PIM_RegionType:$a, PIM_RegionType:$b, PIM_RegionType:$c,
+                       PIM_ExecGroupType:$execution_group,
                        PIM_TilePlanType:$tile_plan,
-                       I32:$full_m, I32:$full_n, I32:$full_k,
-                       StrAttr:$op);
-  let results = (outs PIM_RegionType:$result);
+                       StrAttr:$primitive);
+  let regions = (region AnyRegion:$body);
   let assemblyFormat = [{
-    `(` $a `,` $b `,` $c `)` `using` $tile_plan
-    `extent` `(` $full_m `,` $full_n `,` $full_k `)` attr-dict
-    `:` functional-type(operands, results)
+    `ins` `(` $a `,` $b `)` `outs` `(` $c `)` `using` $execution_group `,` $tile_plan attr-dict
+    `:` `(` type($a) `,` type($b) `,` type($c) `,` type($execution_group) `,` type($tile_plan) `)` $body
   }];
 }
 
