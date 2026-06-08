@@ -992,7 +992,7 @@ device(12.8)는 `DPU_INPUT_ARGUMENTS`의 `Mu/Nu/K/BLOCK_K/offset`을 루프 경�
 
 두 병렬 축은 "값이 어디에 박히는가"가 다르다.
 
-- **`NUM_UNITS`(=SPLIT) — host.cpp 소스에 박힘**: `alloc_units{num_units=U}` → `UPMEMToHost`가 `U`를 C 상수로 host.cpp에 박는다(`dpu_alloc(U)`, A는 행밴드 scatter, B/C는 per-DPU prepare_xfer + push_xfer). host는 g++로 컴파일되는 일반 코드라 상수면 충분 → 소스 번들만으로 완결.
+- **`NUM_UNITS`(=SPLIT) — host.cpp에 런타임 인자로 전달**: `UPMEMToHost`는 `num_units`(=`split_m×split_n`)를 인자로 받는 제네릭 host.cpp를 emit한다(`dpu_alloc(num_units)`, A는 행밴드 scatter, B/C는 per-DPU prepare_xfer + push_xfer). split을 상수로 박지 않으므로 한 번 컴파일한 host.so가 모든 shape·split에 적응한다(인자 값은 driver의 `decide_split` 또는 autotune config가 정함, 15.3/15.4).
 - **`LOCAL_LANES`(=NR_TASKLETS) — device 컴파일 플래그로 전달**: DPU 런타임은 tasklet 개수를 `-DNR_TASKLETS` 컴파일 플래그로만 안다. `UPMEMToDevice`는 device.c를 `NR_TASKLETS` 매크로 기반으로 generic하게 emit하고(`BARRIER_INIT`, tasklet마다 자기 WRAM 캐시, `for(i=me(); i<Mu; i+=NR_TASKLETS)` 행 round-robin), launcher가 `metadata.local_lanes`를 읽어 `dpu-upmem-dpurte-clang -DNR_TASKLETS=L`로 컴파일한다. IR 구조를 바꾸지 않는 device 빌드 파라미터라 metadata 채널로 흐른다.
 
 이득: DPU의 fine-grained multithreading이 한 tasklet의 `mram_read` 지연을 다른 tasklet 연산으로 숨긴다. 제약: per-tasklet WRAM × NR_TASKLETS ≤ WRAM 예산 → `BLOCK`·`local_lanes` 균형(autotune).
