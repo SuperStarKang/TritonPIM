@@ -38,7 +38,10 @@ upmem.device_func "matmul_kernel_device" {
   }
 }
 
-// HOST: extern "C" void matmul_kernel_host(float* A, float* B, float* C, uint32_t M, uint32_t N, uint32_t K)
+// dtype-aware: f32 입력이라 Tin=Tacc=float.
+// HOST: typedef float Tin;
+// HOST: typedef float Tacc;
+// HOST: extern "C" void matmul_kernel_host(Tin* A, Tin* B, Tacc* C, uint32_t M, uint32_t N, uint32_t K)
 // HOST: const uint32_t SPLIT_M = 1, SPLIT_N = 1, SPLIT_K = 1;
 // HOST: dpu_alloc(NUM_UNITS, NULL, &set)
 // HOST: dpu_load(set, DPU_BINARY, NULL)
@@ -50,8 +53,10 @@ upmem.device_func "matmul_kernel_device" {
 // DEVICE: #define BLOCK_M 32
 // DEVICE: #define BLOCK_N 64
 // DEVICE: #define BLOCK_K 64
+// DEVICE: typedef float Tin;
+// DEVICE: typedef float Tacc;
 // DEVICE: __host uint32_t M;
-// DEVICE: __dma_aligned float aW[BLOCK_M * BLOCK_K]
+// DEVICE: __dma_aligned Tin aW[BLOCK_M * BLOCK_K]
 // DEVICE: BARRIER_INIT(my_barrier, NR_TASKLETS)
 // DEVICE: int main()
 // DEVICE: uint32_t t = me();
@@ -59,4 +64,4 @@ upmem.device_func "matmul_kernel_device" {
 // DEVICE: for (uint32_t r = t; r < BLOCK_M; r += NR_TASKLETS)
 // DEVICE: barrier_wait(&my_barrier)
 // DEVICE: acc[r * BLOCK_N + c] += s
-// DEVICE: mram_write(&acc[r * BLOCK_N], &C_mram[(tm + r) * N + tn], BLOCK_N * sizeof(float))
+// DEVICE: mram_write(&acc[r * BLOCK_N], &C_mram[(tm + r) * N + tn], BLOCK_N * sizeof(Tacc))

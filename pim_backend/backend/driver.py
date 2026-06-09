@@ -44,7 +44,9 @@ def _build_pim_so(host_src: str, device_src: str, local_lanes: int) -> str:
     # 소스 번들을 device.elf + host.so로 컴파일하고 host.so 경로를 돌려준다.
     # 소스 해시를 키로 캐시해 같은 커널은 한 번만 컴파일한다(CPULauncher와 동일한 발상).
     # local_lanes는 소스에 안 박히고 -DNR_TASKLETS 플래그로만 들어가므로 키에 따로 포함한다.
-    key = hashlib.sha256((host_src + device_src + f"|L={local_lanes}").encode("utf-8")).hexdigest()
+    # dpu_opt도 키에 넣어 최적화 레벨을 바꾸면 캐시가 자동 무효화되게 한다(안 그러면 옛 elf 재사용).
+    dpu_opt = "-O2"  # device 커널 최적화. -O0(clang 기본)면 MAC 루프 언옵티마이즈드 → ~2× 느림. PGEMM도 -O2(libPGEMM.sh).
+    key = hashlib.sha256((host_src + device_src + f"|L={local_lanes}|{dpu_opt}").encode("utf-8")).hexdigest()
     cache = get_cache_manager(key)
     so_name = "pim_host.so"
     so_path = cache.get_file(so_name)
@@ -57,9 +59,9 @@ def _build_pim_so(host_src: str, device_src: str, local_lanes: int) -> str:
         Path(device_c).write_text(device_src)
         Path(host_cpp).write_text(host_src)
 
-        # device.c → device.elf. NR_TASKLETS = local_lanes (DPU 내부 tasklet 수).
+        # device.c → device.elf. NR_TASKLETS = local_lanes (DPU 내부 tasklet 수). dpu_opt(-O2)는 위에서 정의.
         elf_tmp = os.path.join(tmp, "device.elf")
-        subprocess.check_call(["dpu-upmem-dpurte-clang", f"-DNR_TASKLETS={local_lanes}",
+        subprocess.check_call(["dpu-upmem-dpurte-clang", dpu_opt, f"-DNR_TASKLETS={local_lanes}",
                                device_c, "-o", elf_tmp])
         # host.so는 실행 중 dpu_load(DPU_BINARY)로 elf를 연다 → 캐시에 박아 안정 경로를 확보한다.
         elf_path = cache.put(Path(elf_tmp).read_bytes(), "device.elf", binary=True)
