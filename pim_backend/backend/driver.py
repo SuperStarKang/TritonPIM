@@ -40,13 +40,35 @@ def _dpu_host_flags():
     return ["-I/usr/include/dpu", "-ldpu"]
 
 
+def _build_pim_runtime() -> str:
+    # config 무관한 공유 런타임(pim_runtime.c)을 libpim_runtime.so로 1회 빌드한다.
+    # 내용이 고정이라 캐시 해시도 고정 → 모든 host.so가 "같은 경로의" .so를 링크 →
+    # 동적 로더가 1개만 적재 → set 캐시 globals가 프로세스에서 공유된다(persistent의 핵심).
+    backend_dir = os.path.dirname(os.path.abspath(__file__))
+    rt_c = os.path.join(backend_dir, "pim_runtime.c")
+    key = hashlib.sha256(("pim_runtime|" + Path(rt_c).read_text()).encode("utf-8")).hexdigest()
+    cache = get_cache_manager(key)
+    so_name = "libpim_runtime.so"
+    so_path = cache.get_file(so_name)
+    if so_path is None:
+        with tempfile.TemporaryDirectory() as tmp:
+            so_tmp = os.path.join(tmp, so_name)
+            subprocess.check_call(
+                ["gcc", "-O2", "-fPIC", "-shared", rt_c, *_dpu_host_flags(), "-o", so_tmp])
+            so_path = cache.put(Path(so_tmp).read_bytes(), so_name, binary=True)
+    return so_path
+
+
 def _build_pim_so(host_src: str, device_src: str, local_lanes: int) -> str:
     # 소스 번들을 device.elf + host.so로 컴파일하고 host.so 경로를 돌려준다.
     # 소스 해시를 키로 캐시해 같은 커널은 한 번만 컴파일한다(CPULauncher와 동일한 발상).
     # local_lanes는 소스에 안 박히고 -DNR_TASKLETS 플래그로만 들어가므로 키에 따로 포함한다.
     # dpu_opt도 키에 넣어 최적화 레벨을 바꾸면 캐시가 자동 무효화되게 한다(안 그러면 옛 elf 재사용).
     dpu_opt = "-O2"  # device 커널 최적화. -O0(clang 기본)면 MAC 루프 언옵티마이즈드 → ~2× 느림. PGEMM도 -O2(libPGEMM.sh).
-    key = hashlib.sha256((host_src + device_src + f"|L={local_lanes}|{dpu_opt}").encode("utf-8")).hexdigest()
+    # 공유 런타임 .so 경로(=내용 해시)를 키에 포함 → pim_runtime.c가 바뀌면 host.so도 재빌드되어
+    # 모든 host.so가 동일한 최신 런타임을 링크한다(섞이면 set 캐시 globals가 안 공유됨).
+    runtime_so = _build_pim_runtime()
+    key = hashlib.sha256((host_src + device_src + f"|L={local_lanes}|{dpu_opt}|rt={runtime_so}").encode("utf-8")).hexdigest()
     cache = get_cache_manager(key)
     so_name = "pim_host.so"
     so_path = cache.get_file(so_name)
@@ -63,15 +85,21 @@ def _build_pim_so(host_src: str, device_src: str, local_lanes: int) -> str:
         elf_tmp = os.path.join(tmp, "device.elf")
         subprocess.check_call(["dpu-upmem-dpurte-clang", dpu_opt, f"-DNR_TASKLETS={local_lanes}",
                                device_c, "-o", elf_tmp])
-        # host.so는 실행 중 dpu_load(DPU_BINARY)로 elf를 연다 → 캐시에 박아 안정 경로를 확보한다.
+        # elf를 캐시에 박아 안정 경로를 확보한다. 실행 중 pim_acquire(DPU_BINARY)가 이 경로를 dpu_load한다.
         elf_path = cache.put(Path(elf_tmp).read_bytes(), "device.elf", binary=True)
 
         # host.cpp → host.so : DPU_BINARY 매크로를 캐시의 device.elf 절대경로로 덮어쓴다.
         # -fopenmp: split_k>1일 때 host reduce(tree)의 `#pragma omp parallel for`용. 없으면 pragma 무시되어 순차 실행.
+        # pim_runtime.h(-I backend_dir) + libpim_runtime.so(전체 경로로 링크 + rpath) → 모든 host.so가
+        #   같은 런타임 인스턴스를 공유(persistent set 캐시).
+        backend_dir = os.path.dirname(os.path.abspath(__file__))
+        runtime_dir = os.path.dirname(runtime_so)
         so_tmp = os.path.join(tmp, so_name)
         subprocess.check_call(
             ["g++", "-O2", "-std=c++17", "-fPIC", "-shared", "-fopenmp",
-             f'-DDPU_BINARY="{elf_path}"', host_cpp, *_dpu_host_flags(), "-o", so_tmp])
+             f'-DDPU_BINARY="{elf_path}"', f"-I{backend_dir}",
+             host_cpp, *_dpu_host_flags(),
+             runtime_so, "-Wl,-rpath," + runtime_dir, "-o", so_tmp])
         so_path = cache.put(Path(so_tmp).read_bytes(), so_name, binary=True)
 
     return so_path

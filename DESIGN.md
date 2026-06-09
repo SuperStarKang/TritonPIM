@@ -1281,7 +1281,11 @@ int pim_synchronize(void* device);
 int pim_device_close(void* device);
 ```
 
-UPMEM의 경우 생성된 host.cpp가 dpu_alloc/load/copy/launch를 직접 수행하는 런타임 glue이므로, launcher는 이 host.so를 컴파일·dlopen하여 `<kernel>_host(...)`를 호출한다.
+UPMEM의 경우 생성된 host.cpp가 transfer/launch/gather를 수행하는 런타임 glue이고, DPU 예약(`dpu_alloc`)·커널 적재(`dpu_load`)는 공유 런타임 `pim_runtime`(`libpim_runtime.so` — 모든 host.so가 링크해 globals를 공유)의 `pim_acquire(num_units, elf)`로 위임한다. launcher는 host.so를 컴파일·dlopen하여 `<kernel>_host(...)`를 호출한다.
+
+**persistent DPU set (구현됨)**: `pim_acquire`는 set을 **1개 캐시**해 같은 `num_units` 호출에서 재사용한다 — `dpu_alloc`(예약, HW 측정상 ~280ms = wall의 ~60%)을 세션당 1회로 줄인다(PGEMM이 `main`에서 alloc 1회 하는 것과 동일한 모델). set이 보관하는 건 **예약 + 적재된 elf**뿐(데이터 A/B/C는 매 호출 재전송)이라 1개면 충분하고, `num_units`이 다르면 옛 set을 free 후 새로 잡아 **카운트 누적 고갈을 막는다**. config(=BLOCK/split/dtype) 전환 시엔 같은 set에 elf만 reload(~25ms). 종료 시 `atexit` free.
+
+> **참고(후속 확장, 미구현)**: 작은 config 여러 개가 DPU에 동시에 들어맞으면 **set 다개 보관 + LRU 교체**로 전환 reload까지 없앨 수 있다(LLM에서 weight shape별 커널이 공존할 때). 더 나아가 **weight-stationary**(weight B를 MRAM에 상주시켜 토큰마다 재전송 제거; `pim.data_residency residency="persistent"`, 10.2)로 가면 set이 "재사용할 데이터(weight)"를 들게 되어 *어떤 weight set을 살려둘지*가 핵심 최적화가 된다. 현재는 데이터를 상주시키지 않으므로 **단일 set으로 충분**하다.
 
 ---
 

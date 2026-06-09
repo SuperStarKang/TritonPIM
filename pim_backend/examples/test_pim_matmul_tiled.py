@@ -139,9 +139,8 @@ if __name__ == "__main__":
     # run_i8(M=1024, N=4096, K=1024, BLOCK_M=32, BLOCK_N=32, BLOCK_K=512, split_m=16, split_n=32, split_k=2, local_lanes=16)
 
     # split k test
-    # run_i8(M=1024, N=4096, K=1024, BLOCK_M=32, BLOCK_N=32, BLOCK_K=8, split_m=16, split_n=32, split_k=1, local_lanes=16)
-    # run_i8(M=1024, N=4096, K=1024, BLOCK_M=32, BLOCK_N=32, BLOCK_K=8, split_m=16, split_n=32, split_k=2, local_lanes=16)
-    # run_i8(M=1024, N=4096, K=1024, BLOCK_M=32, BLOCK_N=32, BLOCK_K=8, split_m=16, split_n=32, split_k=4, local_lanes=16)
-    # run_i8(M=1024, N=4096, K=1024, BLOCK_M=32, BLOCK_N=32, BLOCK_K=8, split_m=16, split_n=32, split_k=8, local_lanes=16)
+    run_i8(M=1024, N=4096, K=1024, BLOCK_M=32, BLOCK_N=32, BLOCK_K=8, split_m=16, split_n=32, split_k=1, local_lanes=16)
+    run_i8(M=1024, N=4096, K=1024, BLOCK_M=32, BLOCK_N=32, BLOCK_K=8, split_m=16, split_n=32, split_k=2, local_lanes=16)
+    run_i8(M=1024, N=4096, K=1024, BLOCK_M=32, BLOCK_N=32, BLOCK_K=8, split_m=16, split_n=32, split_k=4, local_lanes=16)
 
     run_i8(M=1024, N=4096, K=1024, BLOCK_M=32, BLOCK_N=32, BLOCK_K=256, split_m=16, split_n=128, split_k=1, local_lanes=16)

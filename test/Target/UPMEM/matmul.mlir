@@ -38,13 +38,13 @@ upmem.device_func "matmul_kernel_device" {
   }
 }
 
-// dtype-aware: f32 입력이라 Tin=Tacc=float.
+// dtype-aware: f32 입력이라 Tin=Tacc=float. persistent: pim_acquire로 set 받음(dpu_alloc/load/free 없음).
+// HOST: #include "pim_runtime.h"
 // HOST: typedef float Tin;
 // HOST: typedef float Tacc;
 // HOST: extern "C" void matmul_kernel_host(Tin* A, Tin* B, Tacc* C, uint32_t M, uint32_t N, uint32_t K)
 // HOST: const uint32_t SPLIT_M = 1, SPLIT_N = 1, SPLIT_K = 1;
-// HOST: dpu_alloc(NUM_UNITS, NULL, &set)
-// HOST: dpu_load(set, DPU_BINARY, NULL)
+// HOST: set = pim_acquire(NUM_UNITS, DPU_BINARY)
 // HOST: dpu_push_xfer(set, DPU_XFER_TO_DPU, "A_mram"
 // HOST: dpu_push_xfer(set, DPU_XFER_TO_DPU, "Bt_mram"
 // HOST: dpu_launch(set, DPU_SYNCHRONOUS)

@@ -109,7 +109,9 @@ static LogicalResult translateUPMEMToHost(ModuleOp module, raw_ostream &os) {
   os << "#define _PROF_D(i,j) (((_ck[j].tv_sec-_ck[i].tv_sec)*1000.0)+((_ck[j].tv_nsec-_ck[i].tv_nsec)/1e6))\n";
   // <<< PIM_PROFILE <<<
   // dpu.h는 C API라, C++로 컴파일할 때 이름 mangling을 막으려면 extern "C"로 감싼다.
-  os << "extern \"C\" {\n#include <dpu.h>\n}\n\n";
+  os << "extern \"C\" {\n#include <dpu.h>\n}\n";
+  // 공유 런타임: dpu_alloc/load/free 대신 pim_acquire로 set을 받아 재사용(persistent). dpu.h를 포함한다.
+  os << "#include \"pim_runtime.h\"\n\n";
   os << "#ifndef DPU_BINARY\n#define DPU_BINARY \"" << binary << "\"\n#endif\n\n";
   os << "// dtype: Tin=입력(A/B), Tacc=누적·출력(C). IR matmul 피연산자/outs에서 읽음.\n";
   os << "typedef " << inT << " Tin;\n";
@@ -126,12 +128,10 @@ static LogicalResult translateUPMEMToHost(ModuleOp module, raw_ostream &os) {
   os << "  }\n";
   os << "  struct dpu_set_t set, dpu;\n";
   os << "  uint32_t idx;\n";
-  os << "  struct timespec _ck[10]; int _ci = 0;  // PIM_PROFILE\n";
+  os << "  struct timespec _ck[9]; int _ci = 0;  // PIM_PROFILE\n";
   os << "  clock_gettime(CLOCK_MONOTONIC, &_ck[_ci++]);  // PIM_PROFILE ck0 start\n";
-  os << "  DPU_ASSERT(dpu_alloc(NUM_UNITS, NULL, &set));\n";
-  os << "  clock_gettime(CLOCK_MONOTONIC, &_ck[_ci++]);  // PIM_PROFILE ck1 after dpu_alloc(예약)\n";
-  os << "  DPU_ASSERT(dpu_load(set, DPU_BINARY, NULL));\n";
-  os << "  clock_gettime(CLOCK_MONOTONIC, &_ck[_ci++]);  // PIM_PROFILE ck2 after dpu_load(elf 적재)\n";
+  os << "  set = pim_acquire(NUM_UNITS, DPU_BINARY);   // persistent: num_units별 set 캐시(처음만 alloc+load, 이후 재사용; config 전환 시 elf만 reload)\n";
+  os << "  clock_gettime(CLOCK_MONOTONIC, &_ck[_ci++]);  // PIM_PROFILE ck1 after pim_acquire(=acquire; cache hit이면 ~0)\n";
   os << "  // DPU idx -> (pm,pn,kj) = (idx/(SPLIT_N*SPLIT_K), (idx/SPLIT_K)%SPLIT_N, idx%SPLIT_K).\n";
   os << "  // 각 DPU는 자기 K분담 Ku에 대한 부분곱 C[Mu,Nu]를 계산한다 (K=Ku를 broadcast).\n";
   os << "  DPU_ASSERT(dpu_broadcast_to(set, \"M\", 0, &Mu, sizeof(uint32_t), DPU_XFER_DEFAULT));\n";
@@ -166,7 +166,7 @@ static LogicalResult translateUPMEMToHost(ModuleOp module, raw_ostream &os) {
     os << "  }\n";
     os << "  DPU_ASSERT(dpu_push_xfer(set, DPU_XFER_TO_DPU, \"A_mram\", 0, (size_t)Mu * Ku * sizeof(Tin), DPU_XFER_DEFAULT));\n";
   }
-  os << "  clock_gettime(CLOCK_MONOTONIC, &_ck[_ci++]);  // PIM_PROFILE ck3 after A(stage+xfer)+bcast\n";
+  os << "  clock_gettime(CLOCK_MONOTONIC, &_ck[_ci++]);  // PIM_PROFILE ck2 after A(stage+xfer)+bcast\n";
   os << "  // B: B[kj*Ku:, pn*Nu:]를 Bt(Nu×Ku)로 전치해 staging.\n";
   os << "  //   고유 버퍼는 (pn,kj)=SPLIT_N*SPLIT_K개뿐 — distinct만 1회 전치하고 같은 (pn,kj) DPU가 공유(중복 제거).\n";
   os << "  uint32_t B_DIST = SPLIT_N * SPLIT_K;\n";
@@ -178,23 +178,23 @@ static LogicalResult translateUPMEMToHost(ModuleOp module, raw_ostream &os) {
   os << "      for (uint32_t kk = 0; kk < Ku; ++kk)\n";
   os << "        for (uint32_t j = 0; j < Nu; ++j) buf[(size_t)j * Ku + kk] = B[(size_t)(kj * Ku + kk) * N + (pn * Nu + j)];\n";
   os << "    }\n";
-  os << "  clock_gettime(CLOCK_MONOTONIC, &_ck[_ci++]);  // PIM_PROFILE ck4 after B staging build (host 전치)\n";
+  os << "  clock_gettime(CLOCK_MONOTONIC, &_ck[_ci++]);  // PIM_PROFILE ck3 after B staging build (host 전치)\n";
   os << "  idx = 0;\n";
   os << "  DPU_FOREACH(set, dpu, idx) {\n";
   os << "    uint32_t pn = (idx / SPLIT_K) % SPLIT_N, kj = idx % SPLIT_K;\n";
   os << "    DPU_ASSERT(dpu_prepare_xfer(dpu, Bt[pn * SPLIT_K + kj]));   // 같은 (pn,kj) DPU 공유\n";
   os << "  }\n";
   os << "  DPU_ASSERT(dpu_push_xfer(set, DPU_XFER_TO_DPU, \"Bt_mram\", 0, (size_t)Nu * Ku * sizeof(Tin), DPU_XFER_DEFAULT));\n";
-  os << "  clock_gettime(CLOCK_MONOTONIC, &_ck[_ci++]);  // PIM_PROFILE ck5 after B xfer(H2D)\n";
+  os << "  clock_gettime(CLOCK_MONOTONIC, &_ck[_ci++]);  // PIM_PROFILE ck4 after B xfer(H2D)\n";
   os << "  DPU_ASSERT(dpu_launch(set, DPU_SYNCHRONOUS));\n";
-  os << "  clock_gettime(CLOCK_MONOTONIC, &_ck[_ci++]);  // PIM_PROFILE ck6 after launch(compute)\n";
+  os << "  clock_gettime(CLOCK_MONOTONIC, &_ck[_ci++]);  // PIM_PROFILE ck5 after launch(compute)\n";
   os << "  // C: 각 DPU의 부분곱 C_local[Mu,Nu] gather.\n";
   os << "  Tacc** Cl = (Tacc**)malloc(NUM_UNITS * sizeof(Tacc*));\n";
   os << "  for (uint32_t u = 0; u < NUM_UNITS; ++u) Cl[u] = (Tacc*)malloc((size_t)Mu * Nu * sizeof(Tacc));\n";
   os << "  idx = 0;\n";
   os << "  DPU_FOREACH(set, dpu, idx) { DPU_ASSERT(dpu_prepare_xfer(dpu, Cl[idx])); }\n";
   os << "  DPU_ASSERT(dpu_push_xfer(set, DPU_XFER_FROM_DPU, \"C_mram\", 0, (size_t)Mu * Nu * sizeof(Tacc), DPU_XFER_DEFAULT));\n";
-  os << "  clock_gettime(CLOCK_MONOTONIC, &_ck[_ci++]);  // PIM_PROFILE ck7 after C gather(D2H)\n";
+  os << "  clock_gettime(CLOCK_MONOTONIC, &_ck[_ci++]);  // PIM_PROFILE ck6 after C gather(D2H)\n";
   os << "  // 출력 그룹 g=(pm,pn) 당 SPLIT_K개 부분곱(kj 연속)을 host tree-reduce(OpenMP) 후 C 2D 배치.\n";
   os << "  for (uint32_t g = 0; g < SPLIT_M * SPLIT_N; ++g) {\n";
   os << "    uint32_t base = g * SPLIT_K;             // 이 그룹의 첫 DPU (kj=0)\n";
@@ -208,7 +208,7 @@ static LogicalResult translateUPMEMToHost(ModuleOp module, raw_ostream &os) {
   os << "      for (uint32_t j = 0; j < Nu; ++j)\n";
   os << "        C[(size_t)(pm * Mu + i) * N + (pn * Nu + j)] = Cl[base][(size_t)i * Nu + j];\n";
   os << "  }\n";
-  os << "  clock_gettime(CLOCK_MONOTONIC, &_ck[_ci++]);  // PIM_PROFILE ck8 after host reduce+C배치\n";
+  os << "  clock_gettime(CLOCK_MONOTONIC, &_ck[_ci++]);  // PIM_PROFILE ck7 after host reduce+C배치\n";
   os << "  for (uint32_t u = 0; u < NUM_UNITS; ++u) free(Cl[u]);   // Cl은 DPU별 고유\n";
   os << "  for (uint32_t u = 0; u < B_DIST; ++u) free(Bt[u]);      // Bt는 distinct만\n";
   os << "  free(Bt); free(Cl);\n";
@@ -216,21 +216,20 @@ static LogicalResult translateUPMEMToHost(ModuleOp module, raw_ostream &os) {
     os << "  for (uint32_t u = 0; u < A_DIST; ++u) free(Au[u]);    // Au는 distinct만\n";
     os << "  free(Au);\n";
   }
-  os << "  DPU_ASSERT(dpu_free(set));\n";
+  os << "  // dpu_free는 호출 안 한다 — set은 pim_acquire가 캐시·소유하고 atexit에 일괄 free(persistent).\n";
   // >>> PIM_PROFILE (구간별 ms를 표 형태로 stderr 출력 — 제거 시 이 블록 + 다른 'PIM_PROFILE' 줄 모두 삭제) >>>
-  // PGEMM(app2.c)와 동일 구간으로 분해. 핵심: PGEMM은 dpu_alloc/load를 main에서 1회만 하고(루프 밖)
-  //   측정 함수 pgemm_float에는 포함하지 않는다 → 우리도 alloc/load/free를 total*에서 제외해 동일 비교.
+  // PGEMM(app2.c)와 동일 구간으로 분해. PGEMM도 alloc/load를 main서 1회 → total*에서 제외해 동일 비교.
   //   total* = H2D+kernel+D2H+pack (PGEMM pgemm_float timer7 대응).
-  //   alloc=dpu_alloc(예약) | load=dpu_load(elf 적재) — persistent 설계용으로 분리 측정.
+  //   acquire = pim_acquire(첫 호출 alloc+load ~305ms, 이후 cache hit ~0) — persistent 효과를 직접 확인.
   //   H2D=A+B xfer | kernel=launch | D2H=C gather | pack=B 전치+reduce. split_k>1이면 A staging(pack)이 H2D에 소량 섞인다.
-  os << "  clock_gettime(CLOCK_MONOTONIC, &_ck[_ci++]);  // PIM_PROFILE ck9 after dpu_free + host free\n";
+  os << "  clock_gettime(CLOCK_MONOTONIC, &_ck[_ci++]);  // PIM_PROFILE ck8 after host free (dpu_free 없음)\n";
   os << "  static int _prof_hdr = 0;  // PIM_PROFILE: 헤더 1회만\n";
   os << "  if (!_prof_hdr) { _prof_hdr = 1; fprintf(stderr, "
-        "\"[PROF]      M      K      N |    total*       H2D    kernel       D2H      pack |    alloc     load     free | config\\n\"); }  // PIM_PROFILE\n";
-  os << "  fprintf(stderr, \"[PROF] %6u %6u %6u | %9.2f %9.2f %9.2f %9.2f %9.2f | %8.2f %8.2f %8.2f | SPLIT=%ux%ux%u BLK="
+        "\"[PROF]      M      K      N |    total*       H2D    kernel       D2H      pack |  acquire     free | config\\n\"); }  // PIM_PROFILE\n";
+  os << "  fprintf(stderr, \"[PROF] %6u %6u %6u | %9.2f %9.2f %9.2f %9.2f %9.2f | %8.2f %8.2f | SPLIT=%ux%ux%u BLK="
      << blockM << "x" << blockN << "x" << blockK << "\\n\", M, K, N, "
-        "_PROF_D(2,8), _PROF_D(2,3)+_PROF_D(4,5), _PROF_D(5,6), _PROF_D(6,7), _PROF_D(3,4)+_PROF_D(7,8), "
-        "_PROF_D(0,1), _PROF_D(1,2), _PROF_D(8,9), SPLIT_M, SPLIT_N, SPLIT_K);  // PIM_PROFILE\n";
+        "_PROF_D(1,7), _PROF_D(1,2)+_PROF_D(3,4), _PROF_D(4,5), _PROF_D(5,6), _PROF_D(2,3)+_PROF_D(6,7), "
+        "_PROF_D(0,1), _PROF_D(7,8), SPLIT_M, SPLIT_N, SPLIT_K);  // PIM_PROFILE\n";
   // <<< PIM_PROFILE <<<
   os << "}\n";
   return success();
