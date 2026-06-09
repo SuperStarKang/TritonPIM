@@ -52,8 +52,10 @@ static Value makeTileSubview(OpBuilder &b, Location loc, Value src, Value off0,
 // 구조 = device.c가 만드는 루프 nest와 1:1: tm/tn(복원된 grid) → BLOCK_M×BLOCK_N 누산기 →
 // K-loop(BLOCK_K 청크) in-place 누적 → 누산기를 C 타일로 copy. program_id 전역 오프셋은
 // 본문에서 사라지고 tm/tn 루프로 흡수된다(분배층으로 이동, DESIGN 4.1 ②).
+// accElemTy = 누산기/출력(C) element type. 입력(A/B) type은 block arg(%a/%b)에서 추론되므로
+// (subview가 source memref 타입을 따름) 별도 인자 없이 mixed(int8 입력 + int32 누적)도 표현된다.
 static void buildGemmBody(OpBuilder &b, Location loc, Block *body, int64_t blockM,
-                          int64_t blockN, int64_t blockK, Type elemTy) {
+                          int64_t blockN, int64_t blockK, Type accElemTy) {
   b.setInsertionPointToStart(body);
   Value a = body->getArgument(0);
   Value bMat = body->getArgument(1);
@@ -64,14 +66,14 @@ static void buildGemmBody(OpBuilder &b, Location loc, Block *body, int64_t block
   Value stepM = b.create<arith::ConstantIndexOp>(loc, blockM);
   Value stepN = b.create<arith::ConstantIndexOp>(loc, blockN);
   Value stepK = b.create<arith::ConstantIndexOp>(loc, blockK);
-  Value zero = b.create<arith::ConstantOp>(loc, cast<TypedAttr>(b.getZeroAttr(elemTy)));
+  Value zero = b.create<arith::ConstantOp>(loc, cast<TypedAttr>(b.getZeroAttr(accElemTy)));
 
   // 유닛이 맡은 로컬 슬라이스 크기(런타임). %a=[Mu,K], %c=[Mu,Nu].
   Value mu = b.create<memref::DimOp>(loc, a, c0);
   Value kDim = b.create<memref::DimOp>(loc, a, c1);
   Value nu = b.create<memref::DimOp>(loc, c, c1);
 
-  auto accTy = MemRefType::get({blockM, blockN}, elemTy);
+  auto accTy = MemRefType::get({blockM, blockN}, accElemTy);
 
   // grid(M) 복원: pid_m*BLOCK_M 전역 오프셋이 이 루프로 들어옴.
   b.create<scf::ForOp>(
@@ -147,7 +149,10 @@ struct BuildPIMOffloadPass
     int64_t blockM = resTy.getDimSize(0);
     int64_t blockN = resTy.getDimSize(1);
     int64_t blockK = lhsTy.getDimSize(1);
-    Type elemTy = resTy.getElementType();
+    // 입력(A/B)과 누적/출력(C) element type을 따로 — fp32면 둘 다 f32(기존), int8 gemm이면
+    // 입력 i8 + 누적 i32(mixed). vendor codegen이 이 타입들을 IR에서 읽어 C 타입을 정한다.
+    Type inElemTy = lhsTy.getElementType();
+    Type accElemTy = resTy.getElementType();
 
     Value A = func.getArgument(0);
     Value B = func.getArgument(1);
@@ -198,13 +203,15 @@ struct BuildPIMOffloadPass
     b.create<func::ReturnOp>(loc);
 
     // region block arg는 유닛-로컬 슬라이스(dynamic memref). operand의 region 핸들과 별개.
-    auto localTy =
-        MemRefType::get({ShapedType::kDynamic, ShapedType::kDynamic}, elemTy);
+    // %a/%b = 입력타입(inElemTy), %c = 누적/출력타입(accElemTy) — mixed dtype을 그대로 표현.
+    auto kDyn = ShapedType::kDynamic;
+    auto inTy = MemRefType::get({kDyn, kDyn}, inElemTy);
+    auto accTy = MemRefType::get({kDyn, kDyn}, accElemTy);
     SmallVector<Location, 3> argLocs(3, loc);
     OpBuilder bodyBuilder(b.getContext());
     Block *body = bodyBuilder.createBlock(&compute.getBody(), {},
-                                          {localTy, localTy, localTy}, argLocs);
-    buildGemmBody(bodyBuilder, loc, body, blockM, blockN, blockK, elemTy);
+                                          {inTy, inTy, accTy}, argLocs);
+    buildGemmBody(bodyBuilder, loc, body, blockM, blockN, blockK, accElemTy);
   }
 };
 
