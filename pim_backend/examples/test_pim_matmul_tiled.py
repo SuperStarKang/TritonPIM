@@ -139,8 +139,13 @@ if __name__ == "__main__":
     # run_i8(M=1024, N=4096, K=1024, BLOCK_M=32, BLOCK_N=32, BLOCK_K=512, split_m=16, split_n=32, split_k=2, local_lanes=16)
 
     # split k test
-    run_i8(M=1024, N=4096, K=1024, BLOCK_M=32, BLOCK_N=32, BLOCK_K=8, split_m=16, split_n=32, split_k=1, local_lanes=16)
-    run_i8(M=1024, N=4096, K=1024, BLOCK_M=32, BLOCK_N=32, BLOCK_K=8, split_m=16, split_n=32, split_k=2, local_lanes=16)
-    run_i8(M=1024, N=4096, K=1024, BLOCK_M=32, BLOCK_N=32, BLOCK_K=8, split_m=16, split_n=32, split_k=4, local_lanes=16)
+    # run_i8(M=1024, N=4096, K=1024, BLOCK_M=32, BLOCK_N=32, BLOCK_K=8, split_m=16, split_n=32, split_k=1, local_lanes=16)
+    # run_i8(M=1024, N=4096, K=1024, BLOCK_M=32, BLOCK_N=32, BLOCK_K=8, split_m=16, split_n=32, split_k=2, local_lanes=16)
+    # run_i8(M=1024, N=4096, K=1024, BLOCK_M=32, BLOCK_N=32, BLOCK_K=8, split_m=16, split_n=32, split_k=4, local_lanes=16)
+    # run_i8(M=1024, N=4096, K=1024, BLOCK_M=32, BLOCK_N=32, BLOCK_K=256, split_m=16, split_n=128, split_k=1, local_lanes=16)
 
-    run_i8(M=1024, N=4096, K=1024, BLOCK_M=32, BLOCK_N=32, BLOCK_K=256, split_m=16, split_n=128, split_k=1, local_lanes=16)
+    # llama-3.1-70b
+    run_i8(M=1024, N=8192,  K=8192,  BLOCK_M=32, BLOCK_N=32, BLOCK_K=256, split_m=8,  split_n=64,  split_k=4, local_lanes=16)   # q_proj, o_proj
+    run_i8(M=1024, N=1024,  K=8192,  BLOCK_M=32, BLOCK_N=32, BLOCK_K=256, split_m=16, split_n=32,  split_k=4, local_lanes=16)   # k/v_proj
+    run_i8(M=1024, N=28672, K=8192,  BLOCK_M=32, BLOCK_N=32, BLOCK_K=256, split_m=4,  split_n=128, split_k=4, local_lanes=16)   # ffn1(gate_proj, up_proj)
+    run_i8(M=1024, N=8192,  K=28672, BLOCK_M=32, BLOCK_N=32, BLOCK_K=256, split_m=16, split_n=128, split_k=1, local_lanes=16)   # ffn2(down_proj)
