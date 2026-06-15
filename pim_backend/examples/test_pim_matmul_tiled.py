@@ -115,7 +115,7 @@ def run_i8(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, split_m=1, split_n=1, split_k=1, 
           f"DPUs={split_m*split_n*split_k}  |  {ms:.3f} ms")
 
 
-if __name__ == "__main__":
+# if __name__ == "__main__":
     # SPLIT: 총 DPU = split_m × split_n × split_k.
     #   유효: M%split_m==0, N%split_n==0, K%split_k==0, 그리고 Mu/Nu/Ku가 BLOCK_M/N/K의 배수.
     # run_f32(M=128, N=128, K=256, BLOCK_M=64, BLOCK_N=64, BLOCK_K=32, split_m=2, split_n=1, local_lanes=8)  # 2 DPU (M분할)
@@ -145,7 +145,35 @@ if __name__ == "__main__":
     # run_i8(M=1024, N=4096, K=1024, BLOCK_M=32, BLOCK_N=32, BLOCK_K=256, split_m=16, split_n=128, split_k=1, local_lanes=16)
 
     # llama-3.1-70b
-    run_i8(M=1024, N=8192,  K=8192,  BLOCK_M=32, BLOCK_N=32, BLOCK_K=256, split_m=8,  split_n=64,  split_k=4, local_lanes=16)   # q_proj, o_proj
-    run_i8(M=1024, N=1024,  K=8192,  BLOCK_M=32, BLOCK_N=32, BLOCK_K=256, split_m=16, split_n=32,  split_k=4, local_lanes=16)   # k/v_proj
-    run_i8(M=1024, N=28672, K=8192,  BLOCK_M=32, BLOCK_N=32, BLOCK_K=256, split_m=4,  split_n=128, split_k=4, local_lanes=16)   # ffn1(gate_proj, up_proj)
-    run_i8(M=1024, N=8192,  K=28672, BLOCK_M=32, BLOCK_N=32, BLOCK_K=256, split_m=16, split_n=128, split_k=1, local_lanes=16)   # ffn2(down_proj)
+    # run_i8(M=1024, N=8192,  K=8192,  BLOCK_M=32, BLOCK_N=32, BLOCK_K=256, split_m=8,  split_n=64,  split_k=4, local_lanes=16)   # q_proj, o_proj
+    # run_i8(M=1024, N=1024,  K=8192,  BLOCK_M=32, BLOCK_N=32, BLOCK_K=256, split_m=16, split_n=32,  split_k=4, local_lanes=16)   # k/v_proj
+    # run_i8(M=1024, N=28672, K=8192,  BLOCK_M=32, BLOCK_N=32, BLOCK_K=256, split_m=4,  split_n=128, split_k=4, local_lanes=16)   # ffn1(gate_proj, up_proj)
+    # run_i8(M=1024, N=8192,  K=28672, BLOCK_M=32, BLOCK_N=32, BLOCK_K=256, split_m=16, split_n=128, split_k=1, local_lanes=16)   # ffn2(down_proj)
+
+if __name__ == "__main__":
+    M, N, K = 1024, 4096, 1024   # K, N 짝수 (int8 정렬 OK)
+
+    # ── Sweep A: BLOCK_K (WRAM 청크 재사용) ── 가장 직접적인 타일링 경향
+    #   split_k=1로 고정해 reduce/D2H 혼입 제거 → kernel이 순수 재사용 효과만 반영.
+    #   Mu=64, Nu=128 (÷BLOCK 32 OK), Ku=1024 (모든 BLOCK_K로 나눠떨어짐)
+    for bk in [8, 16, 32, 64, 128, 256, 512]:   # 512=36KB OK, 1024는 WRAM 초과라 제외
+        run_i8(M, N, K, BLOCK_M=32, BLOCK_N=32, BLOCK_K=bk,
+               split_m=16, split_n=32, split_k=1, local_lanes=16)   # 512 DPU 고정
+
+    # ── Sweep B: BLOCK_M=BLOCK_N (acc 타일 재사용) ──
+    #   local_lanes=8로 고정(BLOCK_M=8도 8을 나눔). BLOCK_K=256 고정.
+    for bm in [8, 16, 32, 64]:                   # Mu=64, Nu=128 모두 나눔. 64×64×256=49KB OK
+        run_i8(M, N, K, BLOCK_M=bm, BLOCK_N=bm, BLOCK_K=256,
+               split_m=16, split_n=32, split_k=1, local_lanes=8)
+
+    # ── Sweep C: split_k (K분담 → reduce/D2H 팽창 경향) ──
+    #   kernel은 줄지만 D2H·pack이 커지는 tradeoff(IMPLEMENT ⑧)를 본다.
+    #   유닛수 바뀌므로 매번 acquire ~305ms 발생 → total*/kernel만 읽을 것.
+    for sk in [1, 2, 4]:                          # Ku=1024/512/256, 모두 ÷256 OK. DPU 512/1024/2048
+        run_i8(M, N, K, BLOCK_M=32, BLOCK_N=32, BLOCK_K=256,
+               split_m=16, split_n=32, split_k=sk, local_lanes=16)
+
+    # ── Sweep D: local_lanes (intra-DPU tasklet 병렬) ──
+    for ll in [1, 2, 4, 8, 16, 24]:               # 모두 BLOCK_M=32를 나눔
+        run_i8(M, N, K, BLOCK_M=32, BLOCK_N=32, BLOCK_K=256,
+               split_m=16, split_n=32, split_k=1, local_lanes=ll)

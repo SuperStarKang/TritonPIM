@@ -83,6 +83,37 @@ def _upmem_to_artifact(upmem_ir: str, metadata) -> bytes:
     metadata["name"] = match.group(1)
     return json.dumps({"host": host_src, "device": device_src}).encode("utf-8")
 
+
+# ── AiMX vendor 경로 (UPMEM helper와 평행) ───────────────────────────────────
+# 아래 두 함수는 _pim_common_to_upmem / _upmem_to_artifact의 AiMX 쌍둥이다. 구조·시그니처는
+# 동일하고 vendor 고유 문자열(pass 이름·translate 이름·번들 키)만 다르다. 호출하는 배관
+# (_run_opt / _run_translate)은 vendor-neutral이라 그대로 재사용한다.
+#
+# 지금은 경로(seam)만 만들어 둔 상태다. AiMX legalize pass(--legalize-pim-to-aimx)와
+# translate(--aimx-to-*)는 아직 triton-shared-opt/-translate에 없으므로, vendor="aimx"로
+# 실행하면 이 함수들이 호출하는 subprocess가 그 자리에서 fail한다(의도된 fail-fast, fallback 없음).
+# 실제 C++ 구현(dialect/legalize/codegen)은 별도 서버/브랜치에서 채운다(IMPLEMENT B1.2/B1.4).
+
+def _pim_common_to_aimx(pim_common: str) -> str:
+    # 같은 vendor-neutral PIM Common IR을 AiMX IR로 legalize한다 (Conversion/PIMToAiMX, B1.2).
+    return _run_opt(pim_common, ["--legalize-pim-to-aimx"])
+
+
+def _aimx_to_artifact(aimx_ir: str, metadata) -> bytes:
+    # AiMX IR → runtime stub(C++) + descriptor stream을 생성해 번들로 묶는다 (Target/AiMX, B1.4).
+    # upmem과 동일하게, launcher가 호출할 진입 함수 이름을 stub에서 파싱해 metadata["name"]에 채운다.
+    # (runtime stub은 extern "C" void <name>(...) 진입점을 emit해야 이 파싱이 성립 — 평행 구조의 계약.)
+    # 주의: descriptor가 binary 포맷으로 확정되면 utf-8 디코드하는 _run_translate로는 못 받으므로,
+    #       그때 binary용 translate 헬퍼가 필요하다(포맷 확정 전이라 지금은 텍스트로 둔다, B1.4).
+    stub_src = _run_translate(aimx_ir, "--aimx-to-runtime-stub")
+    descriptors = _run_translate(aimx_ir, "--aimx-to-descriptors")
+    match = re.search(r'extern "C" void (\w+)\(', stub_src)
+    if not match:
+        raise RuntimeError("generated AiMX stub에서 진입 함수를 찾지 못함")
+    metadata["name"] = match.group(1)
+    return json.dumps({"stub": stub_src, "descriptors": descriptors}).encode("utf-8")
+
+
 @dataclass(frozen=True)
 class PIMOptions:
     # --- Triton 표준 옵션 (CPUOptions와 동일하게 유지) ---
@@ -158,14 +189,23 @@ class PIMBackend(BaseBackend):
         return
 
     def add_stages(self, stages, options, language):
-        # PIM 파이프라인: TTIR → TTSharedIR → PIM Common IR → UPMEM IR → host.cpp/device.c 번들.
-        # ttir/ttsharedir 생성부는 CPU와 동일한 단일 소스를 재사용한다(hybrid 일관성).
+        # PIM 파이프라인: TTIR → TTSharedIR → PIM Common IR → Vendor IR → artifact 번들.
+        # ttir/ttsharedir/pim_common은 vendor-neutral이라 공유하고, 뒤 두 stage만 vendor로 분기한다.
         # 마지막 stage 이름은 binary_ext('pimobj')와 일치해야 CompiledKernel이 kernel을 찾는다.
         stages["ttir"] = lambda src, metadata: cpu_compiler.CPUBackend.make_ttir(src, metadata, options)
         stages["ttsharedir"] = lambda src, metadata: cpu_compiler._ttir_to_ttsharedir(src)
         stages["pim_common"] = lambda src, metadata: _ttsharedir_to_pim_common(src, options.split_m, options.split_n, options.split_k, options.local_lanes)
-        stages["vendor_ir"] = lambda src, metadata: _pim_common_to_upmem(src)
-        stages["pimobj"] = lambda src, metadata: _upmem_to_artifact(src, metadata)
+        # vendor 분기: legalize(vendor_ir)와 codegen(pimobj)만 vendor마다 다르다(DESIGN 19).
+        # __post_init__은 vendor is None만 막으므로, 미지원 값은 여기서 fail-fast한다(fallback 금지).
+        if options.vendor == "upmem":
+            stages["vendor_ir"] = lambda src, metadata: _pim_common_to_upmem(src)
+            stages["pimobj"] = lambda src, metadata: _upmem_to_artifact(src, metadata)
+        elif options.vendor == "aimx":
+            stages["vendor_ir"] = lambda src, metadata: _pim_common_to_aimx(src)
+            stages["pimobj"] = lambda src, metadata: _aimx_to_artifact(src, metadata)
+        else:
+            raise ValueError(
+                f"Unsupported PIM vendor '{options.vendor}'. Supported: 'upmem', 'aimx'.")
 
     @functools.lru_cache()
     def hash(self):

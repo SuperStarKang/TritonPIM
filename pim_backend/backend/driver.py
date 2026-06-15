@@ -9,6 +9,10 @@
 #   2) host.cpp → host.so   (g++ + libdpu, DPU_BINARY를 device.elf 절대경로로)
 #   3) host.so를 dlopen해 <kernel>_host(A,B,C)를 ctypes로 호출
 # CPULauncher가 launcher .so를 컴파일·로드하는 패턴을 PIM 런타임 glue에 맞게 옮긴 것.
+#
+# vendor 분기: 위 1~2(빌드)는 vendor마다 다르다(upmem=dpu-clang/libdpu, aimx=descriptor runtime).
+# 3(dlopen→ctypes 호출)은 stub이 같은 C ABI를 노출한다는 전제로 공유한다. aimx 빌드는 seam만
+# 잡아 두었고(_build_aimx_so) 실제 구현은 별도 서버/브랜치에서 채운다.
 
 import os
 import sys
@@ -105,6 +109,18 @@ def _build_pim_so(host_src: str, device_src: str, local_lanes: int) -> str:
     return so_path
 
 
+def _build_aimx_so(stub_src: str, descriptors: str) -> str:
+    # AiMX runtime stub(C++) + descriptor stream을 .so로 빌드해 경로를 돌려준다.
+    # _build_pim_so의 캐시 패턴(소스 해시 키)을 그대로 따를 예정이다.
+    #
+    # 지금은 경로(seam)만 잡아 둔 상태 — AiMX runtime API·descriptor 포맷·링크 라이브러리·컴파일러가
+    # 아직 정해지지 않아 실제 빌드 커맨드를 쓸 수 없다. upmem 경로로 fallback하지 않고 여기서
+    # 명시적으로 터뜨린다(CLAUDE.md fallback 금지). 실제 구현은 별도 서버/브랜치에서 채운다(B1.4/B1.5).
+    raise NotImplementedError(
+        "AiMX launcher build 미구현 — descriptor 포맷/runtime API 확정 후 _build_aimx_so를 채울 것 "
+        "(DESIGN 13.3/13.5, IMPLEMENT B1.4/B1.5)")
+
+
 class PIMLauncher(object):
 
     def __init__(self, src, metadata):
@@ -117,13 +133,24 @@ class PIMLauncher(object):
         self.extent_indices = [3, 4, 5]
         # local_lanes(=NR_TASKLETS): device 빌드 파라미터. PIMOptions 필드라 metadata에 들어온다.
         self.local_lanes = metadata.local_lanes
+        # vendor: 런타임에 빌드 툴체인을 고르는 분기 키. local_lanes와 같은 PIMOptions 필드라
+        # 같은 경로로 metadata에 들어온다("upmem" | "aimx").
+        self.vendor = metadata.vendor
 
     def __call__(self, gridX, gridY, gridZ, stream, cu_function,
                  kernel_metadata, launch_metadata,
                  launch_enter_hook, launch_exit_hook, *args):
         # cu_function = load_binary가 돌려준 소스 번들 bytes (PIMUtils.load_binary 참고).
         bundle = json.loads(bytes(cu_function).decode("utf-8"))
-        so_path = _build_pim_so(bundle["host"], bundle["device"], self.local_lanes)
+        # vendor마다 빌드 툴체인이 다르다(upmem=dpu-clang+libdpu, aimx=descriptor runtime).
+        # 빌드 단계만 분기하고, 아래 dlopen→ctypes 호출은 stub이 같은 (A,B,C,M,N,K) C ABI를
+        # 노출한다는 전제로 공유한다(AiMX가 다른 인자를 요구하면 그때 호출부도 분기).
+        if self.vendor == "upmem":
+            so_path = _build_pim_so(bundle["host"], bundle["device"], self.local_lanes)
+        elif self.vendor == "aimx":
+            so_path = _build_aimx_so(bundle["stub"], bundle["descriptors"])
+        else:
+            raise ValueError(f"Unsupported PIM vendor '{self.vendor}'.")
 
         # host 진입 함수 이름 = metadata.name (compiler가 host.cpp에서 파싱해 채운 값). index 6.
         entry = kernel_metadata[6]

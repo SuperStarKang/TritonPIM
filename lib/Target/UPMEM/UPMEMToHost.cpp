@@ -225,9 +225,9 @@ static LogicalResult translateUPMEMToHost(ModuleOp module, raw_ostream &os) {
   os << "  clock_gettime(CLOCK_MONOTONIC, &_ck[_ci++]);  // PIM_PROFILE ck8 after host free (dpu_free 없음)\n";
   os << "  static int _prof_hdr = 0;  // PIM_PROFILE: 헤더 1회만\n";
   os << "  if (!_prof_hdr) { _prof_hdr = 1; fprintf(stderr, "
-        "\"[PROF]      M      K      N |    total*       H2D    kernel       D2H      pack |  acquire     free | config\\n\"); }  // PIM_PROFILE\n";
-  os << "  fprintf(stderr, \"[PROF] %6u %6u %6u | %9.2f %9.2f %9.2f %9.2f %9.2f | %8.2f %8.2f | SPLIT=%ux%ux%u BLK="
-     << blockM << "x" << blockN << "x" << blockK << "\\n\", M, K, N, "
+        "\"      M      K      N |    total*       H2D    kernel       D2H      pack |  acquire     free | config\\n\"); }  // PIM_PROFILE\n";
+  os << "  fprintf(stderr, \" %6u %6u %6u | %9.2f %9.2f %9.2f %9.2f %9.2f | %8.2f %8.2f | SPLIT(M=%u,N=%u,K=%u) BLK(M="
+     << blockM << ",N=" << blockN << ",K=" << blockK << ")\\n\", M, K, N, "
         "_PROF_D(1,7), _PROF_D(1,2)+_PROF_D(3,4), _PROF_D(4,5), _PROF_D(5,6), _PROF_D(2,3)+_PROF_D(6,7), "
         "_PROF_D(0,1), _PROF_D(7,8), SPLIT_M, SPLIT_N, SPLIT_K);  // PIM_PROFILE\n";
   // <<< PIM_PROFILE <<<

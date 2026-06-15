@@ -38,11 +38,13 @@
 | O4 | Execution Strategy Selection | `[~]` | 3 / 7 |
 | O5 | Autotune Integration | `[ ]` | 0 / 3 |
 | **Part III — Breadth** | | | |
-| B1 | AiMX Vendor Extension | `[ ]` | 0 / 6 |
+| B1 | AiMX Vendor Extension | `[~]` | 1 / 7 |
 | B2 | Vendor Extension Registry 리팩토링 | `[ ]` | 0 / 3 |
 | B3 | CPU+PIM HybridDriver | `[ ]` | 0 / 5 |
 
-총 진행률: **43 / 76** (Part I MVP 완료. O1.1/O1.2/O1.3/O1.5 **faithful-body IR 변환 + build-pim-offload·execution_group 완료**(`pim.compute` region-carrying, 본문 보존 + program_id 로컬화, `build-pim-offload`가 `execution_group` 합성, e2e 동치 검증). O1.4a(device가 본문 gemm nest에서 BLOCK 읽어 device.c 구동, `local_gemm` 제거, e2e 동치). O1.8 multi-tile, O4 2D SPLIT + **SPLIT_K(host tree-reduce)** + BLOCK 타일 + multi-tasklet HW 검증(2→4→8 DPU 선형 스케일). **host staging 중복 제거(2048-DPU 8029→4165ms) + dtype-aware codegen(int8 입력/int32 누적 검증 — f32 대비 ~5.9× 4535→772ms, 정답 정확).** **O1 남음: O1.4b(비-gemm op-by-op 번역)**)
+총 진행률: **44 / 77** (Part I MVP 완료. O1.1/O1.2/O1.3/O1.5 **faithful-body IR 변환 + build-pim-offload·execution_group 완료**(`pim.compute` region-carrying, 본문 보존 + program_id 로컬화, `build-pim-offload`가 `execution_group` 합성, e2e 동치 검증). O1.4a(device가 본문 gemm nest에서 BLOCK 읽어 device.c 구동, `local_gemm` 제거, e2e 동치). O1.8 multi-tile, O4 2D SPLIT + **SPLIT_K(host tree-reduce)** + BLOCK 타일 + multi-tasklet HW 검증(2→4→8 DPU 선형 스케일). **host staging 중복 제거(2048-DPU 8029→4165ms) + dtype-aware codegen(int8 입력/int32 누적 검증 — f32 대비 ~5.9× 4535→772ms, 정답 정확).** **O1 남음: O1.4b(비-gemm op-by-op 번역)**)
+
+> **B1.0 (AiMX vendor-dispatch seam) 완료**: `compiler.py`가 `options.vendor`로 `vendor_ir`/`pimobj` stage를 분기(upmem|aimx, 미지원 값은 fail-fast)하고 `_pim_common_to_aimx`/`_aimx_to_artifact`를 upmem helper와 평행 추가. `driver.py` PIMLauncher는 `metadata.vendor`로 빌드 단계를 분기하고 `_build_aimx_so`(seam, `NotImplementedError`)를 둔다. **AiMX legalize/translate/toolchain은 미구현** — `vendor="aimx"` 실행 시 그 자리에서 fail(의도). 실제 구현은 별도 서버/브랜치에서 B1.1~B1.6으로 채운다.
 
 ---
 
@@ -302,6 +304,7 @@ pim.launch            (callee, vendor, device_id)
 
 **작업 단위**:
 
+- [x] **B1.0** `[seam]` vendor-dispatch 경로: `compiler.py` `add_stages`가 `options.vendor`로 분기(`vendor_ir`/`pimobj`) + `_pim_common_to_aimx`/`_aimx_to_artifact` 평행 helper(배관 `_run_opt`/`_run_translate`는 공유). `driver.py` PIMLauncher가 `metadata.vendor`로 빌드 분기 + `_build_aimx_so` seam(`NotImplementedError`). dlopen→ctypes 호출은 같은 C ABI 전제로 공유. **실제 AiMX codegen/toolchain은 미구현(fail-fast, fallback 없음)** — 아래 B1.1~B1.6에서 채운다.
 - [ ] **B1.1** `[vendor]` AiMX dialect 최소셋 (`aimx.dma_h2d`, `dma_d2h`, `compute_gemm`, `descriptor_chain`, `submit`, `wait`)
 - [ ] **B1.2** `[vendor]` `LegalizePIMToAiMX` conversion (공통 PIM IR → AiMX IR)
 - [ ] **B1.3** `[vendor]` `AiMXMemoryBankMapping` + `AiMXExecutionMapping`
