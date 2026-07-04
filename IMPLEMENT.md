@@ -32,7 +32,7 @@
 | M5 | Runtime & Launcher | `[x]` | 4 / 4 |
 | M6 | End-to-end: MatMul 실행 + 검증 | `[x]` | 4 / 4 |
 | **Part II — Incremental Optimization** | | | |
-| O1 | faithful-body 전환 (본문 보존 + build-pim-offload 통합) + multi-tile | `[~]` | 5 / 6 |
+| O1 | faithful-body 전환 (본문 보존 + build-pim-offload 통합) + multi-tile | `[~]` | 7 / 9 |
 | O2 | Capability / Constraints | `[ ]` | 0 / 3 |
 | O3 | Common Optimization Passes (하나씩, opt-in) | `[ ]` | 0 / 7 |
 | O4 | Execution Strategy Selection | `[~]` | 3 / 7 |
@@ -42,7 +42,7 @@
 | B2 | Vendor Extension Registry 리팩토링 | `[ ]` | 0 / 3 |
 | B3 | CPU+PIM HybridDriver | `[ ]` | 0 / 5 |
 
-총 진행률: **44 / 77** (Part I MVP 완료. O1.1/O1.2/O1.3/O1.5 **faithful-body IR 변환 + build-pim-offload·execution_group 완료**(`pim.compute` region-carrying, 본문 보존 + program_id 로컬화, `build-pim-offload`가 `execution_group` 합성, e2e 동치 검증). O1.4a(device가 본문 gemm nest에서 BLOCK 읽어 device.c 구동, `local_gemm` 제거, e2e 동치). O1.8 multi-tile, O4 2D SPLIT + **SPLIT_K(host tree-reduce)** + BLOCK 타일 + multi-tasklet HW 검증(2→4→8 DPU 선형 스케일). **host staging 중복 제거(2048-DPU 8029→4165ms) + dtype-aware codegen(int8 입력/int32 누적 검증 — f32 대비 ~5.9× 4535→772ms, 정답 정확).** **O1 남음: O1.4b(비-gemm op-by-op 번역)**)
+총 진행률: **44 / 77** (Part I MVP 완료. O1.1/O1.2/O1.3/O1.5 **faithful-body IR 변환 + build-pim-offload·execution_group 완료**(`pim.compute` region-carrying, 본문 보존 + program_id 로컬화, `build-pim-offload`가 `execution_group` 합성, e2e 동치 검증). O1.4a(device가 본문 gemm nest에서 BLOCK 읽어 device.c 구동, `local_gemm` 제거, e2e 동치). O1.8 multi-tile, O4 2D SPLIT + **SPLIT_K(host tree-reduce)** + BLOCK 타일 + multi-tasklet HW 검증(2→4→8 DPU 선형 스케일). **host staging 중복 제거(2048-DPU 8029→4165ms) + dtype-aware codegen(int8 입력/int32 누적 검증 — f32 대비 ~5.9× 4535→772ms, 정답 정확).** **O1 남음: O1.9~O1.11(preserve+classify 재작성 — 재생성 제거, 2026-07-02 확정) + O1.4b(target device op-by-op 번역)**)
 
 > **B1.0 (AiMX vendor-dispatch seam) 완료**: `compiler.py`가 `options.vendor`로 `vendor_ir`/`pimobj` stage를 분기(upmem|aimx, 미지원 값은 fail-fast)하고 `_pim_common_to_aimx`/`_aimx_to_artifact`를 upmem helper와 평행 추가. `driver.py` PIMLauncher는 `metadata.vendor`로 빌드 단계를 분기하고 `_build_aimx_so`(seam, `NotImplementedError`)를 둔다. **AiMX legalize/translate/toolchain은 미구현** — `vendor="aimx"` 실행 시 그 자리에서 fail(의도). 실제 구현은 별도 서버/브랜치에서 B1.1~B1.6으로 채운다.
 
@@ -224,6 +224,12 @@ pim.launch            (callee, vendor, device_id)
 - [~] **O1.4** `[vendor]` `UPMEMToDevice` 충실 번역. **O1.4a 완료**: legalize가 `pim.compute` 본문을 `device_func` region으로 옮기고(`takeBody`), `UPMEMToDevice`/`UPMEMToHost`가 본문 gemm nest(`linalg.matmul` + 3중 `scf.for`)에서 BLOCK을 읽어 device.c/host.cpp 생성. `upmem.local_gemm` 제거. **검증: translate 출력(BLOCK 32/64/64) + e2e(split 2D) 동치.** **O1.4b 남음**: device.c emission을 gemm 템플릿 → op-by-op 충실 번역으로 일반화(`linalg.matvec`→gemv, `linalg.generic`→relu/fused). 현재는 BLOCK·gemm 구조만 body에서 읽는다.
 - [x] **O1.5** `[검증]` 동치: faithful-body 전환 후 e2e 재통과 — `test_pim_matmul_tiled.py` 3 config(`split_m/n=1` no-split 포함) 정답, `pim_common` dump가 faithful-body 확인. device.c는 gemm shortcut(`local_gemm`) 유지라 결과 동일(M6 green).
 - [x] **O1.8** `[공통·구조]` 전체 M/N/K 복원: 변환이 tiled-gemm(scf.for+matmul+accumulate) 인식, 전체 M/N/K(`%arg3/4/5`)를 운반(BLOCK은 tile_plan에 기록). codegen(UPMEMToHost·launcher)이 런타임 M/N/K로 동작 → **multi-tile 정답**(128×128×256, grid=(2,2)). faithful-body에선 이 복원이 O1.3(분배층 이동)과 합쳐진다.
+
+> **방향 확정 (2026-07-02)**: O1.1~O1.3의 "faithful-body"는 실제로는 `findMatmul`+`buildGemmBody`로 **gemm을 재생성**하는 interim 모델이었다(본문 erase 후 유닛-로컬 nest 재구성). 목표는 **재생성 없이 실제 TTShared 본문을 읽어 보존**하는 것(DESIGN 4.1/10.6). 아래 O1.9~O1.11이 common IR 레벨에서 이를 구현하고, O1.4b가 target(device) 레벨을 잇는다. vocabulary 표현은 **표준 op 보존 + `pim.class` 태그**(새 pim op 없음)로 확정. 관련: vendor→target 리네임은 별도 기계적 커밋으로 후행.
+
+- [x] **O1.9** `[공통·구조]` **preserve+classify 재작성**: `build-pim-offload`를 gemm 재생성(`findMatmul`+`buildGemmBody`+본문 erase)에서 **본문을 읽어 보존**하는 구조로 전환. boundary matcher(tile-load/store idiom → memory_region/transfer) + 계산 op 보존(치환 없이 `pim.compute` region으로 이동) + classifier(O1.10). program_id 주소는 인식 패턴이면 로컬 슬라이스(2단계, gemm 기존 경로), 미인식이면 본문에 보존(1단계 generic). **구현·검증 완료(common IR): `pim.compute` variadic(ins/outs) + `rewriteGenericFaithful` + dispatch(matmul→gemm, else→generic). elementwise 커널이 재생성 없이 변환됨 확인 — boundary(A/B=input, C=output) 정확, 본문(reinterpret_cast/copy/to_tensor/generic/materialize) 그대로 보존, buffer→block arg remap, `pim.class="elementwise"` 태깅. gemm e2e 회귀 없음(128ms). 비-gemm의 DPU e2e는 O1.4b(device 번역) 후. lit: `elementwise.mlir`. (버그 수정: host buffer 판정은 `BaseMemRefType` — TTShared 인자 `memref<*xT>`는 UnrankedMemRefType.)**
+- [x] **O1.10** `[공통·구조]` basic-op vocabulary + classifier: elementwise(add/mul/div/min/max/and/or/xor/not) + big-op(gemm/gemv/transpose/reduce/gather/scatter) 분류표 → 계산 op에 `pim.class` 태그 부착(치환 아님). **구현·검증: `classifyComputeOp`(linalg.matmul→gemm, matvec→gemv, transpose→transpose, reduce/reduction-generic→reduce, parallel-generic→elementwise). gemm·elementwise 태깅 확인. gather/scatter(indexed load/store 인식)는 후속.** (DESIGN 10.6)
+- [ ] **O1.11** `[공통·구조]` `pim-normalize-ops` (opt-in): compute 본문의 vocabulary 밖 op을 basic op으로 분해, 불가 시 fail-fast. 초기엔 실제로 보는 op만(사실상 identity)에서 확장. (DESIGN 10.6/11.1)
 
 > O1.6/O1.7(옛 granular 분해·동치 항목)은 build-pim-offload 통합으로 폐기.
 

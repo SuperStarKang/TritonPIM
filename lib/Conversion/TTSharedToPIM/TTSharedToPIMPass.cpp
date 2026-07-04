@@ -93,8 +93,11 @@ static void buildGemmBody(OpBuilder &b, Location loc, Block *body, int64_t block
                     Value at = makeTileSubview(nb3, lk, a, tm, kc, blockM, blockK);
                     Value bt = makeTileSubview(nb3, lk, bMat, kc, tn, blockK, blockN);
                     // linalg.matmul(memref)은 outs에 in-place 누적(C += A*B).
-                    nb3.create<linalg::MatmulOp>(lk, ValueRange{at, bt},
-                                                 ValueRange{acc});
+                    auto mm = nb3.create<linalg::MatmulOp>(lk, ValueRange{at, bt},
+                                                           ValueRange{acc});
+                    // 본문 op별 class 태그(DESIGN 10.6). 재생성한 gemm nest도 동일 계약을 따른다 —
+                    // generic 경로가 classifyComputeOp로 다는 태그와 같은 의미다.
+                    mm->setAttr("pim.class", nb3.getStringAttr("gemm"));
                     nb3.create<scf::YieldOp>(lk);
                   });
               // 누산기를 이 유닛의 C 타일로 기록.
@@ -120,14 +123,62 @@ static std::string mappingPolicy(unsigned splitM, unsigned splitN, unsigned spli
   return "none";
 }
 
+// 계산 op을 basic-op vocabulary class로 분류한다(DESIGN 10.6). 치환이 아니라 pim.class 태그용.
+// control/glue(fill/for/subview/copy/to_tensor 등)는 "" 반환 → 태그 없음.
+static StringRef classifyComputeOp(Operation *op) {
+  if (isa<linalg::MatmulOp>(op))
+    return "gemm";
+  if (isa<linalg::MatvecOp>(op))
+    return "gemv";
+  if (isa<linalg::TransposeOp>(op))
+    return "transpose";
+  if (isa<linalg::ReduceOp>(op))
+    return "reduce";
+  if (isa<linalg::GenericOp>(op)) {
+    // reduction 루프가 있으면 reduce, 전부 parallel이면 elementwise.
+    if (cast<linalg::LinalgOp>(op).getNumReductionLoops() > 0)
+      return "reduce";
+    return "elementwise";
+  }
+  return "";
+}
+
+// buffer(함수 인자)가 저장(output) 대상인지 판정한다(경계 인식). store idiom =
+// reinterpret_cast(buffer)를 memref.copy의 target 또는 materialize_in_destination의 dest로 쓰는 것.
+// 그 외(로드만)는 input으로 본다.
+static bool isStoredBuffer(Value buf) {
+  for (Operation *user : buf.getUsers()) {
+    auto rc = dyn_cast<memref::ReinterpretCastOp>(user);
+    if (!rc)
+      continue;
+    for (Operation *u2 : rc->getUsers()) {
+      if (auto cp = dyn_cast<memref::CopyOp>(u2))
+        if (cp.getTarget() == rc.getResult())
+          return true;
+      // bufferization dialect에 링크 의존을 만들지 않으려 op 이름으로 확인(dest=operand 1).
+      if (u2->getName().getStringRef() ==
+              "bufferization.materialize_in_destination" &&
+          u2->getNumOperands() >= 2 && u2->getOperand(1) == rc.getResult())
+        return true;
+    }
+  }
+  return false;
+}
+
 struct BuildPIMOffloadPass
     : public mlir::triton::impl::BuildPIMOffloadBase<BuildPIMOffloadPass> {
   using BuildPIMOffloadBase::BuildPIMOffloadBase;
 
   void runOnOperation() override {
     getOperation().walk([&](func::FuncOp func) {
+      if (func.getBody().empty())
+        return; // 선언만 있는 함수는 대상 아님.
+      // gemm 패턴이면 로컬 슬라이스 경로(기존, 최적화 유지), 아니면 본문을 그대로 읽는
+      // generic 경로 — 둘 다 정식 경로다(DESIGN 11.1, no-fallback).
       if (linalg::MatmulOp matmul = findMatmul(func))
         rewriteToFaithfulGemm(func, matmul);
+      else
+        rewriteGenericFaithful(func);
     });
   }
 
@@ -195,8 +246,8 @@ struct BuildPIMOffloadPass
 
     // pim.compute를 먼저 빈 region으로 만들고, 그 다음 entry의 나머지(transfer/launch/return)를
     // 채운다. 본문 region은 별도 builder로 채워 entry의 insertion을 흐트러뜨리지 않는다.
-    auto compute =
-        b.create<pim::ComputeOp>(loc, aReg, bReg, cReg, eg, tp, "gemm");
+    auto compute = b.create<pim::ComputeOp>(loc, ValueRange{aReg, bReg},
+                                            ValueRange{cReg}, eg, tp, "gemm");
 
     b.create<pim::TransferOp>(loc, cReg, "device_global", "host");
     b.create<pim::LaunchOp>(loc, func.getName(), vendor, /*device_id=*/0);
@@ -212,6 +263,106 @@ struct BuildPIMOffloadPass
     Block *body = bodyBuilder.createBlock(&compute.getBody(), {},
                                           {inTy, inTy, accTy}, argLocs);
     buildGemmBody(bodyBuilder, loc, body, blockM, blockN, blockK, accElemTy);
+  }
+
+  // 비-gemm 본문의 faithful 변환 (DESIGN 4.1/10.6, 1단계 simple faithful):
+  // 재생성하지 않고 원본 계산 본문을 pim.compute region으로 그대로 옮긴다. host buffer 인자를
+  // memory_region/transfer로 감싸(경계 인식) 본문 각 op에 pim.class 태그를 단다(분류). program_id
+  // 주소는 이 단계에선 본문에 보존한다(로컬 슬라이스 승격=2단계, 인식 패턴에서만).
+  void rewriteGenericFaithful(func::FuncOp func) {
+    Block &entry = func.getBody().front();
+
+    // host buffer = memref 타입 함수 인자. 스칼라(M/N/K: i32)는 제외. load/store 판정으로 역할 분류.
+    // TTShared 인자는 memref<*xT>(UnrankedMemRefType)라 ranked/unranked 공통 base로 판정한다
+    // (isa<MemRefType>은 ranked만 잡아 언랭크드 인자를 놓친다).
+    SmallVector<Value> inBufs, outBufs;
+    for (Value arg : func.getArguments()) {
+      if (!isa<BaseMemRefType>(arg.getType()))
+        continue;
+      if (isStoredBuffer(arg))
+        outBufs.push_back(arg);
+      else
+        inBufs.push_back(arg);
+    }
+    // 버퍼가 없으면 PIM 오프로드 대상이 아니다(그대로 둔다).
+    if (inBufs.empty() && outBufs.empty())
+      return;
+
+    // 원본 계산 본문(터미네이터 제외)을 prologue 삽입 전에 수집한다 — 이후 region으로 옮긴다.
+    SmallVector<Operation *> bodyOps;
+    for (Operation &op : entry.without_terminator())
+      bodyOps.push_back(&op);
+
+    OpBuilder b = OpBuilder::atBlockBegin(&entry);
+    Location loc = func.getLoc();
+    auto regionTy = pim::RegionType::get(b.getContext());
+    auto tpTy = pim::TilePlanType::get(b.getContext());
+    auto egTy = pim::ExecGroupType::get(b.getContext());
+
+    // 경계 인식: 각 host buffer를 memory_region으로 감싼다(입력/출력 역할 기록).
+    SmallVector<Value> inRegions, outRegions;
+    for (Value buf : inBufs)
+      inRegions.push_back(b.create<pim::MemoryRegionOp>(
+          loc, regionTy, buf, "host", "row_major", "input_activation"));
+    for (Value buf : outBufs)
+      outRegions.push_back(b.create<pim::MemoryRegionOp>(
+          loc, regionTy, buf, "host", "row_major", "output"));
+
+    // 분배 구조: 1단계 generic은 로컬 슬라이스를 안 하므로 BLOCK은 0(파생 안 함), SPLIT/local_lanes만
+    // 기록한다. 인식 패턴(gemm 등)이 BLOCK을 채우는 건 2단계.
+    Value tp = b.create<pim::TilePlanOp>(loc, tpTy, /*block_m=*/0, /*block_n=*/0,
+                                         /*block_k=*/0, (uint64_t)splitM,
+                                         (uint64_t)splitN, (uint64_t)splitK);
+    Value eg = b.create<pim::ExecutionGroupOp>(
+        loc, egTy, mappingPolicy(splitM, splitN, splitK),
+        (uint64_t)splitM * (uint64_t)splitN * (uint64_t)splitK,
+        (uint64_t)localLanes, /*stationary_data=*/"none");
+
+    for (Value r : inRegions)
+      b.create<pim::TransferOp>(loc, r, "host", "device_global");
+
+    // 본문을 담을 pim.compute (variadic ins/outs). primitive는 generic으로 표기(본문 op별 세부
+    // class는 아래에서 pim.class로 단다).
+    auto compute = b.create<pim::ComputeOp>(loc, inRegions, outRegions, eg, tp,
+                                            "generic");
+
+    for (Value r : outRegions)
+      b.create<pim::TransferOp>(loc, r, "device_global", "host");
+    b.create<pim::LaunchOp>(loc, func.getName(), vendor, /*device_id=*/0);
+    // 기존 return은 entry 끝에 그대로 둔다.
+
+    // region block arg = 본문이 참조하는 buffer(전체). operand 순서(inRegions 다음 outRegions)와 맞춘다.
+    SmallVector<Value> orderedBufs(inBufs.begin(), inBufs.end());
+    orderedBufs.append(outBufs.begin(), outBufs.end());
+    SmallVector<Type> argTys;
+    SmallVector<Location> argLocs;
+    for (Value buf : orderedBufs) {
+      argTys.push_back(buf.getType());
+      argLocs.push_back(loc);
+    }
+    OpBuilder rb(b.getContext());
+    Block *body = rb.createBlock(&compute.getBody(), {}, argTys, argLocs);
+
+    // 원본 계산 본문을 region으로 그대로 이동(치환 없음, 순서 보존).
+    for (Operation *op : bodyOps)
+      op->moveBefore(body, body->end());
+
+    // region 안에서만 buffer 인자 사용을 block arg로 remap(밖의 memory_region은 안 건드린다).
+    Region *region = &compute.getBody();
+    for (unsigned i = 0; i < orderedBufs.size(); ++i) {
+      Value buf = orderedBufs[i];
+      Value barg = body->getArgument(i);
+      buf.replaceUsesWithIf(barg, [&](OpOperand &use) {
+        return region->isAncestor(use.getOwner()->getParentRegion());
+      });
+    }
+
+    // 분류: 본문 각 op에 pim.class 태그(치환 아님, DESIGN 10.6).
+    body->walk([&](Operation *op) {
+      StringRef cls = classifyComputeOp(op);
+      if (!cls.empty())
+        op->setAttr("pim.class", StringAttr::get(op->getContext(), cls));
+    });
   }
 };
 

@@ -764,6 +764,24 @@ pim.func @matmul(%A, %B, %C, %M, %N, %K) attributes {
 }
 ```
 
+### 10.6 Basic-op Vocabulary + 분류 태그
+
+PIM Common IR의 compute 본문은 **정해진 basic-op vocabulary만** 담는다. 본문 op을 새 `pim.*` op로 치환하지 않고(4.1), 표준 dialect op을 그대로 둔 채 primitive class를 attribute(`pim.class`)로 태깅한다. vendor는 이 vocabulary만 구현하면 되고, TTSharedIR이 무엇이든 이 목록으로 환원되면 같은 경로로 실행된다.
+
+| class | 대표 표준 op |
+| --- | --- |
+| `elementwise` | parallel `linalg.generic` (arith 스칼라 바디: add/mul/div/min/max/and/or/xor/not) |
+| `gemm` | `linalg.matmul` |
+| `gemv` | `linalg.matvec` |
+| `transpose` | `linalg.transpose` |
+| `reduce` | reduction-iterator `linalg.generic` / `linalg.reduce` |
+| `gather` | indexed load (`tensor.gather` 등) |
+| `scatter` | indexed store |
+
+- **인식 = 태그, 치환 아님**: `linalg.matmul`은 `linalg.matmul`로 남고 `pim.class="gemm"`만 붙는다. `linalg.fill`/`scf.for`/`bufferization.to_tensor` 등 control·glue는 태그 없이 보존한다.
+- **분류기(classifier)**: `build-pim-offload`가 compute op을 walk하며 위 표로 class를 정한다(11.1 ③). 프로그래머블 vendor(UPMEM)는 class와 무관하게 op을 그대로 loops로 번역하고(12.8), 고정기능 vendor(AiMX)는 class로 descriptor를 고른다(13장).
+- **분해(`pim-normalize-ops`)**: vocabulary 밖 op은 basic op(elementwise + 지원 big-op)으로 낮춘다. 대부분 기존 MLIR linalg 분해를 재사용하고(복합 `linalg.generic`을 단일-op generic들로 split 등), 낮출 수 없으면 fail-fast한다(no-fallback). 처음엔 실제로 보는 op만 처리(사실상 identity)하고 필요할 때 키운다.
+
 ---
 
 ## 11. PIM Common Pass Pipeline
@@ -782,13 +800,19 @@ pim.func @matmul(%A, %B, %C, %M, %N, %K) attributes {
 
 ### 11.1 핵심 변환 (TTSharedIR → PIM Common IR)
 
-faithful-body 모델에서 변환의 핵심은 본문을 보존한 채 분배 구조만 합성하는 것이라 패스는 둘이면 충분하다.
+변환의 핵심은 **본문을 재생성하지 않고 읽어서 보존**하는 것이다(4.1). pass는 본문을 walk하며 로드/저장 경계만 분배 구조로 들어올리고, 계산 op은 그대로 두되 class만 태깅한다(10.6). vocabulary 밖 op은 basic op으로 분해한다. 실제 작업은 로드/저장 경계에만 있고 계산은 통과(pass-through)한다.
 
 ```text
-build-pim-offload      # PIM 오프로드 region 인식 → memory_region/transfer/
-                       #   tile_plan(grid·SPLIT)/execution_group을 본문 주위에 합성.
-                       #   본문(scf/linalg/memref)은 그대로 두고, program_id 전역 오프셋만
-                       #   분배층으로 이동. primitive는 속성으로 기록.
+pim-normalize-ops      # (opt-in) compute 본문의 vocabulary(10.6) 밖 op을 basic op으로 분해.
+                       #   분해 불가하면 fail-fast. 실제로 보는 op만 처리(사실상 identity)에서 확장.
+build-pim-offload      # ① boundary 인식: tile-load(reinterpret_cast(arg)+copy+to_tensor) /
+                       #   tile-store(reinterpret_cast(arg)+materialize_in_destination) idiom을
+                       #   memory_region/transfer로 들어올림.
+                       # ② 본문 보존: 계산 op(linalg/arith/scf/memref)을 pim.compute region으로
+                       #   그대로 이동(치환 없음). program_id offset은 인식 패턴이면 분배층으로
+                       #   들어올려 로컬 슬라이스(2단계), 아니면 본문에 그대로 둠(1단계) — 둘 다 정식 경로.
+                       # ③ 분류: 각 계산 op에 pim.class 태그(gemm/gemv/elementwise/reduce/...).
+                       # ④ tile_plan(grid·SPLIT)/execution_group을 option에서 합성.
 select-pim-strategy    # split factor + capability로 적법 전략 표시 (11.4).
                        #   단일 vendor·no-split이면 생략 가능.
 canonicalize

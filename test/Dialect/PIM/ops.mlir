@@ -26,12 +26,21 @@ func.func @matmul(%A: memref<256x512xf32>, %B: memref<512x512xf32>, %C: memref<2
   pim.transfer %b {src = "host", dst = "device_global"} : !pim.region
 
   // faithful-body: pim.compute가 본문 region을 들고 있다. block arg는 유닛-로컬 슬라이스.
+  // ins/outs는 variadic — gemm은 2 in / 1 out.
   // CHECK: pim.compute ins(%{{.*}}, %{{.*}}) outs(%{{.*}}) using %{{.*}}, %{{.*}} {primitive = "gemm"}
-  // CHECK-SAME: : (!pim.region, !pim.region, !pim.region, !pim.exec_group, !pim.tile_plan)
+  // CHECK-SAME: : (!pim.region, !pim.region) (!pim.region) (!pim.exec_group, !pim.tile_plan)
   // CHECK: ^{{.*}}(%{{.*}}: memref<?x?xf32>, %{{.*}}: memref<?x?xf32>, %{{.*}}: memref<?x?xf32>):
   pim.compute ins(%a, %b) outs(%c) using %eg, %tp {primitive = "gemm"}
-      : (!pim.region, !pim.region, !pim.region, !pim.exec_group, !pim.tile_plan) {
+      : (!pim.region, !pim.region) (!pim.region) (!pim.exec_group, !pim.tile_plan) {
   ^unit(%la: memref<?x?xf32>, %lb: memref<?x?xf32>, %lc: memref<?x?xf32>):
+  }
+
+  // variadic 확인: 1 in / 1 out (relu 류). block arg 하나.
+  // CHECK: pim.compute ins(%{{.*}}) outs(%{{.*}}) using %{{.*}}, %{{.*}} {primitive = "relu"}
+  // CHECK-SAME: : (!pim.region) (!pim.region) (!pim.exec_group, !pim.tile_plan)
+  pim.compute ins(%a) outs(%c) using %eg, %tp {primitive = "relu"}
+      : (!pim.region) (!pim.region) (!pim.exec_group, !pim.tile_plan) {
+  ^unit1(%ia: memref<?x?xf32>, %oc: memref<?x?xf32>):
   }
 
   pim.transfer %c {src = "device_global", dst = "host"} : !pim.region

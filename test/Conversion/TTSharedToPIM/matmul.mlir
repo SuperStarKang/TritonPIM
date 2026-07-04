@@ -24,13 +24,14 @@ func.func @matmul_kernel(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>
 // CHECK: pim.execution_group {local_lanes = 1 : i64, mapping_policy = "none", num_units = 1 : i64, stationary_data = "B"}
 // CHECK: pim.transfer
 // CHECK: pim.compute ins(%{{.*}}, %{{.*}}) outs(%{{.*}}) using %{{.*}}, %{{.*}} {primitive = "gemm"}
-// faithful-body: tm/tn(복원된 grid) + K-loop + 보존된 linalg.matmul(memref form).
+// CHECK-SAME: : (!pim.region, !pim.region) (!pim.region) (!pim.exec_group, !pim.tile_plan)
+// faithful-body: tm/tn(복원된 grid) + K-loop + 보존된 linalg.matmul(memref form). 본문 op은 pim.class로 태깅.
 // CHECK: ^{{.*}}(%[[A:.*]]: memref<?x?xf32>, %[[B:.*]]: memref<?x?xf32>, %[[C:.*]]: memref<?x?xf32>):
 // CHECK: scf.for
 // CHECK: scf.for
 // CHECK: linalg.fill
 // CHECK: scf.for
 // CHECK: memref.subview
-// CHECK: linalg.matmul ins({{.*}} : memref<32x256xf32{{.*}}>, memref<256x64xf32{{.*}}>) outs({{.*}} : memref<32x64xf32>)
+// CHECK: linalg.matmul {pim.class = "gemm"} ins({{.*}} : memref<32x256xf32{{.*}}>, memref<256x64xf32{{.*}}>) outs({{.*}} : memref<32x64xf32>)
 // CHECK: memref.copy
 // CHECK: pim.launch @matmul_kernel {device_id = 0 : i64, vendor = "upmem"}

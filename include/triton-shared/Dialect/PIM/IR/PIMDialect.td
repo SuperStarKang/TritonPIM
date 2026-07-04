@@ -98,22 +98,25 @@ def PIM_TransferOp : PIM_Op<"transfer"> {
   let assemblyFormat = "$region attr-dict `:` type($region)";
 }
 
-// PIM 연산 (faithful-body). a/b/c는 memory_region 핸들(전체 buffer), tile_plan은 grid·SPLIT.
-// 본문(scf/linalg/memref)은 치환하지 않고 region에 그대로 보존한다(DESIGN 4.1/10.2).
-// region block arg(%a,%b,%c)는 한 execution_unit이 맡은 로컬 슬라이스 memref다 — operand의
-// 전체 region 핸들과는 별개다. primitive("gemm" 등)는 전략 힌트 속성일 뿐 본문을 대체하지 않는다.
-// 전체 M/N/K는 IR에 박지 않는다: 본문은 block arg의 런타임 dim(Mu/Nu/K)을 쓰고, host codegen은
-// launcher가 넘기는 런타임 M/N/K를 쓴다. NoTerminator: 본문 끝에 별도 종결 op를 요구하지 않는다.
-def PIM_ComputeOp : PIM_Op<"compute", [NoTerminator]> {
+// PIM 연산 (faithful-body). inputs/outputs는 memory_region 핸들(전체 buffer), tile_plan은 grid·SPLIT.
+// 본문(scf/linalg/memref)은 치환하지 않고 region에 그대로 보존한다(DESIGN 4.1/10.2/10.6).
+// ins/outs는 variadic이라 gemm(2 in/1 out)뿐 아니라 임의 arity 커널(gemv/relu/fused)도 표현한다.
+// region block arg는 본문이 참조하는 buffer(전체 또는 로컬 슬라이스) memref다 — operand의 region
+// 핸들과는 별개다. primitive("gemm" 등)는 전략 힌트 속성일 뿐 본문을 대체하지 않으며, 본문 각 op의
+// 세부 class는 pim.class 태그로 단다(DESIGN 10.6). 전체 M/N/K는 IR에 박지 않는다: 본문은 block arg의
+// 런타임 dim을 쓰고, host codegen은 launcher가 넘기는 런타임 M/N/K를 쓴다. NoTerminator: 본문 끝에
+// 별도 종결 op를 요구하지 않는다. AttrSizedOperandSegments: ins/outs 두 variadic 경계를 기록.
+def PIM_ComputeOp : PIM_Op<"compute", [NoTerminator, AttrSizedOperandSegments]> {
   let summary = "PIM compute: per-unit body in a region (faithful-body)";
-  let arguments = (ins PIM_RegionType:$a, PIM_RegionType:$b, PIM_RegionType:$c,
+  let arguments = (ins Variadic<PIM_RegionType>:$inputs,
+                       Variadic<PIM_RegionType>:$outputs,
                        PIM_ExecGroupType:$execution_group,
                        PIM_TilePlanType:$tile_plan,
                        StrAttr:$primitive);
   let regions = (region AnyRegion:$body);
   let assemblyFormat = [{
-    `ins` `(` $a `,` $b `)` `outs` `(` $c `)` `using` $execution_group `,` $tile_plan attr-dict
-    `:` `(` type($a) `,` type($b) `,` type($c) `,` type($execution_group) `,` type($tile_plan) `)` $body
+    `ins` `(` $inputs `)` `outs` `(` $outputs `)` `using` $execution_group `,` $tile_plan attr-dict
+    `:` `(` type($inputs) `)` `(` type($outputs) `)` `(` type($execution_group) `,` type($tile_plan) `)` $body
   }];
 }
 
