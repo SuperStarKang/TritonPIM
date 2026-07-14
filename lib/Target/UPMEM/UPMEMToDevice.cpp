@@ -12,7 +12,7 @@
 
 using namespace mlir;
 
-// scf.for의 step(=BLOCK 크기)을 컴파일타임 상수로 읽는다. build-pim-offload가 항상 상수 step을
+// scf.for의 step(=BLOCK 크기)을 컴파일타임 상수로 읽는다. 앞 단계가 항상 상수 step을
 // 내므로(BLOCK은 Triton constexpr) 상수가 아니면 IR 불변식 위반 — 그대로 터지게 둔다(fail-fast).
 static int64_t constStep(scf::ForOp f) {
   auto c = f.getStep().getDefiningOp<arith::ConstantOp>();

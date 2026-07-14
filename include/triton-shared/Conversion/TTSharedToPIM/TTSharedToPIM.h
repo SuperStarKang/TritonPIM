@@ -7,10 +7,10 @@
 namespace mlir {
 namespace triton {
 
-#define GEN_PASS_DECL_BUILDPIMOFFLOAD
+#define GEN_PASS_DECL_CONVERTTTSHAREDTOPIM
 #include "triton-shared/Conversion/TTSharedToPIM/Passes.h.inc"
 
-std::unique_ptr<OperationPass<ModuleOp>> createBuildPIMOffloadPass();
+std::unique_ptr<OperationPass<ModuleOp>> createConvertTTSharedToPIMPass();
 
 } // namespace triton
 } // namespace mlir

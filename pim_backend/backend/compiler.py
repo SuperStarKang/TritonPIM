@@ -59,10 +59,10 @@ def _run_translate(mlir_text: str, which: str) -> str:
         return subprocess.check_output([tr, which, src]).decode("utf-8")
 
 
-def _ttsharedir_to_pim_common(ttshared: str, split_m: int, split_n: int, split_k: int, local_lanes: int) -> str:
-    # SPLIT/LOCAL_LANES는 build-pim-offload 옵션으로 전달 → tile_plan.split_*·execution_group에 기록(DESIGN 16).
-    # (한 argv에 공백으로 여러 옵션 — mlir pass option 파서가 공백 구분.)
-    return _run_opt(ttshared, [f"--build-pim-offload=split-m={split_m} split-n={split_n} split-k={split_k} local-lanes={local_lanes}"])
+def _ttsharedir_to_pim_common(ttshared: str) -> str:
+    # 메모리 접근을 pim.access/load/store로 변환한다. SPLIT/local_lanes(유닛 분배)는 target 관심사라
+    # 이 단계에서 넘기지 않는다(옛 build-pim-offload의 분배 옵션 제거, target 다리에서 다룬다).
+    return _run_opt(ttshared, ["--convert-ttshared-to-pim"])
 
 
 def _pim_common_to_upmem(pim_common: str) -> str:
@@ -194,7 +194,7 @@ class PIMBackend(BaseBackend):
         # 마지막 stage 이름은 binary_ext('pimobj')와 일치해야 CompiledKernel이 kernel을 찾는다.
         stages["ttir"] = lambda src, metadata: cpu_compiler.CPUBackend.make_ttir(src, metadata, options)
         stages["ttsharedir"] = lambda src, metadata: cpu_compiler._ttir_to_ttsharedir(src)
-        stages["pim_common"] = lambda src, metadata: _ttsharedir_to_pim_common(src, options.split_m, options.split_n, options.split_k, options.local_lanes)
+        stages["pim_common"] = lambda src, metadata: _ttsharedir_to_pim_common(src)
         # vendor 분기: legalize(vendor_ir)와 codegen(pimobj)만 vendor마다 다르다(DESIGN 19).
         # __post_init__은 vendor is None만 막으므로, 미지원 값은 여기서 fail-fast한다(fallback 금지).
         if options.vendor == "upmem":

@@ -1,27 +1,24 @@
-// 비-gemm 커널(elementwise add)이 재생성 없이 generic preserve 경로로 변환되는지 확인.
-// build-pim-offload가 로드/저장 경계만 memory_region/transfer로 들어올리고, 계산 본문
-// (reinterpret_cast/copy/to_tensor/linalg.generic/materialize)은 pim.compute region에 그대로
-// 보존하며, linalg.generic에 pim.class="elementwise"를 태깅한다(DESIGN 4.1/10.6/11.1).
-// RUN: triton-shared-opt --build-pim-offload %s | FileCheck %s
+// 벡터 덧셈 커널(①strided + store)의 메모리 접근이 pim.access/load/store로 올라가고
+// staging 버퍼(alloc/copy/to_tensor/materialize)가 사라지는지 확인. 계산(generic)은 유지되고
+// pim.class 태그만 붙는다.
+// RUN: triton-shared-opt --convert-ttshared-to-pim %s | FileCheck %s
+// RUN: triton-shared-opt --convert-ttshared-to-pim %s | FileCheck %s --check-prefix=CLEAN
 
 #map = affine_map<(d0) -> (d0)>
 
 // CHECK-LABEL: func.func @add_kernel
 func.func @add_kernel(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>, %n: i32) {
   %c0 = arith.constant 0 : index
-  // load A tile
   %ra = memref.reinterpret_cast %A to offset: [%c0], sizes: [32], strides: [1]
       : memref<*xf32> to memref<32xf32, strided<[1], offset: ?>>
   %aa = memref.alloc() : memref<32xf32>
   memref.copy %ra, %aa : memref<32xf32, strided<[1], offset: ?>> to memref<32xf32>
   %at = bufferization.to_tensor %aa restrict writable : memref<32xf32> to tensor<32xf32>
-  // load B tile
   %rb = memref.reinterpret_cast %B to offset: [%c0], sizes: [32], strides: [1]
       : memref<*xf32> to memref<32xf32, strided<[1], offset: ?>>
   %ab = memref.alloc() : memref<32xf32>
   memref.copy %rb, %ab : memref<32xf32, strided<[1], offset: ?>> to memref<32xf32>
   %bt = bufferization.to_tensor %ab restrict writable : memref<32xf32> to tensor<32xf32>
-  // elementwise add
   %z = tensor.empty() : tensor<32xf32>
   %sum = linalg.generic {indexing_maps = [#map, #map, #map], iterator_types = ["parallel"]}
       ins(%at, %bt : tensor<32xf32>, tensor<32xf32>) outs(%z : tensor<32xf32>) {
@@ -29,7 +26,6 @@ func.func @add_kernel(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>, %
     %s = arith.addf %x, %y : f32
     linalg.yield %s : f32
   } -> tensor<32xf32>
-  // store C tile
   %rc = memref.reinterpret_cast %C to offset: [%c0], sizes: [32], strides: [1]
       : memref<*xf32> to memref<32xf32, strided<[1], offset: ?>>
   bufferization.materialize_in_destination %sum in writable %rc
@@ -37,16 +33,18 @@ func.func @add_kernel(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>, %
   return
 }
 
-// 경계 인식: A/B는 input, C는 store idiom 대상이라 output.
-// CHECK: pim.memory_region %arg0 {{.*}}role = "input_activation"
-// CHECK: pim.memory_region %arg1 {{.*}}role = "input_activation"
-// CHECK: pim.memory_region %arg2 {{.*}}role = "output"
-// CHECK: pim.transfer %{{.*}} {dst = "device_global", src = "host"}
-// 본문은 재생성 없이 그대로 보존되고(reinterpret_cast/generic/materialize), generic은 태깅된다.
-// CHECK: pim.compute ins(%{{.*}}, %{{.*}}) outs(%{{.*}}) using
-// CHECK: memref.reinterpret_cast
-// CHECK: linalg.generic {{.*}}pim.class = "elementwise"
-// CHECK: arith.addf
-// CHECK: bufferization.materialize_in_destination
-// CHECK: pim.transfer %{{.*}} {dst = "host", src = "device_global"}
-// CHECK: pim.launch @add_kernel
+// 주소/전송으로 올라간다.
+// CHECK:      pim.access %arg0 offset %{{.*}} sizes [32] strides
+// CHECK:      pim.load
+// CHECK:      pim.access %arg1
+// CHECK:      pim.load
+// CHECK:      linalg.generic
+// CHECK-SAME: pim.class = "elementwise"
+// CHECK:      pim.access %arg2
+// CHECK:      pim.store
+
+// 버퍼 관용구는 마지막 store 이전(=본문 전체)에서 사라진다.
+// CLEAN-LABEL: func.func @add_kernel
+// CLEAN-NOT:   memref.
+// CLEAN-NOT:   bufferization.
+// CLEAN:       pim.store

@@ -3,33 +3,19 @@
 
 include "mlir/Pass/PassBase.td"
 
-def BuildPIMOffload : Pass<"build-pim-offload", "mlir::ModuleOp"> {
-  let summary = "Build vendor-neutral PIM Common IR around a preserved compute body (faithful-body)";
+def ConvertTTSharedToPIM : Pass<"convert-ttshared-to-pim", "mlir::ModuleOp"> {
+  let summary = "Convert ttshared memref access into PIM Common (pim.access/load/store)";
   let description = [{
-    tt.dot에서 내려온 linalg.matmul을 가진 함수에 PIM 오프로드 분배 구조를 합성한다(DESIGN 11.1).
-    계산 본문은 치환하지 않고 pim.compute region에 유닛-로컬 nest로 보존하며(faithful-body),
-    그 주위에 memory_region / transfer / tile_plan(grid·SPLIT) / execution_group(mapping_policy·
-    num_units·local_lanes)을 합성한다. BLOCK은 matmul shape에서, SPLIT/LOCAL_LANES는 option에서
-    읽는다(DESIGN 16). 전체 M/N/K는 IR에 박지 않고 본문 block arg의 런타임 dim으로 흐른다.
+    --triton-to-linalg-experimental 출력의 메모리 접근 3중구조
+    (reinterpret_cast + alloc + copy + to_tensor / materialize_in_destination)를
+    pim.access(주소 명세) + pim.load/pim.store(전송)로 끌어올려 staging 버퍼를 없앤다.
+    scf.for와 program_id 식은 그대로 둔다(SPMD, symbolic). 계산(linalg matmul/reduce/generic)은
+    치환하지 않고 각 op에 pim.class 종류 태그만 단다.
+    현재 지원: ① strided / ② loop-carried / store. (③ block · ④ wrap · ⑤ mask · ⑥⑦ gather는 추후)
   }];
-  let constructor = "mlir::triton::createBuildPIMOffloadPass()";
-  // faithful-body 본문은 scf/memref/arith/linalg op을 생성하므로, 입력 IR이 이들을 참조하지
-  // 않더라도 context에 로드돼 있도록 의존 dialect로 선언한다(미선언 시 build 시점 크래시).
-  let dependentDialects = ["mlir::pim::PIMDialect", "mlir::func::FuncDialect",
-                           "mlir::scf::SCFDialect", "mlir::memref::MemRefDialect",
-                           "mlir::arith::ArithDialect", "mlir::linalg::LinalgDialect"];
-  let options = [
-    Option<"vendor", "vendor", "std::string", /*default*/"\"upmem\"",
-           "pim.launch에 기록할 target PIM vendor 이름">,
-    Option<"splitM", "split-m", "unsigned", /*default*/"1",
-           "M축 inter-unit SPLIT 수. >1이면 출력 M(행)을 여러 유닛에 분배(output_m_partitioned).">,
-    Option<"splitN", "split-n", "unsigned", /*default*/"1",
-           "N축 inter-unit SPLIT 수. >1이면 출력 N(열)을 여러 유닛에 분배(output_n_partitioned).">,
-    Option<"splitK", "split-k", "unsigned", /*default*/"1",
-           "K축 inter-unit SPLIT 수. >1이면 한 출력 타일을 여러 유닛이 K분담(reduction_k_partitioned, host reduce).">,
-    Option<"localLanes", "local-lanes", "unsigned", /*default*/"1",
-           "유닛 내부 병렬 lane 수(=NR_TASKLETS). execution_group.local_lanes에 기록(DESIGN 16).">,
-  ];
+  let constructor = "mlir::triton::createConvertTTSharedToPIMPass()";
+  // pim.access/load/store와 (상수 offset/stride용) arith.constant를 만드므로 의존 dialect로 선언한다.
+  let dependentDialects = ["mlir::pim::PIMDialect", "mlir::arith::ArithDialect"];
 }
 
 #endif
