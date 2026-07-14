@@ -169,6 +169,16 @@ target별로 분해 rewrite pattern을 등록("exp → 다항식", "div → Newt
 - **linalg가 이미 지원** — MLIR 표준 fusion
 - 두 target 다 이득: AiMX는 descriptor 수 감소, UPMEM은 중간 버퍼 write/read 왕복 소멸
 
+> **갱신 (AiMX 소스 `matmul.c`/`elewise.c` 확인 후) — fusion은 PIM Common이 아니라 target으로 옮긴다.**
+> 위 "두 target 다 이득"은 성립하지 않는다. AiMX elementwise는 **opcode당 descriptor 하나**(`_elewise`:
+> A읽기·B읽기·C쓰기, 결과는 C(메모리)로)라 융합된 body를 **되돌려야** 하고, matmul+bias 융합은 `_gemm`의
+> **누산기(vACC) init**으로 target이 자기 방식으로 한다. 즉 fusion은 **target-divergent**다.
+> → **fusion(및 load-compute 융합·reduction 결합)은 target 또는 별도 late 패스로 유예.** PIM Common의
+> target-무관 연산 최적화는 **DCE · LICM 둘로 한정**한다.
+> **레이아웃 op(reshape/broadcast/transpose)은 접지 않고 그대로 둔다** — 물리 배치는 target마다 다르므로
+> (인터리빙/padding/`srcA_buf` 재배치는 AiMX target이 함), PIM Common은 가장 일반적인 명시적 layout op을
+> 유지하고 접기/물리화는 target에 맡긴다. (설계 문서의 "layout 변환 = target 자동"과 일치.)
+
 **2. load-compute 융합 — 메모리 설계 §6.5와 연결**
 
 ```mlir
@@ -187,10 +197,12 @@ target별로 분해 rewrite pattern을 등록("exp → 다항식", "div → Newt
 |---|---|---|---|
 | 산술 단순화 (`x*1`→`x`) | 안 | ❌ (upstream) | 표준 canonicalization |
 | 상수 폴딩 | 안 | ❌ (upstream) | 표준 |
-| **elementwise 융합** | 사이 | ✅ | target 무관, 중간 텐서 제거 |
-| **load-compute 융합** | 사이 | ✅ (태깅) | 메모리 §6.5와 연결 |
-| **reduction 결합** | 사이 | ✅ | target 무관 |
+| **elementwise 융합** | 사이 | ❌ (target/나중) | AiMX opcode 단위·`_gemm` 누산기 = target-divergent |
+| **load-compute 융합** | 사이 | ❌ (fusion과 함께) | 융합 준비물 |
+| **reduction 결합** | 사이 | ❌ (target/나중) | 융합류 |
 | **DCE** | 사이 | ✅ | 값 의미론 위 표준 |
+| **LICM** | 사이 | ✅ | 순수 연산 pure = MLIR 표준 LICM 안전 |
+| 레이아웃 op (reshape/broadcast/transpose) | — | ❌ (그대로 둠) | 물리 배치 target마다 다름 → 접기/물리화는 target |
 | 분해 (`div`→Newton) | 안 | ❌ (target) | legal set이 target 의존 |
 | 근사 (`exp`→다항식) | 안 | ❌ (target) | 정확도/연산량이 target 의존 |
 
@@ -213,21 +225,40 @@ op **내부**(메모리 필드값, 연산 산술)는 (a) 이미 최소이거나 
 
 ## 5. lowering 파이프라인 (연산 부분)
 
-메모리 설계 문서 §6의 Stage C를 구체화.
+메모리 설계 문서 §6의 Stage C를 구체화. **핵심: 분류는 맨 뒤 late 패스, fusion은 target/별도 패스로.**
 
 ```
-PIM Common raising 중 연산 처리:
-  ├─ 구조화 연산(matmul/reduce) → named op 유지 (scalar 루프로 풀지 않음)
-  ├─ 자유형 연산(generic)       → body 분류 태그 (pointwise/broadcast/scan)
-  └─ op 사이 최적화             → fusion / load-compute 융합 / reduction 결합 / DCE
+PIM Common 기본 compute lowering (실제 파이프라인 순서):
+  1. 메모리 raise (--convert-ttshared-to-pim)
+       구조화 연산(matmul/reduce/transpose) → named op 유지 (scalar 루프로 안 풂)
+       ※ 분류는 여기서 하지 않는다 (아래 "분류 시점" 참조)
+  2. 버퍼 최적화 (-cse --pim-remove-buffers -canonicalize)         ← 메모리 Stage B
+  3. 정리: DCE(-canonicalize) + LICM(-loop-invariant-code-motion)
+  4. 분류 (--pim-classify-compute, LATE)
+       자유형 연산(generic) → 정밀 종류 태그 (pointwise/broadcast/scan/generation/splat)
+  · [나중] fusion : 별도 late 패스 또는 target
   │
-PIM Common IR: named linalg 유지 + generic 분류 + 융합됨, 연산-메모리는 의존성으로 분리
+PIM Common IR: named linalg 유지 + generic 종류 태그 + 버퍼 clean, 연산-메모리는 의존성으로 분리
 
-target lowering (연산 분해):
-  ├─ legal 연산      → 직접 매핑 (matmul→chain/MAC, add→opcode)
-  ├─ illegal 연산    → 분해 (target rewrite pattern) 또는 host fallback
-  └─ 근사 차수       → 컴파일러 자동 결정
+target lowering:
+  legal 연산   → 직접 매핑 (matmul→chain/MAC, add→opcode, matmul+bias→_gemm 융합)
+  illegal 연산 → 분해 (target rewrite pattern) 또는 host fallback
+  fusion       → target별 (AiMX: _gemm/opcode 되돌림, UPMEM: tasklet 루프)
 ```
+
+### 분류 시점 — 왜 맨 뒤(late)인가
+
+분류 태그는 **찍는 순간의 스냅샷**이다. 뒤에 오는 패스가 op을 바꾸거나(canonicalize가 접음) 새 op을
+만들면(fusion이 둘을 합쳐 새 `linalg.generic` 생성) 태그가 **낡거나 사라진다**(새 op은 태그 없음). 그래서
+**모든 구조 변형 뒤 맨 마지막에** 분류를 돌린다 — 그러면 앞에서 op이 어떻게 바뀌었든 "지금 최종 op이 무슨
+종류냐"만 보면 된다. → 분류를 raise 패스에서 떼어 **독립 late 패스**(`--pim-classify-compute`)로 둔다.
+
+### 분류의 경계 — "종류(WHAT)"만 PIM Common, "합법성·opcode(HOW)"는 target
+
+PIM Common은 **target 무관한 종류**(pointwise/broadcast/scan/generation/splat)만 태그한다.
+- **합법성**(이 HW가 지원하나) — legal set이 target 의존(AiMX엔 exp illegal, UPMEM엔 legal) → **태그 안 함**.
+- **opcode/분해**(add/sub/mul 매핑, exp→다항식) — target이 body를 보고 정함 → **태그 안 함**.
+즉 PIM Common은 `math.exp`가 있으면 "pointwise"까지만 말하고, 그걸 분해할지는 target이 판단한다.
 
 > named op을 PIM Common에서 유지하는 이유(메모리 설계 §6 재확인): AiMX가 matmul을 descriptor chain으로,
 > elementwise를 opcode로 매핑하려면 named/분류된 형태여야 함. scalar 루프로 풀면 AiMX 매핑이 깨짐. 푸는
@@ -255,11 +286,14 @@ target lowering (연산 분해):
 |---|---|
 | 새 dialect | **최소화** — linalg 최대 재사용, `pim.matmul` 안 만듦 |
 | 구조화 연산(matmul/reduce) | named op 유지, scalar 루프로 안 풂 |
-| 자유형 연산(generic) | body 분류 태그 (pointwise/broadcast/scan) |
+| 자유형 연산(generic) | 정밀 종류 태그 (pointwise/broadcast/scan/generation/splat) — 맨 뒤 late 패스에서 |
+| 분류 시점 | 모든 변형(정리·fusion) 뒤 **late 패스** (태그 staleness 방지). raise에서 분리 |
+| 분류 경계 | 종류만(WHAT). 합법성·opcode·분해는 target(HOW) |
 | 연산-메모리 결합 | 의존성으로 분리, chain 결합은 target 유예 |
 | 분해(legalization) | target에서 (legal set이 target 의존), rewrite pattern 라이브러리 |
 | 근사 정확도 | 컴파일러 자동 결정 |
-| PIM Common 연산 최적화 | op 사이 구조만 (fusion/load-compute 융합/reduction 결합/DCE) |
+| PIM Common 연산 최적화 | **DCE·LICM만** (target 무관). fusion류·레이아웃 op은 target/별도 패스 |
+| fusion | **target-divergent** (AiMX 소스: opcode 단위·`_gemm` 누산기) → target 또는 별도 late 패스 |
 | body 내부 | 손대지 않음 (산술=upstream, 분해/근사=target) |
 | 메모리와의 대칭 | 둘 다 op "사이" 최적화. 융합이 연산·메모리를 연결 |
 

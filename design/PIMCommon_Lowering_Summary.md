@@ -233,7 +233,7 @@ clause 조합이 말이 되는지 op verify로 확인한다(잘못된 조합을 
 - ⑦ gather(무mask) — generic body의 `extract`가 **body에 직접** 있을 때
 - ⑦ gather(mask) — generic(ins 2개) body가 `scf.if{extract}else{default}`
 - ⑦ scatter(무mask/mask) — `store`가 body 직접 / `scf.if` 안
-- 계산 분류 — matmul→`gemm`, reduce→`reduce`, generic→`elementwise`/`reduce` 등 `pim.class` 태그(치환 아님)
+- (계산 분류는 이 raise 패스가 아니라 **별도 late 패스** `--pim-classify-compute`가 맡는다. 아래 §3.5)
 
 **삭제 전략** (dangling 방지):
 - `dead`: 반드시 죽는 관용구 op. 사용처→정의 순으로 쌓아 그 순서로 삭제.
@@ -256,6 +256,12 @@ matcher가 `mask`+`default`를 뽑아 변환. 이 가드가 없으면 마스크�
 ```
 - **쓰기 판별** `mayWrite(op)`: `isMemoryEffectFree`면 통과, 효과 모르면 보수적으로 장벽, `MemoryEffects::Write`
   있으면 장벽. 읽기는 장벽 아님.
+
+## 3.5 compute 기본 lowering — 별도 문서
+
+연산 쪽(종류 분류 late 패스 `--pim-classify-compute` + DCE/LICM, fusion은 target)은
+**`PIMCommon_ComputeLowering_Summary.md`** 에 정리했다. 전체 파이프라인:
+`--convert-ttshared-to-pim -cse --pim-remove-buffers -canonicalize -loop-invariant-code-motion --pim-classify-compute`.
 
 ## 4. MLIR 패스 배선 (새 패스 추가 시 건드리는 7곳)
 
@@ -297,6 +303,7 @@ TableGen이 반복 코드를 자동 생성해줘, 실제로 쓰는 건 `runOnOpe
 | `element_gather` | ⑦ 무mask gather/scatter |
 | `element_gather_masked` | ⑦ mask gather(mask+other)/scatter(mask) |
 | `remove_buffers` | Stage B passthrough/dedup/forwarding/장벽 |
+| `classify` | 종류 태그 (gemm/splat/elementwise/broadcast/generation/reduce) |
 | `Dialect/PIM/ops` | 모든 op·clause parse/print roundtrip (positive) |
 | `Dialect/PIM/invalid` | verifier가 잘못된 조합 거부 (negative, `-verify-diagnostics`) |
 

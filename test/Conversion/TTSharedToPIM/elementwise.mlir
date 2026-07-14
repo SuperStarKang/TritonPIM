@@ -1,7 +1,7 @@
 // 벡터 덧셈 커널(①strided + store)의 메모리 접근이 pim.access/load/store로 올라가고
 // staging 버퍼(alloc/copy/to_tensor/materialize)가 사라지는지 확인. 계산(generic)은 유지되고
 // pim.class 태그만 붙는다.
-// RUN: triton-shared-opt --convert-ttshared-to-pim %s | FileCheck %s
+// RUN: triton-shared-opt --convert-ttshared-to-pim --pim-classify-compute %s | FileCheck %s
 // RUN: triton-shared-opt --convert-ttshared-to-pim %s | FileCheck %s --check-prefix=CLEAN
 
 #map = affine_map<(d0) -> (d0)>

@@ -32,4 +32,18 @@ def RemovePIMBuffers : Pass<"pim-remove-buffers", "mlir::ModuleOp"> {
   let dependentDialects = ["mlir::pim::PIMDialect"];
 }
 
+def PIMClassifyCompute : Pass<"pim-classify-compute", "mlir::ModuleOp"> {
+  let summary = "Tag linalg compute ops with their target-neutral kind (pim.class)";
+  let description = [{
+    각 계산 op에 target 무관한 종류를 `pim.class`로 단다(치환 아님):
+    matmul→gemm, matvec→gemv, transpose→transpose, reduce→reduce, fill→splat,
+    generic→(reduction이면 reduce / linalg.index면 generation / 입력맵이 차원 drop이면 broadcast
+    / 아니면 elementwise). 합법성·opcode·분해는 태그하지 않는다(target 몫).
+    분류 태그는 스냅샷이라 op을 바꾸는 패스(fusion 등) 뒤에 낡으므로, 이 패스는 모든 구조 변형 뒤
+    **맨 마지막(late)** 에 돌린다.
+  }];
+  let constructor = "mlir::triton::createPIMClassifyComputePass()";
+  let dependentDialects = ["mlir::linalg::LinalgDialect"];
+}
+
 #endif

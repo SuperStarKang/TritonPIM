@@ -63,10 +63,13 @@ def _ttsharedir_to_pim_common(ttshared: str) -> str:
     # 메모리 접근을 pim.access/load/store로 변환(Stage A)한 뒤, 중복 전송을 없앤다(Stage B).
     # -cse: Pure한 pim.access(와 중복 상수)를 합쳐 "같은 descriptor"를 SSA 동일성으로 판별 가능하게 함.
     # --pim-remove-buffers: passthrough→pim.copy, 반복 load/RAW 재사용.
-    # -canonicalize: 죽은 pim.load(결과 미사용) 정리.
-    # SPLIT/local_lanes(유닛 분배)는 target 관심사라 이 단계에서 넘기지 않는다.
+    # -canonicalize: 죽은 pim.load/연산(결과 미사용) 정리(DCE).
+    # -loop-invariant-code-motion: 루프 불변 연산(순수 linalg)을 루프 밖으로.
+    # --pim-classify-compute: 연산 종류 태그(pim.class). 모든 구조 변형 뒤 맨 마지막(late)에 돌려 태그가 안 낡게.
+    # SPLIT/local_lanes(유닛 분배)와 fusion은 target 관심사라 이 단계에서 하지 않는다.
     return _run_opt(ttshared, ["--convert-ttshared-to-pim", "-cse",
-                               "--pim-remove-buffers", "-canonicalize"])
+                               "--pim-remove-buffers", "-canonicalize",
+                               "-loop-invariant-code-motion", "--pim-classify-compute"])
 
 
 def _pim_common_to_upmem(pim_common: str) -> str:

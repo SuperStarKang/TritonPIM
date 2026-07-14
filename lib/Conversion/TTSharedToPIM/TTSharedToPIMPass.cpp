@@ -75,26 +75,6 @@ static linalg::FillOp findFill(memref::AllocOp alloc) {
   return nullptr;
 }
 
-// 계산 op을 종류 태그로 분류한다. named op은 그대로 두고 pim.class만 단다(치환 아님).
-// control/glue(fill/for/subview 등)는 "" 반환 → 태그 없음.
-static StringRef classifyComputeOp(Operation *op) {
-  if (isa<linalg::MatmulOp>(op))
-    return "gemm";
-  if (isa<linalg::MatvecOp>(op))
-    return "gemv";
-  if (isa<linalg::TransposeOp>(op))
-    return "transpose";
-  if (isa<linalg::ReduceOp>(op))
-    return "reduce";
-  if (isa<linalg::GenericOp>(op)) {
-    // reduction 루프가 있으면 reduce, 전부 parallel이면 elementwise.
-    if (cast<linalg::LinalgOp>(op).getNumReductionLoops() > 0)
-      return "reduce";
-    return "elementwise";
-  }
-  return "";
-}
-
 struct ConvertTTSharedToPIMPass
     : public mlir::triton::impl::ConvertTTSharedToPIMBase<ConvertTTSharedToPIMPass> {
   using ConvertTTSharedToPIMBase::ConvertTTSharedToPIMBase;
@@ -371,13 +351,6 @@ struct ConvertTTSharedToPIMPass
     for (auto &kv : access)
       if (kv.first->use_empty())
         kv.first->erase();
-
-    // 분류: 각 계산 op에 pim.class 태그(치환 아님).
-    func.walk([&](Operation *op) {
-      StringRef cls = classifyComputeOp(op);
-      if (!cls.empty())
-        op->setAttr("pim.class", b.getStringAttr(cls));
-    });
   }
 };
 
