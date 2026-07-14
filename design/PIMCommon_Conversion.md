@@ -25,7 +25,7 @@ materialize_in_destination                     →   pim.access + pim.store
 |---|---|
 | 옛 래퍼 모델 | **제거**. memory_region / tile_plan / execution_group / compute / launch 삭제 |
 | 새 모델 | func 본문 = `scf.for + pim.access/load/store + named linalg` (top-level, program_id symbolic) |
-| 지원 범위 | ① strided / ② loop-carried / store. (③④⑤⑥⑦ 및 gather/scatter는 추후) |
+| 지원 범위 | ① strided / ② loop-carried / ③ block(=① 형태) / ⑤ mask / ⑥ row-gather(1·다차원) / ⑦ gather·scatter(mask 유·무) / store. (④ wrap은 추후) |
 | `!pim.access` 타입 | 지금은 파라미터 없는 핸들(shape/elemtype는 load 결과 tensor 타입이 보유). 파라미터형은 추후 |
 | offset | reinterpret_cast와 1:1로 **선형 offset 하나** + 축별 strides |
 | 효과 | pim.load = Read, pim.store = Write (추후 버퍼 제거 rewrite가 쓰도록 지금 달아둠) |
@@ -37,8 +37,15 @@ materialize_in_destination                     →   pim.access + pim.store
 - 타입 `!pim.access` — 논리 주소 핸들(무비용).
 - `pim.access %base offset %o sizes array<i64: ...> strides [%s...] : memref<*xT> -> !pim.access`
   - `Pure`. broadcast 축은 stride 0.
+  - 선택 clause: `valid [%e...] pad %p`(⑤ mask 경계+채움값), `gather N index %idx`(⑥ 1축 row-gather).
+    셋 다 optional operand/attr이라 없으면 안 붙는다(`AttrSizedOperandSegments`).
 - `pim.load %d : !pim.access -> tensor<...>` — Read.
 - `pim.store %v, %d : tensor<...>, !pim.access` — Write.
+- `pim.gather %base index %idx [mask %m : ... other %d : T] : memref<*xT>, tensor<Ki32> -> tensor<KxT>`
+  — ⑦ 원소별 random 로드, Read. mask 있으면 masked-out은 other 값으로 채움(default는 C++ 예약어라 operand명은 other).
+- `pim.scatter %v, %base index %idx [mask %m : ...] : tensor<KxT>, memref<*xT>, tensor<Ki32>`
+  — ⑦ 원소별 random 저장, Write. mask 있으면 masked-out은 안 씀.
+- `pim.copy %ds, %dd : !pim.access, !pim.access` — access→access 직접 전송(Read+Write). Stage B passthrough 산출물.
 
 옛 타입(Region/TilePlan/ExecGroup)과 옛 op(memory_region/tile_plan/execution_group/compute/launch)은 삭제.
 
@@ -46,16 +53,24 @@ materialize_in_destination                     →   pim.access + pim.store
 
 ## 4. raising 규칙 (`lib/.../TTSharedToPIM/TTSharedToPIMPass.cpp`)
 
-함수마다 아래 3개를 지역 rewrite로 적용한다. `scf.for`는 건드리지 않으므로 ②는 ①에서 저절로 따라온다.
+함수마다 아래 규칙들을 지역 rewrite로 적용한다. `scf.for`는 건드리지 않으므로 ②는 ①에서 저절로 따라온다.
 
 1. **주소**: `memref.reinterpret_cast`의 offset/sizes/strides를 그대로 `pim.access`로.
    상수 offset/stride는 `arith.constant index`로 만든다.
 2. **로드**: `copy(reinterpret_cast → alloc)` + `to_tensor(alloc)` → `pim.load`. 세 op 제거.
 3. **저장**: `materialize_in_destination(value, reinterpret_cast)` → `pim.store`. 제거.
+4. **⑤ mask**: 양쪽이 `subview`인 `copy`를 신호로 잡아 `pim.access{valid,pad}`+`load`로. valid=subview 크기,
+   pad=`linalg.fill` 입력값. 저장 쪽은 `materialize(extract_slice, subview)` → `pim.access{valid}`+`store`.
+   `alloc`/`fill`/`scf.if`/`subview`/`copy`/`extract_slice` 제거.
+5. **⑥ row-gather**: `copy(행별 reinterpret_cast → subview(alloc))`이고 offset이
+   `index_cast(tensor.extract)`면 `pim.access{gather_dim,index}`+`load`로. `scf.for`째로 제거.
+6. **⑦ gather/scatter**: `linalg.generic` body의 `tensor.extract(to_tensor(memref.cast))`→`pim.gather`,
+   `memref.store(memref.cast)`→`pim.scatter`. generic/cast/to_tensor 제거.
 
 세부:
 - 같은 reinterpret_cast를 load와 store가 함께 쓰면 **하나의 pim.access를 공유**한다(dedup).
-- 지원 안 하는 패턴(예: wraparound의 subview 대상 copy)은 매칭 안 되면 그대로 둔다 — 조용히 바꾸지 않는다.
+- 지원 안 하는 패턴(예: ④ wraparound의 2-view split)은 매칭 안 되면 그대로 둔다 — 조용히 바꾸지 않는다.
+- ③ block ptr은 memref 레벨에서 ①과 형태가 같아 ① 규칙이 그대로 처리한다(`order`는 앞 단계에서 stride에 녹아 사라짐).
 - 계산 분류: matmul→`gemm`, matvec→`gemv`, transpose→`transpose`, reduce→`reduce`,
   generic→(reduction 루프 있으면 `reduce`, 아니면 `elementwise`). named op은 유지하고 `pim.class` 태그만.
 - 예외 처리/우회 경로 없음. 가정(sizes static 등)이 깨지면 그 자리에서 그대로 실패한다.
@@ -125,8 +140,13 @@ lit test/Conversion/TTSharedToPIM test/Dialect/PIM -v
 
 ## 8. 아직 안 한 것 (다음 작업)
 
-- `pim.access` clause: ③ order · ④ wrap · ⑤ valid+pad · ⑥ gather, 그리고 ⑦ `pim.gather`/`pim.scatter`.
-- Stage B 버퍼 제거 rewrite(passthrough elision / load CSE / LICM / store→load forwarding / dead-transfer DCE)
-  — 효과(Read/Write)는 달아뒀으니 여기에 얹으면 된다.
-- `!pim.access` 파라미터형 타입 + verifier(설계 §3 R1~R7).
+- ④ wrap clause, ③ order clause: 둘 다 깨끗한 값이 memref가 아니라 그 앞 tts 레벨에만 남아 있어, 이 pass
+  입력(memref)에서는 복원이 지저분하다. 별도 논의 대상(pass 입력을 tts로 옮길지 등).
+- Stage B 일부 남음: **LICM(루프 밖으로 loop-invariant load hoist)** 은 블록/region을 넘는 분석이라 보류.
+  (완료: `--pim-remove-buffers` = passthrough→pim.copy / 반복 load dedup / store→load forwarding.
+  파이프라인은 `--convert-ttshared-to-pim -cse --pim-remove-buffers -canonicalize`. -cse가 Pure한
+  pim.access를 합쳐 "같은 descriptor"를 SSA 동일성으로 판별하게 하고, -canonicalize가 죽은 load를 지운다.)
+- `!pim.access` 파라미터형 타입(shape/elemtype를 타입에 담기). verifier는 구현됨:
+  `AccessOp::verify`(R1 strides==sizes rank / R2 valid rank / R3 pad⟹valid / R4 gather_dim⟺index+범위),
+  `GatherOp::verify`(mask⟺other). `valid≤sizes` 같은 런타임 비교와 wrap(R5/R6)은 제외.
 - 새 target 다리: PIM Common(pim.access/load/store) → UPMEM. (옛 legalize-pim-to-upmem 대체)

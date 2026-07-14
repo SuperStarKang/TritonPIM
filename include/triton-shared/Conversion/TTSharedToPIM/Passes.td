@@ -18,4 +18,18 @@ def ConvertTTSharedToPIM : Pass<"convert-ttshared-to-pim", "mlir::ModuleOp"> {
   let dependentDialects = ["mlir::pim::PIMDialect", "mlir::arith::ArithDialect"];
 }
 
+def RemovePIMBuffers : Pass<"pim-remove-buffers", "mlir::ModuleOp"> {
+  let summary = "Remove redundant PIM transfers on value semantics (Stage B)";
+  let description = [{
+    pim.load(Read)/store(Write)/access(Pure) 효과 위에서 중복 전송을 없앤다.
+    - passthrough: pim.store(pim.load(%ds), %dd) → pim.copy(%ds, %dd)
+    - load 재사용: 같은 access의 뒤 pim.load → 앞 load 결과 / 앞 store 값으로 대체
+    안전 조건: 두 op 사이(같은 블록)에 쓰기 효과 op이 없어야 한다. "같은 access"는 SSA 동일성으로
+    보므로 이 pass 앞에 -cse를 돌려 Pure한 pim.access를 합쳐 두는 것을 전제한다. 죽은 pim.load
+    (결과 미사용)은 -canonicalize가 정리한다.
+  }];
+  let constructor = "mlir::triton::createRemovePIMBuffersPass()";
+  let dependentDialects = ["mlir::pim::PIMDialect"];
+}
+
 #endif

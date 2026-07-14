@@ -5,8 +5,8 @@
 > raising하면서 불필요한 버퍼를 제거하는 것.
 >
 > 관련 문서:
-> - 메모리 접근 패턴 전수 → `triton-shared-memory-access-patterns.md` (이하 "메모리 패턴 문서")
-> - 연산 패턴 전수 → `triton-shared-compute-patterns.md`
+> - 메모리 접근 패턴 전수 → `MemoryAccess_Patterns.md` (이하 "메모리 패턴 문서")
+> - 연산 패턴 전수 → `Compute_Patterns.md`
 
 ---
 

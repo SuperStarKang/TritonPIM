@@ -1,5 +1,6 @@
 add_triton_library(TTSharedToPIM
   TTSharedToPIMPass.cpp
+  PIMRemoveBuffersPass.cpp
 
   DEPENDS
   PIMTableGen
@@ -13,6 +14,7 @@ add_triton_library(TTSharedToPIM
   MLIRSCFDialect
   MLIRMemRefDialect
   MLIRLinalgDialect
+  MLIRTensorDialect
   MLIRFuncDialect
   PIMIR
 )

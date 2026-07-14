@@ -52,15 +52,23 @@ def PIM_AccessType : PIM_Type<"Access", "access"> {
 // 논리 주소 명세 (memref.reinterpret_cast 대응). 데이터 이동 없음(Pure).
 // base = 원본 host 버퍼(memref<*xT>), offset = 선형 시작 위치, sizes = 타일 shape(static),
 // strides = 축별 간격. broadcast 축은 stride 0.
-def PIM_AccessOp : PIM_Op<"access", [Pure]> {
+// 선택 clause: valid+pad(⑤ mask 경계+채움값), gather_dim+index(⑥ 1축 row-gather).
+def PIM_AccessOp : PIM_Op<"access", [Pure, AttrSizedOperandSegments]> {
   let summary = "Logical strided access spec (no data movement)";
   let arguments = (ins AnyRankedOrUnrankedMemRef:$base, Index:$offset,
-                       Variadic<Index>:$strides, DenseI64ArrayAttr:$sizes);
+                       Variadic<Index>:$strides, DenseI64ArrayAttr:$sizes,
+                       Variadic<Index>:$valid, Optional<AnyType>:$pad,
+                       Optional<AnyRankedTensor>:$index,
+                       OptionalAttr<I64Attr>:$gather_dim);
   let results = (outs PIM_AccessType:$result);
   let assemblyFormat = [{
-    $base `offset` $offset `sizes` $sizes `strides` `[` $strides `]` attr-dict
-    `:` type($base) `->` type($result)
+    $base `offset` $offset `sizes` $sizes `strides` `[` $strides `]`
+    ( `valid` `[` $valid^ `]` )?
+    ( `pad` $pad^ `:` type($pad) )?
+    ( `gather` $gather_dim `index` $index^ `:` type($index) )?
+    attr-dict `:` type($base) `->` type($result)
   }];
+  let hasVerifier = 1;
 }
 
 // host→local 전송. 값(tensor)을 직접 만들어 staging 버퍼를 암묵화한다. Read 효과.
@@ -76,6 +84,45 @@ def PIM_StoreOp : PIM_Op<"store", [MemoryEffects<[MemWrite]>]> {
   let summary = "Store a tile through a PIM access";
   let arguments = (ins AnyRankedTensor:$value, PIM_AccessType:$access);
   let assemblyFormat = "$value `,` $access attr-dict `:` type($value) `,` type($access)";
+}
+
+// access→access 직접 전송. passthrough 최적화 산출물(로컬 버퍼 없이 src→dst).
+// src를 읽고 dst에 쓴다(Read+Write). 두 access가 각자의 clause(valid 등)를 그대로 가진다.
+def PIM_CopyOp : PIM_Op<"copy", [MemoryEffects<[MemRead, MemWrite]>]> {
+  let summary = "Direct descriptor-to-descriptor transfer (no local buffer)";
+  let arguments = (ins PIM_AccessType:$src, PIM_AccessType:$dst);
+  let assemblyFormat = "$src `,` $dst attr-dict `:` type($src) `,` type($dst)";
+}
+
+// ⑦ 원소별 random gather. index 텐서의 각 원소를 base 버퍼의 임의 위치에서 읽는다. Read 효과.
+// 선택 clause: mask 있으면 masked-out 원소는 default 값으로 채운다(predicated load).
+def PIM_GatherOp : PIM_Op<"gather", [MemoryEffects<[MemRead]>, AttrSizedOperandSegments]> {
+  let summary = "Per-element random gather from a base buffer";
+  // default는 C++ 예약어라 operand 이름으로 못 쓴다. Triton 용어인 other를 쓴다.
+  let arguments = (ins AnyRankedOrUnrankedMemRef:$base, AnyRankedTensor:$index,
+                       Optional<AnyRankedTensor>:$mask, Optional<AnyType>:$other);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = [{
+    $base `index` $index
+    ( `mask` $mask^ `:` type($mask) )?
+    ( `other` $other^ `:` type($other) )?
+    attr-dict `:` type($base) `,` type($index) `->` type($result)
+  }];
+  let hasVerifier = 1;
+}
+
+// ⑦ 원소별 random scatter. value의 각 원소를 base 버퍼의 임의 위치에 쓴다. Write 효과.
+// 선택 clause: mask 있으면 masked-out 원소는 쓰지 않는다(predicated store).
+// optional operand가 mask 하나뿐이라 AttrSizedOperandSegments는 불필요(operand 개수로 판별).
+def PIM_ScatterOp : PIM_Op<"scatter", [MemoryEffects<[MemWrite]>]> {
+  let summary = "Per-element random scatter into a base buffer";
+  let arguments = (ins AnyRankedTensor:$value, AnyRankedOrUnrankedMemRef:$base,
+                       AnyRankedTensor:$index, Optional<AnyRankedTensor>:$mask);
+  let assemblyFormat = [{
+    $value `,` $base `index` $index
+    ( `mask` $mask^ `:` type($mask) )?
+    attr-dict `:` type($value) `,` type($base) `,` type($index)
+  }];
 }
 
 #endif // PIM_DIALECT

@@ -60,9 +60,13 @@ def _run_translate(mlir_text: str, which: str) -> str:
 
 
 def _ttsharedir_to_pim_common(ttshared: str) -> str:
-    # 메모리 접근을 pim.access/load/store로 변환한다. SPLIT/local_lanes(유닛 분배)는 target 관심사라
-    # 이 단계에서 넘기지 않는다(옛 build-pim-offload의 분배 옵션 제거, target 다리에서 다룬다).
-    return _run_opt(ttshared, ["--convert-ttshared-to-pim"])
+    # 메모리 접근을 pim.access/load/store로 변환(Stage A)한 뒤, 중복 전송을 없앤다(Stage B).
+    # -cse: Pure한 pim.access(와 중복 상수)를 합쳐 "같은 descriptor"를 SSA 동일성으로 판별 가능하게 함.
+    # --pim-remove-buffers: passthrough→pim.copy, 반복 load/RAW 재사용.
+    # -canonicalize: 죽은 pim.load(결과 미사용) 정리.
+    # SPLIT/local_lanes(유닛 분배)는 target 관심사라 이 단계에서 넘기지 않는다.
+    return _run_opt(ttshared, ["--convert-ttshared-to-pim", "-cse",
+                               "--pim-remove-buffers", "-canonicalize"])
 
 
 def _pim_common_to_upmem(pim_common: str) -> str:
