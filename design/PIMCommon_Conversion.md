@@ -116,8 +116,8 @@ materialize_in_destination                     →   pim.access + pim.store
 
 ## 6.1 지금 끊긴 것 (의도된 상태)
 
-`pim_backend`의 `vendor_ir`/`pimobj` 단계는 옛 다리(`--legalize-pim-to-upmem` + upmem translate)를
-쓰므로, `vendor="upmem"`으로 끝까지 돌리면 **legalize 단계에서 그대로 실패한다**(no-fallback).
+`pim_backend`의 `target_ir`/`pimobj` 단계는 옛 다리(`--legalize-pim-to-upmem` + upmem translate)를
+쓰므로, `target="upmem"`으로 끝까지 돌리면 **legalize 단계에서 그대로 실패한다**(no-fallback).
 `pim_common` 단계까지(=이번 변환)는 정상 동작한다. UPMEM 끝단은 새 target 다리(§8)가 나오면 이어진다.
 
 ---

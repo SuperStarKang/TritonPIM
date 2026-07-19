@@ -14,7 +14,7 @@ def PIM_Dialect : Dialect {
   let name = "pim";
   let cppNamespace = "::mlir::pim";
 
-  let summary = "Vendor-neutral PIM common dialect";
+  let summary = "Target-neutral PIM common dialect";
   let description = [{
     PIM 공통 IR. ttshared IR(--triton-to-linalg-experimental 출력)에서 올라와,
     메모리 접근을 주소 명세(pim.access)와 전송(pim.load/pim.store)으로 표현한다.

@@ -59,17 +59,23 @@ def _run_translate(mlir_text: str, which: str) -> str:
         return subprocess.check_output([tr, which, src]).decode("utf-8")
 
 
+# TTSharedIR → PIM Common IR 파이프라인 (Design §20). 각 pass를 한 줄씩 두어, 실험 시 필요 없는
+# 단계는 그 줄을 주석(#) 처리해 껐다 켰다 할 수 있다. 순서 의미는 각 줄 주석 참고.
+# SPLIT/local_lanes(유닛 분배)와 fusion은 target 관심사라 이 단계에서 하지 않는다.
+PIM_COMMON_PASSES = [
+    "--convert-ttshared-to-pim",     # 메모리 접근을 pim.access/load/store로 변환 (Stage A)
+    "-cse",                          # Pure한 pim.access(와 중복 상수) 병합 → "같은 descriptor"를 SSA 동일성으로 판별(remove-buffers 선행 조건)
+    "--pim-remove-buffers",          # passthrough→pim.copy, 반복 load/RAW 재사용 (Stage B)
+    "-canonicalize",                 # 죽은 pim.load/연산(결과 미사용) 정리(DCE)
+    "-loop-invariant-code-motion",   # 루프 불변 연산(순수 linalg)을 루프 밖으로
+    "--pim-analyze-logical-work",    # program ID↔access offset 의존 분석(execution_model/program_dims/role/invariant), classify 앞·구조 변형 뒤
+    "--pim-classify-compute",        # 연산 종류 태그(pim.class). 모든 구조 변형 뒤 맨 마지막(late)에 돌려 태그가 안 낡게
+]
+
+
 def _ttsharedir_to_pim_common(ttshared: str) -> str:
-    # 메모리 접근을 pim.access/load/store로 변환(Stage A)한 뒤, 중복 전송을 없앤다(Stage B).
-    # -cse: Pure한 pim.access(와 중복 상수)를 합쳐 "같은 descriptor"를 SSA 동일성으로 판별 가능하게 함.
-    # --pim-remove-buffers: passthrough→pim.copy, 반복 load/RAW 재사용.
-    # -canonicalize: 죽은 pim.load/연산(결과 미사용) 정리(DCE).
-    # -loop-invariant-code-motion: 루프 불변 연산(순수 linalg)을 루프 밖으로.
-    # --pim-classify-compute: 연산 종류 태그(pim.class). 모든 구조 변형 뒤 맨 마지막(late)에 돌려 태그가 안 낡게.
-    # SPLIT/local_lanes(유닛 분배)와 fusion은 target 관심사라 이 단계에서 하지 않는다.
-    return _run_opt(ttshared, ["--convert-ttshared-to-pim", "-cse",
-                               "--pim-remove-buffers", "-canonicalize",
-                               "-loop-invariant-code-motion", "--pim-classify-compute"])
+    # 파이프라인 구성과 각 단계 의미는 PIM_COMMON_PASSES 정의 참고(줄 주석으로 토글).
+    return _run_opt(ttshared, PIM_COMMON_PASSES)
 
 
 def _pim_common_to_upmem(pim_common: str) -> str:
@@ -91,18 +97,18 @@ def _upmem_to_artifact(upmem_ir: str, metadata) -> bytes:
     return json.dumps({"host": host_src, "device": device_src}).encode("utf-8")
 
 
-# ── AiMX vendor 경로 (UPMEM helper와 평행) ───────────────────────────────────
+# ── AiMX target 경로 (UPMEM helper와 평행) ───────────────────────────────────
 # 아래 두 함수는 _pim_common_to_upmem / _upmem_to_artifact의 AiMX 쌍둥이다. 구조·시그니처는
-# 동일하고 vendor 고유 문자열(pass 이름·translate 이름·번들 키)만 다르다. 호출하는 배관
-# (_run_opt / _run_translate)은 vendor-neutral이라 그대로 재사용한다.
+# 동일하고 target 고유 문자열(pass 이름·translate 이름·번들 키)만 다르다. 호출하는 배관
+# (_run_opt / _run_translate)은 target-neutral이라 그대로 재사용한다.
 #
 # 지금은 경로(seam)만 만들어 둔 상태다. AiMX legalize pass(--legalize-pim-to-aimx)와
-# translate(--aimx-to-*)는 아직 triton-shared-opt/-translate에 없으므로, vendor="aimx"로
+# translate(--aimx-to-*)는 아직 triton-shared-opt/-translate에 없으므로, target="aimx"로
 # 실행하면 이 함수들이 호출하는 subprocess가 그 자리에서 fail한다(의도된 fail-fast, fallback 없음).
 # 실제 C++ 구현(dialect/legalize/codegen)은 별도 서버/브랜치에서 채운다(IMPLEMENT B1.2/B1.4).
 
 def _pim_common_to_aimx(pim_common: str) -> str:
-    # 같은 vendor-neutral PIM Common IR을 AiMX IR로 legalize한다 (Conversion/PIMToAiMX, B1.2).
+    # 같은 target-neutral PIM Common IR을 AiMX IR로 legalize한다 (Conversion/PIMToAiMX, B1.2).
     return _run_opt(pim_common, ["--legalize-pim-to-aimx"])
 
 
@@ -140,7 +146,7 @@ class PIMOptions:
     sanitize_overflow: bool = True
 
     # --- PIM 고유 옵션 ---
-    vendor: str = None           # "upmem" | "aimx" — 누락 시 아래에서 즉시 에러 (fallback 없음)
+    target: str = None           # "upmem" | "aimx" — 누락 시 아래에서 즉시 에러 (fallback 없음)
     device_id: int = 0
     split_m: int = 1             # M축 inter-unit SPLIT 수. split_m×split_n×split_k = DPU 개수.
     split_n: int = 1             # N축 inter-unit SPLIT 수. 1이면 해당 축 미분배(기존 동작).
@@ -148,10 +154,10 @@ class PIMOptions:
     local_lanes: int = 1         # DPU 내부 intra-unit 병렬 수(=NR_TASKLETS). 1이면 단일 tasklet.
 
     def __post_init__(self):
-        # vendor 없이 PIM을 쓰는 것은 의도된 사용이 아니므로 기본값으로 때우지 않고 바로 터뜨린다.
-        if self.vendor is None:
+        # target 없이 PIM을 쓰는 것은 의도된 사용이 아니므로 기본값으로 때우지 않고 바로 터뜨린다.
+        if self.target is None:
             raise ValueError(
-                "PIMBackend requires an explicit `vendor` option. "
+                "PIMBackend requires an explicit `target` option. "
                 "Supported values: 'upmem', 'aimx'."
             )
 
@@ -196,23 +202,23 @@ class PIMBackend(BaseBackend):
         return
 
     def add_stages(self, stages, options, language):
-        # PIM 파이프라인: TTIR → TTSharedIR → PIM Common IR → Vendor IR → artifact 번들.
-        # ttir/ttsharedir/pim_common은 vendor-neutral이라 공유하고, 뒤 두 stage만 vendor로 분기한다.
+        # PIM 파이프라인: TTIR → TTSharedIR → PIM Common IR → Target IR → artifact 번들.
+        # ttir/ttsharedir/pim_common은 target-neutral이라 공유하고, 뒤 두 stage만 target로 분기한다.
         # 마지막 stage 이름은 binary_ext('pimobj')와 일치해야 CompiledKernel이 kernel을 찾는다.
         stages["ttir"] = lambda src, metadata: cpu_compiler.CPUBackend.make_ttir(src, metadata, options)
         stages["ttsharedir"] = lambda src, metadata: cpu_compiler._ttir_to_ttsharedir(src)
         stages["pim_common"] = lambda src, metadata: _ttsharedir_to_pim_common(src)
-        # vendor 분기: legalize(vendor_ir)와 codegen(pimobj)만 vendor마다 다르다(DESIGN 19).
-        # __post_init__은 vendor is None만 막으므로, 미지원 값은 여기서 fail-fast한다(fallback 금지).
-        if options.vendor == "upmem":
-            stages["vendor_ir"] = lambda src, metadata: _pim_common_to_upmem(src)
+        # target 분기: legalize(target_ir)와 codegen(pimobj)만 target마다 다르다(DESIGN 19).
+        # __post_init__은 target is None만 막으므로, 미지원 값은 여기서 fail-fast한다(fallback 금지).
+        if options.target == "upmem":
+            stages["target_ir"] = lambda src, metadata: _pim_common_to_upmem(src)
             stages["pimobj"] = lambda src, metadata: _upmem_to_artifact(src, metadata)
-        elif options.vendor == "aimx":
-            stages["vendor_ir"] = lambda src, metadata: _pim_common_to_aimx(src)
+        elif options.target == "aimx":
+            stages["target_ir"] = lambda src, metadata: _pim_common_to_aimx(src)
             stages["pimobj"] = lambda src, metadata: _aimx_to_artifact(src, metadata)
         else:
             raise ValueError(
-                f"Unsupported PIM vendor '{options.vendor}'. Supported: 'upmem', 'aimx'.")
+                f"Unsupported PIM target '{options.target}'. Supported: 'upmem', 'aimx'.")
 
     @functools.lru_cache()
     def hash(self):

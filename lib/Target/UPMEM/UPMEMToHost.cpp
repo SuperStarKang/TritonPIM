@@ -1,5 +1,5 @@
 #include "triton-shared/Target/UPMEM/UPMEMTranslations.h"
-#include "triton-shared/Dialect/PIMVendor/UPMEM/IR/UPMEMDialect.h"
+#include "triton-shared/Dialect/PIMTarget/UPMEM/IR/UPMEMDialect.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"

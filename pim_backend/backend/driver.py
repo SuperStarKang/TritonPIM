@@ -10,7 +10,7 @@
 #   3) host.so를 dlopen해 <kernel>_host(A,B,C)를 ctypes로 호출
 # CPULauncher가 launcher .so를 컴파일·로드하는 패턴을 PIM 런타임 glue에 맞게 옮긴 것.
 #
-# vendor 분기: 위 1~2(빌드)는 vendor마다 다르다(upmem=dpu-clang/libdpu, aimx=descriptor runtime).
+# target 분기: 위 1~2(빌드)는 target마다 다르다(upmem=dpu-clang/libdpu, aimx=descriptor runtime).
 # 3(dlopen→ctypes 호출)은 stub이 같은 C ABI를 노출한다는 전제로 공유한다. aimx 빌드는 seam만
 # 잡아 두었고(_build_aimx_so) 실제 구현은 별도 서버/브랜치에서 채운다.
 
@@ -133,24 +133,24 @@ class PIMLauncher(object):
         self.extent_indices = [3, 4, 5]
         # local_lanes(=NR_TASKLETS): device 빌드 파라미터. PIMOptions 필드라 metadata에 들어온다.
         self.local_lanes = metadata.local_lanes
-        # vendor: 런타임에 빌드 툴체인을 고르는 분기 키. local_lanes와 같은 PIMOptions 필드라
+        # target: 런타임에 빌드 툴체인을 고르는 분기 키. local_lanes와 같은 PIMOptions 필드라
         # 같은 경로로 metadata에 들어온다("upmem" | "aimx").
-        self.vendor = metadata.vendor
+        self.target = metadata.target
 
     def __call__(self, gridX, gridY, gridZ, stream, cu_function,
                  kernel_metadata, launch_metadata,
                  launch_enter_hook, launch_exit_hook, *args):
         # cu_function = load_binary가 돌려준 소스 번들 bytes (PIMUtils.load_binary 참고).
         bundle = json.loads(bytes(cu_function).decode("utf-8"))
-        # vendor마다 빌드 툴체인이 다르다(upmem=dpu-clang+libdpu, aimx=descriptor runtime).
+        # target마다 빌드 툴체인이 다르다(upmem=dpu-clang+libdpu, aimx=descriptor runtime).
         # 빌드 단계만 분기하고, 아래 dlopen→ctypes 호출은 stub이 같은 (A,B,C,M,N,K) C ABI를
         # 노출한다는 전제로 공유한다(AiMX가 다른 인자를 요구하면 그때 호출부도 분기).
-        if self.vendor == "upmem":
+        if self.target == "upmem":
             so_path = _build_pim_so(bundle["host"], bundle["device"], self.local_lanes)
-        elif self.vendor == "aimx":
+        elif self.target == "aimx":
             so_path = _build_aimx_so(bundle["stub"], bundle["descriptors"])
         else:
-            raise ValueError(f"Unsupported PIM vendor '{self.vendor}'.")
+            raise ValueError(f"Unsupported PIM target '{self.target}'.")
 
         # host 진입 함수 이름 = metadata.name (compiler가 host.cpp에서 파싱해 채운 값). index 6.
         entry = kernel_metadata[6]

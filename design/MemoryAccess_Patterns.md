@@ -8,7 +8,7 @@
 ## 0. 문서 범위 & 대상 IR
 
 - **대상 IR**: `--triton-to-linalg-experimental`를 **끝까지** 통과한 출력. 즉 `tt.*` / `tts.*`가
-  모두 제거되고 vendor-neutral 표준 MLIR dialect만 남은 상태
+  모두 제거되고 target-neutral 표준 MLIR dialect만 남은 상태
   (`func` / `memref` / `linalg` / `arith` / `math` / `scf` / `tensor` / `bufferization` / `cf`).
 - **제외**: `tptr` dialect. tptr은 **scalar-element 포인터**(`!tt.ptr<scalar>`)의 주소·메모리 연산에서만
   발생하며(scalar load/store, `int_to_ptr`/`ptr_to_int`, scalar ptr bitcast, control-flow로 선택된

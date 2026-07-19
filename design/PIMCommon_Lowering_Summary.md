@@ -191,7 +191,7 @@ Stage A가 버퍼를 없앤 뒤 드러나는 낭비. `pim.load`=Read, `pim.store
 
 ## 1. PIM dialect (`Dialect/PIM/IR/PIMDialect.td`)
 
-target 용어(DPU/FPGA 등) 없는 vendor-neutral op 집합.
+target 용어(DPU/FPGA 등) 없는 target-neutral op 집합.
 
 | op | 역할 | 효과 |
 |---|---|---|

@@ -32,6 +32,23 @@ def RemovePIMBuffers : Pass<"pim-remove-buffers", "mlir::ModuleOp"> {
   let dependentDialects = ["mlir::pim::PIMDialect"];
 }
 
+def PIMAnalyzeLogicalWork : Pass<"pim-analyze-logical-work", "mlir::ModuleOp"> {
+  let summary = "Annotate SPMD program-ID structure and per-access reuse on PIM Common IR";
+  let description = [{
+    program ID(=SPMD tile 좌표)와 각 pim.access offset의 의존 관계를 분석해 속성으로 단다(치환 아님):
+    - func: `pim.execution_model = "spmd"`, 그리고 실제로 쓰이는 program 축이 있으면
+      `pim.program_dims = ["x"(,"y","z")]`.
+    - pim.access: 소비자에 따라 `pim.role`(load/copy-src→input, store/copy-dst→output),
+      그리고 offset이 의존하지 **않는** program 축을 `pim.invariant_program_dims`(program_dims 기준 인덱스)로 단다.
+      invariant = 그 축이 바뀌어도 같은 데이터 영역을 접근 → 축 방향 program 사이 재사용 후보(§14).
+    program ID는 triton-shared ABI(끝 3개 스칼라 인자 = axis 0/1/2)로 식별하며, offset backward slice를
+    arith 체인·scf.for iter_arg/induction까지 따라간다. slice가 불투명(추적 불가)하면 안전하게 그 축에
+    의존한다고 본다(재사용 과대주장 금지). 실제 residency는 target이 결정한다.
+  }];
+  let constructor = "mlir::triton::createPIMAnalyzeLogicalWorkPass()";
+  let dependentDialects = ["mlir::pim::PIMDialect"];
+}
+
 def PIMClassifyCompute : Pass<"pim-classify-compute", "mlir::ModuleOp"> {
   let summary = "Tag linalg compute ops with their target-neutral kind (pim.class)";
   let description = [{
