@@ -9,6 +9,7 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
 
 using namespace mlir;
 
@@ -75,6 +76,26 @@ static linalg::FillOp findFill(memref::AllocOp alloc) {
   return nullptr;
 }
 
+// alloc이 두 개 이상의 copy 대상(=subview)으로 채워지면 wrap-around 로드다(두 view + 두 copy가
+// 한 버퍼로). 이 경우 하나의 pim.access로 온전히 표현할 수 없다(§8 "추후 지원"). ⑤ masked walk가
+// 두 copy를 각각 매치해 공유 alloc/fill/to_tensor를 이중 erase하면 double free가 나므로,
+// 여기서 감지해 변환을 건너뛰고 관용구를 그대로 둔다(크래시·오변환 모두 방지).
+static bool isWrapAroundBuffer(memref::AllocOp alloc) {
+  int copyTargets = 0;
+  for (Operation *u : alloc->getUsers()) {
+    auto sv = dyn_cast<memref::SubViewOp>(u);
+    if (!sv)
+      continue;
+    for (Operation *su : sv->getUsers())
+      if (auto c = dyn_cast<memref::CopyOp>(su))
+        if (c.getTarget() == sv.getResult()) {
+          copyTargets++;
+          break;
+        }
+  }
+  return copyTargets > 1;
+}
+
 struct ConvertTTSharedToPIMPass
     : public mlir::triton::impl::ConvertTTSharedToPIMBase<ConvertTTSharedToPIMPass> {
   using ConvertTTSharedToPIMBase::ConvertTTSharedToPIMBase;
@@ -107,8 +128,9 @@ struct ConvertTTSharedToPIMPass
     SmallVector<Operation *> dead;     // 반드시 죽는 관용구 op (사용처→정의 순으로 쌓는다)
     SmallVector<Operation *> roots;    // reinterpret_cast/cast 등 use_empty일 때만 지운다
 
-    // ⑤ mask 로드: reinterpret_cast + alloc + fill + subview×2 + copy → pim.access{valid,pad}+load.
-    // (판별: copy의 양쪽이 subview) valid = subview 크기, pad = fill 입력값.
+    // ⑤ mask 로드: reinterpret_cast + alloc + (fill?) + subview×2 + copy → pim.access{valid, pad?}+load.
+    // 판별: copy 양쪽이 subview. valid = subview 크기. 채움값(other) 있으면 fill에서 pad, 없으면 valid만
+    // (fill 없는 마스크 로드: vec_add/reduce/layernorm 등. pim.access는 pad 없이 valid만도 허용).
     func.walk([&](memref::CopyOp copy) {
       auto vsub = copy.getSource().getDefiningOp<memref::SubViewOp>();
       auto bsub = copy.getTarget().getDefiningOp<memref::SubViewOp>();
@@ -118,25 +140,31 @@ struct ConvertTTSharedToPIMPass
       auto alloc = bsub.getSource().getDefiningOp<memref::AllocOp>();
       if (!rc || !alloc)
         return;
+      if (isWrapAroundBuffer(alloc))
+        return; // §8 wrap-around: 미지원. 관용구를 그대로 두고 건너뛴다.
       Operation *toTensor = findToTensor(alloc);
-      linalg::FillOp fill = findFill(alloc);
-      if (!toTensor || !fill)
+      if (!toTensor)
         return;
+      linalg::FillOp fill = findFill(alloc); // 없을 수 있다(채움값 없는 마스크 로드).
       b.setInsertionPoint(toTensor);
       Location loc = toTensor->getLoc();
       SmallVector<Value> valid = toIndices(b, loc, vsub.getMixedSizes());
       SmallVector<Value> strides = toIndices(b, loc, rc.getMixedStrides());
       Value offset = toIndex(b, loc, rc.getMixedOffsets()[0]);
+      Value pad = fill ? fill.getInputs()[0] : Value(); // 채움값 있으면 pad, 없으면 널
       Value d = makeAccess(b, loc, rc.getSource(), offset, strides,
-                           rc.getStaticSizes(), valid, fill.getInputs()[0],
-                           Value(), IntegerAttr());
+                           rc.getStaticSizes(), valid, pad, Value(), IntegerAttr());
       Value v = b.create<pim::LoadOp>(loc, toTensor->getResult(0).getType(), d);
       toTensor->getResult(0).replaceAllUsesWith(v);
-      // fill은 scf.if로 감싸여 있으면 그 if째로 지운다.
-      Operation *fillDead = isa<scf::IfOp>(fill->getParentOp()) ? fill->getParentOp()
-                                                                : fill.getOperation();
       dead.append({toTensor, copy.getOperation(), vsub.getOperation(),
-                   bsub.getOperation(), fillDead, alloc.getOperation()});
+                   bsub.getOperation(), alloc.getOperation()});
+      // 채움이 있을 때만 fill(scf.if로 감싸였으면 그 if째)을 죽은 목록에 넣는다.
+      if (fill) {
+        Operation *fillDead = isa<scf::IfOp>(fill->getParentOp())
+                                  ? fill->getParentOp()
+                                  : fill.getOperation();
+        dead.push_back(fillDead);
+      }
       roots.push_back(rc);
     });
 
@@ -343,13 +371,19 @@ struct ConvertTTSharedToPIMPass
     });
 
     // 죽은 관용구 op을 먼저 지우고(사용처→정의 순), 그다음 빈 root(reinterpret_cast/cast)를 지운다.
+    // erased 집합으로 이중 erase를 막는다(같은 op이 여러 walk에서 dead/roots/access에 겹쳐 들어올 수
+    // 있음 — 이미 지운 포인터엔 use_empty()도 부르지 않는다).
+    llvm::SmallPtrSet<Operation *, 32> erased;
     for (Operation *op : dead)
-      op->erase();
-    for (Operation *op : roots)
-      if (op->use_empty())
+      if (erased.insert(op).second)
         op->erase();
+    for (Operation *op : roots)
+      if (!erased.contains(op) && op->use_empty()) {
+        erased.insert(op);
+        op->erase();
+      }
     for (auto &kv : access)
-      if (kv.first->use_empty())
+      if (!erased.contains(kv.first) && kv.first->use_empty())
         kv.first->erase();
   }
 };
