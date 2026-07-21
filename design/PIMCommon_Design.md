@@ -261,8 +261,7 @@ func.func @matmul_kernel(%A, %B, %C, %M, %N, %K, %sam, %sbk, %scm,
 
 ```mlir
 func.func @matmul_kernel(%A, %B, %C, %M, %N, %K, %sam, %sbk, %scm,
-                         %np_x: i32, %np_y: i32, %np_z: i32)
-    attributes {pim.execution_model = "spmd"} {
+                         %np_x: i32, %np_y: i32, %np_z: i32) {
   %ub_x = arith.index_cast %np_x : i32 to index
   scf.for %gx = %c0 to %ub_x step %c1 {
     %pid_x = arith.index_cast %gx : index to i32
@@ -271,6 +270,8 @@ func.func @matmul_kernel(%A, %B, %C, %M, %N, %K, %sam, %sbk, %scm,
   return
 }
 ```
+
+`pim.execution_model`은 이 패스가 달지 않습니다. §5.5의 분석이 답니다.
 
 바뀌는 것은 세 가지뿐입니다.
 

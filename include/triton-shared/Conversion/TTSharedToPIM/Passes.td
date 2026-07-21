@@ -21,6 +21,26 @@ def ConvertTTSharedToPIM : Pass<"convert-ttshared-to-pim", "mlir::ModuleOp"> {
                            "mlir::tensor::TensorDialect"];
 }
 
+def PIMBuildGrid : Pass<"pim-build-grid", "mlir::ModuleOp"> {
+  let summary = "Turn SPMD program IDs into an explicit grid loop nest";
+  let description = [{
+    runtime가 돌던 grid 반복을 IR 안의 scf.for로 옮긴다. 그래야 서로 다른 program instance
+    사이의 중복 전송을 IR에서 볼 수 있다.
+    - program_id 인자 → grid loop의 induction variable. 인자는 지운다(뒤 패스가 끝 3개를
+      계속 program ID로 보지 않도록).
+    - num_programs 인자 → loop 상한. 그대로 남는다(호스트가 받는 grid 크기).
+    - 각 loop에 `pim.grid_dim = "x"|"y"|"z"`. 이 속성이 grid loop와 instance 내부
+      loop(K tile 등)를 구분하며, 이후 분석·분할이 전부 이 구분 위에서 돈다.
+    triton-shared ABI(커널 인자 끝 6개 = num_programs(x,y,z) 다음 program_id(x,y,z))만 보고
+    몸체는 건드리지 않는다. 그래서 커널이 grid를 어떻게 쓰든(grouped ordering 유무, GROUP_M 값)
+    결과가 같다. 다만 1차원 grid + grouped ordering이면 축이 하나뿐이라 분할 후보가 안 나온다.
+    실제로 쓰이는 program 축만 loop가 된다(안 쓰는 축은 범위 1). 단일 블록 func만 다룬다.
+  }];
+  let constructor = "mlir::triton::createPIMBuildGridPass()";
+  // grid loop(scf.for)와 상한·유도변수 변환(arith.constant/index_cast)을 만든다.
+  let dependentDialects = ["mlir::scf::SCFDialect", "mlir::arith::ArithDialect"];
+}
+
 def RemovePIMBuffers : Pass<"pim-remove-buffers", "mlir::ModuleOp"> {
   let summary = "Remove redundant PIM transfers on value semantics (Stage B)";
   let description = [{
