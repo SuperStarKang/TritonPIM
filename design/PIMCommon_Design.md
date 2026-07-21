@@ -234,6 +234,61 @@ func.func @matmul(...) attributes {
 
 ---
 
+## 5.3 reduction 구조 분석
+
+PIM Common은 reduction이 어디에서 일어나고, 여러 장치에 나누어 실행할 경우 무엇을 합쳐야 하는지를 속성으로 표시합니다. 물리 용량(하나의 장치에 담기는지)이나 결합 방식(Host 결합, 하드웨어 누적기 등)은 결정하지 않고, 논리 구조만 표현합니다. 실제 분할과 결합은 Target IR이 정합니다.
+
+### 내부 reduction loop
+
+하나의 program instance 안에서 accumulator에 누적하는 loop에는 결합 연산자를 함께 표시합니다.
+
+판별 기준은 다음과 같습니다.
+
+* tensor 타입 iter_arg를 계산 op의 outs(accumulator)로 받아 누적하고
+* 그 결과를 다시 같은 iter_arg로 yield하는 `scf.for`
+
+```mlir
+%r = scf.for %tk = %c0 to %grid_k step %c1
+    iter_args(%acc = %initial) -> tensor<32x64xf32>
+    { pim.reduction_combine = "add" } {
+  ...
+  %next = linalg.matmul ins(%a, %b) outs(%acc) -> tensor<32x64xf32>
+  scf.yield %next : tensor<32x64xf32>
+}
+```
+
+결합 연산자는 누적 계산 op에서 읽습니다.
+
+| 계산 op                          | `pim.reduction_combine`       |
+| ------------------------------ | ----------------------------- |
+| `linalg.matmul` / `linalg.matvec` | `add` (곱을 더해 누적)          |
+| `linalg.reduce`                | body의 결합 arith               |
+| `linalg.generic` (reduction)   | body의 결합 arith               |
+
+body의 결합 arith는 `addf`/`addi`→`add`, `maxf`/`maxsi`→`max`, `mulf`/`muli`→`mul`과 같이 대응시킵니다.
+
+이 표시는 Target IR이 loop의 reduction 축을 여러 장치에 나눌 때, 각 장치의 부분합을 어떤 연산으로 합칠지 알려 줍니다.
+
+### program instance 간 reduction
+
+서로 다른 program instance가 같은 출력 영역에 부분합을 쓰는 경우(Split-K 등)는, 출력 access가 어떤 program 차원에 불변인지로 판별합니다.
+
+출력 access가 program 차원 d에 불변이면, d만 다른 program instance들이 같은 출력을 접근하므로 그 결과를 합쳐야 합니다. 이때 그 차원들을 함수 속성으로 표시합니다.
+
+```mlir
+func.func @matmul(...) attributes {
+  pim.execution_model = "spmd",
+  pim.program_dims = ["m", "n", "k"],
+  pim.reduce_across_programs = ["k"]   // k 차원 program 사이 부분합 결합 필요
+}
+```
+
+일반적인 GEMM에서는 각 program이 서로 다른 출력 tile을 생성하므로(출력이 모든 program 차원에 의존) 이 속성은 나타나지 않습니다. 출력이 겹치는 경우에만 표시됩니다.
+
+이 표시는 "덮어쓰지 말고 합쳐야 한다"는 논리 사실이며, 합치는 위치와 방식은 Target IR이 결정합니다.
+
+---
+
 # 6. `pim.access`
 
 ## 6.1 기본 역할
@@ -980,6 +1035,8 @@ PIM Common에서는 다음 두 정보를 구분해야 합니다.
 Split-K
 → 서로 다른 program 사이의 partial result 결합
 ```
+
+이 두 경우는 §5.3의 분석으로 구분합니다. 내부 K loop는 reduction loop에 `pim.reduction_combine`으로, Split-K는 출력이 특정 program 차원에 불변인지로 판별해 `pim.reduce_across_programs`로 표시합니다.
 
 초기 구현에서는 Split-K를 다음과 같이 표현할 수 있습니다.
 

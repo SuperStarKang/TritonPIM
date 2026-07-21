@@ -3,6 +3,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
@@ -115,6 +116,39 @@ static StringRef accessRole(Value access) {
   return used ? "input" : StringRef();
 }
 
+// 결합 arith op → target-무관 combine 이름. 판별 불가면 "". op 이름으로 봐 dialect 버전차를 피한다.
+static StringRef arithToCombine(Operation *op) {
+  StringRef n = op->getName().getStringRef();
+  if (n == "arith.addf" || n == "arith.addi")
+    return "add";
+  if (n == "arith.mulf" || n == "arith.muli")
+    return "mul";
+  if (n == "arith.maximumf" || n == "arith.maxnumf" || n == "arith.maxsi" ||
+      n == "arith.maxui")
+    return "max";
+  if (n == "arith.minimumf" || n == "arith.minnumf" || n == "arith.minsi" ||
+      n == "arith.minui")
+    return "min";
+  return "";
+}
+
+// 누적 계산 op의 결합 연산자. matmul/matvec는 add(곱을 더해 누적). reduce/generic은
+// body의 yield 값을 만든 arith op로 판정. 판별 불가면 "".
+static StringRef reductionCombine(Operation *compute) {
+  if (isa<linalg::MatmulOp, linalg::MatvecOp>(compute))
+    return "add";
+  if (!isa<linalg::ReduceOp, linalg::GenericOp>(compute))
+    return "";
+  Region &r = compute->getRegion(0);
+  if (r.empty())
+    return "";
+  auto yield = dyn_cast<linalg::YieldOp>(r.front().getTerminator());
+  if (!yield || yield->getNumOperands() != 1)
+    return "";
+  Operation *def = yield->getOperand(0).getDefiningOp();
+  return def ? arithToCombine(def) : StringRef();
+}
+
 struct PIMAnalyzeLogicalWorkPass
     : public mlir::triton::impl::PIMAnalyzeLogicalWorkBase<
           PIMAnalyzeLogicalWorkPass> {
@@ -155,6 +189,24 @@ struct PIMAnalyzeLogicalWorkPass
       if (StringRef role = accessRole(a.getResult()); !role.empty())
         a->setAttr("pim.role", StringAttr::get(ctx, role));
 
+    // ⑥ reduction loop: tensor iter_arg 누산기를 계산 op의 outs로 받아 누적하는 scf.for에
+    // combine 연산자를 단다(target이 split 시 부분합을 이 연산으로 결합). program 축과 무관.
+    func.walk([&](scf::ForOp forOp) {
+      auto yield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+      for (auto [i, arg] : llvm::enumerate(forOp.getRegionIterArgs())) {
+        if (!isa<RankedTensorType>(arg.getType()))
+          continue;
+        Operation *compute = yield.getOperand(i).getDefiningOp();
+        auto linalgOp = compute ? dyn_cast<linalg::LinalgOp>(compute) : nullptr;
+        if (!linalgOp || !llvm::is_contained(linalgOp.getDpsInits(), arg))
+          continue; // 누산기(iter_arg)를 outs로 받는 계산의 결과가 yield 되어야 한다.
+        if (StringRef c = reductionCombine(compute); !c.empty()) {
+          forOp->setAttr("pim.reduction_combine", StringAttr::get(ctx, c));
+          break;
+        }
+      }
+    });
+
     if (activeAxes.empty())
       return; // program ID에 의존하는 접근이 없으면 여기까지(예: loop-carried offset).
 
@@ -167,6 +219,7 @@ struct PIMAnalyzeLogicalWorkPass
       dimNames.push_back(StringAttr::get(ctx, axisName(axis)));
     func->setAttr("pim.program_dims", ArrayAttr::get(ctx, dimNames));
 
+    llvm::DenseSet<unsigned> reduceAcross; // ⑦ 출력이 불변인 축 = 부분합 결합 필요 축
     for (auto [i, a] : llvm::enumerate(accesses)) {
       SmallVector<int64_t> invariant;
       for (auto [pos, axis] : llvm::enumerate(orderedAxes))
@@ -174,6 +227,21 @@ struct PIMAnalyzeLogicalWorkPass
           invariant.push_back(pos);
       a->setAttr("pim.invariant_program_dims",
                  DenseI64ArrayAttr::get(ctx, invariant));
+      // ⑦ 출력 접근이 어떤 program 축에 불변이면, 그 축만 다른 program들이 같은 출력에 씀
+      // → 부분합을 합쳐야 한다(Split-K류). 그 축들을 모은다.
+      if (accessRole(a.getResult()) == "output")
+        for (unsigned axis : orderedAxes)
+          if (!depsPerAccess[i].contains(axis))
+            reduceAcross.insert(axis);
+    }
+
+    if (!reduceAcross.empty()) {
+      SmallVector<unsigned> ra(reduceAcross.begin(), reduceAcross.end());
+      llvm::sort(ra);
+      SmallVector<Attribute> raNames;
+      for (unsigned axis : ra)
+        raNames.push_back(StringAttr::get(ctx, axisName(axis)));
+      func->setAttr("pim.reduce_across_programs", ArrayAttr::get(ctx, raNames));
     }
   }
 };
