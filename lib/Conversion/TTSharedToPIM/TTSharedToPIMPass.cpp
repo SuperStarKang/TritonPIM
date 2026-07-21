@@ -140,8 +140,15 @@ struct ConvertTTSharedToPIMPass
       auto alloc = bsub.getSource().getDefiningOp<memref::AllocOp>();
       if (!rc || !alloc)
         return;
-      if (isWrapAroundBuffer(alloc))
-        return; // §8 wrap-around: 미지원. 관용구를 그대로 두고 건너뛴다.
+      if (isWrapAroundBuffer(alloc)) {
+        // §8 wrap-around: 단일 pim.access로 표현 불가. 조용히 두면 target에서 깨지므로 여기서 실패시킨다.
+        copy->emitError("wrap-around load (two disjoint regions from `% M`/`% N` "
+                        "index wrapping) is unsupported on PIM; rewrite the kernel "
+                        "to mask the boundary (`mask=`/`other=`) instead of modulo "
+                        "indexing");
+        signalPassFailure();
+        return;
+      }
       Operation *toTensor = findToTensor(alloc);
       if (!toTensor)
         return;
