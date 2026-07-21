@@ -11,11 +11,14 @@ def ConvertTTSharedToPIM : Pass<"convert-ttshared-to-pim", "mlir::ModuleOp"> {
     pim.access(주소 명세) + pim.load/pim.store(전송)로 끌어올려 staging 버퍼를 없앤다.
     scf.for와 program_id 식은 그대로 둔다(SPMD, symbolic). 계산(linalg matmul/reduce/generic)은
     치환하지 않고 각 op에 pim.class 종류 태그만 단다.
-    현재 지원: ① strided / ② loop-carried / store. (③ block · ④ wrap · ⑤ mask · ⑥⑦ gather는 추후)
+    현재 지원: strided · loop-carried · block · masked(pad 있음/없음) 로드, row·element gather/scatter,
+    tile 저장(materialize)·스칼라 저장(affine.store). wrap-around 로드는 미지원(건너뜀).
   }];
   let constructor = "mlir::triton::createConvertTTSharedToPIMPass()";
-  // pim.access/load/store와 (상수 offset/stride용) arith.constant를 만드므로 의존 dialect로 선언한다.
-  let dependentDialects = ["mlir::pim::PIMDialect", "mlir::arith::ArithDialect"];
+  // pim.access/load/store, (상수 offset/stride용) arith.constant, (스칼라 저장 감쌈용)
+  // tensor.from_elements를 만드므로 의존 dialect로 선언한다. 입력에 그 dialect가 없어도 로드되게.
+  let dependentDialects = ["mlir::pim::PIMDialect", "mlir::arith::ArithDialect",
+                           "mlir::tensor::TensorDialect"];
 }
 
 def RemovePIMBuffers : Pass<"pim-remove-buffers", "mlir::ModuleOp"> {

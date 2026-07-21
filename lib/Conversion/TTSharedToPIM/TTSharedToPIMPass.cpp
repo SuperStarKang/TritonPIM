@@ -263,6 +263,28 @@ struct ConvertTTSharedToPIMPass
       roots.push_back(rc);
     });
 
+    // 스칼라 저장: affine.store %scalar, %reinterpret_cast[0] (sizes [1]) → pim.access + pim.store.
+    // reduce/layernorm의 mean/rstd 등 한 칸짜리 결과. 스칼라를 tensor<1xT>로 감싸 pim.store로 넘긴다.
+    // affine dialect 링크 의존을 피하려 op 이름으로 확인한다. index는 크기 1이라 항상 0이므로 무시.
+    func.walk([&](Operation *op) {
+      if (op->getName().getStringRef() != "affine.store")
+        return;
+      auto rc = op->getOperand(1).getDefiningOp<memref::ReinterpretCastOp>();
+      if (!rc)
+        return;
+      ArrayRef<int64_t> sizes = rc.getStaticSizes();
+      if (sizes.size() != 1 || sizes[0] != 1)
+        return; // 한 칸(크기 1) 저장만 다룬다.
+      Value scalar = op->getOperand(0);
+      Value acc = getAccess(rc); // rc 위치에 pim.access 생성(offset/strides/sizes)
+      b.setInsertionPoint(op);
+      Value tv = b.create<tensor::FromElementsOp>(
+          op->getLoc(), RankedTensorType::get({1}, scalar.getType()),
+          ValueRange{scalar});
+      b.create<pim::StoreOp>(op->getLoc(), tv, acc);
+      dead.push_back(op);
+    });
+
     // ⑦ 원소별 gather: linalg.generic 안의 tensor.extract(to_tensor(memref.cast(base))) → pim.gather.
     func.walk([&](linalg::GenericOp g) {
       tensor::ExtractOp extract;
