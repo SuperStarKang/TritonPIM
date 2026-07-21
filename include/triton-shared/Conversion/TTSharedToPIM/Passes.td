@@ -58,15 +58,20 @@ def RemovePIMBuffers : Pass<"pim-remove-buffers", "mlir::ModuleOp"> {
 def PIMAnalyzeLogicalWork : Pass<"pim-analyze-logical-work", "mlir::ModuleOp"> {
   let summary = "Annotate SPMD program-ID structure and per-access reuse on PIM Common IR";
   let description = [{
-    program ID(=SPMD tile 좌표)와 각 pim.access offset의 의존 관계를 분석해 속성으로 단다(치환 아님):
-    - func: `pim.execution_model = "spmd"`, 그리고 실제로 쓰이는 program 축이 있으면
+    grid 차원과 각 pim.access의 의존 관계를 분석해 속성으로 단다(치환 아님):
+    - func: `pim.execution_model = "spmd"`, grid loop가 있으면 그 중첩 순서대로
       `pim.program_dims = ["x"(,"y","z")]`.
     - pim.access: 소비자에 따라 `pim.role`(load/copy-src→input, store/copy-dst→output),
-      그리고 offset이 의존하지 **않는** program 축을 `pim.invariant_program_dims`(program_dims 기준 인덱스)로 단다.
-      invariant = 그 축이 바뀌어도 같은 데이터 영역을 접근 → 축 방향 program 사이 재사용 후보(§14).
-    program ID는 triton-shared ABI(끝 3개 스칼라 인자 = axis 0/1/2)로 식별하며, offset backward slice를
-    arith 체인·scf.for iter_arg/induction까지 따라간다. slice가 불투명(추적 불가)하면 안전하게 그 축에
-    의존한다고 본다(재사용 과대주장 금지). 실제 residency는 target이 결정한다.
+      그리고 의존하지 **않는** grid 차원을 `pim.invariant_program_dims`(program_dims 기준 인덱스)로 단다.
+      invariant = 그 차원이 바뀌어도 같은 데이터를 읽는다 → 그 방향 instance 사이 재사용 후보.
+    - 출력 access가 어떤 차원에 불변이면 그 차원만 다른 instance들이 같은 출력에 쓴다는 뜻이라
+      `pim.reduce_across_programs`로 표시한다(Split-K류). 어떤 access도 그 차원에 의존하지 않으면
+      단순 중복 실행이라 결합 대상이 아니므로 표시하지 않는다.
+    grid 차원은 `pim.grid_dim` 속성이 붙은 scf.for로 식별하므로 --pim-build-grid를 먼저 돌려야 한다.
+    의존성은 backward slice로 구하며 arith 체인과 scf.for iter_arg를 따라간다. 추적 불가한 leaf를
+    만나면 안전하게 모든 차원에 의존한다고 본다(재사용 과대주장 금지).
+    영역을 정하는 것은 offset 하나가 아니므로 strides·valid·index·pad까지 함께 추적한다.
+    실제 residency는 target이 결정한다.
   }];
   let constructor = "mlir::triton::createPIMAnalyzeLogicalWorkPass()";
   let dependentDialects = ["mlir::pim::PIMDialect"];

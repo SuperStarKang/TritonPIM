@@ -20,35 +20,21 @@ namespace triton {
 
 namespace {
 
-// triton-shared ABI: 커널 인자 끝에 6개가 붙는다 — num_programs(axis 0,1,2) 다음에
-// program_id(axis 0,1,2). 즉 program ID는 맨 끝 3개 인자다(GetProgramIDConverter 참고).
-static constexpr unsigned kLaunchGridRank = 3;
-
-// axis 번호(0,1,2) → 이름. program_dims 속성에 쓴다(triton launch 축 그대로).
-static StringRef axisName(unsigned axis) {
-  static constexpr StringRef names[] = {"x", "y", "z"};
-  return names[axis];
+// pim.grid_dim이 붙은 scf.for를 바깥에서 안쪽 순서로 모은다. 이것이 program 차원이다.
+// walk 기본값은 post-order라 안쪽 loop부터 방문하므로 pre-order를 명시한다.
+static void collectGridLoops(func::FuncOp func,
+                             SmallVectorImpl<scf::ForOp> &grid) {
+  func.walk<WalkOrder::PreOrder>([&](scf::ForOp forOp) {
+    if (forOp->hasAttr("pim.grid_dim"))
+      grid.push_back(forOp);
+  });
 }
 
-// func의 program-ID 인자를 axis→BlockArgument로 모은다. 끝 3개 중 스칼라 정수/index만
-// 유효 axis로 본다(hand-written·비정형 시그니처에서 memref 등이 끝에 오면 그 axis는 없음).
-static void collectProgramIdArgs(func::FuncOp func,
-                                 SmallVectorImpl<BlockArgument> &pidByAxis) {
-  pidByAxis.assign(kLaunchGridRank, BlockArgument());
-  unsigned n = func.getNumArguments();
-  if (n < kLaunchGridRank)
-    return;
-  for (unsigned axis = 0; axis < kLaunchGridRank; axis++) {
-    BlockArgument arg = func.getArgument(n - kLaunchGridRank + axis);
-    if (arg.getType().isIntOrIndex())
-      pidByAxis[axis] = arg;
-  }
-}
-
-// offset이 의존하는 program 축 집합을 backward slice로 구한다. slice가 불투명하면(추적 불가한
-// leaf) 안전하게 모든 유효 axis에 의존한다고 보고 opaque=true를 남긴다(재사용 과대주장 금지).
-static void collectOffsetDeps(Value root, ArrayRef<BlockArgument> pidByAxis,
-                              llvm::DenseSet<unsigned> &deps, bool &opaque) {
+// 값이 의존하는 grid 차원 집합을 backward slice로 구한다. 추적할 수 없는 leaf를 만나면
+// opaque=true를 남겨, 호출자가 모든 차원에 의존한다고 보수적으로 처리하게 한다
+// (재사용 가능성을 과대주장하지 않는다).
+static void collectDeps(Value root, ArrayRef<scf::ForOp> grid,
+                        llvm::DenseSet<unsigned> &deps, bool &opaque) {
   SmallVector<Value> worklist{root};
   llvm::DenseSet<Value> visited;
   while (!worklist.empty()) {
@@ -57,31 +43,28 @@ static void collectOffsetDeps(Value root, ArrayRef<BlockArgument> pidByAxis,
       continue;
 
     if (auto ba = dyn_cast<BlockArgument>(v)) {
-      // program-ID 인자면 해당 축을 기록.
-      bool isPid = false;
-      for (unsigned axis = 0; axis < pidByAxis.size(); axis++)
-        if (pidByAxis[axis] == ba) {
-          deps.insert(axis);
-          isPid = true;
-          break;
-        }
-      if (isPid)
-        continue;
-      // scf.for의 iter_arg/induction은 따라간다. iter_arg는 init과 yield 양쪽으로.
-      if (auto forOp = dyn_cast<scf::ForOp>(ba.getOwner()->getParentOp())) {
-        unsigned argNo = ba.getArgNumber();
-        if (argNo == 0)
-          continue; // induction variable → loop-local, program 무관
-        unsigned iterIdx = argNo - 1;
-        worklist.push_back(forOp.getInitArgs()[iterIdx]);
-        worklist.push_back(
-            forOp.getBody()->getTerminator()->getOperand(iterIdx));
+      auto forOp = dyn_cast<scf::ForOp>(ba.getOwner()->getParentOp());
+      if (!forOp) {
+        // func 인자(stride/size 등)는 instance 사이에서 값이 같은 안전한 leaf.
+        // 다른 region의 block arg는 추적할 수 없다.
+        if (!isa<func::FuncOp>(ba.getOwner()->getParentOp()))
+          opaque = true;
         continue;
       }
-      // 그 외 func 인자(stride/size 등, 인스턴스 불변)는 안전한 leaf, 나머지 block arg는 불투명.
-      if (isa<func::FuncOp>(ba.getOwner()->getParentOp()))
+      if (ba == forOp.getInductionVar()) {
+        // grid loop의 유도변수면 그 차원에 의존한다. grid가 아닌 loop(K tile 등)의
+        // 유도변수는 instance 내부의 반복이라 program 차원과 무관하다.
+        for (auto [d, g] : llvm::enumerate(grid))
+          if (g == forOp) {
+            deps.insert(d);
+            break;
+          }
         continue;
-      opaque = true;
+      }
+      // iter_arg는 초기값과 yield 값 양쪽으로 따라간다.
+      unsigned iterIdx = ba.getArgNumber() - 1;
+      worklist.push_back(forOp.getInitArgs()[iterIdx]);
+      worklist.push_back(forOp.getBody()->getTerminator()->getOperand(iterIdx));
       continue;
     }
 
@@ -95,6 +78,23 @@ static void collectOffsetDeps(Value root, ArrayRef<BlockArgument> pidByAxis,
     for (Value o : def->getOperands())
       worklist.push_back(o);
   }
+}
+
+// access가 읽거나 쓰는 데이터가 의존하는 grid 차원 집합.
+// offset만으로는 부족하다. strides는 축 간격을, valid는 경계 tile의 유효 범위를,
+// index는 row gather가 실제로 읽는 행을 정한다. pad는 주소는 아니지만 유효 범위 밖
+// 원소의 값이 되어 load 결과를 바꾸므로 함께 본다.
+static void collectAccessDeps(pim::AccessOp access, ArrayRef<scf::ForOp> grid,
+                              llvm::DenseSet<unsigned> &deps, bool &opaque) {
+  collectDeps(access.getOffset(), grid, deps, opaque);
+  for (Value stride : access.getStrides())
+    collectDeps(stride, grid, deps, opaque);
+  for (Value valid : access.getValid())
+    collectDeps(valid, grid, deps, opaque);
+  if (Value pad = access.getPad())
+    collectDeps(pad, grid, deps, opaque);
+  if (Value index = access.getIndex())
+    collectDeps(index, grid, deps, opaque);
 }
 
 // access를 소비하는 방식으로 role을 정한다. store/copy-dst → output, 그 외(load/copy-src) → input.
@@ -167,24 +167,23 @@ struct PIMAnalyzeLogicalWorkPass
     MLIRContext *ctx = func.getContext();
     func->setAttr("pim.execution_model", StringAttr::get(ctx, "spmd"));
 
-    SmallVector<BlockArgument> pidByAxis;
-    collectProgramIdArgs(func, pidByAxis);
+    SmallVector<scf::ForOp> grid;
+    collectGridLoops(func, grid);
 
-    // 각 access의 program-축 의존 집합을 구하고, 실제로 쓰인 축(active)을 모은다.
+    // 각 access의 grid 차원 의존 집합을 구하고, 어떤 access든 실제로 의존하는 차원을 모은다.
     SmallVector<llvm::DenseSet<unsigned>> depsPerAccess(accesses.size());
-    llvm::DenseSet<unsigned> activeAxes;
+    llvm::DenseSet<unsigned> activeDims;
     for (auto [i, a] : llvm::enumerate(accesses)) {
       bool opaque = false;
-      collectOffsetDeps(a.getOffset(), pidByAxis, depsPerAccess[i], opaque);
+      collectAccessDeps(a, grid, depsPerAccess[i], opaque);
       if (opaque)
-        for (unsigned axis = 0; axis < pidByAxis.size(); axis++)
-          if (pidByAxis[axis])
-            depsPerAccess[i].insert(axis);
-      for (unsigned axis : depsPerAccess[i])
-        activeAxes.insert(axis);
+        for (unsigned d = 0; d < grid.size(); d++)
+          depsPerAccess[i].insert(d);
+      for (unsigned d : depsPerAccess[i])
+        activeDims.insert(d);
     }
 
-    // role은 program 축과 무관하게 항상 단다.
+    // role은 grid 차원과 무관하게 항상 단다.
     for (pim::AccessOp a : accesses)
       if (StringRef role = accessRole(a.getResult()); !role.empty())
         a->setAttr("pim.role", StringAttr::get(ctx, role));
@@ -207,40 +206,39 @@ struct PIMAnalyzeLogicalWorkPass
       }
     });
 
-    if (activeAxes.empty())
-      return; // program ID에 의존하는 접근이 없으면 여기까지(예: loop-carried offset).
+    if (grid.empty())
+      return; // grid loop가 없으면 program 차원도 없다(예: loop-carried offset만 있는 함수).
 
-    // active 축을 axis 순서로 정렬해 program_dims 순서를 정한다. invariant 인덱스는 이 순서 기준.
-    SmallVector<unsigned> orderedAxes(activeAxes.begin(), activeAxes.end());
-    llvm::sort(orderedAxes);
-
+    // program_dims는 grid loop의 중첩 순서 그대로다. invariant 인덱스도 이 순서를 가리킨다.
     SmallVector<Attribute> dimNames;
-    for (unsigned axis : orderedAxes)
-      dimNames.push_back(StringAttr::get(ctx, axisName(axis)));
+    for (scf::ForOp g : grid)
+      dimNames.push_back(g->getAttr("pim.grid_dim"));
     func->setAttr("pim.program_dims", ArrayAttr::get(ctx, dimNames));
 
-    llvm::DenseSet<unsigned> reduceAcross; // ⑦ 출력이 불변인 축 = 부분합 결합 필요 축
+    llvm::DenseSet<unsigned> reduceAcross;
     for (auto [i, a] : llvm::enumerate(accesses)) {
+      bool isOutput = accessRole(a.getResult()) == "output";
       SmallVector<int64_t> invariant;
-      for (auto [pos, axis] : llvm::enumerate(orderedAxes))
-        if (!depsPerAccess[i].contains(axis))
-          invariant.push_back(pos);
+      for (unsigned d = 0; d < grid.size(); d++) {
+        if (depsPerAccess[i].contains(d))
+          continue;
+        invariant.push_back(d);
+        // 출력이 차원 d에 불변이면 d만 다른 instance들이 같은 출력에 쓰므로 부분합을
+        // 합쳐야 한다. 단 어떤 access도 d에 의존하지 않으면 모든 instance가 같은 값을
+        // 만드는 중복 실행이라, 합치면 오히려 결과가 틀린다. 활성 차원일 때만 표시한다.
+        if (isOutput && activeDims.contains(d))
+          reduceAcross.insert(d);
+      }
       a->setAttr("pim.invariant_program_dims",
                  DenseI64ArrayAttr::get(ctx, invariant));
-      // ⑦ 출력 접근이 어떤 program 축에 불변이면, 그 축만 다른 program들이 같은 출력에 씀
-      // → 부분합을 합쳐야 한다(Split-K류). 그 축들을 모은다.
-      if (accessRole(a.getResult()) == "output")
-        for (unsigned axis : orderedAxes)
-          if (!depsPerAccess[i].contains(axis))
-            reduceAcross.insert(axis);
     }
 
     if (!reduceAcross.empty()) {
       SmallVector<unsigned> ra(reduceAcross.begin(), reduceAcross.end());
       llvm::sort(ra);
       SmallVector<Attribute> raNames;
-      for (unsigned axis : ra)
-        raNames.push_back(StringAttr::get(ctx, axisName(axis)));
+      for (unsigned d : ra)
+        raNames.push_back(grid[d]->getAttr("pim.grid_dim"));
       func->setAttr("pim.reduce_across_programs", ArrayAttr::get(ctx, raNames));
     }
   }

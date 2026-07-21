@@ -341,7 +341,7 @@ pid_n = tl.program_id(axis=1)
 
 ### 추적 대상
 
-접근 영역을 결정하는 것은 offset 하나가 아닙니다. 다음 네 가지를 모두 추적합니다.
+접근 영역을 결정하는 것은 offset 하나가 아닙니다. 다음을 모두 추적합니다.
 
 | 피연산자 | 결정하는 것 |
 | --- | --- |
@@ -349,8 +349,11 @@ pid_n = tl.program_id(axis=1)
 | `strides` | 축 간격 |
 | `valid` | 경계 tile의 유효 범위 |
 | `index` | row gather가 읽는 행 |
+| `pad` | 유효 범위 밖 원소의 값 |
 
-`pim.invariant_program_dims = [d]`의 뜻은 "d가 바뀌어도 같은 데이터 영역을 접근한다"입니다. 네 가지 중 하나라도 d에 의존하면 영역이 달라지므로 불변이 아닙니다.
+`pim.invariant_program_dims = [d]`의 뜻은 "d가 바뀌어도 같은 데이터를 읽는다"입니다. 위 중 하나라도 d에 의존하면 읽는 결과가 달라지므로 불변이 아닙니다.
+
+`pad`는 주소가 아니라 값이지만, `pim.load` 결과의 일부가 되므로 함께 봅니다. 재사용이란 결국 읽어 둔 tile을 다시 쓰는 것이라, 패딩 값이 달라지면 같은 tile이 아닙니다.
 
 `index`를 빠뜨리면 정확도가 아니라 정확성 문제가 됩니다. row gather에서 index tensor가 d에 의존하는데 offset은 아닌 경우, 불변이라고 표시하면 Target IR이 그것을 믿고 tile을 유닛에 상주시켜 잘못된 행을 읽습니다.
 
@@ -1757,6 +1760,14 @@ PIM Common IR
    ├─ --legalize-pim-to-upmem
    └─ --legalize-pim-to-aimx
 ```
+
+### 현재 구현과의 차이
+
+위는 §16까지 구현이 끝났을 때의 순서입니다. 지금 `compiler.py`는 다음 두 가지가 다릅니다.
+
+* `--pim-partition`이 아직 없습니다.
+* `--pim-remove-buffers`가 `--pim-analyze-logical-work`보다 **앞**에 있습니다. 순서를 뒤집는 이유는 전송량 계산이 hoisting 이후의 반복 횟수를 필요로 하기 때문인데(§20.2), 그 계산이 아직 없으므로 지금은 어느 쪽이든 결과가 같습니다. `--pim-partition`을 넣을 때 함께 옮깁니다.
+* `-loop-invariant-code-motion`이 들어 있습니다. `pim.load`는 못 옮기지만(§15.7) 주소 계산 `arith`와 순수 `linalg`은 옮기므로 그대로 둡니다.
 
 ## 20.2 순서의 근거
 

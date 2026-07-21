@@ -64,6 +64,7 @@ def _run_translate(mlir_text: str, which: str) -> str:
 # SPLIT/local_lanes(유닛 분배)와 fusion은 target 관심사라 이 단계에서 하지 않는다.
 PIM_COMMON_PASSES = [
     "--convert-ttshared-to-pim",     # 메모리 접근을 pim.access/load/store로 변환 (Stage A)
+    "--pim-build-grid",              # program_id 인자를 grid loop로 세운다. instance 사이 관계를 IR에서 보려면 필요하고, analyze가 grid loop를 전제한다
     "-cse",                          # Pure한 pim.access(와 중복 상수) 병합 → "같은 descriptor"를 SSA 동일성으로 판별(remove-buffers 선행 조건)
     "--pim-remove-buffers",          # passthrough→pim.copy, 반복 load/RAW 재사용 (Stage B)
     "-canonicalize",                 # 죽은 pim.load/연산(결과 미사용) 정리(DCE)
