@@ -84,6 +84,32 @@ def PIMAnalyzeLogicalWork : Pass<"pim-analyze-logical-work", "mlir::ModuleOp"> {
   let dependentDialects = ["mlir::pim::PIMDialect"];
 }
 
+def PIMPartition : Pass<"pim-partition", "mlir::ModuleOp"> {
+  let summary = "Compute transfer cost per partition candidate and the working set";
+  let description = [{
+    분할을 고르기 위한 수치를 계산해 속성으로 단다(치환 아님). 고르는 것은 Target IR이다.
+    - pim.access: `pim.access_bytes` = 이 access로 instance 하나가 옮기는 총 바이트.
+      tile 바이트(sizes 곱 × element bit width, 올림) × 전송 op을 감싸는 비-grid loop
+      반복 횟수. access op이 아니라 load/store/copy의 위치를 본다 — hoisting이 둘을
+      떼어 놓을 수 있다. valid는 동적 값이라 못 쓰므로 sizes 전체를 세는 상한이다.
+    - func: `pim.working_set_bytes` = 한 순간에 유닛 메모리에 있어야 하는 양. 가장 깊이
+      있는 pim.load의 블록에서 그 블록의 load 결과 tensor들 + (그 블록이 scf.for 몸체면)
+      tensor 타입 iter_arg의 바이트 합.
+    - func: `pim.grid_extents` = grid loop 반복 횟수, `pim.grid_permutable` =
+      reduce_across_programs가 없으면 참, `pim.partition_cost` = 후보별 전송량 표.
+    전송량은 축 d의 grid 크기 g_d와 유닛 수 s_d에 대해
+      bytes(s) = Σ_a  access_bytes_a × Π{ s_j : j ∈ I_a } × Π{ g_j : j ∉ I_a }
+    이고 I_a는 pim.invariant_program_dims다. 후보는 각 축의 약수를 모두 조합한 것이라
+    s가 전부 1인 항목이 전송량 하한(= 실제로 필요한 데이터양)이 된다.
+    grid loop 반복 횟수가 상수가 아니면 표를 만들지 않는다. 근거 없는 수를 넣지 않는다.
+    access_bytes와 working_set_bytes는 grid와 무관하므로 그 경우에도 단다.
+    --pim-analyze-logical-work(invariant_program_dims)와 --pim-remove-buffers(hoisting이
+    끝나야 반복 횟수가 실제 전송 횟수와 맞는다) 뒤에 돌려야 한다.
+  }];
+  let constructor = "mlir::triton::createPIMPartitionPass()";
+  let dependentDialects = ["mlir::pim::PIMDialect"];
+}
+
 def PIMClassifyCompute : Pass<"pim-classify-compute", "mlir::ModuleOp"> {
   let summary = "Tag linalg compute ops with their target-neutral kind (pim.class)";
   let description = [{

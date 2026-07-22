@@ -67,9 +67,10 @@ PIM_COMMON_PASSES = [
     "--pim-build-grid",              # program_id 인자를 grid loop로 세운다. instance 사이 관계를 IR에서 보려면 필요하고, analyze가 grid loop를 전제한다
     "-cse",                          # Pure한 pim.access(와 중복 상수) 병합 → "같은 descriptor"를 SSA 동일성으로 판별(remove-buffers 선행 조건)
     "-loop-invariant-code-motion",   # 루프 불변 연산(주소 계산 arith, Pure한 pim.access)을 루프 밖으로. access가 밖에 있어야 remove-buffers가 그 load를 뺄 수 있다
+    "--pim-analyze-logical-work",    # grid 축↔access 의존 분석(execution_model/program_dims/role/invariant). partition의 전송량 식이 invariant를 입력으로 쓴다
     "--pim-remove-buffers",          # load hoisting, passthrough→pim.copy, 반복 load/RAW 재사용 (Stage B)
     "-canonicalize",                 # 죽은 pim.load/연산(결과 미사용) 정리(DCE)
-    "--pim-analyze-logical-work",    # program ID↔access offset 의존 분석(execution_model/program_dims/role/invariant), classify 앞·구조 변형 뒤
+    "--pim-partition",               # access별 전송 바이트, working set, 후보별 전송량 표. hoisting이 끝난 뒤라야 반복 횟수가 실제 전송 횟수와 맞는다
     "--pim-classify-compute",        # 연산 종류 태그(pim.class). 모든 구조 변형 뒤 맨 마지막(late)에 돌려 태그가 안 낡게
 ]
 

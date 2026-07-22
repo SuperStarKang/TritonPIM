@@ -1251,6 +1251,16 @@ scf.for %un = 0 to SPLIT_N {
 
 곱 부분은 유닛 하나가 도는 동안 접근 `a`가 서로 다른 tile을 건드리는 횟수입니다. `a`가 축 `j`에 불변이면 `j`가 달라져도 같은 tile이므로 곱에서 빠집니다.
 
+`U = Π s_d`와 `q_j = g_j / s_j`를 넣어 정리하면 `s`와 `g`만 남습니다. 구현은 이 형태를 씁니다.
+
+```text
+전송량 = Σ_a  E_a × Π{ s_j : j ∈ I_a } × Π{ g_j : j ∉ I_a }
+```
+
+읽는 법이 더 직관적입니다. 접근 `a`가 축 `j`에 불변이면 유닛마다 한 벌씩만 있으면 되므로 `s_j`배, 불변이 아니면 서로 다른 tile을 `g_j`개 건드리므로 `g_j`배입니다.
+
+여기서 `s`가 전부 1인 경우가 전송량의 하한이고, 그 값이 **실제로 필요한 데이터양**입니다. 표에 그 항목이 들어 있으므로 다른 후보가 몇 배를 더 옮기는지 바로 비교할 수 있습니다.
+
 ### `E_a`는 tile 크기가 아니다
 
 `E_a`는 tile 바이트에 **instance 안에서 그 access가 실행되는 횟수**를 곱한 값입니다.
@@ -1264,6 +1274,22 @@ E_a = (sizes 곱 × element 바이트) × (감싸는 grid 아닌 loop 들의 반
 K loop 안에 있는 access는 K loop 반복 횟수만큼 실행되므로 그 횟수를 곱해야 합니다. 이 곱을 빠뜨리면 값이 크게 어긋납니다.
 
 정확한 값을 얻으려면 instance 내부의 hoisting이 끝난 뒤에 세어야 합니다. K loop에서 불변인 전송이 아직 안에 남아 있으면 실제보다 크게 세게 됩니다. 그래서 `--pim-partition`은 `--pim-remove-buffers` 뒤에 놓습니다.
+
+세는 기준은 `pim.access`가 아니라 **전송 op(`pim.load` / `pim.store` / `pim.copy`)의 위치**입니다. hoisting이 `pim.access`는 두고 `pim.load`만 loop 밖으로 옮길 수 있어서 둘의 위치가 다를 수 있습니다. 한 access를 여러 곳에서 전송하면 각각을 더합니다.
+
+`valid`는 SSA 값이라 컴파일 시점에 알 수 없으므로 `sizes` 전체를 셉니다. 따라서 경계 tile에서는 실제보다 크게 잡힌 상한입니다.
+
+`pim.gather`와 `pim.scatter`는 `!pim.access`를 거치지 않으므로 이 계산에 들어가지 않습니다. 원소별 임의 접근이라 전송량이 index 텐서의 값에 달려 있어 컴파일 시점에 셀 수 없습니다.
+
+계산 결과는 각 `pim.access`에 답니다. grid 크기와 무관하게 계산되므로, 표를 만들지 못하는 경우에도 이 값은 남습니다.
+
+```mlir
+%dA = pim.access %A offset %o sizes [32, 16] strides [%c1, %c1] {
+        pim.access_bytes = 65536 : i64,
+        pim.invariant_program_dims = array<i64: 1>,
+        pim.role = "input"
+      } : memref<*xf32> -> !pim.access
+```
 
 ### 예시
 
@@ -1296,14 +1322,20 @@ grid는 m = 32, n = 16입니다. K loop는 32번 돕니다.
 ```mlir
 func.func @matmul_kernel(...) attributes {
   pim.grid_extents    = array<i64: 32, 16>,
+  pim.grid_permutable = true,
   pim.partition_cost  = [
-    {splits = array<i64: 1, 16>,  bytes = 39845888 : i64},
-    {splits = array<i64: 32, 1>,  bytes = 73400320 : i64},
-    {splits = array<i64: 32, 16>, bytes = 104857600 : i64}
-  ],
-  pim.grid_permutable = true
+    {bytes = 8388608 : i64,   splits = array<i64: 1, 1>},
+    ...
+    {bytes = 39845888 : i64,  splits = array<i64: 1, 16>},
+    ...
+    {bytes = 73400320 : i64,  splits = array<i64: 32, 1>},
+    ...
+    {bytes = 104857600 : i64, splits = array<i64: 32, 16>}
+  ]
 }
 ```
+
+후보는 각 축의 약수를 모두 조합한 것입니다. 위 예에서는 32의 약수 6개와 16의 약수 5개를 조합해 30개가 나옵니다. 유닛 수가 정해지면 그중 하나가 정해지는 것이 아니라 여러 후보가 같은 유닛 수를 갖기도 하므로(예: `(2, 16)`과 `(32, 1)`은 둘 다 유닛 32개), 걸러내는 일은 target이 합니다.
 
 Target IR이 하는 일은 다음과 같습니다.
 
@@ -1319,9 +1351,22 @@ Target IR이 하는 일은 다음과 같습니다.
 
 ### 표가 만들어지는 조건
 
-표를 만들려면 grid 크기가 상수여야 합니다. `num_programs`가 runtime 값이면 접히지 않으므로 이 경우 표를 만들지 않고 넘어갑니다. 근거 없는 수를 IR에 넣는 것보다 낫습니다.
+표를 만들려면 grid 크기가 상수여야 합니다. 상수가 아니면 표를 만들지 않고 넘어갑니다. 근거 없는 수를 IR에 넣는 것보다 낫습니다.
 
-M, N, K가 컴파일 시점 상수로 특수화되면 `grid_m = ceildiv(M, BLOCK_M)`이 접혀 상수가 됩니다. autotuning은 config마다 다시 컴파일하고 PyTorch Inductor는 shape을 특수화하므로, 실제로는 상수인 경우가 기본이 됩니다.
+**지금 파이프라인에서는 상수가 아닙니다.** `--pim-build-grid`가 세우는 grid loop의 상한은 triton-shared ABI의 `num_programs` 인자이고 (§5.3), 그 값은 launcher가 실행 시점에 넘깁니다. 커널 하나를 여러 shape에 재사용하기 때문입니다.
+
+그래서 `--pim-partition`이 항상 만드는 것은 grid와 무관한 두 값입니다.
+
+| 속성 | grid가 필요한가 |
+| --- | --- |
+| `pim.access_bytes` (access마다) | 아니요 |
+| `pim.working_set_bytes` (func) | 아니요 |
+| `pim.grid_permutable` (func) | 아니요 |
+| `pim.grid_extents`, `pim.partition_cost` (func) | 예 |
+
+앞의 세 개만으로도 전송량 식은 완전히 정해집니다. `pim.access_bytes`와 `pim.invariant_program_dims`가 있으면 target이 자기가 아는 `g`를 넣어 같은 식을 계산할 수 있습니다. 표는 `g`까지 상수로 접힌 경우에 미리 계산해 둔 편의 값입니다.
+
+`g`를 상수로 만들려면 launch grid를 컴파일 시점에 특수화해야 합니다. autotuning은 config마다 다시 컴파일하고 PyTorch Inductor는 shape을 특수화하므로 그 자리에서 붙일 수 있습니다. 지금은 미룹니다.
 
 ---
 
@@ -1493,7 +1538,7 @@ func.func @matmul_kernel(...) attributes {
 }
 ```
 
-가장 안쪽 loop 몸체의 `pim.load` 결과 tensor들과 tensor 타입 iter_arg의 바이트 합입니다.
+가장 깊이 있는 `pim.load`의 블록을 잡아, 그 블록의 `pim.load` 결과 tensor들과 그 블록이 `scf.for` 몸체라면 tensor 타입 iter_arg의 바이트를 더합니다. GEMM이면 A tile + B tile + 누산기가 됩니다.
 
 `BLOCK`을 autotuning으로 탐색하면 용량을 넘는 config를 반드시 만나게 됩니다. 이 값이 있으면 target이 그 자리에서 실패시킬 수 있고, autotuner가 해당 config를 건너뛸 근거가 됩니다.
 
@@ -1786,12 +1831,7 @@ PIM Common IR
    └─ --legalize-pim-to-aimx
 ```
 
-### 현재 구현과의 차이
-
-위는 §16까지 구현이 끝났을 때의 순서입니다. 지금 `compiler.py`는 두 가지가 다릅니다.
-
-* `--pim-partition`이 아직 없습니다.
-* `--pim-remove-buffers`가 `--pim-analyze-logical-work`보다 **앞**에 있습니다. 순서를 뒤집는 이유는 전송량 계산이 hoisting 이후의 반복 횟수를 필요로 하기 때문인데(§20.2), 그 계산이 아직 없으므로 지금은 어느 쪽이든 결과가 같습니다. `--pim-partition`을 넣을 때 함께 옮깁니다.
+`compiler.py`의 `PIM_COMMON_PASSES`가 이 순서 그대로입니다.
 
 ## 20.2 순서의 근거
 
@@ -1831,6 +1871,7 @@ PIM Common IR
 | `--pim-build-grid` | 같은 디렉터리 |
 | `--pim-remove-buffers` (hoisting 포함) | 같은 디렉터리 |
 | `--pim-analyze-logical-work` | 같은 디렉터리 |
+| `--pim-partition` | 같은 디렉터리 |
 | `--pim-classify-compute` | 같은 디렉터리 |
 | 파이프라인 배선 | `pim_backend/backend/compiler.py` |
 
@@ -1838,9 +1879,9 @@ PIM Common IR
 
 | 항목 | 절 |
 | --- | --- |
-| `--pim-partition` (전송량 표, working set) | §16.2, §16.6 |
 | `--pim-split-reduction` | §16.5 |
 | `--pim-apply-partition` | §20.3 |
+| launch grid를 컴파일 시점에 특수화 (`pim.partition_cost`의 전제) | §16.3 |
 | PIM용 커널은 다차원 grid로 작성 | §5.4 |
 
 ## 21.3 다음 단계로 미루는 것

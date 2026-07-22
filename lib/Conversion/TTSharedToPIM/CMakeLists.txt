@@ -3,6 +3,7 @@ add_triton_library(TTSharedToPIM
   PIMBuildGridPass.cpp
   PIMRemoveBuffersPass.cpp
   PIMAnalyzeLogicalWorkPass.cpp
+  PIMPartitionPass.cpp
   PIMClassifyComputePass.cpp
 
   DEPENDS
