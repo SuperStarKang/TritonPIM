@@ -45,11 +45,18 @@ def RemovePIMBuffers : Pass<"pim-remove-buffers", "mlir::ModuleOp"> {
   let summary = "Remove redundant PIM transfers on value semantics (Stage B)";
   let description = [{
     pim.load(Read)/store(Write)/access(Pure) 효과 위에서 중복 전송을 없앤다.
+    - hoisting: loop 안에서 매번 같은 영역을 읽는 pim.load를 loop 앞으로 옮긴다
     - passthrough: pim.store(pim.load(%ds), %dd) → pim.copy(%ds, %dd)
     - load 재사용: 같은 access의 뒤 pim.load → 앞 load 결과 / 앞 store 값으로 대체
-    안전 조건: 두 op 사이(같은 블록)에 쓰기 효과 op이 없어야 한다. "같은 access"는 SSA 동일성으로
-    보므로 이 pass 앞에 -cse를 돌려 Pure한 pim.access를 합쳐 두는 것을 전제한다. 죽은 pim.load
-    (결과 미사용)은 -canonicalize가 정리한다.
+    hoisting을 먼저 해야 loop 밖으로 나온 load들이 같은 블록에서 재사용 판정을 받는다.
+    표준 -loop-invariant-code-motion은 pim.load가 MemRead라 옮기지 않으므로 여기서 직접 한다.
+    안전 조건: 두 op 사이(같은 블록)에 쓰기 효과 op이 없어야 한다. hoisting은 loop 안에 그
+    버퍼를 쓰는 op이 없어야 하며, base memref가 다르면 겹치지 않는다고 본다(가정 — Triton은
+    포인터 인자가 서로 다른 버퍼임을 보장하지 않는다). scf.if 안의 load는 옮기지 않고,
+    grid loop(pim.grid_dim)에서도 빼지 않는다(instance 사이 공유는 분할 구조가 정한다).
+    "같은 access"는 SSA 동일성으로 보므로 이 pass 앞에 -cse를 돌려 Pure한 pim.access를 합쳐
+    두는 것을, hoisting은 그 앞의 -loop-invariant-code-motion이 불변 pim.access를 loop 밖으로
+    빼 둔 것을 전제한다. 죽은 pim.load(결과 미사용)은 -canonicalize가 정리한다.
   }];
   let constructor = "mlir::triton::createRemovePIMBuffersPass()";
   let dependentDialects = ["mlir::pim::PIMDialect"];

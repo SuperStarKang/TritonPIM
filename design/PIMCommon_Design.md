@@ -1138,7 +1138,7 @@ scf.for %i = ... {
 }
 ```
 
-`%d`가 `%i`에 의존하지 않고 loop 내부에 같은 영역을 쓰는 op이 없다면 다음처럼 옮길 수 있습니다.
+다음처럼 옮길 수 있습니다.
 
 ```mlir
 %v = pim.load %d
@@ -1148,24 +1148,47 @@ scf.for %i = ... {
 }
 ```
 
-instance 내부 loop에서 빼면 그 instance의 반복 전송이 줄고, grid loop에서 빼면 여러 instance가 공유하는 전송이 줄어듭니다. 후자는 §16.1의 분할 구조가 정해진 뒤에 가능합니다.
+### 조건
+
+세 가지를 모두 만족해야 옮깁니다.
+
+| 조건 | 이유 |
+| --- | --- |
+| `%d`가 loop 밖에서 정의된다 | loop 안에서 만들어지면 반복마다 읽는 영역이 달라질 수 있습니다. |
+| loop 안에 그 버퍼를 쓰는 op이 없다 | 반복 중간에 값이 바뀌면 한 번만 읽은 결과가 틀립니다. |
+| load가 loop 몸체 블록의 직속 자식이다 | `scf.if` 안의 load를 빼면 조건이 거짓일 때도 읽게 됩니다. |
+
+첫 조건은 `pim.access`가 이미 loop 밖에 있어야 한다는 뜻입니다. `pim.access`는 `Pure`이므로 표준 `-loop-invariant-code-motion`이 빼 줍니다. 그래서 파이프라인에서 그 패스를 `--pim-remove-buffers` **앞**에 둡니다 (§20.1).
+
+여러 겹의 loop는 안쪽부터 처리하면 저절로 올라갑니다. 안쪽 loop에서 빠져나온 load는 바깥 loop 몸체의 직속 자식이 되므로 다음 차례에 다시 후보가 됩니다.
+
+### grid loop에서는 빼지 않는다
+
+instance 내부 loop에서 빼면 그 instance의 반복 전송이 줄어듭니다. 이것이 지금 하는 일입니다.
+
+grid loop에서 빼면 "grid 전체가 이 tile을 한 번만 읽는다"는 뜻이 되는데, 실제 하드웨어는 그렇게 동작하지 않습니다. 유닛마다 자기 사본이 필요하고, 몇 개의 사본이 필요한지는 §16.1의 분할 구조가 정해져야 알 수 있습니다. 여기서 빼면 그 정보가 사라집니다. 따라서 `pim.grid_dim`이 붙은 loop는 건너뜁니다.
+
+분할이 정해진 뒤 `--pim-apply-partition`이 축을 재배치하고 나면 같은 패스를 다시 돌려 유닛 사이 전송을 뺍니다 (§20.3).
 
 ---
 
 ## 15.7 메모리 효과와 표준 패스
 
-`pim.load`는 `MemRead` 효과를 선언합니다. 이 때문에 **§15.5와 §15.6은 표준 패스로 얻어지지 않습니다.**
+`pim.load`는 `MemRead` 효과를 선언합니다. 이것이 표준 패스에 어떻게 걸리는지는 최적화마다 다릅니다.
 
-* `-canonicalize`의 DCE는 `isMemoryEffectFree`인 op만 지웁니다. `MemRead`는 여기서 걸립니다.
-* `-loop-invariant-code-motion`은 `isMemoryEffectFree(op) && isSpeculatable(op)`인 op만 옮깁니다. 역시 걸립니다.
+| 최적화 | 표준 패스로 되는가 | 이유 |
+| --- | --- | --- |
+| §15.1 동일 access CSE | `-cse`로 됩니다 | `pim.access`는 `Pure`입니다. |
+| §15.5 dead load 제거 | `-canonicalize`로 됩니다 | MLIR의 `wouldOpBeTriviallyDead`는 효과가 전부 `Read`인 op을 지울 수 있다고 판정합니다. `MemRead`만 있는 `pim.load`가 여기 해당합니다. |
+| §15.6 hoisting | **되지 않습니다** | `-loop-invariant-code-motion`은 `isMemoryEffectFree(op) && isSpeculatable(op)`인 op만 옮깁니다. `MemRead`는 첫 조건에서 걸립니다. |
 
-따라서 두 최적화는 `--pim-remove-buffers`에 직접 구현합니다. 그 패스에는 이미 §15.2와 §15.4를 위한 쓰기 장벽 판정(`mayWrite`)이 있으므로 같은 안전성 논리를 씁니다.
+따라서 §15.6만 `--pim-remove-buffers`에 직접 구현합니다. 그 패스에는 이미 §15.2와 §15.4를 위한 쓰기 장벽 판정(`mayWrite`)이 있으므로 같은 안전성 논리를 씁니다.
 
-반면 §15.1은 표준 `-cse`로 얻어집니다. `pim.access`는 `Pure`이므로 걸리지 않습니다.
+hoisting은 표준 LICM이 요구하는 `isSpeculatable`을 `pim.load`에 대해 가정하는 셈입니다. loop가 0번 도는 경우 원래 하지 않았을 읽기를 하게 되기 때문입니다. §15.5가 이미 "load는 fault나 synchronization 같은 관찰 가능한 의미를 갖지 않는다"를 전제하므로 같은 가정입니다.
 
 ### alias 가정
 
-hoisting이 안전한지 판단하려면 loop 안의 쓰기가 읽는 영역과 겹치는지 알아야 합니다. 현재는 `pim.access`의 base memref가 다르면 겹치지 않는다고 봅니다.
+hoisting이 안전한지 판단하려면 loop 안의 쓰기가 읽는 영역과 겹치는지 알아야 합니다. 현재는 `pim.access`의 base memref가 다르면 겹치지 않는다고 봅니다. 영역 단위가 아니라 버퍼 단위로 보므로, 같은 버퍼의 겹치지 않는 두 영역도 겹친다고 판정합니다. 안전한 쪽입니다.
 
 **이것은 가정입니다.** Triton은 커널 포인터 인자가 서로 다른 버퍼임을 보장하지 않습니다. 제자리 연산에서는 같은 버퍼가 두 인자로 들어올 수 있습니다.
 
@@ -1744,13 +1767,15 @@ TTShared IR
    ↓
 -cse                           동일한 pim.access 병합 (§15.1)
    ↓
--canonicalize
+-loop-invariant-code-motion    불변 주소 계산과 Pure한 pim.access를 loop 밖으로 (§15.6 선행)
    ↓
 --pim-analyze-logical-work     role, invariant_program_dims,
    │                           reduction_combine, reduce_across_programs (§5.5, §5.6)
    ↓
---pim-remove-buffers           반복 load 제거, passthrough → pim.copy,
-   │                           store-to-load forwarding, instance 내부 hoisting (§15)
+--pim-remove-buffers           instance 내부 hoisting, passthrough → pim.copy,
+   │                           반복 load 제거, store-to-load forwarding (§15)
+   ↓
+-canonicalize                  죽은 pim.load 정리 (§15.5)
    ↓
 --pim-partition                분할 후보별 전송량, working set (§16.2, §16.6)
    ↓
@@ -1763,11 +1788,10 @@ PIM Common IR
 
 ### 현재 구현과의 차이
 
-위는 §16까지 구현이 끝났을 때의 순서입니다. 지금 `compiler.py`는 다음 두 가지가 다릅니다.
+위는 §16까지 구현이 끝났을 때의 순서입니다. 지금 `compiler.py`는 두 가지가 다릅니다.
 
 * `--pim-partition`이 아직 없습니다.
 * `--pim-remove-buffers`가 `--pim-analyze-logical-work`보다 **앞**에 있습니다. 순서를 뒤집는 이유는 전송량 계산이 hoisting 이후의 반복 횟수를 필요로 하기 때문인데(§20.2), 그 계산이 아직 없으므로 지금은 어느 쪽이든 결과가 같습니다. `--pim-partition`을 넣을 때 함께 옮깁니다.
-* `-loop-invariant-code-motion`이 들어 있습니다. `pim.load`는 못 옮기지만(§15.7) 주소 계산 `arith`와 순수 `linalg`은 옮기므로 그대로 둡니다.
 
 ## 20.2 순서의 근거
 
@@ -1778,6 +1802,8 @@ PIM Common IR
 **`--pim-analyze-logical-work`가 `--pim-partition`보다 앞에 온다.** 전송량 계산이 `pim.invariant_program_dims`를 입력으로 씁니다.
 
 **`--pim-remove-buffers`가 `--pim-partition`보다 앞에 온다.** §16.2의 `E_a`는 instance 안에서 access가 실행되는 횟수를 곱한 값입니다. instance 내부 hoisting이 끝난 뒤라야 그 횟수가 실제 전송 횟수와 맞습니다.
+
+**`-loop-invariant-code-motion`이 `--pim-remove-buffers`보다 앞에 온다.** §15.6의 첫 조건이 "`pim.access`가 loop 밖에 있다"입니다. `pim.access`는 `Pure`라 표준 LICM이 빼 주므로, 그 뒤에 돌아야 load가 따라 나옵니다.
 
 **`--pim-classify-compute`가 마지막이다.** 분류 태그는 찍는 순간의 스냅샷이라 이후 구조가 바뀌면 낡습니다 (§13).
 
@@ -1802,7 +1828,8 @@ PIM Common IR
 | --- | --- |
 | `pim` dialect 6개 op + `!pim.access` + verifier | `include/triton-shared/Dialect/PIM/IR/PIMDialect.td` |
 | `--convert-ttshared-to-pim` | `lib/Conversion/TTSharedToPIM/TTSharedToPIMPass.cpp` |
-| `--pim-remove-buffers` | 같은 디렉터리 |
+| `--pim-build-grid` | 같은 디렉터리 |
+| `--pim-remove-buffers` (hoisting 포함) | 같은 디렉터리 |
 | `--pim-analyze-logical-work` | 같은 디렉터리 |
 | `--pim-classify-compute` | 같은 디렉터리 |
 | 파이프라인 배선 | `pim_backend/backend/compiler.py` |
@@ -1811,11 +1838,9 @@ PIM Common IR
 
 | 항목 | 절 |
 | --- | --- |
-| `--pim-build-grid` | §5.3 |
-| `pim.invariant_program_dims`의 추적 대상을 네 피연산자로 확장 | §5.5 |
 | `--pim-partition` (전송량 표, working set) | §16.2, §16.6 |
 | `--pim-split-reduction` | §16.5 |
-| `--pim-remove-buffers`에 hoisting 추가 | §15.6, §15.7 |
+| `--pim-apply-partition` | §20.3 |
 | PIM용 커널은 다차원 grid로 작성 | §5.4 |
 
 ## 21.3 다음 단계로 미루는 것
