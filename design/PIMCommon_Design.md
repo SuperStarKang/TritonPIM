@@ -20,12 +20,11 @@ PIM Common IR이 담당하는 범위는 다음과 같습니다.
 * grid를 명시적 loop로 표현해 program instance 사이의 관계를 드러냄
 * 입력과 출력 데이터의 논리적 접근 영역 표현
 * 외부 메모리와 PIM 계산 영역 사이의 데이터 이동 표현
-* 반복되는 데이터 접근과 중복 전송 분석
-* 분할 후보별 전송량 계산
-* reduction loop를 grid 축으로 승격하는 변환 (Split-K)
-* 유닛 하나가 동시에 담아야 하는 working set 크기 계산
+* 반복되는 데이터 접근과 중복 전송 제거
+* 축을 쪼갤 때 나누는 데이터와 복제하는 데이터의 구분
+* 쪼갤 수 있는 축과, 쪼개면 유닛 밖 결합이 필요한 축의 구분
+* 전송량, 유닛당 연산량, 유닛당 상주량 계산에 필요한 값 제공
 * GEMM, reduction, elementwise와 같은 연산 종류 표현
-* Target lowering에서 활용할 데이터 의존성과 재사용 가능성 제공
 
 다음 정보는 PIM Common IR에 포함하지 않습니다.
 
@@ -40,15 +39,23 @@ PIM Common IR이 담당하는 범위는 다음과 같습니다.
 
 이러한 정보는 UPMEM IR이나 AiMX IR과 같은 Target IR에서 결정합니다.
 
-### 구조와 파라미터의 분리
+### 분석, 결정, 실현의 분리
 
 PIM Common과 Target IR의 경계를 정하는 원칙은 다음과 같습니다.
 
-> 구조는 PIM Common이 만들고, 파라미터는 Target IR이 정한다.
+> 사실은 PIM Common이 기록하고, 수치는 Target IR이 넣는다.
 
-유닛 분할을 예로 들면, "각 grid 축을 유닛 부분과 순차 부분으로 쪼갠다"는 구조와 "각 후보의 전송량이 얼마인가"라는 계산은 하드웨어 정보 없이 형태만으로 결정되므로 PIM Common이 합니다. "유닛을 몇 개 쓸 것인가"는 유닛 개수를 알아야 하므로 Target IR이 정합니다.
+분할을 예로 들면 세 단계로 나뉩니다.
 
-변환 코드는 PIM Common에 한 벌만 두고, Target IR은 인자를 주어 호출합니다. 같은 loop 변환을 target마다 다시 구현하면 공통 계층을 둔 의미가 없습니다.
+| 단계 | 하는 일 | 누가 | 근거 |
+| --- | --- | --- | --- |
+| 분석 | 무엇이 공유되는가, 무엇이 같은 유닛 메모리에 있어야 하는가, 어느 축을 쪼갤 수 있는가 | PIM Common | 전부 주소 식과 loop 구조에서 나옵니다 |
+| 결정 | 몇 개 유닛에 어떤 비율로 쪼갤 것인가 | Target IR | 유닛 개수와 유닛 메모리 용량을 알아야 합니다 |
+| 실현 | 유닛 인덱스에서 데이터 영역을 계산하고 전송·결합 코드를 낸다 | Target codegen | 전송 API와 메모리 계층에 종속됩니다 |
+
+PIM Common은 숫자를 만들지 않고 사실만 기록합니다. 전송량과 상주량은 대역폭·용량과 곱해야 시간이 되므로, PIM Common은 곱하기 전의 항만 내보내고 Target IR이 자기 값을 넣습니다.
+
+이 경계 덕분에 분할 실현은 IR loop를 재구조화하지 않아도 됩니다. 유닛에 줄 인자와 base 주소를 계산하는 일이므로 Target codegen에서 끝납니다.
 
 ---
 
@@ -195,7 +202,7 @@ PIM Common IR의 기본 원칙은 다음과 같습니다.
 | Fill        | `linalg.fill`                     |
 | Elementwise | `linalg.generic`                  |
 | Broadcast   | `linalg.generic`                  |
-| Generation  | `linalg.generic` + `linalg.index` |
+| Index generation | `linalg.generic` + `linalg.index` |
 
 이 구조에서는 메모리 접근 의미만 PIM dialect에서 정의하고, 계산 의미는 표준 MLIR dialect가 담당합니다.
 
@@ -333,9 +340,9 @@ pid_n = tl.program_id(axis=1)
 
 ---
 
-## 5.5 논리적 작업 분석
+## 5.5 재사용 분석
 
-`--pim-analyze-logical-work`는 각 `pim.access`가 어느 grid 축에 의존하는지 분석합니다.
+`--pim-analyze-reuse`는 각 `pim.access`가 어느 grid 축에 의존하는지 분석합니다.
 
 판별은 backward slice로 합니다. access의 주소를 결정하는 값들을 거슬러 올라가다 `pim.grid_dim`이 붙은 loop의 induction variable을 만나면 그 축에 의존한다고 봅니다. 속성이 없는 loop의 induction variable은 instance 내부의 일이므로 무시합니다. 추적이 불가능한 값을 만나면 보수적으로 모든 축에 의존한다고 봅니다.
 
@@ -351,7 +358,7 @@ pid_n = tl.program_id(axis=1)
 | `index` | row gather가 읽는 행 |
 | `pad` | 유효 범위 밖 원소의 값 |
 
-`pim.invariant_program_dims = [d]`의 뜻은 "d가 바뀌어도 같은 데이터를 읽는다"입니다. 위 중 하나라도 d에 의존하면 읽는 결과가 달라지므로 불변이 아닙니다.
+`pim.invariant_grid_dims = [d]`의 뜻은 "d가 바뀌어도 같은 데이터를 읽는다"입니다. 위 중 하나라도 d에 의존하면 읽는 결과가 달라지므로 불변이 아닙니다.
 
 `pad`는 주소가 아니라 값이지만, `pim.load` 결과의 일부가 되므로 함께 봅니다. 재사용이란 결국 읽어 둔 tile을 다시 쓰는 것이라, 패딩 값이 달라지면 같은 tile이 아닙니다.
 
@@ -362,22 +369,59 @@ pid_n = tl.program_id(axis=1)
 ```mlir
 func.func @matmul_kernel(...) attributes {
   pim.execution_model = "spmd",
-  pim.program_dims = ["x", "y"]
+  pim.grid_dims = ["m", "n"]
 }
 ```
 
 ```mlir
 %dA = pim.access %A ... {
   pim.role = "input",
-  pim.invariant_program_dims = array<i64: 1>
+  pim.invariant_grid_dims = array<i64: 1>,
+  pim.reuse_realizable = false
 }
 ```
 
-`pim.program_dims`는 grid loop의 `pim.grid_dim` 속성을 바깥부터 모은 것입니다.
+`pim.grid_dims`는 grid loop의 `pim.grid_dim` 속성을 바깥부터 모은 것입니다. `pim.invariant_grid_dims`의 인덱스는 이 순서를 가리킵니다.
 
 `pim.role`은 access를 소비하는 방식으로 정합니다. `pim.store`나 `pim.copy`의 dst면 `output`, 그 외면 `input`입니다.
 
 이 속성들은 Target lowering과 디버깅을 위한 정보이며, 프로그램의 계산 의미를 바꾸지 않습니다. 분석이 보수적으로 나와도 성능만 손해이고 결과는 옳습니다.
+
+### 재사용 실현 가능성
+
+`pim.invariant_grid_dims`는 재사용의 **가능성**을 말합니다. 그것이 실현되려면 그 데이터를 한 번만 받아 유닛 메모리에 들고 있어야 하고, 그러려면 전송을 반복 밖으로 뺄 수 있어야 합니다.
+
+주소가 grid 아닌 loop의 induction variable에 의존하면 `pim.access`가 그 loop 안에서 만들어지므로 전송을 밖으로 뺄 수 없습니다 (§15.6의 첫 조건). GEMM의 A와 B가 이 경우입니다.
+
+```mlir
+%aoff = arith.addi %m_off, %k_off : index    // %k_off 는 K loop 유도변수에서 옴
+%dA = pim.access %A offset %aoff ...
+```
+
+같은 backward slice에서 판별되므로 `pim.reuse_realizable`로 함께 답니다. 거짓이면 그 access의 재사용 할인은 loop 순서를 바꾸지 않는 한 얻을 수 없다는 뜻이고, 그 대가가 얼마인지는 `pim.tile_bytes`(§16.2)로 target이 계산합니다.
+
+### 쪼갤 수 있는 축
+
+어느 축을 쪼갤 수 있는지, 쪼개면 유닛 밖 결합이 필요한지를 함수 속성으로 모읍니다.
+
+```mlir
+func.func @matmul_kernel(...) attributes {
+  pim.grid_dims  = ["m", "n"],
+  pim.split_axes = [{axis = "m", source = "grid"},
+                    {axis = "n", source = "grid"},
+                    {axis = "k", combine = "add", source = "reduction"}]
+}
+```
+
+| 필드 | 뜻 |
+| --- | --- |
+| `axis` | 축 이름 |
+| `source` | `grid`면 grid 축, `reduction`이면 instance 내부 reduction loop (§5.6) |
+| `combine` | 있으면 쪼갤 때 부분 출력이 생기며 이 연산자로 합쳐야 합니다 |
+
+`pim.grid_dims`에 있는데 `pim.split_axes`에 없는 축은 쪼갤 수 없다는 뜻입니다. `pim.scatter`가 있는 커널이 그 경우입니다 — 인덱스 텐서의 값을 컴파일 시점에 모르므로 서로 다른 유닛이 같은 원소에 쓰지 않는다고 보장할 수 없습니다.
+
+`combine`이 붙는 판정은 두 가지입니다. 출력 access가 그 grid 축에 불변이거나, 그 축이 reduction loop이거나입니다. 둘 다 "그 축만 다른 실행들이 같은 출력을 만든다"는 같은 사실입니다.
 
 ---
 
@@ -430,23 +474,24 @@ matmul은 루프 밖에서 만든 zero tensor에 쓰고, 누산기에 더하는 
 
 이 모양은 K 반복마다 tile 크기의 elementwise add가 한 번씩 더 붙는다는 뜻이기도 합니다. `matmul(outs=zero) + add(acc)`를 `matmul(outs=acc)`로 합치는 정규화는 완전히 target 독립적이지만, 초기 구현 범위에는 넣지 않습니다.
 
-### program instance 간 reduction
+### 유닛 밖 결합이 필요한 축
 
-서로 다른 program instance가 같은 출력 영역에 부분합을 쓰는 경우는, 출력 access가 어떤 grid 축에 불변인지로 판별합니다.
+reduction loop는 그 자체로 쪼갤 수 있는 축입니다. 서로 다른 유닛이 K 구간을 나눠 맡으면 각자 완전한 크기의 부분합을 만들고, 그것들을 합쳐야 최종 출력이 됩니다.
 
-출력 access가 축 d에 불변이면, d만 다른 instance들이 같은 출력을 접근하므로 그 결과를 합쳐야 합니다. 그 축들을 함수 속성으로 표시합니다.
+grid 축에서도 같은 일이 생깁니다. 출력 access가 축 d에 불변이면 d만 다른 instance들이 같은 출력 영역에 쓰므로 합쳐야 합니다.
+
+두 경우 모두 `pim.split_axes`의 `combine` 필드로 표시합니다 (§5.5).
 
 ```mlir
 func.func @matmul_kernel(...) attributes {
-  pim.execution_model = "spmd",
-  pim.program_dims = ["x", "y", "k"],
-  pim.reduce_across_programs = ["k"]   // k 축 instance 사이 부분합 결합 필요
+  pim.grid_dims  = ["m", "n"],
+  pim.split_axes = [{axis = "m", source = "grid"},
+                    {axis = "n", source = "grid"},
+                    {axis = "k", combine = "add", source = "reduction"}]
 }
 ```
 
-이 상황은 저절로 생기지 않습니다. 일반적인 GEMM에서는 각 instance가 서로 다른 출력 tile을 만들므로 출력이 모든 축에 의존하고, 이 속성은 나타나지 않습니다. **§16.5의 Split-K 변환이 reduction loop를 grid 축으로 올렸을 때 나타납니다.**
-
-이 표시는 "덮어쓰지 말고 합쳐야 한다"는 논리 사실이며, 합치는 위치와 방식은 Target IR이 결정합니다.
+`combine` 값은 그 reduction loop의 `pim.reduction_combine`에서 가져옵니다. 이 표시는 "덮어쓰지 말고 합쳐야 한다"는 논리 사실이며, 그 축을 실제로 쪼갤지와 합치는 위치·방식은 Target IR이 결정합니다.
 
 ---
 
@@ -501,7 +546,7 @@ element type은 `!pim.access`에 없고 **base memref가 들고 있습니다.**
 %a  = pim.load %dA : !pim.access -> tensor<32x16xf32>   // load 결과에도 f32
 ```
 
-바이트가 필요한 계산(§16.2의 전송량, §16.6의 working set, Target IR의 DMA 크기)은 base memref에서 element type을 읽어 변환합니다.
+바이트가 필요한 계산(§16.2의 전송량, §16.6의 상주량, Target IR의 DMA 크기)은 base memref에서 element type을 읽어 변환합니다.
 
 ```text
 바이트 = 원소 개수 × element bit width / 8
@@ -943,7 +988,7 @@ Target IR은 body를 분석하여 직접 지원, 분해 또는 Host fallback 여
 
 # 13. Compute 분류
 
-Target lowering이 연산의 전체 구조를 쉽게 식별할 수 있도록 linalg 연산에 `pim.class` 속성을 붙입니다.
+Target lowering이 연산의 전체 구조를 쉽게 식별할 수 있도록 linalg 연산에 `pim.op` 속성을 붙입니다.
 
 ```text
 --pim-classify-compute
@@ -951,17 +996,17 @@ Target lowering이 연산의 전체 구조를 쉽게 식별할 수 있도록 lin
 
 분류 종류는 다음과 같습니다.
 
-| `pim.class`   | 판별 기준                                    |
-| ------------- | ---------------------------------------- |
-| `gemm`        | `linalg.matmul`                          |
-| `gemv`        | `linalg.matvec`                          |
-| `transpose`   | `linalg.transpose`                       |
-| `reduce`      | `linalg.reduce` 또는 reduction iterator    |
-| `splat`       | `linalg.fill`                            |
-| `generation`  | body에 `linalg.index` 존재                  |
-| `broadcast`   | 입력 indexing map이 일부 차원을 제거               |
-| `elementwise` | 모든 iterator가 parallel이고 identity mapping |
-| `scan`        | 이전 원소 또는 index-carried 값에 의존             |
+| `pim.op`            | 판별 기준                                    |
+| ------------------- | ---------------------------------------- |
+| `gemm`              | `linalg.matmul`                          |
+| `gemv`              | `linalg.matvec`                          |
+| `transpose`         | `linalg.transpose`                       |
+| `reduce`            | `linalg.reduce` 또는 reduction iterator    |
+| `fill`              | `linalg.fill`                            |
+| `index_generation`  | body에 `linalg.index` 존재                  |
+| `broadcast`         | 입력 indexing map이 일부 차원을 제거               |
+| `elementwise`       | 모든 iterator가 parallel이고 identity mapping |
+| `scan`              | 이전 원소 또는 index-carried 값에 의존             |
 
 예시는 다음과 같습니다.
 
@@ -969,7 +1014,7 @@ Target lowering이 연산의 전체 구조를 쉽게 식별할 수 있도록 lin
 %c = linalg.matmul
   ins(%a, %b)
   outs(%init)
-  {pim.class = "gemm"}
+  {pim.op = "gemm"}
 ```
 
 ```mlir
@@ -977,10 +1022,14 @@ Target lowering이 연산의 전체 구조를 쉽게 식별할 수 있도록 lin
   {
     indexing_maps = [...],
     iterator_types = ["parallel"],
-    pim.class = "elementwise"
+    pim.op = "elementwise"
   }
   ...
 ```
+
+`linalg.generic`은 이름만으로 종류를 알 수 없습니다. reduction iterator 유무, indexing map, body를 함께 봐야 하고, 그 판별은 target과 무관합니다. 한 벌만 두어 target들이 같은 연산을 서로 다르게 분류하는 일을 막습니다.
+
+`index_generation`은 전송이 필요 없는 연산입니다. iota를 호스트에서 만들어 보내는 대신 유닛이 자기 인덱스로 만들 수 있으므로, 이 태그가 있으면 target이 그 결정을 할 수 있습니다.
 
 분류 패스는 연산 구조가 모두 정리된 뒤 실행합니다.
 
@@ -1016,27 +1065,41 @@ C: (pid_m, pid_n)
 | B | X | O | m이 다른 instance 사이에서 재사용 가능 |
 | C | O | O | 각 instance가 서로 다른 출력 생성 |
 
-분석 결과는 속성으로 표현합니다. 인덱스는 `pim.program_dims`의 순서를 가리킵니다.
+분석 결과는 속성으로 표현합니다. 인덱스는 `pim.grid_dims`의 순서를 가리킵니다.
 
 ```mlir
 %dA = pim.access %A ... {
   pim.role = "input",
-  pim.invariant_program_dims = array<i64: 1>     // y 에 불변
+  pim.invariant_grid_dims = array<i64: 1>     // n 에 불변
 }
 ```
 
 ```mlir
 %dB = pim.access %B ... {
   pim.role = "input",
-  pim.invariant_program_dims = array<i64: 0>     // x 에 불변
+  pim.invariant_grid_dims = array<i64: 0>     // m 에 불변
 }
 ```
+
+GEMV는 같은 분석에서 다른 모양이 나옵니다. `y[M] = A[M,K] · x[K]`를 m 한 축의 grid로 쓰면 x만 m에 불변입니다.
+
+```text
+A: (pid_m, k)   → 불변 축 없음
+x: (k)          → m 에 불변
+y: (pid_m)      → 불변 축 없음
+```
+
+| 데이터 | `m` 의존 | 재사용 가능성 |
+| --- | ---: | --- |
+| A | O | 없음. 유닛마다 서로 다른 행 밴드 |
+| x | X | 모든 instance가 같은 x를 읽음 |
+| y | O | 없음. 각 instance가 서로 다른 출력 |
 
 ### 전제 조건
 
 이 분석은 **grid 축이 서로 독립된 induction variable로 존재할 때만** 의미 있는 결과를 냅니다.
 
-1차원 grid에 grouped ordering을 쓴 커널에서는 A, B, C의 주소가 모두 같은 `pid_x` 하나로 역추적됩니다. 그러면 `program_dims`가 축 하나뿐이고 모든 access의 `invariant_program_dims`가 빈 배열이 되어, 위 표의 정보가 나오지 않습니다. 분석이 틀리는 것이 아니라 **찾을 것이 없는 것**입니다.
+1차원 grid에 grouped ordering을 쓴 커널에서는 A, B, C의 주소가 모두 같은 `pid` 하나로 역추적됩니다. 그러면 `grid_dims`가 축 하나뿐이고 모든 access의 `invariant_grid_dims`가 빈 배열이 되어, 위 표의 정보가 나오지 않습니다. 분석이 틀리는 것이 아니라 **찾을 것이 없는 것**입니다.
 
 따라서 §5.4의 규칙 — PIM용 커널은 다차원 grid로 작성한다 — 이 이 분석의 전제입니다.
 
@@ -1045,7 +1108,7 @@ C: (pid_m, pid_n)
 실제 데이터 residency는 확정하지 않습니다. Target IR은 다음을 검사한 뒤 재사용 여부를 결정합니다.
 
 * 같은 데이터를 쓰는 instance들이 같은 유닛에 배치되는가 (§16.1의 분할이 결정)
-* 유닛 메모리에 데이터를 유지할 공간이 있는가 (§16.6의 working set)
+* 유닛 메모리에 데이터를 유지할 공간이 있는가 (§16.6)
 * 데이터를 유지하는 것이 재전송보다 유리한가
 * 여러 유닛에 같은 값을 보내는 경로를 쓰는 것이 더 나은가
 
@@ -1158,7 +1221,9 @@ scf.for %i = ... {
 | loop 안에 그 버퍼를 쓰는 op이 없다 | 반복 중간에 값이 바뀌면 한 번만 읽은 결과가 틀립니다. |
 | load가 loop 몸체 블록의 직속 자식이다 | `scf.if` 안의 load를 빼면 조건이 거짓일 때도 읽게 됩니다. |
 
-첫 조건은 `pim.access`가 이미 loop 밖에 있어야 한다는 뜻입니다. `pim.access`는 `Pure`이므로 표준 `-loop-invariant-code-motion`이 빼 줍니다. 그래서 파이프라인에서 그 패스를 `--pim-remove-buffers` **앞**에 둡니다 (§20.1).
+첫 조건은 `pim.access`가 이미 loop 밖에 있어야 한다는 뜻입니다. `pim.access`는 `Pure`이므로 표준 `-loop-invariant-code-motion`이 빼 줍니다. 그래서 파이프라인에서 그 패스를 `--pim-remove-redundant-transfers` **앞**에 둡니다 (§20.1).
+
+주소가 loop 유도변수에 의존하면 이 조건이 영원히 성립하지 않습니다. 그 사실을 `pim.reuse_realizable`로 남겨 target이 재사용 할인을 기대하지 않도록 합니다 (§5.5).
 
 여러 겹의 loop는 안쪽부터 처리하면 저절로 올라갑니다. 안쪽 loop에서 빠져나온 load는 바깥 loop 몸체의 직속 자식이 되므로 다음 차례에 다시 후보가 됩니다.
 
@@ -1168,7 +1233,7 @@ instance 내부 loop에서 빼면 그 instance의 반복 전송이 줄어듭니�
 
 grid loop에서 빼면 "grid 전체가 이 tile을 한 번만 읽는다"는 뜻이 되는데, 실제 하드웨어는 그렇게 동작하지 않습니다. 유닛마다 자기 사본이 필요하고, 몇 개의 사본이 필요한지는 §16.1의 분할 구조가 정해져야 알 수 있습니다. 여기서 빼면 그 정보가 사라집니다. 따라서 `pim.grid_dim`이 붙은 loop는 건너뜁니다.
 
-분할이 정해진 뒤 `--pim-apply-partition`이 축을 재배치하고 나면 같은 패스를 다시 돌려 유닛 사이 전송을 뺍니다 (§20.3).
+유닛마다 몇 개의 사본이 필요한지는 §16.2의 전송량 식이 표현하고, 실제 사본 수는 분할이 정해진 뒤 Target codegen이 계산합니다.
 
 ---
 
@@ -1182,7 +1247,7 @@ grid loop에서 빼면 "grid 전체가 이 tile을 한 번만 읽는다"는 뜻�
 | §15.5 dead load 제거 | `-canonicalize`로 됩니다 | MLIR의 `wouldOpBeTriviallyDead`는 효과가 전부 `Read`인 op을 지울 수 있다고 판정합니다. `MemRead`만 있는 `pim.load`가 여기 해당합니다. |
 | §15.6 hoisting | **되지 않습니다** | `-loop-invariant-code-motion`은 `isMemoryEffectFree(op) && isSpeculatable(op)`인 op만 옮깁니다. `MemRead`는 첫 조건에서 걸립니다. |
 
-따라서 §15.6만 `--pim-remove-buffers`에 직접 구현합니다. 그 패스에는 이미 §15.2와 §15.4를 위한 쓰기 장벽 판정(`mayWrite`)이 있으므로 같은 안전성 논리를 씁니다.
+따라서 §15.6만 `--pim-remove-redundant-transfers`에 직접 구현합니다. 그 패스에는 이미 §15.2와 §15.4를 위한 쓰기 장벽 판정(`mayWrite`)이 있으므로 같은 안전성 논리를 씁니다.
 
 hoisting은 표준 LICM이 요구하는 `isSpeculatable`을 `pim.load`에 대해 가정하는 셈입니다. loop가 0번 도는 경우 원래 하지 않았을 읽기를 하게 되기 때문입니다. §15.5가 이미 "load는 fault나 synchronization 같은 관찰 가능한 의미를 갖지 않는다"를 전제하므로 같은 가정입니다.
 
@@ -1196,177 +1261,213 @@ hoisting이 안전한지 판단하려면 loop 안의 쓰기가 읽는 영역과 
 
 ---
 
-# 16. 작업 분할, K loop, Split-K
+# 16. 작업 분할
 
-## 16.1 유닛 축과 순차 축
+## 16.1 나누는 데이터와 복제하는 데이터
 
-grid loop가 IR에 있으면 분할을 표현할 수 있습니다. 각 grid 축을 **유닛 부분과 순차 부분으로 쪼갭니다.**
+축 `d`를 유닛 `s_d`개에 쪼갤 때 각 데이터가 어떻게 되는지는 한 줄로 정해집니다.
 
-```mlir
-scf.for %um = 0 to SPLIT_M {                 // 유닛 사이. 동시 실행
-  scf.for %un = 0 to SPLIT_N {               // 유닛 사이
-    scf.for %sm = 0 to grid_m/SPLIT_M {      // 유닛 안. 순차 실행
-      scf.for %sn = 0 to grid_n/SPLIT_N {    // 유닛 안
-        // gm = %um × (grid_m/SPLIT_M) + %sm
-        // gn = %un × (grid_n/SPLIT_N) + %sn
-        body
-      }
-    }
-  }
-}
-```
+> access가 축 `d`에 **의존**하면 → 유닛마다 서로 다른 조각을 받는다 (**나눈다**)
+> access가 축 `d`에 **불변**이면 → 유닛마다 같은 데이터가 필요하다 (**복제한다**)
 
-바깥 loop의 각 반복이 서로 다른 유닛이고, 안쪽 loop는 유닛 하나가 시간을 들여 도는 것입니다.
+유닛끼리 통신할 수 없으므로 복제는 실제 전송으로 나타납니다. 이것이 §1이 말한 공통 성질에서 곧바로 따라 나오는 유일한 결과이고, 세 target에서 같습니다.
 
-전송이 줄어드는 이유가 여기서 나옵니다. 바깥 변수에만 의존하는 값은 안쪽 loop가 도는 내내 같은 값이므로 안쪽 loop 밖으로 뺄 수 있습니다.
+판정에 필요한 것은 `pim.invariant_grid_dims` 하나뿐입니다 (§5.5).
 
-```mlir
-scf.for %un = 0 to SPLIT_N {
-  %dB = pim.access %B offset f(%un) ...
-  %b  = pim.load %dB                    // 여기로 뺀다
-  scf.for %sm = 0 to grid_m {
-    %dA = pim.access %A offset g(%sm) ...
-    %a  = pim.load %dA
-    ...
-  }
-}
-```
+**GEMM** `C[M,N] = A[M,K] · B[K,N]`, grid는 m, n 두 축입니다.
 
-"B tile을 유닛에 한 번 올려놓고 재사용한다"는 문장이 IR에서는 "`pim.load`를 안쪽 loop 밖으로 뺀다"가 됩니다. 그래서 어느 축을 바깥에 두느냐가 어느 데이터를 아끼느냐를 결정합니다.
+| 데이터 | `I_a` | m축 분할 | n축 분할 |
+| --- | --- | --- | --- |
+| A | {n} | 나눈다 | **복제한다** |
+| B | {m} | **복제한다** | 나눈다 |
+| C | {} | 나눈다 | 나눈다 |
 
-이 구조는 `UPMEMToHost.cpp`의 `split_m` / `split_n` / `split_k` 모델과 같습니다. 바깥 loop 개수가 `SPLIT_*`이고, 안쪽 loop와 몸체가 device 몸체가 됩니다.
+**GEMV** `y[M] = A[M,K] · x[K]`, grid는 m 한 축입니다.
+
+| 데이터 | `I_a` | m축 분할 |
+| --- | --- | --- |
+| A | {} | 나눈다 |
+| x | {m} | **복제한다** |
+| y | {} | 나눈다 |
+
+두 연산의 차이가 여기서 갈립니다. GEMM은 복제 대상이 A와 B 둘이고 둘 다 큽니다. GEMV는 복제 대상이 x 하나이고 A에 비해 아주 작습니다. 같은 규칙에서 나온 결과이며 연산별 특수 처리가 필요 없습니다.
+
+Target codegen에서 이 구분은 전송 API 선택이 됩니다.
+
+| | 호스트가 하는 일 |
+| --- | --- |
+| 나눈다 | 유닛마다 다른 시작 주소로 전송 |
+| 복제한다 | 여러 유닛에 같은 데이터를 전송 |
+
+서로 다른 조각의 개수는 `Π{s_j : j ∉ I_a}`, 복제 배수는 `Π{s_j : j ∈ I_a}`입니다.
 
 ---
 
 ## 16.2 전송량 계산
 
-축 `d`의 grid 크기를 `g_d`, 유닛 수를 `s_d`, 유닛 안 순차 횟수를 `q_d = g_d / s_d`라 하고, 총 유닛 수를 `U = Π s_d`라 하면 전송량은 다음과 같습니다.
+축 `d`의 grid 크기를 `g_d`, 유닛 수를 `s_d`라 하면 grid 축 분할의 전송량은 다음과 같습니다.
 
 ```text
-전송량 = U × Σ_a  E_a × Π{ q_j : j ∉ I_a }
+전송량 = Σ_a  tile_bytes_a × transfer_count_a × Π{ s_j : j ∈ I_a } × Π{ g_j : j ∉ I_a }
 ```
 
-* `E_a` — instance 하나가 접근 `a`로 읽거나 쓰는 총 바이트
+* `tile_bytes_a` — 접근 `a`가 한 번에 옮기는 바이트
+* `transfer_count_a` — instance 하나 안에서 `a`가 전송되는 횟수
 * `I_a` — `a`의 불변 축 집합 (§5.5)
 
-곱 부분은 유닛 하나가 도는 동안 접근 `a`가 서로 다른 tile을 건드리는 횟수입니다. `a`가 축 `j`에 불변이면 `j`가 달라져도 같은 tile이므로 곱에서 빠집니다.
+읽는 법은 §16.1 그대로입니다. 접근 `a`가 축 `j`에 불변이면 복제되므로 `s_j`배, 불변이 아니면 나뉘어 서로 다른 조각 `g_j`개가 되므로 `g_j`배입니다.
 
-`U = Π s_d`와 `q_j = g_j / s_j`를 넣어 정리하면 `s`와 `g`만 남습니다. 구현은 이 형태를 씁니다.
+`s`가 전부 1인 경우가 전송량의 하한이고, 그 값이 **실제로 필요한 데이터양**입니다.
 
-```text
-전송량 = Σ_a  E_a × Π{ s_j : j ∈ I_a } × Π{ g_j : j ∉ I_a }
-```
-
-읽는 법이 더 직관적입니다. 접근 `a`가 축 `j`에 불변이면 유닛마다 한 벌씩만 있으면 되므로 `s_j`배, 불변이 아니면 서로 다른 tile을 `g_j`개 건드리므로 `g_j`배입니다.
-
-여기서 `s`가 전부 1인 경우가 전송량의 하한이고, 그 값이 **실제로 필요한 데이터양**입니다. 표에 그 항목이 들어 있으므로 다른 후보가 몇 배를 더 옮기는지 바로 비교할 수 있습니다.
-
-### `E_a`는 tile 크기가 아니다
-
-`E_a`는 tile 바이트에 **instance 안에서 그 access가 실행되는 횟수**를 곱한 값입니다.
+### `tile_bytes`와 `transfer_count`를 나누어 둔다
 
 ```text
-E_a = (sizes 곱 × element 바이트) × (감싸는 grid 아닌 loop 들의 반복 횟수 곱)
+tile_bytes     = sizes 곱 × element 바이트
+transfer_count = 감싸는 grid 아닌 loop 들의 반복 횟수 곱
 ```
 
 `sizes`는 원소 개수이므로 바이트로 바꿔야 합니다. element type은 base memref에서 읽습니다 (§6.2).
 
-K loop 안에 있는 access는 K loop 반복 횟수만큼 실행되므로 그 횟수를 곱해야 합니다. 이 곱을 빠뜨리면 값이 크게 어긋납니다.
+두 값을 곱해 두지 않는 이유는 세 가지입니다.
 
-정확한 값을 얻으려면 instance 내부의 hoisting이 끝난 뒤에 세어야 합니다. K loop에서 불변인 전송이 아직 안에 남아 있으면 실제보다 크게 세게 됩니다. 그래서 `--pim-partition`은 `--pim-remove-buffers` 뒤에 놓습니다.
+* **전송 건수를 복원할 수 있어야 합니다.** 캐시가 없고 호스트가 명시적으로 전송하는 구조에서 건당 고정비는 실질 비용입니다. `BLOCK_K`만 바꾸면 총 바이트는 그대로인데 건수는 그 비율만큼 달라집니다.
+* **유닛당 상주량 계산에 `tile_bytes`가 필요합니다** (§16.6).
+* **`transfer_count`는 셀 수 없을 때가 있습니다.** K loop 상한이 런타임 값이면 세지 못합니다. 나누어 두면 항상 상수인 `tile_bytes`는 남고, `transfer_count`만 빠집니다.
 
-세는 기준은 `pim.access`가 아니라 **전송 op(`pim.load` / `pim.store` / `pim.copy`)의 위치**입니다. hoisting이 `pim.access`는 두고 `pim.load`만 loop 밖으로 옮길 수 있어서 둘의 위치가 다를 수 있습니다. 한 access를 여러 곳에서 전송하면 각각을 더합니다.
+`transfer_count`를 세는 기준은 `pim.access`가 아니라 **전송 op(`pim.load` / `pim.store` / `pim.copy`)의 위치**입니다. hoisting이 `pim.access`는 두고 `pim.load`만 loop 밖으로 옮길 수 있어서 둘의 위치가 다를 수 있습니다. 한 access를 여러 곳에서 전송하면 각각을 더합니다.
+
+정확한 값을 얻으려면 중복 전송 제거가 끝난 뒤에 세어야 합니다. K loop에서 불변인 전송이 아직 안에 남아 있으면 실제보다 크게 세게 됩니다. 그래서 분석 패스는 변환 패스 뒤에 놓습니다 (§20.2).
 
 `valid`는 SSA 값이라 컴파일 시점에 알 수 없으므로 `sizes` 전체를 셉니다. 따라서 경계 tile에서는 실제보다 크게 잡힌 상한입니다.
 
 `pim.gather`와 `pim.scatter`는 `!pim.access`를 거치지 않으므로 이 계산에 들어가지 않습니다. 원소별 임의 접근이라 전송량이 index 텐서의 값에 달려 있어 컴파일 시점에 셀 수 없습니다.
 
-계산 결과는 각 `pim.access`에 답니다. grid 크기와 무관하게 계산되므로, 표를 만들지 못하는 경우에도 이 값은 남습니다.
-
 ```mlir
 %dA = pim.access %A offset %o sizes [32, 16] strides [%c1, %c1] {
-        pim.access_bytes = 65536 : i64,
-        pim.invariant_program_dims = array<i64: 1>,
-        pim.role = "input"
+        pim.tile_bytes          = 2048 : i64,
+        pim.transfer_count      = 32 : i64,
+        pim.invariant_grid_dims = array<i64: 1>,
+        pim.reuse_realizable    = false,
+        pim.role                = "input"
       } : memref<*xf32> -> !pim.access
 ```
 
-### 예시
+### 재사용 할인은 실현될 때만 얻는다
 
-`C[1024,1024] = A[1024,512] × B[512,1024]`, f32, `BLOCK_M = 32, BLOCK_N = 64, BLOCK_K = 16`
+`Π{s_j : j ∈ I_a}`가 `Π{g_j}`보다 작다는 것은 "그 데이터를 유닛에 올려 두고 여러 instance가 재사용한다"는 뜻입니다. `pim.reuse_realizable`이 거짓이면 그 재사용이 일어나지 않으므로, 그 access는 불변 축에서도 `g_j`배로 세야 합니다 (§5.5).
 
-grid는 m = 32, n = 16입니다. K loop는 32번 돕니다.
+```text
+불변 축 j의 배수 = s_j   (pim.reuse_realizable = true)
+                  g_j   (pim.reuse_realizable = false)
+```
 
-| access | `sizes` | tile | 반복 | `E_a` | `I_a` |
-| --- | --- | ---: | ---: | ---: | --- |
-| A | `[32, 16]` | 2 KB | 32 | 64 KB | {n} |
-| B | `[16, 64]` | 4 KB | 32 | 128 KB | {m} |
-| C | `[32, 64]` | 8 KB | 1 | 8 KB | {} |
+### 예시: GEMM
 
-| `s_m` | `s_n` | 유닛 수 | A | B | C | 합 |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 16 | 16 | 32 MB | 2 MB | 4 MB | **38 MB** |
-| 32 | 1 | 32 | 2 MB | 64 MB | 4 MB | **70 MB** |
-| 32 | 16 | 512 | 32 MB | 64 MB | 4 MB | **100 MB** |
+`C[4096,4096] = A[4096,4096] × B[4096,4096]`, f32, `BLOCK_M = BLOCK_N = BLOCK_K = 64`
 
-실제로 필요한 데이터는 A 2 MB + B 2 MB + C 4 MB = 8 MB입니다. 마지막 줄은 필요량의 12배를 전송합니다.
+grid는 m = 64, n = 64입니다. K loop는 64번 돕니다. 각 행렬은 64 MiB입니다.
 
-전송만 보면 첫 줄이 최선이지만 유닛을 16개만 씁니다. 마지막 줄은 512개를 쓰지만 전송이 100 MB입니다. **선택은 유닛 개수에 달려 있습니다.**
+| access | `tile_bytes` | `transfer_count` | instance당 | `I_a` |
+| --- | ---: | ---: | ---: | --- |
+| A | 16,384 | 64 | 1,048,576 | {n} |
+| B | 16,384 | 64 | 1,048,576 | {m} |
+| C | 16,384 | 1 | 16,384 | {} |
+
+```text
+A = 1,048,576 × g_m(64) × s_n = 67,108,864 × s_n
+B = 1,048,576 × s_m × g_n(64) = 67,108,864 × s_m
+C =    16,384 × g_m × g_n     = 67,108,864
+```
+
+| `s_m` | `s_n` | 유닛 수 | 전송량 | 하한 대비 |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | 1 | 192 MiB | 1.0배 |
+| 8 | 8 | 64 | 1.06 GiB | 5.7배 |
+| 64 | 32 | 2048 | 6.06 GiB | **32.3배** |
+
+### 예시: GEMV
+
+`y[4096] = A[4096,4096] · x[4096]`, f32, `BLOCK_M = 64, BLOCK_K = 256`
+
+grid는 m = 64입니다. K loop는 16번 돕니다.
+
+| access | `tile_bytes` | `transfer_count` | instance당 | `I_a` |
+| --- | ---: | ---: | ---: | --- |
+| A | 65,536 | 16 | 1,048,576 | {} |
+| x | 1,024 | 16 | 16,384 | {m} |
+| y | 256 | 1 | 256 | {} |
+
+```text
+A = 1,048,576 × g_m(64) = 64 MiB      s와 무관
+x =    16,384 × s_m
+y =       256 × g_m(64) = 16 KiB
+```
+
+| `s_m` | 유닛 수 | 전송량 | 하한 대비 |
+| ---: | ---: | ---: | ---: |
+| 1 | 1 | 64.03 MiB | 1.000배 |
+| 8 | 8 | 64.14 MiB | 1.002배 |
+| 64 | 64 | 65.02 MiB | **1.015배** |
+
+**유닛을 64배로 늘려도 전송이 1.5%만 늡니다.** 복제되는 것이 x 하나뿐이고 그 크기가 A의 1/4096이기 때문입니다. 같은 식이 GEMM에서는 32배, GEMV에서는 1.015배를 내놓습니다. 갈리는 지점은 복제 대상의 `tile_bytes`입니다.
 
 ---
 
 ## 16.3 결정은 Target IR이 한다
 
-`--pim-partition`은 후보별 전송량 표를 함수 속성으로 답니다. 어느 것을 고를지는 정하지 않습니다.
+PIM Common은 후보 목록을 만들지 않습니다. 후보를 열거하려면 유닛 개수를 알아야 하고, 그것은 §1이 배제한 정보입니다. 대신 **곱하기 전의 항**을 내보내고 Target IR이 자기 수치를 넣습니다.
 
 ```mlir
 func.func @matmul_kernel(...) attributes {
-  pim.grid_extents    = array<i64: 32, 16>,
-  pim.grid_permutable = true,
-  pim.partition_cost  = [
-    {bytes = 8388608 : i64,   splits = array<i64: 1, 1>},
-    ...
-    {bytes = 39845888 : i64,  splits = array<i64: 1, 16>},
-    ...
-    {bytes = 73400320 : i64,  splits = array<i64: 32, 1>},
-    ...
-    {bytes = 104857600 : i64, splits = array<i64: 32, 16>}
-  ]
+  pim.grid_dims    = ["m", "n"],
+  pim.grid_extents = array<i64: 64, 64>,
+  pim.split_axes   = [{axis = "m", source = "grid"},
+                      {axis = "n", source = "grid"},
+                      {axis = "k", combine = "add", source = "reduction"}],
+  pim.co_resident  = [{access = 0 : i64, bytes = 16384 : i64, lifetime = "streaming"},
+                      {access = 1 : i64, bytes = 16384 : i64, lifetime = "streaming"},
+                      {bytes = 16384 : i64, lifetime = "persistent"}],
+  pim.compute_ops  = 33554432 : i64
 }
 ```
 
-후보는 각 축의 약수를 모두 조합한 것입니다. 위 예에서는 32의 약수 6개와 16의 약수 5개를 조합해 30개가 나옵니다. 유닛 수가 정해지면 그중 하나가 정해지는 것이 아니라 여러 후보가 같은 유닛 수를 갖기도 하므로(예: `(2, 16)`과 `(32, 1)`은 둘 다 유닛 32개), 걸러내는 일은 target이 합니다.
-
 Target IR이 하는 일은 다음과 같습니다.
 
-1. 표와 자기 유닛 개수를 보고 후보를 고른다
-2. `pim.grid_permutable`을 확인한다
-3. grid loop를 쪼개고 재배치해 유닛 축을 바깥으로 보낸다
-4. hoisting을 다시 돌린다
-5. 바깥 loop를 유닛 dispatch로 바꾸고 전송 명령을 만든다
+1. `pim.split_axes`로 쪼갤 수 있는 축을 추린다
+2. 자기 유닛 개수 `U`를 만족하는 `s` 조합을 만든다
+3. 유닛 메모리 용량을 넘는 조합을 버린다 (§16.6)
+4. 남은 조합을 시간으로 정렬한다
+5. 고른 `s`로 유닛별 데이터 영역과 전송·결합 코드를 만든다
 
-3번과 4번은 PIM Common의 패스를 인자만 주어 호출합니다. target마다 다시 구현하지 않습니다. target마다 다른 것은 1번과 5번뿐입니다.
+4번의 시간 식은 다음과 같습니다. `BW`, `throughput`, `capacity`는 target 값입니다.
 
-`pim.grid_permutable`은 grid 반복의 순서를 바꿔도 되는지를 나타냅니다. 반복들이 서로 독립일 때만 합법이고, 독립이 깨지는 경우가 §16.5의 `pim.reduce_across_programs`입니다. 그 속성이 비어 있으면 참입니다.
+```text
+T(s) =  전송량(s) / BW
+      + pim.compute_ops × (Π g_d) / (U × throughput_unit)
+      + 결합 연산 수(s) / throughput_host
 
-### 표가 만들어지는 조건
+제약:  유닛당 상주량(s) ≤ capacity
+```
 
-표를 만들려면 grid 크기가 상수여야 합니다. 상수가 아니면 표를 만들지 않고 넘어갑니다. 근거 없는 수를 IR에 넣는 것보다 낫습니다.
+**전송량 하나만으로는 후보를 고를 수 없습니다.** 전송량은 모든 `s_d`에 대해 단조 비감소이므로 그것만 정렬하면 항상 유닛 하나를 고르게 되는데, 그 설정은 연산 시간이 가장 길고 대개 유닛 메모리에도 들어가지 않습니다. 유닛을 늘리는 이득은 두 번째 항에 있습니다.
 
-**지금 파이프라인에서는 상수가 아닙니다.** `--pim-build-grid`가 세우는 grid loop의 상한은 triton-shared ABI의 `num_programs` 인자이고 (§5.3), 그 값은 launcher가 실행 시점에 넘깁니다. 커널 하나를 여러 shape에 재사용하기 때문입니다.
+`M = N = K = 4096` f32 GEMM에서 유닛 하나는 A 64 MiB + B 64 MiB + C 64 MiB = 192 MiB를 담아야 합니다. **용량 제약이 유닛 수의 하한을 정하고, 전송량이 상한을 정하며, 최적점은 그 사이에서 연산 시간이 결정합니다.**
 
-그래서 `--pim-partition`이 항상 만드는 것은 grid와 무관한 두 값입니다.
+### grid 크기를 모를 때
 
-| 속성 | grid가 필요한가 |
+`pim.grid_extents`는 grid loop 상한이 상수일 때만 답니다. `--pim-build-grid`가 세우는 상한은 triton-shared ABI의 `num_programs` 인자이고 (§5.3), 그 값은 launcher가 실행 시점에 넘깁니다. 커널 하나를 여러 shape에 재사용하기 때문입니다.
+
+grid 크기를 몰라도 나머지 항은 전부 남습니다.
+
+| 속성 | grid 크기가 필요한가 |
 | --- | --- |
-| `pim.access_bytes` (access마다) | 아니요 |
-| `pim.working_set_bytes` (func) | 아니요 |
-| `pim.grid_permutable` (func) | 아니요 |
-| `pim.grid_extents`, `pim.partition_cost` (func) | 예 |
+| `pim.tile_bytes` (access마다) | 아니요 |
+| `pim.transfer_count` (access마다) | 아니요 (감싸는 loop 반복이 상수면) |
+| `pim.invariant_grid_dims`, `pim.reuse_realizable` (access마다) | 아니요 |
+| `pim.split_axes`, `pim.co_resident`, `pim.compute_ops` (func) | 아니요 |
+| `pim.grid_extents` (func) | 예 |
 
-앞의 세 개만으로도 전송량 식은 완전히 정해집니다. `pim.access_bytes`와 `pim.invariant_program_dims`가 있으면 target이 자기가 아는 `g`를 넣어 같은 식을 계산할 수 있습니다. 표는 `g`까지 상수로 접힌 경우에 미리 계산해 둔 편의 값입니다.
-
-`g`를 상수로 만들려면 launch grid를 컴파일 시점에 특수화해야 합니다. autotuning은 config마다 다시 컴파일하고 PyTorch Inductor는 shape을 특수화하므로 그 자리에서 붙일 수 있습니다. 지금은 미룹니다.
+`g_d`는 실행 시점에 `num_programs`로 알 수 있으므로, 전송량 식을 호스트에서 평가하거나 launch grid를 컴파일 시점에 특수화해 IR에 상수로 박을 수 있습니다. 어느 쪽을 쓸지는 Target IR이 정합니다.
 
 ---
 
@@ -1398,11 +1499,13 @@ for k_tile:
     C_tile += A_tile × B_tile
 ```
 
-instance 사이의 reduction은 필요하지 않습니다. `BLOCK_K`는 grid 차원을 만들지 않고 이 loop의 반복 횟수만 정합니다.
+`BLOCK_K`는 grid 차원을 만들지 않고 이 loop의 반복 횟수만 정합니다. 이 loop를 유닛에 쪼개지 않으면 reduction은 instance 하나 안에서 끝나고 유닛 밖 결합이 필요 없습니다.
+
+쪼갤지 여부는 Target IR이 정하므로, PIM Common은 이 loop를 `pim.split_axes`에 `source = "reduction"`으로 올려 두기만 합니다 (§16.5).
 
 ---
 
-## 16.5 Split-K: reduction loop를 grid 축으로 승격
+## 16.5 reduction 축 분할 (Split-K)
 
 ### 언제 필요한가
 
@@ -1414,135 +1517,130 @@ BLOCK_M = 32, BLOCK_N = 64, BLOCK_K = 64
 → grid_m = 8, grid_n = 4  →  instance 32개
 ```
 
-유닛이 2048개면 32개만 씁니다. 반면 K loop는 64번 돌고, 여기에 병렬성이 남아 있습니다.
+유닛이 2048개면 32개만 씁니다. 반면 K loop는 64번 돌고, 여기에 병렬성이 남아 있습니다. 그래서 grid 축뿐 아니라 **reduction loop도 분할 축으로 둡니다.** `pim.split_axes`의 `source = "reduction"` 항목이 그것입니다 (§5.5).
 
-K는 grid 차원이 아니라 instance 안의 순차 loop입니다. 그래서 **순차 reduction loop를 잘라 새 grid 축으로 올려야** 합니다.
+### 유닛에 나누는 방법
 
-### 변환
+reduction 축을 `s_k`개 유닛에 쪼갠다는 것은 각 유닛이 K 구간의 `1/s_k`만 맡는다는 뜻입니다. 유닛 하나가 보는 것은 축소된 문제입니다.
 
-`--pim-split-reduction=factor=S`가 K loop를 `S × (trip/S)`로 자르고 바깥 조각을 grid 축으로 올립니다.
-
-**변환 전**
-
-```mlir
-scf.for %gm = 0 to 8 {
-  scf.for %gn = 0 to 4 {
-    %init = linalg.fill ins(%zero) outs(%empty)
-    %acc = scf.for %k = 0 to 64 iter_args(%a = %init) {
-      ...
-      scf.yield %next
-    } {pim.reduction_combine = "add"}
-    pim.store %acc, %dC
-  } {pim.grid_dim = "y"}
-} {pim.grid_dim = "x"}
+```text
+유닛 (·, ·, kj) 가 받는 것:  A[·, kj·Ku : (kj+1)·Ku],  B[kj·Ku : (kj+1)·Ku, ·]
+유닛이 만드는 것:            C tile 전체 크기의 부분합
 ```
 
-**변환 후 (S = 64)**
-
-```mlir
-scf.for %gm = 0 to 8 {
-  scf.for %gn = 0 to 4 {
-    scf.for %gk = 0 to 64 {                  // 새 grid 축
-      %init = linalg.fill ins(%zero) outs(%empty)     // 안으로 들어옴
-      %acc = scf.for %k = 0 to 1 iter_args(%a = %init) {
-        %kk = arith.addi (arith.muli %gk, %c1), %k
-        ...
-        scf.yield %next
-      } {pim.reduction_combine = "add"}
-      pim.store %acc, %dC_partial            // %gk 에 무관한 주소
-    } {pim.grid_dim = "k"}
-  } {pim.grid_dim = "y"}
-} {pim.grid_dim = "x"}
-```
-
-누산기 초기화가 새 loop **안**으로 들어가야 합니다. 각 `%gk`가 자기 부분합을 0에서 시작해야 하기 때문입니다.
-
-### 기존 분석이 그대로 동작한다
-
-변환 후 `%dC_partial`의 주소는 `%gm`, `%gn`에만 의존하고 `%gk`에는 의존하지 않습니다. §5.5의 분석이 자동으로 이렇게 답니다.
-
-```mlir
-%dC_partial = pim.access %C ... {
-  pim.role = "output",
-  pim.invariant_program_dims = array<i64: 2>      // k 에 불변
-}
-
-func.func @matmul_kernel(...) attributes {
-  pim.reduce_across_programs = ["k"]
-}
-```
-
-출력이 어떤 grid 축에 불변이면 그 축만 다른 instance들이 같은 출력에 쓰므로 합쳐야 한다는 뜻이고, 합치는 연산자는 K loop의 `pim.reduction_combine`이 알려 줍니다. **부분합 처리에 필요한 정보가 추가 작업 없이 나옵니다.**
+`Ku = K / s_k`입니다. 커널 몸체는 그대로이고 K 상한과 base 주소만 달라집니다. IR의 loop 구조를 바꾸지 않아도 되는 이유가 이것입니다.
 
 ### 합법성
 
-세 조건이며 모두 IR에서 확인됩니다. 판단은 PIM Common이 합니다.
+두 조건이며 모두 IR에서 확인됩니다. 판단은 PIM Common이 합니다.
 
 1. loop에 `pim.reduction_combine`이 붙어 있다 (결합 법칙이 성립하는 누적이다)
 2. loop 몸체에 `pim.store` / `pim.scatter`가 없다 (반복마다 부수 효과가 없다)
-3. 누산기 초기값이 `linalg.fill` 같은 상수 채움이다 (`%gk`마다 다시 만들 수 있다)
 
-부동소수점 덧셈은 엄밀히는 결합 법칙이 성립하지 않으므로 Split-K는 결과를 바꿉니다. 알려진 trade-off이고, 현재 `UPMEMToHost.cpp`의 tree reduce도 같은 성질을 갖습니다.
+만족하면 `pim.split_axes`에 `source = "reduction"` 항목으로 올라가며 `combine` 필드가 함께 붙습니다.
+
+부동소수점 덧셈은 엄밀히는 결합 법칙이 성립하지 않으므로 이 분할은 결과를 바꿉니다. 알려진 trade-off이며 `s_k`가 클수록 커집니다.
 
 ### 비용
 
-위 예제(`M = N = 256, K = 4096`, f32)의 값입니다.
+grid 축 분할과 규칙이 다릅니다. reduction 축은 `transfer_count` 안에 들어 있으므로 §16.2의 곱에 넣지 않고 따로 셉니다.
 
-| | S = 1 (유닛 32개) | S = 64 (유닛 2048개) |
+| | `s_k`에 대한 의존 |
+| --- | --- |
+| 입력 access (k에 의존) | **무관.** 유닛당 `transfer_count / s_k`이고 유닛이 `s_k`배라 상쇄됩니다 |
+| 출력 access (k에 불변) | **정비례.** 유닛마다 완전한 크기의 부분합을 내보냅니다 |
+| 결합 연산 수 | `(s_k − 1) × 출력 원소 수` |
+
+`M = N = 256, K = 4096`, f32 GEMM입니다.
+
+| | `s_k` = 1 (유닛 32개) | `s_k` = 64 (유닛 2048개) |
 | --- | ---: | ---: |
 | A 전송 | 16 MB | 16 MB |
 | B 전송 | 32 MB | 32 MB |
 | C 전송 | 0.25 MB | **16 MB** |
 | 합계 | 48.25 MB | 64 MB |
 | 유닛당 연산 | 16.8 MFLOP | 262 KFLOP |
-| 호스트 리덕션 | 없음 | 4.13 M 덧셈 |
-
-**A와 B 전송은 S와 무관합니다.** 유닛 하나가 읽는 K 구간이 `1/S`로 줄고 유닛 수가 `S`배 늘어 정확히 상쇄됩니다.
-
-**C 전송은 S에 정비례합니다.** 유닛마다 완전한 `BLOCK_M × BLOCK_N` 부분합을 만들어 내보내기 때문입니다. 여기에 `(S-1) × M × N`번의 리덕션이 붙습니다.
+| 호스트 결합 | 없음 | 4.13 M 덧셈 |
 
 ```text
-연산 시간 ∝ 1/S
-출력 비용 ∝ S
+연산 시간 ∝ 1/s_k
+출력 비용 ∝ s_k
 ```
 
-**둘의 합이 최소가 되는 S가 존재하므로 S를 최대로 키우는 것이 답이 아닙니다.** S를 고르는 것은 유닛 개수와 대역폭을 알아야 하므로 Target IR의 몫입니다. PIM Common은 합법성과 위 비용의 형태만 제공합니다.
+**둘의 합이 최소가 되는 `s_k`가 존재하므로 최대로 키우는 것이 답이 아닙니다.**
+
+### 출력 크기가 결론을 가른다
+
+같은 규칙이 GEMV에서는 반대 결론을 냅니다. 출력이 작기 때문입니다.
+
+`s_k = 32` 기준입니다.
+
+| | 출력 크기 | 부분합 전송 | 결합 연산 수 | 전체 전송 대비 |
+| --- | ---: | ---: | ---: | ---: |
+| GEMM `M = N = 4096` | 64 MiB | 2 GiB | 520 M | 하한의 10배 |
+| GEMV `M = 4096` | 16 KiB | 512 KiB | 127 K | 0.8% |
+
+GEMV는 유닛 2048개를 `s_m = 64`, `s_k = 32`로 채워도 전송이 하한의 1.02배입니다. GEMM은 같은 유닛 수에서 32배입니다. `pim.split_axes`의 `combine` 표시는 두 경우에 똑같이 붙고, 갈리는 것은 출력 access의 `pim.tile_bytes`입니다. 그래서 `combine` 표시만으로는 부족하고 출력 크기가 함께 있어야 합니다.
 
 ---
 
-## 16.6 working set
+## 16.6 유닛당 상주량과 연산량
 
-`BLOCK_K`는 전송 총량에 영향을 주지 않습니다. instance 하나가 결국 읽는 A의 총량은 `BLOCK_M × K`로 고정이고, `BLOCK_K`는 그것을 몇 번에 나눠 읽느냐만 정합니다.
+### 상주량
 
-`BLOCK_K`가 결정하는 것은 **working set**, 즉 한 순간에 유닛 메모리에 있어야 하는 양입니다.
+한 순간에 유닛 메모리에 함께 있어야 하는 tile들을 목록으로 냅니다. 가장 깊이 있는 `pim.load`의 블록을 잡아, 그 블록의 `pim.load` 결과 tensor들과 그 블록이 `scf.for` 몸체라면 tensor 타입 iter_arg를 모읍니다. GEMM이면 A tile, B tile, 누산기가 됩니다.
 
-```text
-working set = (BLOCK_M × BLOCK_K)      A tile
-            + (BLOCK_K × BLOCK_N)      B tile
-            + (BLOCK_M × BLOCK_N)      누산기
+```mlir
+func.func @matmul_kernel(...) attributes {
+  pim.co_resident = [{access = 0 : i64, bytes = 2048 : i64, lifetime = "streaming"},
+                     {access = 1 : i64, bytes = 4096 : i64, lifetime = "streaming"},
+                     {bytes = 8192 : i64, lifetime = "persistent"}]
+}
 ```
 
-f32 기준입니다.
+`access`는 함수 안 `pim.access`의 순서 인덱스입니다. 누산기는 access를 거치지 않으므로 이 필드가 없습니다.
 
-| BLOCK M / N / K | working set |
+`lifetime`은 loop 구조에서 나옵니다. reduction loop 안에서 매 반복 새로 읽히면 `streaming`, loop를 관통하면 `persistent`입니다. 버퍼 하나를 돌려쓸 수 있는지가 이것으로 갈립니다.
+
+합계가 아니라 목록으로 두는 이유는 target의 메모리 계층이 하나가 아니기 때문입니다. 어느 tile을 빠른 쪽에 두고 어느 것을 스트리밍할지는 개별 크기를 알아야 정할 수 있습니다.
+
+GEMV `BLOCK_M = 64, BLOCK_K = 256`, f32의 목록입니다.
+
+| tile | bytes | lifetime |
+| --- | ---: | --- |
+| A | 65,536 | streaming |
+| x | 1,024 | streaming |
+| y (누산기) | 256 | persistent |
+
+A tile 하나가 98%를 차지합니다. 합계만 보면 "용량 초과"로 끝나지만, 목록을 보면 `BLOCK_K`를 줄여 A tile만 작게 하고 x와 y는 그대로 두면 된다는 것이 보입니다.
+
+`BLOCK_K`는 전송 총량에 영향을 주지 않습니다. instance 하나가 결국 읽는 A의 총량은 `BLOCK_M × K`로 고정이고, `BLOCK_K`는 그것을 몇 번에 나눠 읽느냐만 정합니다. `BLOCK_K`가 정하는 것은 상주량과 전송 건수입니다.
+
+f32 GEMM 기준입니다.
+
+| BLOCK M / N / K | 상주량 합 |
 | --- | ---: |
 | 32 / 64 / 16 | 14 KB |
 | 64 / 64 / 64 | 48 KB |
 | 128 / 128 / 64 | 128 KB |
 
-용량 판단은 §1이 배제한 항목이므로 Target IR이 합니다. 다만 **계산은 tile 크기와 element 크기만 쓰므로 target과 무관합니다.** PIM Common이 계산해 값으로 남기고, 들어가는지는 target이 판단합니다.
+용량 판단은 §1이 배제한 항목이므로 Target IR이 합니다. 다만 **계산은 tile 크기와 element 크기만 쓰므로 target과 무관합니다.**
+
+### 연산량
+
+instance 하나가 하는 산술 연산 횟수를 함수 속성으로 냅니다.
 
 ```mlir
 func.func @matmul_kernel(...) attributes {
-  pim.working_set_bytes = 14336 : i64
+  pim.compute_ops = 2097152 : i64
 }
 ```
 
-가장 깊이 있는 `pim.load`의 블록을 잡아, 그 블록의 `pim.load` 결과 tensor들과 그 블록이 `scf.for` 몸체라면 tensor 타입 iter_arg의 바이트를 더합니다. GEMM이면 A tile + B tile + 누산기가 됩니다.
+`linalg.matmul`의 tile이 `[BM, BK] × [BK, BN]`이고 reduction loop가 `t`번 돌면 `2 · BM · BN · BK · t`입니다. tile shape과 loop 횟수만 쓰므로 target과 무관합니다.
 
-`BLOCK`을 autotuning으로 탐색하면 용량을 넘는 config를 반드시 만나게 됩니다. 이 값이 있으면 target이 그 자리에서 실패시킬 수 있고, autotuner가 해당 config를 건너뛸 근거가 됩니다.
+이 값이 §16.3 시간 식의 두 번째 항입니다. 유닛 하나가 맡는 instance 수는 `(Π g_d) / U`이므로 유닛당 연산량은 `pim.compute_ops × (Π g_d) / U`이고, **유닛 수에 반비례합니다.** 전송량이 유닛 수에 비례해 느는 것과 반대 방향이라, 이 항이 없으면 분할의 이득이 식에 나타나지 않습니다.
 
-`BLOCK`은 Python autotune 설정에서 온 값이라 PIM Common에 도착할 때 이미 IR에 상수로 박혀 있습니다. Target IR은 그것을 바꿀 수 없고 맞는지 확인만 할 수 있습니다. target에 맞춰 `BLOCK`을 고르려면 autotuning 쪽으로 정보를 돌려보내야 합니다.
+`BLOCK`은 Python autotune 설정에서 온 값이라 PIM Common에 도착할 때 이미 IR에 상수로 박혀 있습니다. Target IR은 그것을 바꿀 수 없고 맞는지 확인만 할 수 있습니다. target에 맞춰 `BLOCK`을 고르려면 autotuning 쪽으로 정보를 돌려보내야 합니다 (§16.7).
 
 ---
 
@@ -1558,14 +1656,18 @@ func.func @matmul_kernel(...) attributes {
 | 16 | 32 | 16 × 8 | 128 | S = 16 |
 | 16 | 16 | 16 × 16 | 256 | S = 8 |
 
-세 줄 다 2048개를 쓰지만 비용이 다릅니다. tile을 작게 하면 유닛당 연산 대비 전송 비율이 나빠지고, S를 키우면 출력 전송과 리덕션이 늘어납니다. **`BLOCK`을 먼저 고정하고 분할을 정하면 최적을 놓칩니다.**
+세 줄 다 2048개를 쓰지만 비용이 다릅니다. tile을 작게 하면 유닛당 연산 대비 전송 비율이 나빠지고, `s_k`를 키우면 출력 전송과 결합이 늘어납니다. **`BLOCK`을 먼저 고정하고 분할을 정하면 최적을 놓칩니다.**
 
-§16.2의 전송량과 §16.6의 working set은 실행하지 않고 계산되므로, 실제로 컴파일하기 전에 후보를 걸러낼 수 있습니다.
+§16.2의 전송량, §16.6의 상주량과 연산량은 실행하지 않고 계산되므로 컴파일 전에 후보를 걸러낼 수 있습니다.
 
 1. `BLOCK` × 분할 조합을 나열한다
-2. working set으로 거른다
-3. 전송량으로 순위를 매긴다
+2. 상주량이 유닛 메모리를 넘는 조합을 버린다
+3. §16.3의 `T(s)`로 순위를 매긴다
 4. 상위 몇 개만 컴파일해 측정한다
+
+2번과 3번을 나누는 것이 중요합니다. 2번은 **실행 가능 여부**이므로 넘으면 버립니다. 3번은 **추정**이므로 순위만 정하고 최종 판단은 4번의 측정에 맡깁니다. 전송량만으로 3번을 하면 항상 유닛 하나를 1등으로 고르는데, 그 설정은 2번에서 이미 걸러졌거나 연산 시간이 가장 깁니다 (§16.3).
+
+`BLOCK`은 커널의 `tl.constexpr`이고 분할은 유닛 배치 파라미터이므로 둘 다 커널 호출 시점에 정해집니다. 두 축을 한 탐색 공간에 두면 2번과 3번을 컴파일 전에 수행하고 살아남은 조합만 컴파일할 수 있습니다.
 
 ---
 
@@ -1684,16 +1786,15 @@ func.func @matmul_kernel(
     %stride_am: i32, %stride_bk: i32, %stride_cm: i32,
     %np_x: i32, %np_y: i32, %np_z: i32)
     attributes {
-      pim.execution_model   = "spmd",
-      pim.program_dims      = ["x", "y"],
-      pim.grid_extents      = array<i64: 32, 16>,
-      pim.grid_permutable   = true,
-      pim.working_set_bytes = 14336 : i64,
-      pim.partition_cost    = [
-        {splits = array<i64: 1, 16>,  bytes = 39845888 : i64},
-        {splits = array<i64: 32, 1>,  bytes = 73400320 : i64},
-        {splits = array<i64: 32, 16>, bytes = 104857600 : i64}
-      ]
+      pim.execution_model = "spmd",
+      pim.grid_dims       = ["m", "n"],
+      pim.split_axes      = [{axis = "m", source = "grid"},
+                             {axis = "n", source = "grid"},
+                             {axis = "k", combine = "add", source = "reduction"}],
+      pim.co_resident     = [{access = 0 : i64, bytes = 2048 : i64, lifetime = "streaming"},
+                             {access = 1 : i64, bytes = 4096 : i64, lifetime = "streaming"},
+                             {bytes = 8192 : i64, lifetime = "persistent"}],
+      pim.compute_ops     = 2097152 : i64
     } {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
@@ -1702,17 +1803,17 @@ func.func @matmul_kernel(
   %sam  = arith.index_cast %stride_am : i32 to index
   %sbk  = arith.index_cast %stride_bk : i32 to index
   %scm  = arith.index_cast %stride_cm : i32 to index
-  %ub_x = arith.index_cast %np_x : i32 to index
-  %ub_y = arith.index_cast %np_y : i32 to index
+  %ub_m = arith.index_cast %np_x : i32 to index
+  %ub_n = arith.index_cast %np_y : i32 to index
 
-  scf.for %gx = %c0 to %ub_x step %c1 {
-    scf.for %gy = %c0 to %ub_y step %c1 {
+  scf.for %gm = %c0 to %ub_m step %c1 {
+    scf.for %gn = %c0 to %ub_n step %c1 {
 
-      // m_off = gx × BLOCK_M,  n_off = gy × BLOCK_N
+      // m_off = gm × BLOCK_M,  n_off = gn × BLOCK_N
       // valid_m, valid_n 은 minsi/maxsi/subi 연쇄로 계산 (경계 tile)
 
       %empty = tensor.empty() : tensor<32x64xf32>
-      %init  = linalg.fill {pim.class = "splat"}
+      %init  = linalg.fill {pim.op = "fill"}
                ins(%zero : f32) outs(%empty : tensor<32x64xf32>) -> tensor<32x64xf32>
 
       %result = scf.for %tk = %c0 to %grid_k step %c1
@@ -1723,25 +1824,29 @@ func.func @matmul_kernel(
 
         %dA = pim.access %A offset %a_off sizes [32, 16] strides [%sam, %c1]
               valid [%valid_m, %valid_k] pad %zero
-              {pim.role = "input", pim.invariant_program_dims = array<i64: 1>}
+              {pim.role = "input", pim.invariant_grid_dims = array<i64: 1>,
+               pim.tile_bytes = 2048 : i64, pim.transfer_count = 32 : i64,
+               pim.reuse_realizable = false}
               : memref<*xf32> -> !pim.access
 
         %dB = pim.access %B offset %b_off sizes [16, 64] strides [%sbk, %c1]
               valid [%valid_k, %valid_n] pad %zero
-              {pim.role = "input", pim.invariant_program_dims = array<i64: 0>}
+              {pim.role = "input", pim.invariant_grid_dims = array<i64: 0>,
+               pim.tile_bytes = 4096 : i64, pim.transfer_count = 32 : i64,
+               pim.reuse_realizable = false}
               : memref<*xf32> -> !pim.access
 
         %a = pim.load %dA : !pim.access -> tensor<32x16xf32>
         %b = pim.load %dB : !pim.access -> tensor<16x64xf32>
 
-        %prod = linalg.matmul {pim.class = "gemm"}
+        %prod = linalg.matmul {pim.op = "gemm"}
                 ins(%a, %b : tensor<32x16xf32>, tensor<16x64xf32>)
                 outs(%init : tensor<32x64xf32>) -> tensor<32x64xf32>
 
         %next = linalg.generic {
                   indexing_maps = [#identity, #identity, #identity],
                   iterator_types = ["parallel", "parallel"],
-                  pim.class = "elementwise"
+                  pim.op = "elementwise"
                 }
                 ins(%acc, %prod : tensor<32x64xf32>, tensor<32x64xf32>)
                 outs(%acc : tensor<32x64xf32>) {
@@ -1756,13 +1861,15 @@ func.func @matmul_kernel(
       // c_off = m_off × stride_cm + n_off
       %dC = pim.access %C offset %c_off sizes [32, 64] strides [%scm, %c1]
             valid [%valid_m, %valid_n]
-            {pim.role = "output", pim.invariant_program_dims = array<i64>}
+            {pim.role = "output", pim.invariant_grid_dims = array<i64>,
+             pim.tile_bytes = 8192 : i64, pim.transfer_count = 1 : i64,
+             pim.reuse_realizable = true}
             : memref<*xf32> -> !pim.access
 
       pim.store %result, %dC : tensor<32x64xf32>, !pim.access
 
-    } {pim.grid_dim = "y"}
-  } {pim.grid_dim = "x"}
+    } {pim.grid_dim = "n"}
+  } {pim.grid_dim = "m"}
 
   return
 }
@@ -1775,22 +1882,24 @@ func.func @matmul_kernel(
 
 이 IR이 표현하는 정보입니다.
 
-* grid 두 축과 각 축의 크기
+* grid 두 축과, 쪼갤 수 있는 축 세 개 (m, n, 그리고 결합이 필요한 k)
 * A, B, C의 논리적 접근 범위와 경계 tile 유효 크기
 * K 방향 반복과 누산, 그 결합 연산자
-* A는 y축에, B는 x축에 불변 — 재사용 가능성
-* 분할 후보 세 개와 각각의 전송량
-* 유닛 하나가 담아야 하는 working set 크기
+* A는 n축에, B는 m축에 불변 — 쪼갤 때 복제 대상
+* A와 B의 주소가 K loop에 의존해 그 재사용이 실현되지 않는다는 사실
+* 전송량 식의 항 (`tile_bytes`, `transfer_count`)
+* 유닛 하나가 동시에 담아야 하는 tile 목록과 각각의 수명
+* instance 하나의 연산량
 * load–compute–store 데이터 의존성과 연산 종류
 
 Target IR이 결정하는 정보입니다.
 
-* 사용할 유닛 개수와 분할 후보 선택
-* Split-K 분할 개수
-* grid loop 재배치와 유닛 dispatch
+* 사용할 유닛 개수와 축별 분할 비율
+* 유닛 인덱스에서 데이터 영역을 계산하는 방법
 * MRAM, WRAM, bank 메모리 배치와 실제 buffer 크기
 * B의 실제 residency
 * DMA alignment, padding 형식, descriptor chain
+* 부분합을 합치는 위치와 순서
 * 연산 fusion과 legalization
 * Host와 device의 역할 분담
 
@@ -1806,25 +1915,26 @@ TTIR
    ↓ --triton-to-linalg-experimental
 TTShared IR
    ↓
---convert-ttshared-to-pim      memref 접근 패턴 raising, staging buffer 제거
+--convert-ttshared-to-pim         memref 접근 패턴 raising, staging buffer 제거
    ↓
---pim-build-grid               program ID → grid loop (§5.3)
+--pim-build-grid                  program ID → grid loop (§5.3)
    ↓
--cse                           동일한 pim.access 병합 (§15.1)
+-cse                              동일한 pim.access 병합 (§15.1)
    ↓
--loop-invariant-code-motion    불변 주소 계산과 Pure한 pim.access를 loop 밖으로 (§15.6 선행)
+-loop-invariant-code-motion       불변 주소 계산과 Pure한 pim.access를 loop 밖으로 (§15.6 선행)
    ↓
---pim-analyze-logical-work     role, invariant_program_dims,
-   │                           reduction_combine, reduce_across_programs (§5.5, §5.6)
+--pim-remove-redundant-transfers  instance 내부 hoisting, load-store를 copy로,
+   │                              반복 load 제거, store-to-load forwarding (§15)
    ↓
---pim-remove-buffers           instance 내부 hoisting, passthrough → pim.copy,
-   │                           반복 load 제거, store-to-load forwarding (§15)
+-canonicalize                     죽은 pim.load 정리 (§15.5)
    ↓
--canonicalize                  죽은 pim.load 정리 (§15.5)
+--pim-analyze-reuse               role, invariant_grid_dims, reuse_realizable,
+   │                              reduction_combine, split_axes (§5.5, §5.6)
    ↓
---pim-partition                분할 후보별 전송량, working set (§16.2, §16.6)
+--pim-analyze-transfer            tile_bytes, transfer_count, co_resident,
+   │                              compute_ops, grid_extents (§16.2, §16.6)
    ↓
---pim-classify-compute         gemm / reduce / elementwise 등 분류 (§13)
+--pim-classify-compute            gemm / reduce / elementwise 등 분류 (§13)
    ↓
 PIM Common IR
    ├─ --legalize-pim-to-upmem
@@ -1835,28 +1945,25 @@ PIM Common IR
 
 ## 20.2 순서의 근거
 
-**`--pim-build-grid`가 앞에 온다.** 뒤의 세 패스가 모두 "grid 축"이라는 개념 위에서 동작합니다. grid loop가 없으면 분석할 대상이 없습니다.
+파이프라인은 **변환 패스를 전부 돌린 뒤 분석 패스를 전부 돌리는** 두 구간으로 나뉩니다. 분석 결과는 IR의 최종 모습을 기술해야 하고, IR을 바꾸는 패스가 뒤에 오면 그 기술이 낡기 때문입니다. 이 규칙에는 예외를 두지 않습니다.
 
 **`--convert-ttshared-to-pim`이 `--pim-build-grid`보다 앞에 온다.** 둘 다 가능하지만, raise 패스의 matcher들이 지금 보는 IR 모양을 유지하는 편이 낫습니다. 이미 동작하는 패스를 흔들지 않습니다.
 
-**`--pim-analyze-logical-work`가 `--pim-partition`보다 앞에 온다.** 전송량 계산이 `pim.invariant_program_dims`를 입력으로 씁니다.
+**`--pim-build-grid`가 나머지보다 앞에 온다.** 뒤의 패스들이 모두 "grid 축"이라는 개념 위에서 동작합니다. grid loop가 없으면 분석할 대상이 없습니다.
 
-**`--pim-remove-buffers`가 `--pim-partition`보다 앞에 온다.** §16.2의 `E_a`는 instance 안에서 access가 실행되는 횟수를 곱한 값입니다. instance 내부 hoisting이 끝난 뒤라야 그 횟수가 실제 전송 횟수와 맞습니다.
+**`-loop-invariant-code-motion`이 `--pim-remove-redundant-transfers`보다 앞에 온다.** §15.6의 첫 조건이 "`pim.access`가 loop 밖에 있다"입니다. `pim.access`는 `Pure`라 표준 LICM이 빼 주므로, 그 뒤에 돌아야 load가 따라 나옵니다.
 
-**`-loop-invariant-code-motion`이 `--pim-remove-buffers`보다 앞에 온다.** §15.6의 첫 조건이 "`pim.access`가 loop 밖에 있다"입니다. `pim.access`는 `Pure`라 표준 LICM이 빼 주므로, 그 뒤에 돌아야 load가 따라 나옵니다.
+**분석 패스가 `--pim-remove-redundant-transfers`와 `-canonicalize` 뒤에 온다.** `pim.transfer_count`는 전송 op의 위치를 세므로 hoisting이 끝난 뒤라야 실제 전송 횟수와 맞습니다 (§16.2). `-canonicalize`가 죽은 access를 지운 뒤에 분석하면 사라질 op에 속성을 다는 일도 없습니다.
+
+**`--pim-analyze-reuse`가 `--pim-analyze-transfer`보다 앞에 온다.** 전송량 식이 `pim.invariant_grid_dims`를 입력으로 씁니다.
 
 **`--pim-classify-compute`가 마지막이다.** 분류 태그는 찍는 순간의 스냅샷이라 이후 구조가 바뀌면 낡습니다 (§13).
 
-## 20.3 Target 쪽에서 호출하는 PIM Common 패스
+## 20.3 IR을 바꾸는 패스는 하나뿐이다
 
-다음 두 패스는 PIM Common에 두지만 파이프라인에 기본으로 넣지 않습니다. Target IR이 파라미터를 정한 뒤 호출합니다 (§16.3).
+`--pim-remove-redundant-transfers`만 IR을 바꿉니다. 나머지는 전부 속성만 붙입니다.
 
-| 패스 | 파라미터 | 하는 일 |
-| --- | --- | --- |
-| `--pim-split-reduction` | `factor` | reduction loop를 grid 축으로 승격 (§16.5) |
-| `--pim-apply-partition` | `splits` | grid 축을 유닛/순차로 쪼개고 재배치 |
-
-재배치 후에는 `--pim-remove-buffers`를 다시 돌려 grid 수준의 전송을 뺍니다. 같은 패스를 재사용하므로 target마다 구현하지 않습니다.
+분할도 IR 변환이 아닙니다. 유닛에 나누는 일은 유닛 인덱스에서 데이터 영역과 축소된 문제 크기를 계산하는 것이고, 커널 몸체는 그대로입니다 (§16.5). 그래서 분할을 반영하려고 grid loop를 쪼개거나 재배치할 필요가 없고, Target codegen이 전송·결합 코드를 만들 때 처리합니다.
 
 ---
 
@@ -1869,29 +1976,41 @@ PIM Common IR
 | `pim` dialect 6개 op + `!pim.access` + verifier | `include/triton-shared/Dialect/PIM/IR/PIMDialect.td` |
 | `--convert-ttshared-to-pim` | `lib/Conversion/TTSharedToPIM/TTSharedToPIMPass.cpp` |
 | `--pim-build-grid` | 같은 디렉터리 |
-| `--pim-remove-buffers` (hoisting 포함) | 같은 디렉터리 |
-| `--pim-analyze-logical-work` | 같은 디렉터리 |
-| `--pim-partition` | 같은 디렉터리 |
+| `--pim-remove-redundant-transfers` (hoisting 포함) | 같은 디렉터리 |
+| `--pim-analyze-reuse` | 같은 디렉터리 |
+| `--pim-analyze-transfer` | 같은 디렉터리 |
 | `--pim-classify-compute` | 같은 디렉터리 |
 | 파이프라인 배선 | `pim_backend/backend/compiler.py` |
+| 테스트 | `test/Conversion/TTSharedToPIM/` |
 
-## 21.2 이 문서에서 새로 정하는 것
+분석 패스가 다는 속성은 다음과 같습니다. 어느 것도 IR을 바꾸지 않고, Target IR이 읽을 근거만 남깁니다.
 
-| 항목 | 절 |
-| --- | --- |
-| `--pim-split-reduction` | §16.5 |
-| `--pim-apply-partition` | §20.3 |
-| launch grid를 컴파일 시점에 특수화 (`pim.partition_cost`의 전제) | §16.3 |
-| PIM용 커널은 다차원 grid로 작성 | §5.4 |
+| 속성 | 붙는 곳 | 다는 패스 | 절 |
+| --- | --- | --- | --- |
+| `pim.grid_dim` | grid loop | `--pim-build-grid` | §5.3 |
+| `pim.execution_model`, `pim.grid_dims` | func | `--pim-analyze-reuse` | §5.5 |
+| `pim.role`, `pim.invariant_grid_dims` | `pim.access` | `--pim-analyze-reuse` | §5.5, §16.1 |
+| `pim.reuse_realizable` | `pim.access` | `--pim-analyze-reuse` | §5.5, §15.6 |
+| `pim.reduction_combine` | reduction loop | `--pim-analyze-reuse` | §5.6 |
+| `pim.split_axes` | func | `--pim-analyze-reuse` | §5.5, §16.5 |
+| `pim.tile_bytes`, `pim.transfer_count` | `pim.access` | `--pim-analyze-transfer` | §16.2 |
+| `pim.co_resident` | func | `--pim-analyze-transfer` | §16.6 |
+| `pim.compute_ops` | func | `--pim-analyze-transfer` | §16.6 |
+| `pim.grid_extents` | func | `--pim-analyze-transfer` | §16.2 |
+| `pim.op` | 계산 op | `--pim-classify-compute` | §13 |
 
-## 21.3 다음 단계로 미루는 것
+커널이 다차원 grid로 작성되어 있어야 분할 후보가 둘 이상 나옵니다 (§5.4).
+
+## 21.2 다음 단계로 미루는 것
 
 **Host/device 분리.** grid loop가 곧 호스트 loop이므로 §5.3이 절반을 해 둔 셈입니다. 어디서 자를지는 전송이 어디로 옮겨지는지 본 뒤에 정합니다.
 
-**`--legalize-pim-to-upmem` 재작성.** `compiler.py`가 호출하지만 구현이 없습니다. §16의 출력을 입력으로 받도록 새로 씁니다. `UPMEMToHost.cpp`의 `split_m` / `split_n` / `split_k` 모델은 §16.1과 같은 구조이므로 대부분 그대로 씁니다. 다만 두 가지를 맞춰야 합니다.
+**`--legalize-pim-to-upmem` 재작성.** `compiler.py`가 호출하지만 구현이 없습니다. §16의 출력을 입력으로 받도록 새로 씁니다. `UPMEMToHost.cpp`의 `split_m` / `split_n` / `split_k` 모델은 §16.1과 같은 구조이므로 대부분 그대로 씁니다. 그 파일의 `A_DIST = SPLIT_M × SPLIT_K`가 §16.1의 "서로 다른 조각 수" `Π{s_j : j ∉ I_A}`이고, 같은 버퍼를 `SPLIT_N`개 유닛이 공유하는 것이 복제 배수 `Π{s_j : j ∈ I_A}`입니다. 지금은 그 값들을 사람이 정하고 있고, 새로 쓸 때는 §16의 속성에서 유도합니다.
+
+맞춰야 할 것은 두 가지입니다.
 
 * `extractGemmBlocks`가 memref 위의 `linalg.matmul`을 기대합니다. PIM Common은 tensor 위에 있으므로 사이에 bufferization이 필요합니다.
-* GEMM 전용입니다. 그 외 커널을 어디로 보낼지 정해야 합니다.
+* GEMM 전용입니다. 그 외 커널을 어디로 보낼지 정해야 합니다. `pim.op`가 그 분기의 근거입니다 (§13).
 
 **AiMX 경로.** `--legalize-pim-to-aimx` 등이 모두 stub입니다.
 
@@ -1924,7 +2043,7 @@ func.func @matmul_kernel(
 
 **1차원 grid 정규화.** grouped ordering을 알아보고 다차원으로 되돌리는 패스. Inductor 커널을 받을 때 필요합니다 (§5.4).
 
-## 21.4 지원하지 않는 것
+## 21.3 지원하지 않는 것
 
 * 랩어라운드 접근 — 필요한 경계값이 memref 레벨에 남지 않습니다 (§2.1)
 * 여러 kernel 사이의 데이터 residency
@@ -1942,7 +2061,7 @@ func.func @matmul_kernel(
 
 PIM Common IR은 다음과 같이 정의합니다.
 
-> PIM Common IR은 TTShared의 구조화된 IR을 입력으로 받아, 메모리 접근 관용구를 논리적 주소와 데이터 이동 연산으로 끌어올리고, runtime에 있던 grid를 명시적 loop로 옮겨 program instance 사이의 데이터 관계를 드러내며, 분할 후보별 전송량과 working set을 계산해 Target IR에 넘기는 PIM-neutral 중간 계층이다.
+> PIM Common IR은 TTShared의 구조화된 IR을 입력으로 받아, 메모리 접근 관용구를 논리적 주소와 데이터 이동 연산으로 끌어올리고, runtime에 있던 grid를 명시적 loop로 옮겨 program instance 사이의 데이터 관계를 드러내며, 축을 유닛에 쪼갤 때 무엇이 나뉘고 무엇이 복제되며 어디서 결합이 필요한지를 기록해 Target IR에 넘기는 PIM-neutral 중간 계층이다.
 
 역할 구분은 다음과 같습니다.
 
@@ -1950,17 +2069,16 @@ PIM Common IR은 다음과 같이 정의합니다.
 PIM Common IR
   ├─ 논리적 데이터 접근과 load/store/copy
   ├─ grid loop와 instance 내부 loop
-  ├─ linalg 계산 의미
-  ├─ grid 축별 불변성 (재사용 가능성)
-  ├─ reduction 구조와 결합 연산자
-  ├─ 분할 후보별 전송량
-  ├─ working set 크기
-  ├─ loop 변환 코드 (분할 적용, reduction 승격)
-  └─ target-neutral 중복 제거
+  ├─ linalg 계산 의미와 연산 종류
+  ├─ grid 축별 불변성 — 나누는 데이터와 복제하는 데이터
+  ├─ 재사용 할인이 실현되는지
+  ├─ 쪼갤 수 있는 축과 결합 연산자
+  ├─ 전송량·상주량·연산량 식의 항
+  └─ target-neutral 중복 전송 제거
 
 Target IR
-  ├─ 유닛 개수
-  ├─ 분할 후보 선택과 Split-K 분할 개수
+  ├─ 유닛 개수와 유닛 메모리 용량
+  ├─ 축별 분할 비율 선택
   ├─ 물리 메모리 배치와 용량 판정
   ├─ alignment와 padding
   ├─ 실제 residency
@@ -1973,4 +2091,4 @@ Target IR
 
 > PIM Common IR은 어떤 데이터를 어떤 방식으로 접근하고 어떤 계산을 수행하는지를 표현하며, 실제 하드웨어에서 어디에 배치하고 어떻게 실행할지는 Target IR에 위임한다.
 
-> 구조는 PIM Common이 만들고, 파라미터는 Target IR이 정한다. 변환 코드는 한 벌만 둔다.
+> 사실은 PIM Common이 기록하고, 수치는 Target IR이 넣는다. IR을 바꾸는 것은 중복 전송 제거 하나뿐이다.

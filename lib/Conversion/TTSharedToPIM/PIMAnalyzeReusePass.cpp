@@ -13,7 +13,7 @@ using namespace mlir;
 
 namespace mlir {
 namespace triton {
-#define GEN_PASS_DEF_PIMANALYZELOGICALWORK
+#define GEN_PASS_DEF_PIMANALYZEREUSE
 #include "triton-shared/Conversion/TTSharedToPIM/Passes.h.inc"
 } // namespace triton
 } // namespace mlir
@@ -33,8 +33,12 @@ static void collectGridLoops(func::FuncOp func,
 // 값이 의존하는 grid 차원 집합을 backward slice로 구한다. 추적할 수 없는 leaf를 만나면
 // opaque=true를 남겨, 호출자가 모든 차원에 의존한다고 보수적으로 처리하게 한다
 // (재사용 가능성을 과대주장하지 않는다).
+// grid가 아닌 loop의 유도변수에 의존하면 inner=true를 남긴다. 그러면 pim.access가 그
+// loop 안에서 만들어져 전송을 밖으로 뺄 수 없고(§15.6의 첫 조건), 불변 축이 약속하는
+// 재사용이 loop 순서를 바꾸지 않는 한 실현되지 않는다.
 static void collectDeps(Value root, ArrayRef<scf::ForOp> grid,
-                        llvm::DenseSet<unsigned> &deps, bool &opaque) {
+                        llvm::DenseSet<unsigned> &deps, bool &opaque,
+                        bool &inner) {
   SmallVector<Value> worklist{root};
   llvm::DenseSet<Value> visited;
   while (!worklist.empty()) {
@@ -51,14 +55,20 @@ static void collectDeps(Value root, ArrayRef<scf::ForOp> grid,
           opaque = true;
         continue;
       }
+      // grid가 아닌 loop 안에서 변하는 값이면(유도변수든 iter_arg든) 그 loop마다 주소가
+      // 달라져 pim.access를 loop 밖으로 뺄 수 없다.
+      bool isGrid = llvm::is_contained(grid, forOp);
+      if (!isGrid)
+        inner = true;
       if (ba == forOp.getInductionVar()) {
         // grid loop의 유도변수면 그 차원에 의존한다. grid가 아닌 loop(K tile 등)의
-        // 유도변수는 instance 내부의 반복이라 program 차원과 무관하다.
-        for (auto [d, g] : llvm::enumerate(grid))
-          if (g == forOp) {
-            deps.insert(d);
-            break;
-          }
+        // 유도변수는 instance 내부의 반복이라 grid 차원과 무관하다.
+        if (isGrid)
+          for (auto [d, g] : llvm::enumerate(grid))
+            if (g == forOp) {
+              deps.insert(d);
+              break;
+            }
         continue;
       }
       // iter_arg는 초기값과 yield 값 양쪽으로 따라간다.
@@ -85,16 +95,17 @@ static void collectDeps(Value root, ArrayRef<scf::ForOp> grid,
 // index는 row gather가 실제로 읽는 행을 정한다. pad는 주소는 아니지만 유효 범위 밖
 // 원소의 값이 되어 load 결과를 바꾸므로 함께 본다.
 static void collectAccessDeps(pim::AccessOp access, ArrayRef<scf::ForOp> grid,
-                              llvm::DenseSet<unsigned> &deps, bool &opaque) {
-  collectDeps(access.getOffset(), grid, deps, opaque);
+                              llvm::DenseSet<unsigned> &deps, bool &opaque,
+                              bool &inner) {
+  collectDeps(access.getOffset(), grid, deps, opaque, inner);
   for (Value stride : access.getStrides())
-    collectDeps(stride, grid, deps, opaque);
+    collectDeps(stride, grid, deps, opaque, inner);
   for (Value valid : access.getValid())
-    collectDeps(valid, grid, deps, opaque);
+    collectDeps(valid, grid, deps, opaque, inner);
   if (Value pad = access.getPad())
-    collectDeps(pad, grid, deps, opaque);
+    collectDeps(pad, grid, deps, opaque, inner);
   if (Value index = access.getIndex())
-    collectDeps(index, grid, deps, opaque);
+    collectDeps(index, grid, deps, opaque, inner);
 }
 
 // access를 소비하는 방식으로 role을 정한다. store/copy-dst → output, 그 외(load/copy-src) → input.
@@ -149,10 +160,9 @@ static StringRef reductionCombine(Operation *compute) {
   return def ? arithToCombine(def) : StringRef();
 }
 
-struct PIMAnalyzeLogicalWorkPass
-    : public mlir::triton::impl::PIMAnalyzeLogicalWorkBase<
-          PIMAnalyzeLogicalWorkPass> {
-  using PIMAnalyzeLogicalWorkBase::PIMAnalyzeLogicalWorkBase;
+struct PIMAnalyzeReusePass
+    : public mlir::triton::impl::PIMAnalyzeReuseBase<PIMAnalyzeReusePass> {
+  using PIMAnalyzeReuseBase::PIMAnalyzeReuseBase;
 
   void runOnOperation() override {
     getOperation().walk([&](func::FuncOp func) { analyzeFunc(func); });
@@ -172,24 +182,30 @@ struct PIMAnalyzeLogicalWorkPass
 
     // 각 access의 grid 차원 의존 집합을 구하고, 어떤 access든 실제로 의존하는 차원을 모은다.
     SmallVector<llvm::DenseSet<unsigned>> depsPerAccess(accesses.size());
+    SmallVector<bool> innerDep(accesses.size(), false);
     llvm::DenseSet<unsigned> activeDims;
     for (auto [i, a] : llvm::enumerate(accesses)) {
       bool opaque = false;
-      collectAccessDeps(a, grid, depsPerAccess[i], opaque);
+      bool inner = false;
+      collectAccessDeps(a, grid, depsPerAccess[i], opaque, inner);
       if (opaque)
         for (unsigned d = 0; d < grid.size(); d++)
           depsPerAccess[i].insert(d);
+      innerDep[i] = inner;
       for (unsigned d : depsPerAccess[i])
         activeDims.insert(d);
     }
 
-    // role은 grid 차원과 무관하게 항상 단다.
-    for (pim::AccessOp a : accesses)
+    // role과 재사용 실현 가능성은 grid 차원과 무관하게 항상 단다.
+    for (auto [i, a] : llvm::enumerate(accesses)) {
       if (StringRef role = accessRole(a.getResult()); !role.empty())
         a->setAttr("pim.role", StringAttr::get(ctx, role));
+      a->setAttr("pim.reuse_realizable", BoolAttr::get(ctx, !innerDep[i]));
+    }
 
-    // ⑥ reduction loop: tensor iter_arg 누산기를 계산 op의 outs로 받아 누적하는 scf.for에
-    // combine 연산자를 단다(target이 split 시 부분합을 이 연산으로 결합). program 축과 무관.
+    // reduction loop: tensor iter_arg 누산기를 계산 op의 outs로 받아 누적하는 scf.for에
+    // combine 연산자를 단다(유닛에 나눌 때 부분 결과를 이 연산으로 합친다). grid 축과 무관.
+    SmallVector<scf::ForOp> reductionLoops;
     func.walk([&](scf::ForOp forOp) {
       auto yield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
       for (auto [i, arg] : llvm::enumerate(forOp.getRegionIterArgs())) {
@@ -201,21 +217,22 @@ struct PIMAnalyzeLogicalWorkPass
           continue; // 누산기(iter_arg)를 outs로 받는 계산의 결과가 yield 되어야 한다.
         if (StringRef c = reductionCombine(compute); !c.empty()) {
           forOp->setAttr("pim.reduction_combine", StringAttr::get(ctx, c));
+          reductionLoops.push_back(forOp);
           break;
         }
       }
     });
 
     if (grid.empty())
-      return; // grid loop가 없으면 program 차원도 없다(예: loop-carried offset만 있는 함수).
+      return; // grid loop가 없으면 grid 차원도 없다(예: loop-carried offset만 있는 함수).
 
-    // program_dims는 grid loop의 중첩 순서 그대로다. invariant 인덱스도 이 순서를 가리킨다.
+    // grid_dims는 grid loop의 중첩 순서 그대로다. invariant 인덱스도 이 순서를 가리킨다.
     SmallVector<Attribute> dimNames;
     for (scf::ForOp g : grid)
       dimNames.push_back(g->getAttr("pim.grid_dim"));
-    func->setAttr("pim.program_dims", ArrayAttr::get(ctx, dimNames));
+    func->setAttr("pim.grid_dims", ArrayAttr::get(ctx, dimNames));
 
-    llvm::DenseSet<unsigned> reduceAcross;
+    llvm::DenseSet<unsigned> needCombine;
     for (auto [i, a] : llvm::enumerate(accesses)) {
       bool isOutput = accessRole(a.getResult()) == "output";
       SmallVector<int64_t> invariant;
@@ -223,30 +240,85 @@ struct PIMAnalyzeLogicalWorkPass
         if (depsPerAccess[i].contains(d))
           continue;
         invariant.push_back(d);
-        // 출력이 차원 d에 불변이면 d만 다른 instance들이 같은 출력에 쓰므로 부분합을
+        // 출력이 차원 d에 불변이면 d만 다른 instance들이 같은 출력에 쓰므로 부분 결과를
         // 합쳐야 한다. 단 어떤 access도 d에 의존하지 않으면 모든 instance가 같은 값을
         // 만드는 중복 실행이라, 합치면 오히려 결과가 틀린다. 활성 차원일 때만 표시한다.
         if (isOutput && activeDims.contains(d))
-          reduceAcross.insert(d);
+          needCombine.insert(d);
       }
-      a->setAttr("pim.invariant_program_dims",
+      a->setAttr("pim.invariant_grid_dims",
                  DenseI64ArrayAttr::get(ctx, invariant));
     }
 
-    if (!reduceAcross.empty()) {
-      SmallVector<unsigned> ra(reduceAcross.begin(), reduceAcross.end());
-      llvm::sort(ra);
-      SmallVector<Attribute> raNames;
-      for (unsigned d : ra)
-        raNames.push_back(grid[d]->getAttr("pim.grid_dim"));
-      func->setAttr("pim.reduce_across_programs", ArrayAttr::get(ctx, raNames));
+    func->setAttr("pim.split_axes",
+                  buildSplitAxes(func, ctx, grid, reductionLoops, needCombine));
+  }
+
+  // 쪼갤 수 있는 축을 모은다. grid 축과 reduction loop 둘 다 후보다.
+  // - pim.scatter가 있으면 인덱스 텐서의 값을 컴파일 시점에 몰라 서로 다른 유닛이 같은
+  //   원소에 쓰지 않는다고 보장할 수 없으므로 grid 축을 올리지 않는다.
+  // - 쪼갤 때 부분 결과가 생기는 축은 combine 연산자를 함께 적는다. 연산자를 모르면 그
+  //   축을 올리지 않는다 — 모르는 채 쪼개면 target이 덮어쓰는 코드를 만든다.
+  // - reduction loop는 몸체에 pim.store/pim.scatter가 있으면 반복마다 부수 효과가
+  //   있다는 뜻이라 올리지 않는다.
+  ArrayAttr buildSplitAxes(func::FuncOp func, MLIRContext *ctx,
+                           ArrayRef<scf::ForOp> grid,
+                           ArrayRef<scf::ForOp> reductionLoops,
+                           const llvm::DenseSet<unsigned> &needCombine) {
+    auto axisName = StringAttr::get(ctx, "axis");
+    auto sourceName = StringAttr::get(ctx, "source");
+    auto combineName = StringAttr::get(ctx, "combine");
+
+    bool hasScatter = false;
+    func.walk([&](pim::ScatterOp) { hasScatter = true; });
+
+    // grid 축이 결합을 요구할 때 쓸 연산자. reduction loop가 정확히 하나일 때만 정해진다.
+    StringAttr gridCombine;
+    if (reductionLoops.size() == 1)
+      gridCombine =
+          reductionLoops[0]->getAttrOfType<StringAttr>("pim.reduction_combine");
+
+    SmallVector<Attribute> axes;
+    if (!hasScatter)
+      for (auto [d, g] : llvm::enumerate(grid)) {
+        SmallVector<NamedAttribute> fields{
+            NamedAttribute(axisName, g->getAttr("pim.grid_dim")),
+            NamedAttribute(sourceName, StringAttr::get(ctx, "grid"))};
+        if (needCombine.contains(d)) {
+          if (!gridCombine)
+            continue;
+          fields.push_back(NamedAttribute(combineName, gridCombine));
+        }
+        axes.push_back(DictionaryAttr::get(ctx, fields));
+      }
+
+    for (unsigned i = 0, e = reductionLoops.size(); i < e; i++) {
+      // ArrayRef가 주는 참조는 const라, 값 의미인 Op을 복사해 non-const 멤버를 부른다.
+      scf::ForOp loop = reductionLoops[i];
+      bool sideEffect = false;
+      loop.getBody()->walk([&](Operation *op) {
+        if (isa<pim::StoreOp, pim::ScatterOp>(op))
+          sideEffect = true;
+      });
+      if (sideEffect)
+        continue;
+      StringAttr name = reductionLoops.size() == 1
+                            ? StringAttr::get(ctx, "k")
+                            : StringAttr::get(ctx, "k" + llvm::Twine(i));
+      axes.push_back(DictionaryAttr::get(
+          ctx,
+          {NamedAttribute(axisName, name),
+           NamedAttribute(sourceName, StringAttr::get(ctx, "reduction")),
+           NamedAttribute(combineName, loop->getAttrOfType<StringAttr>(
+                                           "pim.reduction_combine"))}));
     }
+    return ArrayAttr::get(ctx, axes);
   }
 };
 
 } // namespace
 
 std::unique_ptr<OperationPass<ModuleOp>>
-mlir::triton::createPIMAnalyzeLogicalWorkPass() {
-  return std::make_unique<PIMAnalyzeLogicalWorkPass>();
+mlir::triton::createPIMAnalyzeReusePass() {
+  return std::make_unique<PIMAnalyzeReusePass>();
 }

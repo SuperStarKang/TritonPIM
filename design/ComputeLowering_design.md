@@ -232,7 +232,7 @@ PIM Common 기본 compute lowering (실제 파이프라인 순서):
   1. 메모리 raise (--convert-ttshared-to-pim)
        구조화 연산(matmul/reduce/transpose) → named op 유지 (scalar 루프로 안 풂)
        ※ 분류는 여기서 하지 않는다 (아래 "분류 시점" 참조)
-  2. 버퍼 최적화 (-cse --pim-remove-buffers -canonicalize)         ← 메모리 Stage B
+  2. 버퍼 최적화 (-cse --pim-remove-redundant-transfers -canonicalize)         ← 메모리 Stage B
   3. 정리: DCE(-canonicalize) + LICM(-loop-invariant-code-motion)
   4. 분류 (--pim-classify-compute, LATE)
        자유형 연산(generic) → 정밀 종류 태그 (pointwise/broadcast/scan/generation/splat)

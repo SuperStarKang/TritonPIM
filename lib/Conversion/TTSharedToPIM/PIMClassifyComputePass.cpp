@@ -25,7 +25,7 @@ static StringRef classifyComputeOp(Operation *op) {
   if (isa<linalg::ReduceOp>(op))
     return "reduce";
   if (isa<linalg::FillOp>(op))
-    return "splat";
+    return "fill";
   auto g = dyn_cast<linalg::GenericOp>(op);
   if (!g)
     return "";
@@ -36,7 +36,7 @@ static StringRef classifyComputeOp(Operation *op) {
   bool hasIndex = false;
   g.walk([&](linalg::IndexOp) { hasIndex = true; });
   if (hasIndex)
-    return "generation";
+    return "index_generation";
   // 입력 인덱스 맵이 차원을 drop하면(결과 수 < 도메인 수) broadcast.
   SmallVector<AffineMap> maps = g.getIndexingMapsArray();
   for (unsigned i = 0, n = g.getNumDpsInputs(); i < n; i++)
@@ -53,7 +53,7 @@ struct PIMClassifyComputePass
     getOperation().walk([&](Operation *op) {
       StringRef cls = classifyComputeOp(op);
       if (!cls.empty())
-        op->setAttr("pim.class", StringAttr::get(op->getContext(), cls));
+        op->setAttr("pim.op", StringAttr::get(op->getContext(), cls));
     });
   }
 };

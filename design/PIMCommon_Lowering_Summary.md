@@ -24,9 +24,9 @@ PIM Common으로 올리는 일은 두 단계다.
 | 단계 | 패스 | 하는 일 |
 |---|---|---|
 | **Stage A** | `--convert-ttshared-to-pim` | memref 관용구 → `pim.*`로 **끌어올림**(raising). 버퍼 소멸 |
-| **Stage B** | `--pim-remove-buffers` | `pim.*` 사이의 **중복 전송 제거** |
+| **Stage B** | `--pim-remove-redundant-transfers` | `pim.*` 사이의 **중복 전송 제거** |
 
-실제 파이프라인: `--convert-ttshared-to-pim -cse --pim-remove-buffers -canonicalize`
+실제 파이프라인: `--convert-ttshared-to-pim -cse --pim-remove-redundant-transfers -canonicalize`
 (`-cse`가 Pure한 `pim.access`를 합쳐 "같은 descriptor"를 SSA 동일성으로 판별하게 하고, `-canonicalize`가
 죽은 `pim.load`를 지운다.)
 
@@ -243,7 +243,7 @@ clause 조합이 말이 되는지 op verify로 확인한다(잘못된 조합을 
 **⑦ mask 가드의 핵심**: `extract`/`store`가 `scf.if` 안(=조건부)이면 무마스크 matcher는 건드리지 않고, 마스크
 matcher가 `mask`+`default`를 뽑아 변환. 이 가드가 없으면 마스크가 유실됨(실제로 있었던 버그).
 
-## 3. Stage B 패스 — `--pim-remove-buffers` (`PIMRemoveBuffersPass.cpp`)
+## 3. Stage B 패스 — `--pim-remove-redundant-transfers` (`PIMRemoveRedundantTransfersPass.cpp`)
 
 ```
 1) passthrough: pim.store(pim.load(%ds), %dd) → pim.copy(%ds, %dd)
@@ -261,7 +261,7 @@ matcher가 `mask`+`default`를 뽑아 변환. 이 가드가 없으면 마스크�
 
 연산 쪽(종류 분류 late 패스 `--pim-classify-compute` + DCE/LICM, fusion은 target)은
 **`PIMCommon_ComputeLowering_Summary.md`** 에 정리했다. 전체 파이프라인:
-`--convert-ttshared-to-pim -cse --pim-remove-buffers -canonicalize -loop-invariant-code-motion --pim-classify-compute`.
+`--convert-ttshared-to-pim -cse --pim-remove-redundant-transfers -canonicalize -loop-invariant-code-motion --pim-classify-compute`.
 
 ## 4. MLIR 패스 배선 (새 패스 추가 시 건드리는 7곳)
 
@@ -277,12 +277,12 @@ TableGen이 반복 코드를 자동 생성해줘, 실제로 쓰는 건 `runOnOpe
 | 6 | `tools/triton-shared-opt/RegisterTritonSharedDialects.h` | `registerXPass()` 호출(→ `--cli-name` 인식) |
 | 7 | `pim_backend/backend/compiler.py` | 파이프라인에 `--cli-name` 끼움 |
 
-이름 규칙: def `RemovePIMBuffers` → 매크로 `GEN_PASS_DEF_REMOVEPIMBUFFERS`, 부모 `impl::RemovePIMBuffersBase`,
-등록 함수 `registerRemovePIMBuffersPass()`. (빌드 전엔 이 `.h.inc`가 없어 IDE가 base 클래스를 못 찾고 오류를 냄 — 정상.)
+이름 규칙: def `PIMRemoveRedundantTransfers` → 매크로 `GEN_PASS_DEF_PIMREMOVEREDUNDANTTRANSFERS`, 부모 `impl::PIMRemoveRedundantTransfersBase`,
+등록 함수 `registerPIMRemoveRedundantTransfersPass()`. (빌드 전엔 이 `.h.inc`가 없어 IDE가 base 클래스를 못 찾고 오류를 냄 — 정상.)
 
 ## 5. 두 패스 성격 비교
 
-| | Stage A (`--convert-ttshared-to-pim`) | Stage B (`--pim-remove-buffers`) |
+| | Stage A (`--convert-ttshared-to-pim`) | Stage B (`--pim-remove-redundant-transfers`) |
 |---|---|---|
 | 하는 일 | memref 관용구 → `pim.*` **raising** | `pim.*` 사이 중복 전송 제거 |
 | runOnOperation | cluster를 `walk`로 매칭 → pim op 생성 → `dead`/`roots` 삭제 | pim op을 `walk` → RAUW/erase, 메모리효과로 안전성 판단 |

@@ -9,7 +9,7 @@ using namespace mlir;
 
 namespace mlir {
 namespace triton {
-#define GEN_PASS_DEF_REMOVEPIMBUFFERS
+#define GEN_PASS_DEF_PIMREMOVEREDUNDANTTRANSFERS
 #include "triton-shared/Conversion/TTSharedToPIM/Passes.h.inc"
 } // namespace triton
 } // namespace mlir
@@ -120,9 +120,9 @@ static void hoistLoads(scf::ForOp loop) {
     load->moveBefore(loop.getOperation());
 }
 
-struct RemovePIMBuffersPass
-    : public mlir::triton::impl::RemovePIMBuffersBase<RemovePIMBuffersPass> {
-  using RemovePIMBuffersBase::RemovePIMBuffersBase;
+struct PIMRemoveRedundantTransfersPass
+    : public mlir::triton::impl::PIMRemoveRedundantTransfersBase<PIMRemoveRedundantTransfersPass> {
+  using PIMRemoveRedundantTransfersBase::PIMRemoveRedundantTransfersBase;
 
   void runOnOperation() override {
     // 0) loop-invariant load hoisting. 뒤의 두 재작성보다 먼저 한다. loop 밖으로 나온
@@ -163,6 +163,6 @@ struct RemovePIMBuffersPass
 } // namespace
 
 std::unique_ptr<OperationPass<ModuleOp>>
-mlir::triton::createRemovePIMBuffersPass() {
-  return std::make_unique<RemovePIMBuffersPass>();
+mlir::triton::createPIMRemoveRedundantTransfersPass() {
+  return std::make_unique<PIMRemoveRedundantTransfersPass>();
 }

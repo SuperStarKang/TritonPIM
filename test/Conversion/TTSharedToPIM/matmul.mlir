@@ -1,4 +1,4 @@
-// linalg.matmul은 치환하지 않고 그대로 두되 pim.class = "gemm" 태그만 붙는지 확인.
+// linalg.matmul은 치환하지 않고 그대로 두되 pim.op = "gemm" 태그만 붙는지 확인.
 // (이 입력엔 메모리 접근이 없으므로 pim.access/load/store는 생기지 않는다.)
 // RUN: triton-shared-opt --convert-ttshared-to-pim --pim-classify-compute %s | FileCheck %s
 
@@ -16,5 +16,5 @@ func.func @matmul_kernel(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>
 
 // named op은 유지되고 종류 태그만 단다.
 // CHECK:     linalg.matmul
-// CHECK-SAME: pim.class = "gemm"
+// CHECK-SAME: pim.op = "gemm"
 // CHECK-NOT: pim.access

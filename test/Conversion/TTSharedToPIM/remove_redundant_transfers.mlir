@@ -1,6 +1,6 @@
-// Stage B(중복 전송 제거) 검증. 입력은 -cse가 끝난 형태(같은 영역은 하나의 pim.access 공유)로 두고,
-// --pim-remove-buffers로 재작성한 뒤 -canonicalize로 죽은 load를 정리한다.
-// RUN: triton-shared-opt --split-input-file --pim-remove-buffers -canonicalize %s | FileCheck %s
+// 중복 전송 제거 검증. 입력은 -cse가 끝난 형태(같은 영역은 하나의 pim.access 공유)로 두고,
+// --pim-remove-redundant-transfers로 재작성한 뒤 -canonicalize로 죽은 load를 정리한다.
+// RUN: triton-shared-opt --split-input-file --pim-remove-redundant-transfers -canonicalize %s | FileCheck %s
 
 // ── passthrough: store(load(%ds), %dd) → pim.copy ──────────────────────────────
 // CHECK-LABEL: @passthrough

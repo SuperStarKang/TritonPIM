@@ -62,16 +62,20 @@ def _run_translate(mlir_text: str, which: str) -> str:
 # TTSharedIR → PIM Common IR 파이프라인 (Design §20). 각 pass를 한 줄씩 두어, 실험 시 필요 없는
 # 단계는 그 줄을 주석(#) 처리해 껐다 켰다 할 수 있다. 순서 의미는 각 줄 주석 참고.
 # SPLIT/local_lanes(유닛 분배)와 fusion은 target 관심사라 이 단계에서 하지 않는다.
+# 순서 규칙: IR을 바꾸는 패스를 전부 돌린 뒤 분석 패스를 전부 돌린다(Design §20.2). 분석 결과는
+# IR의 최종 모습을 기술해야 하므로, IR을 바꾸는 패스가 뒤에 오면 그 기술이 낡는다. 예외를 두지 않는다.
 PIM_COMMON_PASSES = [
-    "--convert-ttshared-to-pim",     # 메모리 접근을 pim.access/load/store로 변환 (Stage A)
-    "--pim-build-grid",              # program_id 인자를 grid loop로 세운다. instance 사이 관계를 IR에서 보려면 필요하고, analyze가 grid loop를 전제한다
-    "-cse",                          # Pure한 pim.access(와 중복 상수) 병합 → "같은 descriptor"를 SSA 동일성으로 판별(remove-buffers 선행 조건)
-    "-loop-invariant-code-motion",   # 루프 불변 연산(주소 계산 arith, Pure한 pim.access)을 루프 밖으로. access가 밖에 있어야 remove-buffers가 그 load를 뺄 수 있다
-    "--pim-analyze-logical-work",    # grid 축↔access 의존 분석(execution_model/program_dims/role/invariant). partition의 전송량 식이 invariant를 입력으로 쓴다
-    "--pim-remove-buffers",          # load hoisting, passthrough→pim.copy, 반복 load/RAW 재사용 (Stage B)
-    "-canonicalize",                 # 죽은 pim.load/연산(결과 미사용) 정리(DCE)
-    "--pim-partition",               # access별 전송 바이트, working set, 후보별 전송량 표. hoisting이 끝난 뒤라야 반복 횟수가 실제 전송 횟수와 맞는다
-    "--pim-classify-compute",        # 연산 종류 태그(pim.class). 모든 구조 변형 뒤 맨 마지막(late)에 돌려 태그가 안 낡게
+    # --- 변환 ---
+    "--convert-ttshared-to-pim",          # 메모리 접근을 pim.access/load/store로 변환
+    "--pim-build-grid",                   # program_id 인자를 grid loop로 세운다. instance 사이 관계를 IR에서 보려면 필요하고, 뒤 분석이 grid loop를 전제한다
+    "-cse",                               # Pure한 pim.access(와 중복 상수) 병합 → "같은 access"를 SSA 동일성으로 판별(중복 전송 제거의 선행 조건)
+    "-loop-invariant-code-motion",        # 루프 불변 연산(주소 계산 arith, Pure한 pim.access)을 루프 밖으로. access가 밖에 있어야 그 load를 뺄 수 있다
+    "--pim-remove-redundant-transfers",   # load hoisting, load-store를 copy로, 반복 load/RAW 재사용
+    "-canonicalize",                      # 죽은 pim.load/access(결과 미사용) 정리(DCE)
+    # --- 분석 ---
+    "--pim-analyze-reuse",                # grid 축↔access 의존 분석(execution_model/grid_dims/role/invariant). 전송량 식이 invariant를 입력으로 쓴다
+    "--pim-analyze-transfer",             # access별 tile 바이트와 전송 횟수, 상주량, 연산량. hoisting이 끝난 뒤라야 전송 횟수가 실제와 맞는다
+    "--pim-classify-compute",             # 연산 종류 태그(pim.op). 모든 구조 변형 뒤 맨 마지막(late)에 돌려 태그가 안 낡게
 ]
 
 

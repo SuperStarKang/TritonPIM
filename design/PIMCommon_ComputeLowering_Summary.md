@@ -14,7 +14,7 @@
 PIM Common의 연산 처리는 딱 셋:
 
 1. **named op(matmul/reduce/transpose) 유지** — target이 원시연산으로 매핑(scalar 루프로 안 풂).
-2. **generic을 종류 태그(`pim.class`)로 분류** — target이 뭘 할지 알게.
+2. **generic을 종류 태그(`pim.op`)로 분류** — target이 뭘 할지 알게.
 3. **DCE + LICM만** 최적화.
 
 연산을 loop로 푸는 것도, **fusion·분해도 target 몫**이다.
@@ -33,19 +33,19 @@ PIM Common은 **target 무관한 종류**만 태그한다.
 
 ### 종류별 판별 (`--pim-classify-compute`)
 
-| 종류 `pim.class` | 판별 신호 | target 예 |
+| 종류 `pim.op` | 판별 신호 | target 예 |
 |---|---|---|
 | `gemm` | `linalg.matmul` | AiMX `_matmul` |
 | `gemv` | `linalg.matvec` | |
 | `transpose` | `linalg.transpose` | 물리 재배치 |
 | `reduce` | `linalg.reduce` 또는 reduction iterator | 리덕션 트리/반복 add |
-| `splat` | `linalg.fill` | 상수 채움 |
-| `generation` | generic body에 `linalg.index` | iota |
+| `fill` | `linalg.fill` | 상수 채움 |
+| `index_generation` | generic body에 `linalg.index` | iota |
 | `broadcast` | generic **입력 맵이 차원 drop**(결과 수 < 도메인 수) | AiMX `_bias` |
 | `elementwise` | generic 전부 parallel + identity map | AiMX `_elewise` add/sub/mul |
 
 - **extern**(exp/sin/erf 등 libdevice): body에 `math.*`가 있는 generic → `elementwise`로 태그. 함수·합법성은 target.
-- 판별 순서: reduction → generation(linalg.index) → broadcast(입력맵 drop) → elementwise.
+- 판별 순서: reduction → index_generation(linalg.index) → broadcast(입력맵 drop) → elementwise.
 
 ### PIM Common에서 안 하는 것 (왜 target인가)
 
@@ -62,14 +62,14 @@ PIM Common은 **target 무관한 종류**만 태그한다.
 
 ### `--pim-classify-compute` (late 패스, `PIMClassifyComputePass.cpp`)
 
-위 종류를 `pim.class`로 단다(치환 아님). **왜 맨 뒤(late)인가**:
+위 종류를 `pim.op`로 단다(치환 아님). **왜 맨 뒤(late)인가**:
 
 > 분류 태그는 **찍는 순간의 스냅샷**이다. 뒤에 오는 패스가 op을 바꾸거나(canonicalize 접기) 새 op을
 > 만들면(fusion이 둘을 합쳐 새 `linalg.generic` 생성) 태그가 낡거나 사라진다. 그래서 **모든 구조 변형 뒤
 > 맨 마지막에** 분류를 돌린다 — 앞에서 op이 어떻게 바뀌었든 "지금 최종 op이 무슨 종류냐"만 보면 된다.
 
 → 분류를 raise 패스(`--convert-ttshared-to-pim`)에서 **떼어내** 독립 late 패스로 뒀다. (그래서 raise 단독으로는
-`pim.class`가 안 붙고, 전체 파이프라인에서만 붙는다.)
+`pim.op`가 안 붙고, 전체 파이프라인에서만 붙는다.)
 
 ### DCE + LICM (표준 패스)
 
@@ -81,7 +81,7 @@ PIM Common은 **target 무관한 종류**만 태그한다.
 ```
 --convert-ttshared-to-pim    # 1. 메모리 raise (분류 안 함)
 -cse                         # 2. 버퍼 최적화(Stage B) — Pure한 pim.access 합침
---pim-remove-buffers         #    passthrough→copy / dedup / forwarding
+--pim-remove-redundant-transfers         #    passthrough→copy / dedup / forwarding
 -canonicalize                # 3. DCE
 -loop-invariant-code-motion  #    LICM
 --pim-classify-compute       # 4. late 분류 (맨 뒤)
@@ -91,7 +91,7 @@ PIM Common은 **target 무관한 종류**만 태그한다.
 
 | 테스트 | 확인 |
 |---|---|
-| `classify` | 종류 태그: gemm/splat/elementwise/broadcast/generation/reduce |
+| `classify` | 종류 태그: gemm/fill/elementwise/broadcast/index_generation/reduce |
 | `matmul` / `elementwise` | raise + late 분류 후 태그(`--convert-ttshared-to-pim --pim-classify-compute`) |
 
 ---

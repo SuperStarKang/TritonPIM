@@ -72,7 +72,7 @@ materialize_in_destination                     →   pim.access + pim.store
 - 지원 안 하는 패턴(예: ④ wraparound의 2-view split)은 매칭 안 되면 그대로 둔다 — 조용히 바꾸지 않는다.
 - ③ block ptr은 memref 레벨에서 ①과 형태가 같아 ① 규칙이 그대로 처리한다(`order`는 앞 단계에서 stride에 녹아 사라짐).
 - 계산 분류: matmul→`gemm`, matvec→`gemv`, transpose→`transpose`, reduce→`reduce`,
-  generic→(reduction 루프 있으면 `reduce`, 아니면 `elementwise`). named op은 유지하고 `pim.class` 태그만.
+  generic→(reduction 루프 있으면 `reduce`, 아니면 `elementwise`). named op은 유지하고 `pim.op` 태그만.
 - 예외 처리/우회 경로 없음. 가정(sizes static 등)이 깨지면 그 자리에서 그대로 실패한다.
 
 ---
@@ -134,7 +134,7 @@ triton-shared-opt --convert-ttshared-to-pim test/Conversion/TTSharedToPIM/loop_c
 lit test/Conversion/TTSharedToPIM test/Dialect/PIM -v
 ```
 기대: `elementwise`/`loop_carried`는 `memref.*`·`bufferization.*`가 사라지고 `pim.access/load/store`가 나온다.
-`matmul`은 `linalg.matmul`이 유지되고 `pim.class = "gemm"` 태그가 붙는다.
+`matmul`은 `linalg.matmul`이 유지되고 `pim.op = "gemm"` 태그가 붙는다.
 
 ---
 
@@ -143,8 +143,8 @@ lit test/Conversion/TTSharedToPIM test/Dialect/PIM -v
 - ④ wrap clause, ③ order clause: 둘 다 깨끗한 값이 memref가 아니라 그 앞 tts 레벨에만 남아 있어, 이 pass
   입력(memref)에서는 복원이 지저분하다. 별도 논의 대상(pass 입력을 tts로 옮길지 등).
 - Stage B 일부 남음: **LICM(루프 밖으로 loop-invariant load hoist)** 은 블록/region을 넘는 분석이라 보류.
-  (완료: `--pim-remove-buffers` = passthrough→pim.copy / 반복 load dedup / store→load forwarding.
-  파이프라인은 `--convert-ttshared-to-pim -cse --pim-remove-buffers -canonicalize`. -cse가 Pure한
+  (완료: `--pim-remove-redundant-transfers` = passthrough→pim.copy / 반복 load dedup / store→load forwarding.
+  파이프라인은 `--convert-ttshared-to-pim -cse --pim-remove-redundant-transfers -canonicalize`. -cse가 Pure한
   pim.access를 합쳐 "같은 descriptor"를 SSA 동일성으로 판별하게 하고, -canonicalize가 죽은 load를 지운다.)
 - `!pim.access` 파라미터형 타입(shape/elemtype를 타입에 담기). verifier는 구현됨:
   `AccessOp::verify`(R1 strides==sizes rank / R2 valid rank / R3 pad⟹valid / R4 gather_dim⟺index+범위),

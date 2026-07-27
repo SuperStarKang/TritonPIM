@@ -1,36 +1,30 @@
-// 분할을 고르기 위한 수치를 계산해 속성으로 단다. 고르는 것은 Target IR이 한다.
-// 전송량 식이 pim.invariant_program_dims를 입력으로 쓰므로 analyze를 먼저 돌린다.
+// 분할 비용 식에 들어갈 항을 계산해 속성으로 단다. 항을 곱해 시간으로 바꾸는 것은
+// Target IR이 한다.
 // grid loop는 상수 범위로 직접 쓴다. --pim-build-grid가 만드는 상한은 num_programs
 // 인자라 runtime 값이고, 그 경우는 아래 @runtime_grid에서 따로 확인한다.
-// RUN: triton-shared-opt --pim-analyze-logical-work --pim-partition %s | FileCheck %s
+// RUN: triton-shared-opt --pim-analyze-reuse --pim-analyze-transfer %s | FileCheck %s
 
 // C[1024,1024] = A[1024,512] x B[512,1024], f32, BLOCK M/N/K = 32/64/16.
 // grid는 m=32, n=16이고 K loop는 32번 돈다.
 //
-//   access | sizes    | tile |  반복 | access_bytes | invariant
-//   A      | [32, 16] | 2 KB |    32 |        64 KB | {n}
-//   B      | [16, 64] | 4 KB |    32 |       128 KB | {m}
-//   C      | [32, 64] | 8 KB |     1 |         8 KB | {}
+//   access | sizes    | tile_bytes | transfer_count | invariant
+//   A      | [32, 16] |       2048 |             32 | {n}
+//   B      | [16, 64] |       4096 |             32 | {m}
+//   C      | [32, 64] |       8192 |              1 | {}
 //
-// working set = A tile 2 KB + B tile 4 KB + 누산기 8 KB = 14 KB.
+// 동시 상주: A tile 2048 + B tile 4096 (매 반복 새로 읽으므로 streaming)
+//          + 누산기 8192 (K loop를 관통하므로 persistent).
+// 연산량: matmul 반복 공간 32x64x16 = 32768, 원소당 곱셈+덧셈 2개, K loop 32번
+//        → 32768 x 2 x 32 = 2097152. (linalg.fill은 산술이 없어 0이다.)
 //
 // CHECK-LABEL: func.func @matmul
+// CHECK-SAME:  pim.co_resident = [{access = 0 : i64, bytes = 2048 : i64, lifetime = "streaming"}, {access = 1 : i64, bytes = 4096 : i64, lifetime = "streaming"}, {bytes = 8192 : i64, lifetime = "persistent"}]
+// CHECK-SAME:  pim.compute_ops = 2097152 : i64
 // CHECK-SAME:  pim.grid_extents = array<i64: 32, 16>
-// CHECK-SAME:  pim.grid_permutable = true
-// 후보는 각 축의 약수를 모두 조합한 것이라 32의 약수 6개 x 16의 약수 5개 = 30개다.
-// s가 전부 1이면 유닛이 하나라는 뜻이고, 그때 값이 전송량 하한(실제로 필요한 데이터양)이다.
-// CHECK-SAME:  bytes = 8388608 : i64, splits = array<i64: 1, 1>
-// n축만 쪼갠다: 유닛 16개, A를 16번 중복 전송.
-// CHECK-SAME:  bytes = 39845888 : i64, splits = array<i64: 1, 16>
-// m축만 쪼갠다: 유닛 32개, B를 32번 중복 전송.
-// CHECK-SAME:  bytes = 73400320 : i64, splits = array<i64: 32, 1>
-// 둘 다 쪼갠다: 유닛 512개, 필요량의 12배를 전송.
-// CHECK-SAME:  bytes = 104857600 : i64, splits = array<i64: 32, 16>
-// CHECK-SAME:  pim.working_set_bytes = 14336 : i64
 //
-// CHECK:       pim.access %arg0 {{.*}} pim.access_bytes = 65536 : i64
-// CHECK:       pim.access %arg1 {{.*}} pim.access_bytes = 131072 : i64
-// CHECK:       pim.access %arg2 {{.*}} pim.access_bytes = 8192 : i64
+// CHECK:       pim.access %arg0 {{.*}} pim.tile_bytes = 2048 : i64, pim.transfer_count = 32 : i64
+// CHECK:       pim.access %arg1 {{.*}} pim.tile_bytes = 4096 : i64, pim.transfer_count = 32 : i64
+// CHECK:       pim.access %arg2 {{.*}} pim.tile_bytes = 8192 : i64, pim.transfer_count = 1 : i64
 func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>) {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
@@ -63,11 +57,16 @@ func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>) {
   return
 }
 
-// 출력 C가 y축에 불변이면 y만 다른 instance들이 같은 C에 쓴다. 순서를 바꾸면 결과가
-// 달라지므로 grid_permutable이 거짓이다.
+// 출력 C가 y축에 불변이면 y만 다른 instance들이 같은 C에 쓴다. 그 축을 쪼개면 부분 결과가
+// 생겨 유닛 밖 결합이 필요하다. 여기서는 전송 항만 확인하고, 결합 필요 여부는
+// analyze_reuse.mlir이 확인한다.
+// 연산량: 반복 공간 32x64x16 = 32768, 원소당 2개, K loop 8번 → 524288.
 // CHECK-LABEL: func.func @splitk
+// CHECK-SAME:  pim.compute_ops = 524288 : i64
 // CHECK-SAME:  pim.grid_extents = array<i64: 8, 4>
-// CHECK-SAME:  pim.grid_permutable = false
+// CHECK:       pim.access %arg0 {{.*}} pim.tile_bytes = 2048 : i64, pim.transfer_count = 8 : i64
+// CHECK:       pim.access %arg1 {{.*}} pim.tile_bytes = 4096 : i64, pim.transfer_count = 8 : i64
+// CHECK:       pim.access %arg2 {{.*}} pim.tile_bytes = 8192 : i64, pim.transfer_count = 1 : i64
 func.func @splitk(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>) {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
@@ -95,12 +94,12 @@ func.func @splitk(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>) {
   return
 }
 
-// grid 크기가 runtime 값이면 표를 만들지 않는다. 근거 없는 수를 IR에 넣지 않는다.
-// access_bytes와 working_set_bytes는 grid와 무관하므로 그대로 단다.
-// 아래는 func 속성 전체를 그대로 맞춰, grid_extents와 partition_cost가 없음을 확인한다.
+// grid 크기가 runtime 값이면 pim.grid_extents를 붙이지 않는다. 근거 없는 수를 IR에 넣지
+// 않는다. 나머지 항은 grid 크기와 무관하므로 그대로 단다.
+// 아래는 func 속성 전체를 그대로 맞춰, grid_extents가 없음을 확인한다.
 // CHECK-LABEL: func.func @runtime_grid
-// CHECK-SAME:  attributes {pim.execution_model = "spmd", pim.grid_permutable = true, pim.program_dims = ["x"], pim.working_set_bytes = 1024 : i64}
-// CHECK:       pim.access %arg0 {{.*}} pim.access_bytes = 1024 : i64
+// CHECK-SAME:  attributes {pim.co_resident = [{access = 0 : i64, bytes = 1024 : i64, lifetime = "streaming"}], pim.compute_ops = 0 : i64, pim.execution_model = "spmd", pim.grid_dims = ["x"], pim.split_axes = [{axis = "x", source = "grid"}]}
+// CHECK:       pim.access %arg0 {{.*}} pim.tile_bytes = 1024 : i64, pim.transfer_count = 1 : i64
 func.func @runtime_grid(%A: memref<*xf32>, %C: memref<*xf32>, %np: index) {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
@@ -115,8 +114,8 @@ func.func @runtime_grid(%A: memref<*xf32>, %C: memref<*xf32>, %np: index) {
 
 // 8비트 미만 타입은 올림 나눗셈으로 센다. i1 타일 100개면 13 바이트다.
 // CHECK-LABEL: func.func @sub_byte
-// CHECK-SAME:  pim.working_set_bytes = 13 : i64
-// CHECK:       pim.access %arg0 {{.*}} pim.access_bytes = 13 : i64
+// CHECK-SAME:  pim.co_resident = [{access = 0 : i64, bytes = 13 : i64, lifetime = "streaming"}]
+// CHECK:       pim.access %arg0 {{.*}} pim.tile_bytes = 13 : i64, pim.transfer_count = 1 : i64
 func.func @sub_byte(%M: memref<*xi1>, %C: memref<*xi1>) {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
