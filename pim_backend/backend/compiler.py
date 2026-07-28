@@ -97,8 +97,10 @@ def _ttsharedir_to_pim_common(ttshared: str, options) -> str:
                                for p in PIM_COMMON_PASSES])
 
 
-def _pim_common_to_upmem(pim_common: str) -> str:
-    return _run_opt(pim_common, ["--legalize-pim-to-upmem"])
+def _pim_common_to_upmem(pim_common: str, options) -> str:
+    # MRAM 버퍼 크기를 유닛 메모리에서 나눠 정한다(Conversion/PIMToUPMEM 참고).
+    return _run_opt(pim_common,
+                    [f"--convert-pim-to-upmem=unit-memory-bytes={options.unit_memory_bytes}"])
 
 
 def _upmem_to_artifact(upmem_ir: str, metadata) -> bytes:
@@ -121,14 +123,14 @@ def _upmem_to_artifact(upmem_ir: str, metadata) -> bytes:
 # 동일하고 target 고유 문자열(pass 이름·translate 이름·번들 키)만 다르다. 호출하는 배관
 # (_run_opt / _run_translate)은 target-neutral이라 그대로 재사용한다.
 #
-# 지금은 경로(seam)만 만들어 둔 상태다. AiMX legalize pass(--legalize-pim-to-aimx)와
+# 지금은 경로(seam)만 만들어 둔 상태다. AiMX 변환 pass(--convert-pim-to-aimx)와
 # translate(--aimx-to-*)는 아직 triton-shared-opt/-translate에 없으므로, target="aimx"로
 # 실행하면 이 함수들이 호출하는 subprocess가 그 자리에서 fail한다(의도된 fail-fast, fallback 없음).
 # 실제 C++ 구현(dialect/legalize/codegen)은 별도 서버/브랜치에서 채운다(IMPLEMENT B1.2/B1.4).
 
 def _pim_common_to_aimx(pim_common: str) -> str:
-    # 같은 target-neutral PIM Common IR을 AiMX IR로 legalize한다 (Conversion/PIMToAiMX, B1.2).
-    return _run_opt(pim_common, ["--legalize-pim-to-aimx"])
+    # 같은 target-neutral PIM IR을 AiMX IR로 변환한다 (Conversion/PIMToAiMX, B1.2).
+    return _run_opt(pim_common, ["--convert-pim-to-aimx"])
 
 
 def _aimx_to_artifact(aimx_ir: str, metadata) -> bytes:
@@ -165,11 +167,17 @@ class PIMOptions:
     sanitize_overflow: bool = True
 
     # --- PIM 고유 옵션 ---
-    target: str = None           # "upmem" | "aimx" — 누락 시 아래에서 즉시 에러 (fallback 없음)
+    # 이름을 target으로 두면 안 된다. Triton이 metadata를 {"target": GPUTarget, **options.__dict__}
+    # 로 만들어서 같은 이름의 옵션이 GPUTarget을 덮어쓰고, CompiledKernel이 그것을 다시 읽는다.
+    pim_target: str = None       # "upmem" | "aimx" — 누락 시 아래에서 즉시 에러 (fallback 없음)
     device_id: int = 0
     # 기계 — 이름을 target 중립으로 둔다(UPMEM에서는 유닛=DPU, 빠른 메모리=WRAM).
     num_units: int = 2048        # 물리 유닛 개수. split의 곱이 이보다 크면 컴파일 시점에 실패.
-    local_memory_bytes: int = 64 * 1024   # 유닛당 빠른 메모리. co_resident 합계가 넘으면 실패.
+    local_memory_bytes: int = 64 * 1024        # 유닛당 빠른 메모리. co_resident 합계가 넘으면 실패.
+    # 유닛당 큰 메모리. target이 버퍼 크기를 여기서 나눈다. UPMEM의 물리 MRAM은 64 MB지만
+    # DPU 런타임도 MRAM에 자리를 잡으므로 전부를 나눠 주면 링커가 넘친다. 커널이 써도 되는
+    # 몫이라는 뜻이라 물리 크기보다 작게 둔다.
+    unit_memory_bytes: int = 32 * 1024 * 1024
     split_m: int = 1             # M축 inter-unit SPLIT 수. split_m×split_n×split_k = DPU 개수.
     split_n: int = 1             # N축 inter-unit SPLIT 수. 1이면 해당 축 미분배(기존 동작).
     split_k: int = 1             # K축 inter-unit SPLIT 수. >1이면 한 출력 타일을 여러 DPU가 K분담 → host reduce.
@@ -177,9 +185,9 @@ class PIMOptions:
 
     def __post_init__(self):
         # target 없이 PIM을 쓰는 것은 의도된 사용이 아니므로 기본값으로 때우지 않고 바로 터뜨린다.
-        if self.target is None:
+        if self.pim_target is None:
             raise ValueError(
-                "PIMBackend requires an explicit `target` option. "
+                "PIMBackend requires an explicit `pim_target` option. "
                 "Supported values: 'upmem', 'aimx'."
             )
 
@@ -230,17 +238,17 @@ class PIMBackend(BaseBackend):
         stages["ttir"] = lambda src, metadata: cpu_compiler.CPUBackend.make_ttir(src, metadata, options)
         stages["ttsharedir"] = lambda src, metadata: cpu_compiler._ttir_to_ttsharedir(src)
         stages["pim_common"] = lambda src, metadata: _ttsharedir_to_pim_common(src, options)
-        # target 분기: legalize(target_ir)와 codegen(pimobj)만 target마다 다르다(DESIGN 19).
-        # __post_init__은 target is None만 막으므로, 미지원 값은 여기서 fail-fast한다(fallback 금지).
-        if options.target == "upmem":
-            stages["target_ir"] = lambda src, metadata: _pim_common_to_upmem(src)
+        # target 분기: 변환(target_ir)과 codegen(pimobj)만 target마다 다르다(DESIGN 19).
+        # __post_init__은 pim_target is None만 막으므로, 미지원 값은 여기서 fail-fast한다(fallback 금지).
+        if options.pim_target == "upmem":
+            stages["target_ir"] = lambda src, metadata: _pim_common_to_upmem(src, options)
             stages["pimobj"] = lambda src, metadata: _upmem_to_artifact(src, metadata)
-        elif options.target == "aimx":
+        elif options.pim_target == "aimx":
             stages["target_ir"] = lambda src, metadata: _pim_common_to_aimx(src)
             stages["pimobj"] = lambda src, metadata: _aimx_to_artifact(src, metadata)
         else:
             raise ValueError(
-                f"Unsupported PIM target '{options.target}'. Supported: 'upmem', 'aimx'.")
+                f"Unsupported PIM target '{options.pim_target}'. Supported: 'upmem', 'aimx'.")
 
     @functools.lru_cache()
     def hash(self):

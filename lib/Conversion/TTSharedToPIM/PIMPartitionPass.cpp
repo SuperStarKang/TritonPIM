@@ -73,12 +73,27 @@ static scf::ForOp driverLoop(Value v, ArrayRef<scf::ForOp> loops,
   return found;
 }
 
-// loop를 유닛 u(총 n개) 몫으로 좁히고, 그 유닛이 실제로 도는 횟수를 index로 낸다.
-// 배정량은 올림 나눗셈이고 상한은 원래 상한으로 자르므로, 반복 횟수가 n으로
-// 나누어떨어지지 않으면 마지막 유닛이 덜 맡고, 유닛이 반복보다 많으면 빈 범위가 된다.
-// 그래서 배정량이 아니라 좁힌 범위에서 실제 횟수를 다시 구한다 — unit_data 크기가
-// 여기서 나오므로, 배정량을 쓰면 마지막 유닛이 원본 버퍼 밖을 가리킨다.
-static Value narrowLoop(OpBuilder &b, scf::ForOp loop, Value u, int64_t n) {
+// loop 하나를 유닛 몫으로 좁힌 결과.
+struct UnitRange {
+  Value trips;     // 이 유닛이 실제로 도는 횟수 (index)
+  Value per;       // 유닛 하나에 배정된 횟수 (index). trips <= per
+  Value globalIv;  // 몸체 안에서 원래 전역 인덱스를 대신하는 값
+  Value unitStart; // 그 유닛의 첫 전역 인덱스 (globalIv 를 local=0 에서 본 값)
+};
+
+// loop를 유닛 u(총 n개) 몫으로 좁힌다.
+//
+// 좁힌 뒤 loop는 [0, trips)를 1씩 돈다. 유닛 안에서 인덱스를 0부터 세는 것이 이 계층의
+// 약속이다 — 그래야 target의 device 코드가 자기 좌표를 몰라도 되고, 마지막 유닛이 덜
+// 맡는 것도 trips 하나로 표현된다. 원래 전역 인덱스는 몸체 첫머리에서 다시 만들어
+// 기존 사용처에 넣는다(주소 계산이 그것을 쓴다).
+//
+// 배정량(per)은 올림 나눗셈이고 상한은 원래 상한으로 자르므로, 반복 횟수가 n으로
+// 나누어떨어지지 않으면 마지막 유닛이 덜 맡고 유닛이 반복보다 많으면 빈 범위가 된다.
+// 그래서 실제 횟수(trips)와 배정량(per)을 둘 다 낸다 — 전자는 unit_data의 크기가 되고
+// (배정량을 쓰면 마지막 유닛이 원본 버퍼 밖을 가리킨다), 후자는 유닛마다 같은 크기를
+// 요구하는 전송 방식에서 버퍼 용량이 된다.
+static UnitRange narrowLoop(OpBuilder &b, scf::ForOp loop, Value u, int64_t n) {
   Location loc = loop.getLoc();
   Value lb = loop.getLowerBound(), ub = loop.getUpperBound(), step = loop.getStep();
   Type t = lb.getType();
@@ -86,24 +101,41 @@ static Value narrowLoop(OpBuilder &b, scf::ForOp loop, Value u, int64_t n) {
                  ? u
                  : b.create<arith::IndexCastOp>(loc, t, u).getResult();
   Value cn = b.create<arith::ConstantOp>(loc, b.getIntegerAttr(t, n));
-  Value trips = b.create<arith::CeilDivSIOp>(
+  Value all = b.create<arith::CeilDivSIOp>(
       loc, b.create<arith::SubIOp>(loc, ub, lb), step);
-  Value per = b.create<arith::CeilDivSIOp>(loc, trips, cn);
+  Value per = b.create<arith::CeilDivSIOp>(loc, all, cn);
   Value chunk = b.create<arith::MulIOp>(loc, per, step);
   Value newLb = b.create<arith::AddIOp>(loc, lb,
                                         b.create<arith::MulIOp>(loc, uc, chunk));
   Value newUb = b.create<arith::MinSIOp>(
       loc, b.create<arith::AddIOp>(loc, newLb, chunk), ub);
-  loop.getLowerBoundMutable().assign(newLb);
-  loop.getUpperBoundMutable().assign(newUb);
   Value zero = b.create<arith::ConstantOp>(loc, b.getIntegerAttr(t, 0));
+  Value one = b.create<arith::ConstantOp>(loc, b.getIntegerAttr(t, 1));
   Value span = b.create<arith::MaxSIOp>(
       loc, b.create<arith::SubIOp>(loc, newUb, newLb), zero);
-  Value mine = b.create<arith::CeilDivSIOp>(loc, span, step);
-  return isa<IndexType>(t)
-             ? mine
-             : b.create<arith::IndexCastOp>(loc, b.getIndexType(), mine)
-                   .getResult();
+  Value trips = b.create<arith::CeilDivSIOp>(loc, span, step);
+
+  loop.getLowerBoundMutable().assign(zero);
+  loop.getUpperBoundMutable().assign(trips);
+  loop.getStepMutable().assign(one);
+
+  // 전역 인덱스 = 유닛의 시작 + 로컬 인덱스 × 원래 step.
+  // 이 op에 표시를 남긴다. 유닛 안의 주소를 구하려는 쪽(target)은 첫 피연산자(유닛의
+  // 시작)를 0으로 바꾸면 되는데, 표시가 없으면 어느 op인지 다시 찾아야 한다.
+  OpBuilder bb(loop.getBody(), loop.getBody()->begin());
+  Value local = loop.getInductionVar();
+  auto scaled = bb.create<arith::MulIOp>(loc, local, step);
+  auto global = bb.create<arith::AddIOp>(loc, newLb, scaled);
+  global->setAttr("pim.unit_origin", bb.getUnitAttr());
+  local.replaceAllUsesExcept(global, scaled);
+
+  auto toIndex = [&](Value v) {
+    return isa<IndexType>(t)
+               ? v
+               : b.create<arith::IndexCastOp>(loc, b.getIndexType(), v)
+                     .getResult();
+  };
+  return {toIndex(trips), toIndex(per), global, newLb};
 }
 
 struct PIMPartitionPass
@@ -131,11 +163,13 @@ struct PIMPartitionPass
         reductionLoops.push_back(l);
     });
 
-    // 쪼개는 축(유닛 수 > 1)만 모은다. 이름·유닛 수·해당 loop가 자리 순서로 대응한다.
+    // 쪼갤 수 있는 축을 전부 모은다. 유닛 수가 1인 축도 넣는다 — 유닛이 하나뿐이어도
+    // 유닛 형태는 필요하고(target이 그것을 입력으로 받는다), 좌표가 0으로 고정될 뿐이다.
+    // 이름·유닛 수·해당 loop가 자리 순서로 대응한다.
     SmallVector<Attribute> names;
     SmallVector<int64_t> counts;
     SmallVector<scf::ForOp> loops;
-    SmallVector<Attribute> combineOver; // 부분 결과가 생기는 축
+    SmallVector<Attribute> combineOver; // 부분 결과가 실제로 생기는 축
     StringAttr combine;
     unsigned reductionSeen = 0;
     for (auto [i, a] : llvm::enumerate(axesAttr)) {
@@ -145,22 +179,23 @@ struct PIMPartitionPass
       unsigned rIdx = reductionSeen;
       if (isReduction)
         reductionSeen++;
-      if (splits[i] <= 1)
-        continue;
       auto axis = cast<StringAttr>(d.get("axis"));
       scf::ForOp loop;
       if (isReduction) {
         loop = reductionLoops[rIdx];
-        auto c = cast<StringAttr>(d.get("combine"));
-        // pim.unit_data는 결합 연산자를 하나만 나른다. 쪼갠 reduction 축들의 연산자가
-        // 다르면 어느 것으로 합칠지 적을 수 없다.
-        if (combine && combine != c) {
-          func->emitError("pim-partition: split reduction axes use different "
-                          "combine operators");
-          return signalPassFailure();
+        // 축약 축을 실제로 쪼갠 경우에만 부분 결과가 생긴다.
+        if (splits[i] > 1) {
+          auto c = cast<StringAttr>(d.get("combine"));
+          // pim.unit_data는 결합 연산자를 하나만 나른다. 쪼갠 reduction 축들의 연산자가
+          // 다르면 어느 것으로 합칠지 적을 수 없다.
+          if (combine && combine != c) {
+            func->emitError("pim-partition: split reduction axes use different "
+                            "combine operators");
+            return signalPassFailure();
+          }
+          combine = c;
+          combineOver.push_back(axis);
         }
-        combine = c;
-        combineOver.push_back(axis);
       } else {
         func.walk([&](scf::ForOp l) {
           auto g = l->getAttrOfType<StringAttr>("pim.grid_dim");
@@ -172,9 +207,6 @@ struct PIMPartitionPass
       counts.push_back(splits[i]);
       loops.push_back(loop);
     }
-    if (names.empty())
-      return; // 전부 1이면 나눌 것이 없다.
-
     int64_t total = 1;
     for (int64_t c : counts)
       total *= c;
@@ -213,14 +245,17 @@ struct PIMPartitionPass
     Block *body = b.createBlock(&units.getBody(), {}, argTys, argLocs);
     outermost->moveBefore(body, body->end());
 
-    // 유닛 몫으로 loop를 좁히고, 좁힌 하한을 기억한다(unit_data의 시작 위치가 여기서 나온다).
+    // 유닛 몫으로 loop를 좁힌다. unit_data의 시작 위치는 전역 인덱스를 그 유닛의
+    // 첫 값으로 되돌려 얻으므로, globalIv를 유닛 시작(로컬 0에서의 값)에 대응시킨다.
     b.setInsertionPoint(outermost);
-    IRMapping toUnitLb;
-    llvm::DenseMap<Operation *, Value> perUnitTrips;
+    IRMapping toUnitStart;
+    llvm::DenseMap<Operation *, Value> unitTrips, unitPer;
     for (auto [i, l] : llvm::enumerate(loops)) {
-      Value per = narrowLoop(b, l, body->getArgument(i), counts[i]);
-      perUnitTrips[l] = per;
-      toUnitLb.map(l.getInductionVar(), l.getLowerBound());
+      UnitRange r = narrowLoop(b, l, body->getArgument(i), counts[i]);
+      unitTrips[l] = r.trips;
+      unitPer[l] = r.per;
+      // globalIv = newLb + local*step 이므로 local=0 일 때가 newLb 다.
+      toUnitStart.map(r.globalIv, r.unitStart);
     }
 
     // unit_data를 loop 앞에 끼워 넣으므로, 순회 중 블록을 고치지 않도록 먼저 모은다.
@@ -228,16 +263,17 @@ struct PIMPartitionPass
     units.getBody().walk([&](pim::AccessOp a) { accesses.push_back(a); });
     auto gridDims = func->getAttrOfType<ArrayAttr>("pim.grid_dims");
     for (pim::AccessOp a : accesses)
-      buildUnitData(b, a, outermost, loops, perUnitTrips, toUnitLb, names,
-                    gridDims, combine, combineOver);
+      buildUnitData(b, a, outermost, loops, unitTrips, unitPer, toUnitStart,
+                    names, gridDims, combine, combineOver);
   }
 
   // access 하나에 대한 pim.unit_data를 만든다. 축별 시작 위치가 없거나 유닛 좌표로 되돌릴
   // 수 없는 형태면 만들지 않는다 — 없는 것이 틀린 것보다 낫다.
   void buildUnitData(OpBuilder &b, pim::AccessOp a, Operation *nest,
                      ArrayRef<scf::ForOp> loops,
-                     const llvm::DenseMap<Operation *, Value> &perUnitTrips,
-                     IRMapping &toUnitLb, ArrayRef<Attribute> names,
+                     const llvm::DenseMap<Operation *, Value> &unitTrips,
+                     const llvm::DenseMap<Operation *, Value> &unitPer,
+                     IRMapping &toUnitStart, ArrayRef<Attribute> names,
                      ArrayAttr gridDims, StringAttr combine,
                      ArrayRef<Attribute> combineOver) {
     auto role = a->getAttrOfType<StringAttr>("pim.role");
@@ -247,10 +283,10 @@ struct PIMPartitionPass
 
     Location loc = a.getLoc();
     MLIRContext *ctx = b.getContext();
-    SmallVector<Value> origin, sizes, strides;
+    SmallVector<Value> origin, sizes, capacity, strides;
     for (auto [d, o] : llvm::enumerate(a.getOrigin())) {
-      Value start = rebuild(b, o, toUnitLb, nest);
-      Value stride = rebuild(b, a.getStrides()[d], toUnitLb, nest);
+      Value start = rebuild(b, o, toUnitStart, nest);
+      Value stride = rebuild(b, a.getStrides()[d], toUnitStart, nest);
       if (!start || !stride)
         return;
       // 이 축을 움직이는 loop가 있으면 유닛이 그 loop를 도는 횟수만큼 타일이 이어 붙는다.
@@ -261,9 +297,16 @@ struct PIMPartitionPass
       origin.push_back(start);
       strides.push_back(stride);
       Value tile = b.create<arith::ConstantIndexOp>(loc, a.getSizes()[d]);
-      sizes.push_back(drv ? b.create<arith::MulIOp>(
-                                loc, perUnitTrips.lookup(drv), tile)
-                          : tile);
+      if (!drv) {
+        // 움직이는 loop가 없으면 유닛마다 타일 하나뿐이라 실제와 배정량이 같다.
+        sizes.push_back(tile);
+        capacity.push_back(tile);
+        continue;
+      }
+      sizes.push_back(
+          b.create<arith::MulIOp>(loc, unitTrips.lookup(drv), tile));
+      capacity.push_back(
+          b.create<arith::MulIOp>(loc, unitPer.lookup(drv), tile));
     }
 
     bool isOutput = role.getValue() == "output";
@@ -278,7 +321,7 @@ struct PIMPartitionPass
         }
 
     b.create<pim::UnitDataOp>(
-        loc, a.getBase(), origin, sizes, strides,
+        loc, a.getBase(), origin, sizes, capacity, strides,
         StringAttr::get(ctx, isOutput ? "out" : "in"), id,
         replicated.empty() ? ArrayAttr() : ArrayAttr::get(ctx, replicated),
         isOutput && !combineOver.empty() ? combine : StringAttr(),

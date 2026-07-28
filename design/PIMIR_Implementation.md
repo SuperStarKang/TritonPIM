@@ -78,7 +78,7 @@ PIM IR (인스턴스 형태)           "모든 인스턴스가 하는 일" — �
    ▼
 PIM IR (유닛 형태)               "유닛 하나가 하는 일 + 유닛 경계의 데이터 이동"
    │
-   ├ [5] --legalize-pim-to-<target>             결정: 메모리 계층, DMA 단위,
+   ├ [5] --convert-pim-to-<target>              결정: 메모리 계층, DMA 단위,
    │                                                  유닛 내부 병렬, 레이아웃 변환
    ▼
 Target IR                        "실제로 실행될 코드의 구조"

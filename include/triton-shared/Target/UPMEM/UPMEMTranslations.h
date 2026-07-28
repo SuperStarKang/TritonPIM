@@ -1,15 +1,15 @@
-#ifndef TRITON_SHARED_TARGET_UPMEM_UPMEMTRANSLATIONS_H
-#define TRITON_SHARED_TARGET_UPMEM_UPMEMTRANSLATIONS_H
+#ifndef TRITON_SHARED_TARGET_UPMEM_UPMEMTRANSLATIONS_H_
+#define TRITON_SHARED_TARGET_UPMEM_UPMEMTRANSLATIONS_H_
 
 namespace mlir {
 namespace triton {
 
-// UPMEM IR → host C++ / device C 소스 번역을 mlir-translate 레지스트리에 등록한다.
-// triton-shared-translate가 main에서 호출한다.
+// UPMEM IR을 소스로 옮긴다. 둘 다 IR을 그대로 읽어 낸다 — op 하나가 코드 한 덩어리이고,
+// 다루지 못하는 op을 만나면 에러를 낸다(모르는 것을 짐작해 채우지 않는다).
 void registerUPMEMToHostTranslation();
 void registerUPMEMToDeviceTranslation();
 
 } // namespace triton
 } // namespace mlir
 
-#endif // TRITON_SHARED_TARGET_UPMEM_UPMEMTRANSLATIONS_H
+#endif // TRITON_SHARED_TARGET_UPMEM_UPMEMTRANSLATIONS_H_

@@ -151,6 +151,10 @@ def PIM_UnitsOp : PIM_Op<"units", [NoTerminator]> {
 // pim.access가 인스턴스 하나의 타일이라면 이쪽은 유닛 하나가 전체 실행 동안 쓰는 영역이다.
 // origin/sizes는 pim.access의 origin에 이 유닛의 loop 범위를 대입해서 나온다.
 // strides는 원본 버퍼 안 배치라 pim.access의 것을 그대로 쓴다.
+// capacity는 유닛 하나에 배정된 크기다. sizes는 실제로 맡은 크기라 반복이 유닛 수로
+//   나누어떨어지지 않으면 마지막 유닛에서 더 작다. 유닛마다 같은 크기를 요구하는
+//   전송 방식(UPMEM의 push_xfer 등)에서는 capacity로 버퍼를 잡고 남는 자리를 채운다.
+//   언제나 capacity >= sizes 다.
 // direction: "in"(host→유닛) | "out"(유닛→host).
 // access: 이 영역을 유도한 pim.access의 pim.access_id. 이 영역 안에서 타일이 어디인지는
 //   그 access의 origin에서 이 영역의 origin을 빼면 나온다. 같은 버퍼를 여러 access가
@@ -161,13 +165,14 @@ def PIM_UnitDataOp : PIM_Op<"unit_data", [AttrSizedOperandSegments]> {
   let summary = "Region of a buffer that one unit needs in its own memory";
   let arguments = (ins AnyRankedOrUnrankedMemRef:$base,
                        Variadic<Index>:$origin, Variadic<Index>:$sizes,
-                       Variadic<Index>:$strides, StrAttr:$direction,
-                       I64Attr:$access,
+                       Variadic<Index>:$capacity, Variadic<Index>:$strides,
+                       StrAttr:$direction, I64Attr:$access,
                        OptionalAttr<StrArrayAttr>:$replicated_over,
                        OptionalAttr<StrAttr>:$combine,
                        OptionalAttr<StrArrayAttr>:$combine_over);
   let assemblyFormat = [{
-    $base `origin` `[` $origin `]` `sizes` `[` $sizes `]` `strides` `[` $strides `]`
+    $base `origin` `[` $origin `]` `sizes` `[` $sizes `]`
+    `capacity` `[` $capacity `]` `strides` `[` $strides `]`
     attr-dict `:` type($base)
   }];
   let hasVerifier = 1;

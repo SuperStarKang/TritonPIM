@@ -64,28 +64,28 @@ func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
 // CHECK-NEXT: ^{{.*}}(%[[UX:.*]]: index, %[[UY:.*]]: index, %[[UK:.*]]: index)
 
 // A: x축 loop가 시작을, k축 loop가 열 범위를 정한다. y축에 불변이라 y만 다른 유닛은 같은 것을 받는다.
-// CHECK:      pim.unit_data %arg0 origin[%{{.*}}, %{{.*}}] sizes[%{{.*}}, %{{.*}}] strides[%{{.*}}, %{{.*}}]
+// CHECK:      pim.unit_data %arg0 origin[%{{.*}}, %{{.*}}] sizes[%{{.*}}, %{{.*}}] capacity[%{{.*}}, %{{.*}}] strides[%{{.*}}, %{{.*}}]
 // CHECK-SAME:   direction = "in"
 // CHECK-SAME:   access =
 // CHECK-SAME:   replicated_over = ["y"]
 
 // B: x축에 불변.
-// CHECK:      pim.unit_data %arg1 origin[%{{.*}}, %{{.*}}] sizes[%{{.*}}, %{{.*}}] strides[%{{.*}}, %{{.*}}]
+// CHECK:      pim.unit_data %arg1 origin[%{{.*}}, %{{.*}}] sizes[%{{.*}}, %{{.*}}] capacity[%{{.*}}, %{{.*}}] strides[%{{.*}}, %{{.*}}]
 // CHECK-SAME:   direction = "in"
 // CHECK-SAME:   access =
 // CHECK-SAME:   replicated_over = ["x"]
 
 // C: 어느 grid 축에도 불변이 아니라 복제가 없고, k축을 쪼갰으므로 부분 결과를 더해야 한다.
-// CHECK:      pim.unit_data %arg2 origin[%{{.*}}, %{{.*}}] sizes[%{{.*}}, %{{.*}}] strides[%{{.*}}, %{{.*}}]
+// CHECK:      pim.unit_data %arg2 origin[%{{.*}}, %{{.*}}] sizes[%{{.*}}, %{{.*}}] capacity[%{{.*}}, %{{.*}}] strides[%{{.*}}, %{{.*}}]
 // CHECK-SAME:   combine = "add"
 // CHECK-SAME:   combine_over = ["k"]
 // CHECK-SAME:   direction = "out"
 
-// 축 loop 셋의 범위가 유닛 몫으로 좁혀진다(올림 나눗셈 + 원래 상한으로 자르기).
-// 크기는 배정량이 아니라 좁힌 범위의 실제 횟수에서 나온다(마지막 유닛이 덜 맡는 경우).
+// 축 loop 셋이 유닛 몫으로 좁혀져 0부터 실제 반복 횟수까지 돈다.
 // CHECK:      arith.ceildivsi
 // CHECK:      arith.minsi
 // CHECK:      arith.maxsi
+// CHECK:      scf.for %{{.*}} = %c0{{.*}} to %{{.*}} step %c1
 
 // 쪼갤 축이 하나도 없으면(전부 1) 유닛 형태를 만들지 않는다.
 // RUN: triton-shared-opt --pim-partition="splits=1,1,1" %s | FileCheck %s --check-prefix=NOSPLIT

@@ -124,18 +124,18 @@ def _build_aimx_so(stub_src: str, descriptors: str) -> str:
 class PIMLauncher(object):
 
     def __init__(self, src, metadata):
-        # signature에서 pointer 인자(A,B,C)의 위치를 뽑아둔다. 호출 시 args에서 같은 위치를 꺼낸다.
+        # 생성된 host 함수의 시그니처는 "커널의 비-constexpr 인자를 원래 순서대로" 다음
+        # "num_programs(x,y,z)"다. --pim-build-grid가 program_id 인자를 지우고 num_programs만
+        # 남기기 때문이다. 그래서 인자 위치를 특정 커널 모양에 맞춰 박지 않고 시그니처에서 읽는다.
         cst_key = lambda i: src.fn.arg_names.index(i) if isinstance(i, str) else i
         signature = {cst_key(k): v for k, v in src.signature.items()}
-        self.pointer_indices = [i for i, ty in sorted(signature.items()) if ty[0] == "*"]
-        # 전체 M/N/K(런타임)는 matmul(A,B,C,M,N,K) 규약상 포인터 다음 i32 인자 3,4,5.
-        # host 함수가 baked 상수가 아니라 런타임 M/N/K를 파라미터로 받으므로 여기서 꺼내 넘긴다.
-        self.extent_indices = [3, 4, 5]
+        self.arg_indices = [i for i, ty in sorted(signature.items()) if ty != "constexpr"]
+        self.arg_is_pointer = [signature[i][0] == "*" for i in self.arg_indices]
         # local_lanes(=NR_TASKLETS): device 빌드 파라미터. PIMOptions 필드라 metadata에 들어온다.
         self.local_lanes = metadata.local_lanes
-        # target: 런타임에 빌드 툴체인을 고르는 분기 키. local_lanes와 같은 PIMOptions 필드라
+        # pim_target: 런타임에 빌드 툴체인을 고르는 분기 키. local_lanes와 같은 PIMOptions 필드라
         # 같은 경로로 metadata에 들어온다("upmem" | "aimx").
-        self.target = metadata.target
+        self.pim_target = metadata.pim_target
 
     def __call__(self, gridX, gridY, gridZ, stream, cu_function,
                  kernel_metadata, launch_metadata,
@@ -145,27 +145,30 @@ class PIMLauncher(object):
         # target마다 빌드 툴체인이 다르다(upmem=dpu-clang+libdpu, aimx=descriptor runtime).
         # 빌드 단계만 분기하고, 아래 dlopen→ctypes 호출은 stub이 같은 (A,B,C,M,N,K) C ABI를
         # 노출한다는 전제로 공유한다(AiMX가 다른 인자를 요구하면 그때 호출부도 분기).
-        if self.target == "upmem":
+        if self.pim_target == "upmem":
             so_path = _build_pim_so(bundle["host"], bundle["device"], self.local_lanes)
-        elif self.target == "aimx":
+        elif self.pim_target == "aimx":
             so_path = _build_aimx_so(bundle["stub"], bundle["descriptors"])
         else:
-            raise ValueError(f"Unsupported PIM target '{self.target}'.")
+            raise ValueError(f"Unsupported PIM target '{self.pim_target}'.")
 
         # host 진입 함수 이름 = metadata.name (compiler가 host.cpp에서 파싱해 채운 값). index 6.
         entry = kernel_metadata[6]
         lib = ctypes.CDLL(so_path)
         fn = getattr(lib, entry)
-        # host 시그니처 = (float* A, B, C, uint32_t M, N, K)
-        fn.argtypes = [ctypes.c_void_p] * len(self.pointer_indices) + [ctypes.c_uint32] * 3
+        # 커널 인자를 원래 순서대로, 그 뒤에 grid 크기 셋.
+        # grid는 컴파일 캐시 키에 없으므로(jit.py가 캐시를 조회한 뒤 정규화한다) 반드시
+        # 런타임 인자로 넘겨야 한다. host 코드가 이 값으로 유닛별 영역을 계산한다.
+        fn.argtypes = [ctypes.c_void_p if p else ctypes.c_int32
+                       for p in self.arg_is_pointer] + [ctypes.c_int32] * 3
         fn.restype = None
 
         if launch_enter_hook is not None:
             launch_enter_hook(launch_metadata)
 
-        ptrs = [ctypes.c_void_p(args[i].data_ptr()) for i in self.pointer_indices]
-        extent = [ctypes.c_uint32(int(args[i])) for i in self.extent_indices]
-        fn(*ptrs, *extent)
+        call = [ctypes.c_void_p(args[i].data_ptr()) if p else ctypes.c_int32(int(args[i]))
+                for i, p in zip(self.arg_indices, self.arg_is_pointer)]
+        fn(*call, ctypes.c_int32(gridX), ctypes.c_int32(gridY), ctypes.c_int32(gridZ))
 
         if launch_exit_hook is not None:
             launch_exit_hook(launch_metadata)

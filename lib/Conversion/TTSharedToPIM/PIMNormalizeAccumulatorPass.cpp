@@ -66,8 +66,9 @@ static void sinkInit(scf::ForOp loop) {
     chain.push_back(def);
     work.append(def->getOperands().begin(), def->getOperands().end());
   }
-  // 소비하는 쪽부터 옮기므로 생산하는 쪽이 앞에 오게 된다.
-  for (Operation *op : chain)
+  // chain은 소비하는 쪽부터 담겼다. moveBefore(loop)는 언제나 loop 바로 앞에 놓으므로
+  // 나중에 옮긴 것이 loop에 더 가까워진다. 생산하는 쪽부터 옮겨야 순서가 맞는다.
+  for (Operation *op : llvm::reverse(chain))
     op->moveBefore(loop);
 }
 

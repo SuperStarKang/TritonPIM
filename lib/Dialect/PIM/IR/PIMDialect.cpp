@@ -77,10 +77,12 @@ LogicalResult UnitsOp::verify() {
 }
 
 LogicalResult UnitDataOp::verify() {
-  // 세 리스트가 같은 rank를 기술한다.
+  // 네 리스트가 같은 rank를 기술한다.
   size_t rank = getOrigin().size();
-  if (getSizes().size() != rank || getStrides().size() != rank)
-    return emitOpError("origin, sizes, and strides must have the same rank");
+  if (getSizes().size() != rank || getCapacity().size() != rank ||
+      getStrides().size() != rank)
+    return emitOpError(
+        "origin, sizes, capacity, and strides must have the same rank");
   StringRef dir = getDirection();
   if (dir != "in" && dir != "out")
     return emitOpError("direction must be \"in\" or \"out\"");
