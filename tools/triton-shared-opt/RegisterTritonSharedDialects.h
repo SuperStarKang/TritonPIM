@@ -44,8 +44,10 @@ inline void registerTritonSharedDialects(mlir::DialectRegistry &registry) {
   mlir::triton::registerConvertTTSharedToPIMPass();
   mlir::triton::registerPIMBuildGridPass();
   mlir::triton::registerPIMRemoveRedundantTransfersPass();
+  mlir::triton::registerPIMNormalizeAccumulatorPass();
   mlir::triton::registerPIMAnalyzeReusePass();
   mlir::triton::registerPIMAnalyzeTransferPass();
+  mlir::triton::registerPIMPartitionPass();
   mlir::triton::registerPIMClassifyComputePass();
   mlir::triton::registerAddLLVMDebugInfoPass();
 

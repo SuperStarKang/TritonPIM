@@ -128,3 +128,27 @@ func.func @sub_byte(%M: memref<*xi1>, %C: memref<*xi1>) {
   } {pim.grid_dim = "x"}
   return
 }
+
+// pim.gather는 !pim.access를 거치지 않으므로 전송량 항이 붙지 않는다. 원소별 임의 접근이라
+// 전송량이 index 텐서의 값에 달려 컴파일 시점에 셀 수 없기 때문이다.
+// 반면 상주량은 결과 tensor 타입에서 나오므로 목록에 든다. gather 결과에는 access 인덱스가
+// 없다(누산기와 같다). index tile 8xi32 = 32 바이트, gather 결과 8xf32 = 32 바이트.
+// CHECK-LABEL: func.func @element_gather
+// CHECK-SAME:  pim.co_resident = [{access = 0 : i64, bytes = 32 : i64, lifetime = "streaming"}, {bytes = 32 : i64, lifetime = "streaming"}]
+// CHECK:       pim.access %arg1 {{.*}} pim.tile_bytes = 32 : i64, pim.transfer_count = 1 : i64
+// CHECK:       pim.gather
+// CHECK-NOT:   pim.tile_bytes
+// CHECK:       pim.access %arg2 {{.*}} pim.tile_bytes = 32 : i64, pim.transfer_count = 1 : i64
+func.func @element_gather(%A: memref<*xf32>, %I: memref<*xi32>, %C: memref<*xf32>) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c4 = arith.constant 4 : index
+  scf.for %g = %c0 to %c4 step %c1 {
+    %dI = pim.access %I offset %g sizes [8] strides [%c1] : memref<*xi32> -> !pim.access
+    %idx = pim.load %dI : !pim.access -> tensor<8xi32>
+    %v = pim.gather %A index %idx : memref<*xf32>, tensor<8xi32> -> tensor<8xf32>
+    %dC = pim.access %C offset %g sizes [8] strides [%c1] : memref<*xf32> -> !pim.access
+    pim.store %v, %dC : tensor<8xf32>, !pim.access
+  } {pim.grid_dim = "x"}
+  return
+}

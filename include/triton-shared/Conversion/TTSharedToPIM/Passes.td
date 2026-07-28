@@ -62,18 +62,43 @@ def PIMRemoveRedundantTransfers : Pass<"pim-remove-redundant-transfers", "mlir::
   let dependentDialects = ["mlir::pim::PIMDialect"];
 }
 
+def PIMNormalizeAccumulator : Pass<"pim-normalize-accumulator", "mlir::ModuleOp"> {
+  let summary = "Accumulate into the accumulator instead of into a zero-filled temporary";
+  let description = [{
+    `matmul(outs=0으로 채운 tile)` + `generic(add)(누산기, 그 결과)`를
+    `matmul(outs=누산기)`로 접는다. 0에 더한 것을 누산기에 더하는 것과 누산기에 바로
+    더하는 것이 같으므로 결과가 바뀌지 않는다.
+    임시 tile 하나와 tile 크기만큼의 덧셈이 사라진다. 유닛 메모리가 작을수록 크게 영향을
+    주며, 접지 않으면 pim.co_resident가 실제 필요량보다 tile 하나만큼 작게 나온다
+    (임시 tile은 pim.load 결과가 아니라 목록에 안 들어간다).
+    조건: generic이 두 입력을 그대로 더하기만 하고(축 전부 parallel, map 전부 항등),
+    outs가 그 누산기이고, 계산 결과가 그 generic에서만 쓰이고, 계산의 outs가 0이어야 한다.
+    하나라도 어긋나면 그대로 둔다.
+    이어서 누산기 초기값을 만드는 op을 그 loop 바로 앞으로 내린다. tensor는 값 의미라
+    -loop-invariant-code-motion이 grid loop 밖까지 빼 두는데, 값으로는 맞아도 버퍼로
+    내리면 초기화가 한 번만 돌아 두 번째 instance부터 앞 결과가 남는다. 접은 뒤라야
+    초기값이 iter_args에서만 쓰여 옮길 수 있다.
+    구조를 바꾸므로 분석 패스들보다 앞에 둔다 — 접은 뒤라야 상주량과 연산량이 실제와 맞는다.
+    --pim-partition보다도 앞이라야 초기값이 유닛 region 안에 들어간다.
+  }];
+  let constructor = "mlir::triton::createPIMNormalizeAccumulatorPass()";
+  let dependentDialects = ["mlir::linalg::LinalgDialect"];
+}
+
 def PIMAnalyzeReuse : Pass<"pim-analyze-reuse", "mlir::ModuleOp"> {
   let summary = "Annotate grid-axis dependence, reuse, and splittable axes";
   let description = [{
     grid 축과 각 pim.access의 의존 관계를 분석해 속성으로 단다(치환 아님):
     - func: `pim.execution_model = "spmd"`, grid loop가 있으면 그 중첩 순서대로
       `pim.grid_dims = ["x"(,"y","z")]`.
+    - pim.access: `pim.access_id` = 이 함수 안에서 이 access를 가리키는 이름. 뒤 패스가
+      자리 번호 대신 이 값으로 참조한다 — 자리 번호는 access가 하나 늘거나 줄면 어긋난다.
     - pim.access: 소비자에 따라 `pim.role`(load/copy-src→input, store/copy-dst→output),
       그리고 의존하지 **않는** grid 축을 `pim.invariant_grid_dims`(grid_dims 기준 인덱스)로 단다.
       invariant = 그 축이 바뀌어도 같은 데이터다 → 쪼갤 때 나누지 않고 복제한다.
-    - pim.access: `pim.reuse_realizable` = 주소가 grid 아닌 loop 안에서 변하지 않는가.
-      거짓이면 pim.access가 그 loop 안에서 만들어져 전송을 밖으로 뺄 수 없고, 불변 축이
-      약속하는 재사용이 loop 순서를 바꾸지 않는 한 실현되지 않는다.
+    - pim.access: `pim.tile_hoistable` = 주소가 grid 아닌 loop 안에서 변하지 않는가.
+      거짓이면 그 loop 반복마다 tile을 다시 가져와야 한다. 불변 축이 약속하는 유닛 사이
+      공유와는 다른 질문이다 — 그쪽은 pim.invariant_grid_dims가 답한다.
     - scf.for: 누산기(tensor iter_arg)를 계산 op의 outs로 받아 누적하면
       `pim.reduction_combine`으로 결합 연산자를 단다.
     - func: `pim.split_axes` = 쪼갤 수 있는 축 목록. 항목마다 axis · source 필드가 있고,
@@ -82,6 +107,10 @@ def PIMAnalyzeReuse : Pass<"pim-analyze-reuse", "mlir::ModuleOp"> {
       같은 원소에 쓰지 않는다고 보장할 수 없어 grid 축을 올리지 않고, reduction loop는
       몸체에 pim.store/pim.scatter가 있으면 올리지 않는다. 결합 연산자를 못 정하는 축도
       올리지 않는다 — 모르는 채 쪼개면 target이 덮어쓰는 코드를 만든다.
+      grid 축에 결합이 필요한지는 출력에 **저장되는 값**이 그 축에 의존하는지로 정한다.
+      위치가 그 축에 불변인 것만으로는 부족하다 — 값도 불변이면 모든 instance가 같은 것을
+      쓰는 중복 실행이라 합치면 결과가 유닛 수만큼 커진다. 값을 추적하지 못한 축은
+      어느 쪽인지 모르므로 아예 올리지 않는다.
     grid 축은 `pim.grid_dim` 속성이 붙은 scf.for로 식별하므로 --pim-build-grid를 먼저 돌려야 한다.
     의존성은 backward slice로 구하며 arith 체인과 scf.for iter_arg를 따라간다. 추적 불가한 leaf를
     만나면 안전하게 모든 축에 의존한다고 본다(재사용 과대주장 금지).
@@ -105,9 +134,11 @@ def PIMAnalyzeTransfer : Pass<"pim-analyze-transfer", "mlir::ModuleOp"> {
       둘을 곱해 두지 않는 이유: 곱하면 전송 건수를 복원할 수 없고, 상주량 계산에 tile
       바이트가 따로 필요하며, 감싸는 loop 반복이 비상수여도 tile 바이트는 남길 수 있다.
     - func: `pim.co_resident` = 한 순간에 유닛 메모리에 함께 있어야 하는 tile 목록.
-      항목마다 access · bytes · lifetime 세 필드다. 가장 깊이 있는 pim.load의 블록에서
-      그 블록의 load 결과 tensor들(streaming) + (그 블록이 scf.for 몸체면) tensor 타입
-      iter_arg(persistent). access는 함수 안 pim.access의 walk 순서 인덱스다(누산기엔 없다).
+      항목마다 access · bytes · lifetime 세 필드다. 가장 깊이 있는 pim.load/pim.gather의
+      블록에서 그 블록의 load·gather 결과 tensor들(streaming) + (그 블록이 scf.for 몸체면)
+      tensor 타입 iter_arg(persistent). access는 pim.access_id이며,
+      access를 거치지 않는 gather 결과와 누산기에는 없다. gather는 전송량을 못 세도
+      (index 텐서 값에 달렸다) 상주량은 결과 tensor 타입에서 나오므로 목록에 넣는다.
       합계가 아니라 목록인 이유는 target의 메모리 계층이 하나가 아니어서 어느 tile을
       빠른 쪽에 둘지 정하려면 개별 크기가 필요하기 때문이다.
     - func: `pim.compute_ops` = instance 하나의 산술 연산 횟수. 계산 op마다
@@ -125,6 +156,45 @@ def PIMAnalyzeTransfer : Pass<"pim-analyze-transfer", "mlir::ModuleOp"> {
   }];
   let constructor = "mlir::triton::createPIMAnalyzeTransferPass()";
   let dependentDialects = ["mlir::pim::PIMDialect"];
+}
+
+def PIMPartition : Pass<"pim-partition", "mlir::ModuleOp"> {
+  let summary = "Assign grid instances to units and derive each unit's data region";
+  let description = [{
+    반복 공간을 유닛 수만큼 나눈다. 여기까지가 target 무관이고, 이 결과를 어느 메모리에
+    어떤 단위로 올릴지부터가 target 몫이다.
+    - `pim.units`: 유닛 하나가 하는 일을 담는 region. 축 loop nest를 이 안으로 옮긴다.
+      region 밖 = host(데이터 준비·배포·회수), region 안 = 유닛 하나. block argument는
+      이 유닛의 좌표다. 속성이 아니라 region인 이유는 target이 무시할 수 없게 하기 위해서다.
+    - 각 축 loop의 하한·상한을 그 유닛 몫으로 좁힌다. 유닛당 반복 수는 올림 나눗셈이고
+      상한은 원래 상한으로 자르므로, grid 크기가 유닛 수로 나누어떨어지지 않아도 된다.
+      타일 안의 나머지는 pim.access의 valid가 이미 담당한다.
+    - `pim.unit_data`: 유닛 하나가 자기 메모리에 갖고 있어야 하는 영역. pim.access의
+      origin에 그 유닛의 loop 하한을 대입해 시작 위치를, 그 유닛이 실제로 도는 횟수 ×
+      타일 크기로 크기를 얻는다. 배정량이 아니라 실제 횟수를 쓰는 이유는, 반복이 유닛
+      수로 나누어떨어지지 않을 때 마지막 유닛이 덜 맡기 때문이다 — 배정량을 쓰면 원본
+      버퍼 밖을 가리킨다. origin이 없는 access(주소를 loop iter_arg로 나르는 형태)는
+      건너뛴다. `access` 필드에 유도한 pim.access_id를 적어, 이 영역 안에서 타일이
+      어디인지 target이 되짚을 수 있게 한다.
+      입력이 어느 축에 불변이면 그 축만 다른 유닛들이 같은 데이터를 받으므로
+      `replicated_over`로 적고, 출력은 쪼갠 reduction 축마다 부분 결과가 생기므로
+      `combine`/`combine_over`로 적는다.
+    - num-units / local-memory-bytes를 주면 요청한 유닛 수와 pim.co_resident 합계를
+      확인한다. 0이면 확인하지 않는다.
+    쪼갤 축과 결합 연산자는 --pim-analyze-reuse가 `pim.split_axes`로 내므로 그 뒤에 돌린다.
+    splits는 그 목록 순서대로 축마다 하나씩 주며, 1이면 그 축은 쪼개지 않는다.
+  }];
+  let constructor = "mlir::triton::createPIMPartitionPass()";
+  let options = [
+    ListOption<"splits", "splits", "int64_t",
+               "축별 유닛 수. pim.split_axes 순서대로 하나씩.">,
+    Option<"numUnits", "num-units", "int64_t", "0",
+           "기계의 유닛 개수. 0이면 확인하지 않는다.">,
+    Option<"localMemoryBytes", "local-memory-bytes", "int64_t", "0",
+           "유닛당 빠른 메모리 바이트. 0이면 확인하지 않는다.">,
+  ];
+  let dependentDialects = ["mlir::pim::PIMDialect", "mlir::arith::ArithDialect",
+                           "mlir::scf::SCFDialect"];
 }
 
 def PIMClassifyCompute : Pass<"pim-classify-compute", "mlir::ModuleOp"> {

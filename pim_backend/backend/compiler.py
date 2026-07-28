@@ -61,9 +61,10 @@ def _run_translate(mlir_text: str, which: str) -> str:
 
 # TTSharedIR → PIM Common IR 파이프라인 (Design §20). 각 pass를 한 줄씩 두어, 실험 시 필요 없는
 # 단계는 그 줄을 주석(#) 처리해 껐다 켰다 할 수 있다. 순서 의미는 각 줄 주석 참고.
-# SPLIT/local_lanes(유닛 분배)와 fusion은 target 관심사라 이 단계에서 하지 않는다.
+# local_lanes(유닛 내부 병렬)와 fusion은 target 관심사라 이 단계에서 하지 않는다.
 # 순서 규칙: IR을 바꾸는 패스를 전부 돌린 뒤 분석 패스를 전부 돌린다(Design §20.2). 분석 결과는
-# IR의 최종 모습을 기술해야 하므로, IR을 바꾸는 패스가 뒤에 오면 그 기술이 낡는다. 예외를 두지 않는다.
+# IR의 최종 모습을 기술해야 하므로, IR을 바꾸는 패스가 뒤에 오면 그 기술이 낡는다.
+# --pim-partition만 예외다 — 분석이 낸 pim.split_axes를 입력으로 쓰므로 분석 뒤에 올 수밖에 없다.
 PIM_COMMON_PASSES = [
     # --- 변환 ---
     "--convert-ttshared-to-pim",          # 메모리 접근을 pim.access/load/store로 변환
@@ -72,16 +73,29 @@ PIM_COMMON_PASSES = [
     "-loop-invariant-code-motion",        # 루프 불변 연산(주소 계산 arith, Pure한 pim.access)을 루프 밖으로. access가 밖에 있어야 그 load를 뺄 수 있다
     "--pim-remove-redundant-transfers",   # load hoisting, load-store를 copy로, 반복 load/RAW 재사용
     "-canonicalize",                      # 죽은 pim.load/access(결과 미사용) 정리(DCE)
+    "--pim-normalize-accumulator",        # matmul(outs=0)+add를 matmul(outs=누산기)로. tile 하나와 tile만큼의 덧셈이 사라지고, 상주량이 실제와 맞게 된다
     # --- 분석 ---
     "--pim-analyze-reuse",                # grid 축↔access 의존 분석(execution_model/grid_dims/role/invariant). 전송량 식이 invariant를 입력으로 쓴다
     "--pim-analyze-transfer",             # access별 tile 바이트와 전송 횟수, 상주량, 연산량. hoisting이 끝난 뒤라야 전송 횟수가 실제와 맞는다
+    # --- 분할 ---
+    # 반복 공간을 유닛 수만큼 나눠 유닛 형태를 만든다. pim.split_axes를 입력으로 쓰므로 분석 뒤다.
+    # splits는 그 목록 순서(grid 축 중첩 순서 다음 reduction 축)라 split_m/n/k가 그대로 맞는다.
+    # 주의: 앞선 pim.transfer_count는 쪼개기 전 instance 기준이라, 유닛당 값을 보려면
+    # pim.units의 counts로 나눠야 한다.
+    "--pim-partition=splits={splits} num-units={num_units} local-memory-bytes={local_memory_bytes}",
+    "-cse",                               # 분할이 access마다 주소식을 따로 복제하므로 여기서 합친다
+    "-canonicalize",                      # 중복 상수와 접히는 산술 정리
+    # --- 태그 ---
     "--pim-classify-compute",             # 연산 종류 태그(pim.op). 모든 구조 변형 뒤 맨 마지막(late)에 돌려 태그가 안 낡게
 ]
 
 
-def _ttsharedir_to_pim_common(ttshared: str) -> str:
+def _ttsharedir_to_pim_common(ttshared: str, options) -> str:
     # 파이프라인 구성과 각 단계 의미는 PIM_COMMON_PASSES 정의 참고(줄 주석으로 토글).
-    return _run_opt(ttshared, PIM_COMMON_PASSES)
+    splits = "{},{},{}".format(options.split_m, options.split_n, options.split_k)
+    return _run_opt(ttshared, [p.format(splits=splits, num_units=options.num_units,
+                                        local_memory_bytes=options.local_memory_bytes)
+                               for p in PIM_COMMON_PASSES])
 
 
 def _pim_common_to_upmem(pim_common: str) -> str:
@@ -154,6 +168,9 @@ class PIMOptions:
     # --- PIM 고유 옵션 ---
     target: str = None           # "upmem" | "aimx" — 누락 시 아래에서 즉시 에러 (fallback 없음)
     device_id: int = 0
+    # 기계 — 이름을 target 중립으로 둔다(UPMEM에서는 유닛=DPU, 빠른 메모리=WRAM).
+    num_units: int = 2048        # 물리 유닛 개수. split의 곱이 이보다 크면 컴파일 시점에 실패.
+    local_memory_bytes: int = 64 * 1024   # 유닛당 빠른 메모리. co_resident 합계가 넘으면 실패.
     split_m: int = 1             # M축 inter-unit SPLIT 수. split_m×split_n×split_k = DPU 개수.
     split_n: int = 1             # N축 inter-unit SPLIT 수. 1이면 해당 축 미분배(기존 동작).
     split_k: int = 1             # K축 inter-unit SPLIT 수. >1이면 한 출력 타일을 여러 DPU가 K분담 → host reduce.
@@ -213,7 +230,7 @@ class PIMBackend(BaseBackend):
         # 마지막 stage 이름은 binary_ext('pimobj')와 일치해야 CompiledKernel이 kernel을 찾는다.
         stages["ttir"] = lambda src, metadata: cpu_compiler.CPUBackend.make_ttir(src, metadata, options)
         stages["ttsharedir"] = lambda src, metadata: cpu_compiler._ttir_to_ttsharedir(src)
-        stages["pim_common"] = lambda src, metadata: _ttsharedir_to_pim_common(src)
+        stages["pim_common"] = lambda src, metadata: _ttsharedir_to_pim_common(src, options)
         # target 분기: legalize(target_ir)와 codegen(pimobj)만 target마다 다르다(DESIGN 19).
         # __post_init__은 target is None만 막으므로, 미지원 값은 여기서 fail-fast한다(fallback 금지).
         if options.target == "upmem":

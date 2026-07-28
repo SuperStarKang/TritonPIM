@@ -7,6 +7,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -40,14 +41,61 @@ static SmallVector<Value> toIndices(OpBuilder &b, Location loc,
   return vs;
 }
 
-// pim.access 생성. clause(valid/pad/index/gather_dim)는 없으면 빈 값/널로 둔다.
+// offset = Σ_d origin[d]·strides[d] 로 되돌린다. 유닛이 맡을 데이터 영역은 origin에
+// 유닛의 loop 범위를 대입해 나오므로, 합쳐진 offset만으로는 유도할 수 없다.
+// addi 항을 펼친 뒤 항마다: muli(x, strides[d])면 축 d의 origin이 x이고, 어느 축과도
+// 안 맞으면 stride가 1인 축(마지막 축)의 origin으로 본다. 못 맞추면 빈 결과를 낸다
+// (주소를 loop iter_arg로 나르는 커널이 이 경우 — origin 없이 offset만 남는다).
+static SmallVector<Value> decomposeOffset(OpBuilder &b, Location loc, Value offset,
+                                          ValueRange strides) {
+  SmallVector<Value> work{offset}, terms;
+  while (!work.empty()) {
+    Value t = work.pop_back_val();
+    if (auto add = t.getDefiningOp<arith::AddIOp>()) {
+      work.append({add.getLhs(), add.getRhs()});
+      continue;
+    }
+    terms.push_back(t);
+  }
+
+  SmallVector<Value> origin(strides.size());
+  for (Value t : terms) {
+    std::optional<int64_t> c = getConstantIntValue(t);
+    if (c && *c == 0)
+      continue; // 0 항은 어느 축에도 기여하지 않는다
+    size_t axis = strides.size();
+    Value val = t;
+    if (auto mul = t.getDefiningOp<arith::MulIOp>())
+      for (auto [d, s] : llvm::enumerate(strides)) {
+        if (mul.getRhs() == s) { axis = d; val = mul.getLhs(); break; }
+        if (mul.getLhs() == s) { axis = d; val = mul.getRhs(); break; }
+      }
+    if (axis == strides.size())
+      for (auto [d, s] : llvm::enumerate(strides)) {
+        std::optional<int64_t> sc = getConstantIntValue(s);
+        if (sc && *sc == 1) { axis = d; break; }
+      }
+    // 축을 못 찾거나 한 축에 두 항이 오면 이 형태를 신뢰할 수 없다.
+    if (axis == strides.size() || origin[axis])
+      return {};
+    origin[axis] = val;
+  }
+  // 항이 없던 축은 시작이 0이다. 실패 가능성이 사라진 뒤에 만든다(버려질 op을 만들지 않게).
+  for (Value &o : origin)
+    if (!o)
+      o = b.create<arith::ConstantIndexOp>(loc, 0);
+  return origin;
+}
+
+// pim.access 생성. clause(origin/valid/pad/index/gather_dim)는 없으면 빈 값/널로 둔다.
 static Value makeAccess(OpBuilder &b, Location loc, Value base, Value offset,
-                        ValueRange strides, ArrayRef<int64_t> sizes,
-                        ValueRange valid, Value pad, Value index,
-                        IntegerAttr gatherDim) {
+                        ValueRange origin, ValueRange strides,
+                        ArrayRef<int64_t> sizes, ValueRange valid, Value pad,
+                        Value index, IntegerAttr gatherDim) {
   return b.create<pim::AccessOp>(loc, pim::AccessType::get(b.getContext()), base,
-                                 offset, strides, b.getDenseI64ArrayAttr(sizes),
-                                 valid, pad, index, gatherDim);
+                                 offset, origin, strides,
+                                 b.getDenseI64ArrayAttr(sizes), valid, pad, index,
+                                 gatherDim);
 }
 
 // reinterpret_cast의 offset/sizes/strides를 그대로 pim.access로 옮긴다(①②③).
@@ -55,8 +103,9 @@ static Value buildAccess(OpBuilder &b, memref::ReinterpretCastOp rc) {
   Location loc = rc.getLoc();
   Value offset = toIndex(b, loc, rc.getMixedOffsets()[0]);
   SmallVector<Value> strides = toIndices(b, loc, rc.getMixedStrides());
-  return makeAccess(b, loc, rc.getSource(), offset, strides, rc.getStaticSizes(),
-                    {}, Value(), Value(), IntegerAttr());
+  SmallVector<Value> origin = decomposeOffset(b, loc, offset, strides);
+  return makeAccess(b, loc, rc.getSource(), offset, origin, strides,
+                    rc.getStaticSizes(), {}, Value(), Value(), IntegerAttr());
 }
 
 // alloc 사용처 중 bufferization.to_tensor를 찾는다(로드 관용구의 끝).
@@ -159,7 +208,8 @@ struct ConvertTTSharedToPIMPass
       SmallVector<Value> strides = toIndices(b, loc, rc.getMixedStrides());
       Value offset = toIndex(b, loc, rc.getMixedOffsets()[0]);
       Value pad = fill ? fill.getInputs()[0] : Value(); // 채움값 있으면 pad, 없으면 널
-      Value d = makeAccess(b, loc, rc.getSource(), offset, strides,
+      SmallVector<Value> origin = decomposeOffset(b, loc, offset, strides);
+      Value d = makeAccess(b, loc, rc.getSource(), offset, origin, strides,
                            rc.getStaticSizes(), valid, pad, Value(), IntegerAttr());
       Value v = b.create<pim::LoadOp>(loc, toTensor->getResult(0).getType(), d);
       toTensor->getResult(0).replaceAllUsesWith(v);
@@ -210,7 +260,8 @@ struct ConvertTTSharedToPIMPass
       Location loc = forOp.getLoc();
       SmallVector<Value> strides = toIndices(b, loc, rc.getMixedStrides());
       Value offset = b.create<arith::ConstantIndexOp>(loc, 0);
-      Value d = makeAccess(b, loc, rc.getSource(), offset, strides,
+      // gather 축의 시작은 index 텐서 값이 정하므로 축별 origin을 쓸 수 없다.
+      Value d = makeAccess(b, loc, rc.getSource(), offset, {}, strides,
                            alloc.getType().getShape(), {}, Value(),
                            extract.getTensor(), b.getI64IntegerAttr(gdim));
       Value v = b.create<pim::LoadOp>(loc, toTensor->getResult(0).getType(), d);
@@ -262,7 +313,8 @@ struct ConvertTTSharedToPIMPass
       SmallVector<Value> valid = toIndices(b, loc, es.getMixedSizes());
       SmallVector<Value> strides = toIndices(b, loc, rc.getMixedStrides());
       Value offset = toIndex(b, loc, rc.getMixedOffsets()[0]);
-      Value d = makeAccess(b, loc, rc.getSource(), offset, strides,
+      SmallVector<Value> origin = decomposeOffset(b, loc, offset, strides);
+      Value d = makeAccess(b, loc, rc.getSource(), offset, origin, strides,
                            rc.getStaticSizes(), valid, Value(), Value(),
                            IntegerAttr());
       b.create<pim::StoreOp>(loc, es.getSource(), d);

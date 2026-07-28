@@ -6,7 +6,6 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
-#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 
@@ -120,14 +119,26 @@ static unsigned blockDepth(Block *block) {
 // 합계가 아니라 목록으로 두는 이유는 target의 메모리 계층이 하나가 아니기 때문이다.
 // 어느 tile을 빠른 쪽에 두고 어느 것을 스트리밍할지는 개별 크기를 알아야 정한다.
 // access 필드는 함수 안 pim.access의 walk 순서 인덱스다(누산기에는 없다).
-static ArrayAttr coResident(func::FuncOp func,
-                            const llvm::DenseMap<Operation *, int64_t> &index) {
+// pim.load는 !pim.access를 거치고 pim.gather는 base를 직접 받지만, 둘 다 유닛 메모리에
+// tile 하나를 만든다. 전송량은 index 텐서 값에 달려 못 세지만(§16.2) 상주량은 결과
+// tensor 타입에서 나오므로 gather도 목록에 넣는다. gather에는 access 인덱스가 없다.
+static Value residentTile(Operation *op) {
+  if (auto load = dyn_cast<pim::LoadOp>(op))
+    return load.getResult();
+  if (auto gather = dyn_cast<pim::GatherOp>(op))
+    return gather.getResult();
+  return {};
+}
+
+static ArrayAttr coResident(func::FuncOp func) {
   Block *deepest = nullptr;
   unsigned deepestDepth = 0;
-  func.walk([&](pim::LoadOp load) {
-    unsigned depth = blockDepth(load->getBlock());
+  func.walk([&](Operation *op) {
+    if (!residentTile(op))
+      return;
+    unsigned depth = blockDepth(op->getBlock());
     if (!deepest || depth > deepestDepth) {
-      deepest = load->getBlock();
+      deepest = op->getBlock();
       deepestDepth = depth;
     }
   });
@@ -142,18 +153,18 @@ static ArrayAttr coResident(func::FuncOp func,
 
   SmallVector<Attribute> entries;
   for (Operation &op : *deepest) {
-    auto load = dyn_cast<pim::LoadOp>(&op);
-    if (!load)
+    Value tileValue = residentTile(&op);
+    if (!tileValue)
       continue;
     int64_t tile;
     // 하나라도 못 세면 목록이 불완전해져 용량 판정에 쓸 수 없으므로 아예 붙이지 않는다.
-    if (!tensorBytes(load.getResult().getType(), tile))
+    if (!tensorBytes(tileValue.getType(), tile))
       return {};
     SmallVector<NamedAttribute> fields;
-    auto it = index.find(load.getAccess().getDefiningOp());
-    if (it != index.end())
-      fields.push_back(
-          NamedAttribute(accessName, IntegerAttr::get(i64, it->second)));
+    if (auto load = dyn_cast<pim::LoadOp>(&op))
+      if (auto id = load.getAccess().getDefiningOp()->getAttrOfType<IntegerAttr>(
+              "pim.access_id"))
+        fields.push_back(NamedAttribute(accessName, id));
     fields.push_back(NamedAttribute(bytesName, IntegerAttr::get(i64, tile)));
     fields.push_back(
         NamedAttribute(lifetimeName, StringAttr::get(ctx, "streaming")));
@@ -244,9 +255,7 @@ struct PIMAnalyzeTransferPass
 
     // tile 바이트는 sizes와 element type만 쓰므로 언제나 붙는다. 전송 횟수는 감싸는
     // 비-grid loop 반복이 상수일 때만 붙는다.
-    llvm::DenseMap<Operation *, int64_t> index;
-    for (auto [i, a] : llvm::enumerate(accesses)) {
-      index[a.getOperation()] = i;
+    for (pim::AccessOp a : accesses) {
       int64_t tile;
       if (!tileBytes(a, tile))
         continue;
@@ -256,7 +265,7 @@ struct PIMAnalyzeTransferPass
         a->setAttr("pim.transfer_count", IntegerAttr::get(i64, count));
     }
 
-    if (ArrayAttr resident = coResident(func, index))
+    if (ArrayAttr resident = coResident(func))
       func->setAttr("pim.co_resident", resident);
 
     int64_t ops;

@@ -44,6 +44,9 @@ LogicalResult AccessOp::verify() {
   // R2: valid를 쓰면 축별로 하나씩(= rank).
   if (!getValid().empty() && static_cast<int64_t>(getValid().size()) != rank)
     return emitOpError("valid count must equal sizes rank");
+  // R2': origin도 쓰면 축별로 하나씩. 분해가 안 되면 아예 비운다(부분 origin은 금지).
+  if (!getOrigin().empty() && static_cast<int64_t>(getOrigin().size()) != rank)
+    return emitOpError("origin count must equal sizes rank");
   // R3: pad(채움값)는 valid(mask)와 함께만 의미가 있다. (저장은 valid만 OK.)
   if (getPad() && getValid().empty())
     return emitOpError("pad requires valid");
@@ -60,5 +63,29 @@ LogicalResult GatherOp::verify() {
   // masked gather는 masked-out을 채울 other가 있어야 한다.
   if (static_cast<bool>(getMask()) != static_cast<bool>(getOther()))
     return emitOpError("mask and other must be set together");
+  return success();
+}
+
+LogicalResult UnitsOp::verify() {
+  // 축마다 유닛 수 하나, 그리고 block argument 하나(= 이 유닛의 그 축 좌표).
+  size_t n = getAxes().size();
+  if (getCounts().size() != n)
+    return emitOpError("counts must have one entry per axis");
+  if (getBody().front().getNumArguments() != n)
+    return emitOpError("body must take one coordinate per axis");
+  return success();
+}
+
+LogicalResult UnitDataOp::verify() {
+  // 세 리스트가 같은 rank를 기술한다.
+  size_t rank = getOrigin().size();
+  if (getSizes().size() != rank || getStrides().size() != rank)
+    return emitOpError("origin, sizes, and strides must have the same rank");
+  StringRef dir = getDirection();
+  if (dir != "in" && dir != "out")
+    return emitOpError("direction must be \"in\" or \"out\"");
+  // 결합 연산자와 결합 축은 쌍이다. 하나만 있으면 target이 무엇을 어떻게 합칠지 못 정한다.
+  if (static_cast<bool>(getCombineAttr()) != static_cast<bool>(getCombineOverAttr()))
+    return emitOpError("combine and combine_over must be set together");
   return success();
 }

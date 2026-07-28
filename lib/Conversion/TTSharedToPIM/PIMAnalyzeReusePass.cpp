@@ -85,6 +85,23 @@ static void collectDeps(Value root, ArrayRef<scf::ForOp> grid,
     }
     if (isa<arith::ConstantOp>(def))
       continue; // 상수 leaf
+    // loop/if의 결과는 몸체가 yield 하는 값이다. 피연산자(loop면 lb/ub/step/init,
+    // if면 조건)만 따라가면 몸체 안에서 생긴 의존을 놓친다. linalg처럼 데이터가
+    // 피연산자로만 흐르는 op은 아래 일반 경로가 맞다.
+    if (auto forOp = dyn_cast<scf::ForOp>(def)) {
+      unsigned idx = cast<OpResult>(v).getResultNumber();
+      worklist.push_back(forOp.getBody()->getTerminator()->getOperand(idx));
+      worklist.push_back(forOp.getInitArgs()[idx]);
+      continue;
+    }
+    if (auto ifOp = dyn_cast<scf::IfOp>(def)) {
+      unsigned idx = cast<OpResult>(v).getResultNumber();
+      worklist.push_back(ifOp.getCondition());
+      for (Region *r : {&ifOp.getThenRegion(), &ifOp.getElseRegion()})
+        if (!r->empty())
+          worklist.push_back(r->front().getTerminator()->getOperand(idx));
+      continue;
+    }
     for (Value o : def->getOperands())
       worklist.push_back(o);
   }
@@ -106,6 +123,30 @@ static void collectAccessDeps(pim::AccessOp access, ArrayRef<scf::ForOp> grid,
     collectDeps(pad, grid, deps, opaque, inner);
   if (Value index = access.getIndex())
     collectDeps(index, grid, deps, opaque, inner);
+}
+
+// 출력 access에 저장되는 **값**이 의존하는 grid 축. 위치가 축 d에 불변인 것만으로는
+// 부분 결과인지 알 수 없다 — 값도 d에 불변이면 모든 instance가 같은 것을 쓰는 중복 실행이라,
+// 합치면 결과가 유닛 수만큼 커진다. 값이 d에 의존할 때만 합쳐야 한다.
+// pim.copy는 src access가 정하는 데이터를 그대로 옮기므로 그쪽 의존을 본다.
+static void collectStoredValueDeps(pim::AccessOp access,
+                                   ArrayRef<scf::ForOp> grid,
+                                   llvm::DenseSet<unsigned> &deps, bool &opaque) {
+  bool inner = false;
+  for (Operation *u : access.getResult().getUsers()) {
+    if (auto store = dyn_cast<pim::StoreOp>(u)) {
+      collectDeps(store.getValue(), grid, deps, opaque, inner);
+      continue;
+    }
+    auto copy = dyn_cast<pim::CopyOp>(u);
+    if (!copy || copy.getDst() != access.getResult())
+      continue;
+    auto src = copy.getSrc().getDefiningOp<pim::AccessOp>();
+    if (src)
+      collectAccessDeps(src, grid, deps, opaque, inner);
+    else
+      opaque = true;
+  }
 }
 
 // access를 소비하는 방식으로 role을 정한다. store/copy-dst → output, 그 외(load/copy-src) → input.
@@ -180,10 +221,9 @@ struct PIMAnalyzeReusePass
     SmallVector<scf::ForOp> grid;
     collectGridLoops(func, grid);
 
-    // 각 access의 grid 차원 의존 집합을 구하고, 어떤 access든 실제로 의존하는 차원을 모은다.
+    // 각 access의 grid 차원 의존 집합을 구한다.
     SmallVector<llvm::DenseSet<unsigned>> depsPerAccess(accesses.size());
     SmallVector<bool> innerDep(accesses.size(), false);
-    llvm::DenseSet<unsigned> activeDims;
     for (auto [i, a] : llvm::enumerate(accesses)) {
       bool opaque = false;
       bool inner = false;
@@ -192,15 +232,16 @@ struct PIMAnalyzeReusePass
         for (unsigned d = 0; d < grid.size(); d++)
           depsPerAccess[i].insert(d);
       innerDep[i] = inner;
-      for (unsigned d : depsPerAccess[i])
-        activeDims.insert(d);
     }
 
-    // role과 재사용 실현 가능성은 grid 차원과 무관하게 항상 단다.
+    // id·role·hoistable은 grid 차원과 무관하게 항상 단다. id는 뒤 패스가 access를 가리키는
+    // 이름이다 — 자리 번호로 가리키면 access가 하나 늘거나 줄 때 조용히 어긋난다.
+    auto i64 = IntegerType::get(ctx, 64);
     for (auto [i, a] : llvm::enumerate(accesses)) {
+      a->setAttr("pim.access_id", IntegerAttr::get(i64, i));
       if (StringRef role = accessRole(a.getResult()); !role.empty())
         a->setAttr("pim.role", StringAttr::get(ctx, role));
-      a->setAttr("pim.reuse_realizable", BoolAttr::get(ctx, !innerDep[i]));
+      a->setAttr("pim.tile_hoistable", BoolAttr::get(ctx, !innerDep[i]));
     }
 
     // reduction loop: tensor iter_arg 누산기를 계산 op의 outs로 받아 누적하는 scf.for에
@@ -232,18 +273,29 @@ struct PIMAnalyzeReusePass
       dimNames.push_back(g->getAttr("pim.grid_dim"));
     func->setAttr("pim.grid_dims", ArrayAttr::get(ctx, dimNames));
 
-    llvm::DenseSet<unsigned> needCombine;
+    llvm::DenseSet<unsigned> needCombine;    // 부분 결과가 생긴다 — 합쳐야 한다
+    llvm::DenseSet<unsigned> unknownCombine; // 합쳐야 하는지 모른다 — 쪼개지 않는다
     for (auto [i, a] : llvm::enumerate(accesses)) {
       bool isOutput = accessRole(a.getResult()) == "output";
+      // 출력이면 저장되는 값이 어느 축에 의존하는지 따로 본다. 위치가 불변이어도 값이
+      // 불변이면 중복 실행이라 합치면 틀린다.
+      llvm::DenseSet<unsigned> valueDeps;
+      bool valueOpaque = false;
+      if (isOutput)
+        collectStoredValueDeps(a, grid, valueDeps, valueOpaque);
       SmallVector<int64_t> invariant;
       for (unsigned d = 0; d < grid.size(); d++) {
         if (depsPerAccess[i].contains(d))
           continue;
         invariant.push_back(d);
-        // 출력이 차원 d에 불변이면 d만 다른 instance들이 같은 출력에 쓰므로 부분 결과를
-        // 합쳐야 한다. 단 어떤 access도 d에 의존하지 않으면 모든 instance가 같은 값을
-        // 만드는 중복 실행이라, 합치면 오히려 결과가 틀린다. 활성 차원일 때만 표시한다.
-        if (isOutput && activeDims.contains(d))
+        if (!isOutput)
+          continue;
+        // 위치는 d에 불변이다. 값이 d에 의존하면 d만 다른 instance들이 같은 자리에
+        // 부분 결과를 쓴다. 값도 불변이면 전부 같은 것을 쓰는 중복 실행이라 결합이
+        // 필요 없다. 값을 추적하지 못했으면 어느 쪽인지 모르므로 그 축은 쪼개지 않는다.
+        if (valueOpaque)
+          unknownCombine.insert(d);
+        else if (valueDeps.contains(d))
           needCombine.insert(d);
       }
       a->setAttr("pim.invariant_grid_dims",
@@ -251,7 +303,8 @@ struct PIMAnalyzeReusePass
     }
 
     func->setAttr("pim.split_axes",
-                  buildSplitAxes(func, ctx, grid, reductionLoops, needCombine));
+                  buildSplitAxes(func, ctx, grid, reductionLoops, needCombine,
+                                 unknownCombine));
   }
 
   // 쪼갤 수 있는 축을 모은다. grid 축과 reduction loop 둘 다 후보다.
@@ -264,7 +317,8 @@ struct PIMAnalyzeReusePass
   ArrayAttr buildSplitAxes(func::FuncOp func, MLIRContext *ctx,
                            ArrayRef<scf::ForOp> grid,
                            ArrayRef<scf::ForOp> reductionLoops,
-                           const llvm::DenseSet<unsigned> &needCombine) {
+                           const llvm::DenseSet<unsigned> &needCombine,
+                           const llvm::DenseSet<unsigned> &unknownCombine) {
     auto axisName = StringAttr::get(ctx, "axis");
     auto sourceName = StringAttr::get(ctx, "source");
     auto combineName = StringAttr::get(ctx, "combine");
@@ -281,6 +335,8 @@ struct PIMAnalyzeReusePass
     SmallVector<Attribute> axes;
     if (!hasScatter)
       for (auto [d, g] : llvm::enumerate(grid)) {
+        if (unknownCombine.contains(d))
+          continue; // 합쳐야 하는지 모르는 축은 올리지 않는다
         SmallVector<NamedAttribute> fields{
             NamedAttribute(axisName, g->getAttr("pim.grid_dim")),
             NamedAttribute(sourceName, StringAttr::get(ctx, "grid"))};

@@ -11,8 +11,9 @@ func.func @scalar_store(%C: memref<*xf32>, %i: index, %v: f32) {
   return
 }
 
-// 스칼라를 tensor<1xf32>로 감싸 pim.store로 올린다.
-// CHECK:      %[[D:.*]] = pim.access %arg0 offset %arg1 sizes [1] strides[%{{.*}}] : memref<*xf32> -> !pim.access
+// 스칼라를 tensor<1xf32>로 감싸 pim.store로 올린다. origin은 offset을 축으로 되돌린 것이라
+// 크기 1 저장에서는 offset과 같은 값이다.
+// CHECK:      %[[D:.*]] = pim.access %arg0 offset %arg1 sizes [1] strides[%{{.*}}] origin[%arg1] : memref<*xf32> -> !pim.access
 // CHECK:      %[[T:.*]] = tensor.from_elements %arg2 : tensor<1xf32>
 // CHECK:      pim.store %[[T]], %[[D]] : tensor<1xf32>, !pim.access
 
