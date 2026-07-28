@@ -96,9 +96,6 @@ def PIMAnalyzeReuse : Pass<"pim-analyze-reuse", "mlir::ModuleOp"> {
     - pim.access: 소비자에 따라 `pim.role`(load/copy-src→input, store/copy-dst→output),
       그리고 의존하지 **않는** grid 축을 `pim.invariant_grid_dims`(grid_dims 기준 인덱스)로 단다.
       invariant = 그 축이 바뀌어도 같은 데이터다 → 쪼갤 때 나누지 않고 복제한다.
-    - pim.access: `pim.tile_hoistable` = 주소가 grid 아닌 loop 안에서 변하지 않는가.
-      거짓이면 그 loop 반복마다 tile을 다시 가져와야 한다. 불변 축이 약속하는 유닛 사이
-      공유와는 다른 질문이다 — 그쪽은 pim.invariant_grid_dims가 답한다.
     - scf.for: 누산기(tensor iter_arg)를 계산 op의 outs로 받아 누적하면
       `pim.reduction_combine`으로 결합 연산자를 단다.
     - func: `pim.split_axes` = 쪼갤 수 있는 축 목록. 항목마다 axis · source 필드가 있고,
@@ -122,37 +119,29 @@ def PIMAnalyzeReuse : Pass<"pim-analyze-reuse", "mlir::ModuleOp"> {
 }
 
 def PIMAnalyzeTransfer : Pass<"pim-analyze-transfer", "mlir::ModuleOp"> {
-  let summary = "Annotate the terms of the transfer, residency, and compute cost";
+  let summary = "Annotate transfer size and per-unit residency";
   let description = [{
-    분할 비용 식에 들어갈 항을 계산해 속성으로 단다(치환 아님). 항을 곱해 시간으로 바꾸는
-    것은 대역폭·유닛 수·용량을 아는 Target IR이다.
+    전송 한 번의 크기와 유닛 하나가 동시에 들고 있어야 하는 양을 속성으로 단다(치환 아님).
     - pim.access: `pim.tile_bytes` = 한 번에 옮기는 바이트(sizes 곱 × element bit width,
       올림). valid는 동적 값이라 못 쓰므로 sizes 전체를 세는 상한이다.
-      `pim.transfer_count` = instance 하나 안에서 전송되는 횟수. 전송 op을 감싸는 비-grid
-      loop 반복 횟수의 합이며, access op이 아니라 load/store/copy의 위치를 본다 —
-      hoisting이 둘을 떼어 놓을 수 있다.
-      둘을 곱해 두지 않는 이유: 곱하면 전송 건수를 복원할 수 없고, 상주량 계산에 tile
-      바이트가 따로 필요하며, 감싸는 loop 반복이 비상수여도 tile 바이트는 남길 수 있다.
     - func: `pim.co_resident` = 한 순간에 유닛 메모리에 함께 있어야 하는 tile 목록.
-      항목마다 access · bytes · lifetime 세 필드다. 가장 깊이 있는 pim.load/pim.gather의
-      블록에서 그 블록의 load·gather 결과 tensor들(streaming) + (그 블록이 scf.for 몸체면)
-      tensor 타입 iter_arg(persistent). access는 pim.access_id이며,
-      access를 거치지 않는 gather 결과와 누산기에는 없다. gather는 전송량을 못 세도
-      (index 텐서 값에 달렸다) 상주량은 결과 tensor 타입에서 나오므로 목록에 넣는다.
+      항목마다 access · bytes · lifetime 세 필드다. 가장 깊이 있는 전송의 블록을 잡아,
+      그 블록에서 매 반복 새로 읽는 것(streaming)과 그 블록을 감싸는 loop를 관통하는
+      것(persistent = 누산기 iter_arg, 그리고 밖에서 한 번 읽어 안에서 쓰는 tile)을 모은다.
+      뒤엣것은 --pim-remove-redundant-transfers가 loop 밖으로 뺀 load다. 빠뜨리면 용량을
+      실제보다 작게 보고 들어가지 않는 분할을 고른다.
+      access는 pim.access_id이며, access를 거치지 않는 gather 결과와 누산기에는 없다.
+      gather는 전송량을 못 세도(index 텐서 값에 달렸다) 상주량은 결과 tensor 타입에서
+      나오므로 목록에 넣는다.
       합계가 아니라 목록인 이유는 target의 메모리 계층이 하나가 아니어서 어느 tile을
       빠른 쪽에 둘지 정하려면 개별 크기가 필요하기 때문이다.
-    - func: `pim.compute_ops` = instance 하나의 산술 연산 횟수. 계산 op마다
-      (반복 공간 크기) × (원소당 산술 개수) × (감싸는 비-grid loop 반복 횟수)를 더한다.
-      전송량은 유닛 수에 비례해 늘지만 유닛당 연산량은 반비례하므로, 이 항이 없으면
-      분할의 이득이 비용 식에 나타나지 않는다.
-    - func: `pim.grid_extents` = grid loop 반복 횟수. 상수가 아니면 붙이지 않는다.
-      근거 없는 수를 IR에 넣지 않는다. 나머지 값은 grid 크기와 무관하므로 그때도 붙는다.
-    전송량은 축 d의 grid 크기 g_d와 유닛 수 s_d에 대해
-      bytes(s) = Σ_a tile_bytes_a × transfer_count_a × Π{s_j: j ∈ I_a} × Π{g_j: j ∉ I_a}
-    이고 I_a는 pim.invariant_grid_dims다. s가 전부 1일 때가 전송량 하한(= 실제로 필요한
-    데이터양)이다.
-    --pim-remove-redundant-transfers(hoisting이 끝나야 전송 횟수가 실제와 맞는다) 뒤에
-    돌려야 한다.
+    hoisting이 끝난 뒤라야 어느 tile이 어느 블록에 있는지가 확정되므로
+    --pim-remove-redundant-transfers 뒤에 돌린다.
+
+    비용 모델(전송 횟수·연산량·grid 크기)은 여기서 내지 않는다. 셋 다 감싸는 loop 반복
+    횟수를 컴파일 시점 상수로 요구하는데, 실제 커널에서는 K loop 상한이 런타임 인자이고
+    grid 상한은 num_programs 인자라 상수인 적이 없다. 값이 필요해지면(autotune) 반복
+    횟수와 반복 1회분을 나눠서, 곱하는 쪽은 그 수를 아는 launch 계층에 두어야 한다.
   }];
   let constructor = "mlir::triton::createPIMAnalyzeTransferPass()";
   let dependentDialects = ["mlir::pim::PIMDialect"];

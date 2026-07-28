@@ -33,12 +33,8 @@ static void collectGridLoops(func::FuncOp func,
 // 값이 의존하는 grid 차원 집합을 backward slice로 구한다. 추적할 수 없는 leaf를 만나면
 // opaque=true를 남겨, 호출자가 모든 차원에 의존한다고 보수적으로 처리하게 한다
 // (재사용 가능성을 과대주장하지 않는다).
-// grid가 아닌 loop의 유도변수에 의존하면 inner=true를 남긴다. 그러면 pim.access가 그
-// loop 안에서 만들어져 전송을 밖으로 뺄 수 없고(§15.6의 첫 조건), 불변 축이 약속하는
-// 재사용이 loop 순서를 바꾸지 않는 한 실현되지 않는다.
 static void collectDeps(Value root, ArrayRef<scf::ForOp> grid,
-                        llvm::DenseSet<unsigned> &deps, bool &opaque,
-                        bool &inner) {
+                        llvm::DenseSet<unsigned> &deps, bool &opaque) {
   SmallVector<Value> worklist{root};
   llvm::DenseSet<Value> visited;
   while (!worklist.empty()) {
@@ -55,20 +51,14 @@ static void collectDeps(Value root, ArrayRef<scf::ForOp> grid,
           opaque = true;
         continue;
       }
-      // grid가 아닌 loop 안에서 변하는 값이면(유도변수든 iter_arg든) 그 loop마다 주소가
-      // 달라져 pim.access를 loop 밖으로 뺄 수 없다.
-      bool isGrid = llvm::is_contained(grid, forOp);
-      if (!isGrid)
-        inner = true;
       if (ba == forOp.getInductionVar()) {
         // grid loop의 유도변수면 그 차원에 의존한다. grid가 아닌 loop(K tile 등)의
         // 유도변수는 instance 내부의 반복이라 grid 차원과 무관하다.
-        if (isGrid)
-          for (auto [d, g] : llvm::enumerate(grid))
-            if (g == forOp) {
-              deps.insert(d);
-              break;
-            }
+        for (auto [d, g] : llvm::enumerate(grid))
+          if (g == forOp) {
+            deps.insert(d);
+            break;
+          }
         continue;
       }
       // iter_arg는 초기값과 yield 값 양쪽으로 따라간다.
@@ -112,17 +102,16 @@ static void collectDeps(Value root, ArrayRef<scf::ForOp> grid,
 // index는 row gather가 실제로 읽는 행을 정한다. pad는 주소는 아니지만 유효 범위 밖
 // 원소의 값이 되어 load 결과를 바꾸므로 함께 본다.
 static void collectAccessDeps(pim::AccessOp access, ArrayRef<scf::ForOp> grid,
-                              llvm::DenseSet<unsigned> &deps, bool &opaque,
-                              bool &inner) {
-  collectDeps(access.getOffset(), grid, deps, opaque, inner);
+                              llvm::DenseSet<unsigned> &deps, bool &opaque) {
+  collectDeps(access.getOffset(), grid, deps, opaque);
   for (Value stride : access.getStrides())
-    collectDeps(stride, grid, deps, opaque, inner);
+    collectDeps(stride, grid, deps, opaque);
   for (Value valid : access.getValid())
-    collectDeps(valid, grid, deps, opaque, inner);
+    collectDeps(valid, grid, deps, opaque);
   if (Value pad = access.getPad())
-    collectDeps(pad, grid, deps, opaque, inner);
+    collectDeps(pad, grid, deps, opaque);
   if (Value index = access.getIndex())
-    collectDeps(index, grid, deps, opaque, inner);
+    collectDeps(index, grid, deps, opaque);
 }
 
 // 출력 access에 저장되는 **값**이 의존하는 grid 축. 위치가 축 d에 불변인 것만으로는
@@ -132,10 +121,9 @@ static void collectAccessDeps(pim::AccessOp access, ArrayRef<scf::ForOp> grid,
 static void collectStoredValueDeps(pim::AccessOp access,
                                    ArrayRef<scf::ForOp> grid,
                                    llvm::DenseSet<unsigned> &deps, bool &opaque) {
-  bool inner = false;
   for (Operation *u : access.getResult().getUsers()) {
     if (auto store = dyn_cast<pim::StoreOp>(u)) {
-      collectDeps(store.getValue(), grid, deps, opaque, inner);
+      collectDeps(store.getValue(), grid, deps, opaque);
       continue;
     }
     auto copy = dyn_cast<pim::CopyOp>(u);
@@ -143,7 +131,7 @@ static void collectStoredValueDeps(pim::AccessOp access,
       continue;
     auto src = copy.getSrc().getDefiningOp<pim::AccessOp>();
     if (src)
-      collectAccessDeps(src, grid, deps, opaque, inner);
+      collectAccessDeps(src, grid, deps, opaque);
     else
       opaque = true;
   }
@@ -223,25 +211,21 @@ struct PIMAnalyzeReusePass
 
     // 각 access의 grid 차원 의존 집합을 구한다.
     SmallVector<llvm::DenseSet<unsigned>> depsPerAccess(accesses.size());
-    SmallVector<bool> innerDep(accesses.size(), false);
     for (auto [i, a] : llvm::enumerate(accesses)) {
       bool opaque = false;
-      bool inner = false;
-      collectAccessDeps(a, grid, depsPerAccess[i], opaque, inner);
+      collectAccessDeps(a, grid, depsPerAccess[i], opaque);
       if (opaque)
         for (unsigned d = 0; d < grid.size(); d++)
           depsPerAccess[i].insert(d);
-      innerDep[i] = inner;
     }
 
-    // id·role·hoistable은 grid 차원과 무관하게 항상 단다. id는 뒤 패스가 access를 가리키는
+    // id와 role은 grid 차원과 무관하게 항상 단다. id는 뒤 패스가 access를 가리키는
     // 이름이다 — 자리 번호로 가리키면 access가 하나 늘거나 줄 때 조용히 어긋난다.
     auto i64 = IntegerType::get(ctx, 64);
     for (auto [i, a] : llvm::enumerate(accesses)) {
       a->setAttr("pim.access_id", IntegerAttr::get(i64, i));
       if (StringRef role = accessRole(a.getResult()); !role.empty())
         a->setAttr("pim.role", StringAttr::get(ctx, role));
-      a->setAttr("pim.tile_hoistable", BoolAttr::get(ctx, !innerDep[i]));
     }
 
     // reduction loop: tensor iter_arg 누산기를 계산 op의 outs로 받아 누적하는 scf.for에

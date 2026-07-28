@@ -1,5 +1,5 @@
 // grid 축과 각 pim.access의 의존 관계를 분석해 func엔 execution_model/grid_dims/split_axes,
-// access엔 access_id/role/invariant_grid_dims/tile_hoistable을 단다.
+// access엔 access_id/role/invariant_grid_dims를 단다.
 // grid 차원은 pim.grid_dim이 붙은 scf.for로 식별하므로 --pim-build-grid를 먼저 돌린다.
 // RUN: triton-shared-opt --pim-build-grid --pim-analyze-reuse %s | FileCheck %s
 
@@ -20,17 +20,17 @@ func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
   %coff = arith.addi %aoff, %boff : index
 
   // A: m 방향으로만 움직임 → n(dim1) 불변, 재사용은 n방향 program 사이.
-  // CHECK: pim.access %arg0 {{.*}} {pim.access_id = {{[0-9]+}} : i64, pim.invariant_grid_dims = array<i64: 1>, pim.role = "input", pim.tile_hoistable = true}
+  // CHECK: pim.access %arg0 {{.*}} {pim.access_id = {{[0-9]+}} : i64, pim.invariant_grid_dims = array<i64: 1>, pim.role = "input"}
   %dA = pim.access %A offset %aoff sizes [32, 256] strides [%c1, %c1] : memref<*xf32> -> !pim.access
   %a = pim.load %dA : !pim.access -> tensor<32x256xf32>
 
   // B: n 방향으로만 움직임 → m(dim0) 불변.
-  // CHECK: pim.access %arg1 {{.*}} {pim.access_id = {{[0-9]+}} : i64, pim.invariant_grid_dims = array<i64: 0>, pim.role = "input", pim.tile_hoistable = true}
+  // CHECK: pim.access %arg1 {{.*}} {pim.access_id = {{[0-9]+}} : i64, pim.invariant_grid_dims = array<i64: 0>, pim.role = "input"}
   %dB = pim.access %B offset %boff sizes [256, 64] strides [%c1, %c1] : memref<*xf32> -> !pim.access
   %b = pim.load %dB : !pim.access -> tensor<256x64xf32>
 
   // C: 두 축 모두 의존 → 불변 없음, output role.
-  // CHECK: pim.access %arg2 {{.*}} {pim.access_id = {{[0-9]+}} : i64, pim.invariant_grid_dims = array<i64>, pim.role = "output", pim.tile_hoistable = true}
+  // CHECK: pim.access %arg2 {{.*}} {pim.access_id = {{[0-9]+}} : i64, pim.invariant_grid_dims = array<i64>, pim.role = "output"}
   %z = tensor.empty() : tensor<32x64xf32>
   %dC = pim.access %C offset %coff sizes [32, 64] strides [%c1, %c1] : memref<*xf32> -> !pim.access
   pim.store %z, %dC : tensor<32x64xf32>, !pim.access
@@ -99,7 +99,7 @@ func.func @splitk(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
   }
 
   // 출력 C 는 y 에 불변 → invariant=[1], role=output.
-  // CHECK:      pim.access %arg2 {{.*}} {pim.access_id = {{[0-9]+}} : i64, pim.invariant_grid_dims = array<i64: 1>, pim.role = "output", pim.tile_hoistable = true}
+  // CHECK:      pim.access %arg2 {{.*}} {pim.access_id = {{[0-9]+}} : i64, pim.invariant_grid_dims = array<i64: 1>, pim.role = "output"}
   %dC = pim.access %C offset %coff sizes [32, 64] strides [%c1, %c1] : memref<*xf32> -> !pim.access
   pim.store %r, %dC : tensor<32x64xf32>, !pim.access
   return
@@ -135,12 +135,12 @@ func.func @gemm(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
   %r = scf.for %k = %c0 to %c32 step %c1 iter_args(%acc = %init) -> tensor<32x64xf32> {
     %koff = arith.muli %k, %c32 : index
     // A: m 과 k 에 의존, n 에 불변 → n 축을 쪼개면 복제된다.
-    // CHECK: pim.access %arg0 {{.*}} {pim.access_id = {{[0-9]+}} : i64, pim.invariant_grid_dims = array<i64: 1>, pim.role = "input", pim.tile_hoistable = false}
+    // CHECK: pim.access %arg0 {{.*}} {pim.access_id = {{[0-9]+}} : i64, pim.invariant_grid_dims = array<i64: 1>, pim.role = "input"}
     %aoff = arith.addi %moff, %koff : index
     %dA = pim.access %A offset %aoff sizes [32, 16] strides [%c1, %c1] : memref<*xf32> -> !pim.access
     %a = pim.load %dA : !pim.access -> tensor<32x16xf32>
     // B: n 과 k 에 의존, m 에 불변 → m 축을 쪼개면 복제된다.
-    // CHECK: pim.access %arg1 {{.*}} {pim.access_id = {{[0-9]+}} : i64, pim.invariant_grid_dims = array<i64: 0>, pim.role = "input", pim.tile_hoistable = false}
+    // CHECK: pim.access %arg1 {{.*}} {pim.access_id = {{[0-9]+}} : i64, pim.invariant_grid_dims = array<i64: 0>, pim.role = "input"}
     %boff = arith.addi %noff, %koff : index
     %dB = pim.access %B offset %boff sizes [16, 64] strides [%c1, %c1] : memref<*xf32> -> !pim.access
     %b = pim.load %dB : !pim.access -> tensor<16x64xf32>
@@ -149,7 +149,7 @@ func.func @gemm(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
     scf.yield %next : tensor<32x64xf32>
   }
   // C: 두 축 모두 의존 → 복제 없이 나뉜다. 주소가 grid 에만 의존하므로 재사용 실현 가능.
-  // CHECK: pim.access %arg2 {{.*}} {pim.access_id = {{[0-9]+}} : i64, pim.invariant_grid_dims = array<i64>, pim.role = "output", pim.tile_hoistable = true}
+  // CHECK: pim.access %arg2 {{.*}} {pim.access_id = {{[0-9]+}} : i64, pim.invariant_grid_dims = array<i64>, pim.role = "output"}
   %dC = pim.access %C offset %coff sizes [32, 64] strides [%c1, %c1] : memref<*xf32> -> !pim.access
   pim.store %r, %dC : tensor<32x64xf32>, !pim.access
   return
@@ -176,12 +176,12 @@ func.func @gemv(%A: memref<*xf32>, %X: memref<*xf32>, %Y: memref<*xf32>,
   %r = scf.for %k = %c0 to %c16 step %c1 iter_args(%acc = %init) -> tensor<64xf32> {
     %koff = arith.muli %k, %c64 : index
     // A: m 과 k 에 의존 → 불변 축 없음. 쪼개면 유닛마다 서로 다른 행 밴드를 받는다.
-    // CHECK: pim.access %arg0 {{.*}} {pim.access_id = {{[0-9]+}} : i64, pim.invariant_grid_dims = array<i64>, pim.role = "input", pim.tile_hoistable = false}
+    // CHECK: pim.access %arg0 {{.*}} {pim.access_id = {{[0-9]+}} : i64, pim.invariant_grid_dims = array<i64>, pim.role = "input"}
     %aoff = arith.addi %moff, %koff : index
     %dA = pim.access %A offset %aoff sizes [64, 256] strides [%c1, %c1] : memref<*xf32> -> !pim.access
     %a = pim.load %dA : !pim.access -> tensor<64x256xf32>
     // x: k 에만 의존 → m 에 불변. 모든 instance 가 같은 x 를 읽으므로 쪼개면 복제된다.
-    // CHECK: pim.access %arg1 {{.*}} {pim.access_id = {{[0-9]+}} : i64, pim.invariant_grid_dims = array<i64: 0>, pim.role = "input", pim.tile_hoistable = false}
+    // CHECK: pim.access %arg1 {{.*}} {pim.access_id = {{[0-9]+}} : i64, pim.invariant_grid_dims = array<i64: 0>, pim.role = "input"}
     %dX = pim.access %X offset %koff sizes [256] strides [%c1] : memref<*xf32> -> !pim.access
     %x = pim.load %dX : !pim.access -> tensor<256xf32>
     %next = linalg.matvec ins(%a, %x : tensor<64x256xf32>, tensor<256xf32>)
@@ -189,7 +189,7 @@ func.func @gemv(%A: memref<*xf32>, %X: memref<*xf32>, %Y: memref<*xf32>,
     scf.yield %next : tensor<64xf32>
   }
   // y: m 에 의존 → 복제 없이 나뉜다.
-  // CHECK: pim.access %arg2 {{.*}} {pim.access_id = {{[0-9]+}} : i64, pim.invariant_grid_dims = array<i64>, pim.role = "output", pim.tile_hoistable = true}
+  // CHECK: pim.access %arg2 {{.*}} {pim.access_id = {{[0-9]+}} : i64, pim.invariant_grid_dims = array<i64>, pim.role = "output"}
   %dY = pim.access %Y offset %moff sizes [64] strides [%c1] : memref<*xf32> -> !pim.access
   pim.store %r, %dY : tensor<64xf32>, !pim.access
   return
@@ -203,9 +203,9 @@ func.func @gemv(%A: memref<*xf32>, %X: memref<*xf32>, %Y: memref<*xf32>,
 // CHECK-LABEL: func.func @gather_index_dep
 // CHECK-SAME:  pim.grid_dims = ["x", "y"]
 // index를 만드는 access 자체는 y에만 의존 → x에 불변.
-// CHECK:      pim.access %arg1 {{.*}} {pim.access_id = {{[0-9]+}} : i64, pim.invariant_grid_dims = array<i64: 0>, pim.role = "input", pim.tile_hoistable = true}
+// CHECK:      pim.access %arg1 {{.*}} {pim.access_id = {{[0-9]+}} : i64, pim.invariant_grid_dims = array<i64: 0>, pim.role = "input"}
 // gather access는 offset(x) + index(y) 둘 다 의존 → 불변 없음.
-// CHECK:      pim.access %arg0 {{.*}} {pim.access_id = {{[0-9]+}} : i64, pim.invariant_grid_dims = array<i64>, pim.role = "input", pim.tile_hoistable = true}
+// CHECK:      pim.access %arg0 {{.*}} {pim.access_id = {{[0-9]+}} : i64, pim.invariant_grid_dims = array<i64>, pim.role = "input"}
 func.func @gather_index_dep(%A: memref<*xf32>, %I: memref<*xi32>,
                             %np0: i32, %np1: i32, %np2: i32,
                             %pid0: i32, %pid1: i32, %pid2: i32) {
@@ -225,9 +225,9 @@ func.func @gather_index_dep(%A: memref<*xf32>, %I: memref<*xi32>,
 // CHECK-LABEL: func.func @valid_pad_dep
 // CHECK-SAME:  pim.grid_dims = ["x", "y"]
 // valid가 y에 의존 → 불변 없음.
-// CHECK:      pim.access %arg0 {{.*}} valid[%{{.*}}] {pim.access_id = {{[0-9]+}} : i64, pim.invariant_grid_dims = array<i64>, pim.role = "input", pim.tile_hoistable = true}
+// CHECK:      pim.access %arg0 {{.*}} valid[%{{.*}}] {pim.access_id = {{[0-9]+}} : i64, pim.invariant_grid_dims = array<i64>, pim.role = "input"}
 // pad가 y에 의존 → 불변 없음.
-// CHECK:      pim.access %arg1 {{.*}} pad %{{.*}} {pim.access_id = {{[0-9]+}} : i64, pim.invariant_grid_dims = array<i64>, pim.role = "input", pim.tile_hoistable = true}
+// CHECK:      pim.access %arg1 {{.*}} pad %{{.*}} {pim.access_id = {{[0-9]+}} : i64, pim.invariant_grid_dims = array<i64>, pim.role = "input"}
 func.func @valid_pad_dep(%A: memref<*xf32>, %B: memref<*xf32>,
                          %np0: i32, %np1: i32, %np2: i32,
                          %pid0: i32, %pid1: i32, %pid2: i32) {

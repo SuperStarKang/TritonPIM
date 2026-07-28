@@ -76,12 +76,11 @@ PIM_COMMON_PASSES = [
     "--pim-normalize-accumulator",        # matmul(outs=0)+add를 matmul(outs=누산기)로. tile 하나와 tile만큼의 덧셈이 사라지고, 상주량이 실제와 맞게 된다
     # --- 분석 ---
     "--pim-analyze-reuse",                # grid 축↔access 의존 분석(execution_model/grid_dims/role/invariant). 전송량 식이 invariant를 입력으로 쓴다
-    "--pim-analyze-transfer",             # access별 tile 바이트와 전송 횟수, 상주량, 연산량. hoisting이 끝난 뒤라야 전송 횟수가 실제와 맞는다
+    "--pim-analyze-transfer",             # access별 tile 바이트와 유닛당 상주량. hoisting이 끝난 뒤라야 어느 tile이 어느 블록에 있는지 확정된다
     # --- 분할 ---
     # 반복 공간을 유닛 수만큼 나눠 유닛 형태를 만든다. pim.split_axes를 입력으로 쓰므로 분석 뒤다.
     # splits는 그 목록 순서(grid 축 중첩 순서 다음 reduction 축)라 split_m/n/k가 그대로 맞는다.
-    # 주의: 앞선 pim.transfer_count는 쪼개기 전 instance 기준이라, 유닛당 값을 보려면
-    # pim.units의 counts로 나눠야 한다.
+    # 앞선 pim.co_resident로 유닛 용량을, splits의 곱으로 유닛 개수를 여기서 확인한다.
     "--pim-partition=splits={splits} num-units={num_units} local-memory-bytes={local_memory_bytes}",
     "-cse",                               # 분할이 access마다 주소식을 따로 복제하므로 여기서 합친다
     "-canonicalize",                      # 중복 상수와 접히는 산술 정리
