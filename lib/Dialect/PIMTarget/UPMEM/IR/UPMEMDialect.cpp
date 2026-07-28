@@ -149,6 +149,8 @@ LogicalResult StageOp::verify() {
   // pad_to는 결과 버퍼의 shape이라 같은 rank여야 한다.
   if (getPadTo().size() != getOrigin().size())
     return emitOpError("pad_to must have the same rank as origin");
+  if (getTile().size() != getOrigin().size())
+    return emitOpError("tile must have the same rank as origin");
   auto result = cast<MemRefType>(getResult().getType());
   if (result.getRank() != static_cast<int64_t>(getPadTo().size()))
     return emitOpError("result rank must equal pad_to rank");
@@ -162,6 +164,8 @@ LogicalResult UnstageOp::verify() {
   // capacity는 버퍼의 shape이라 같은 rank여야 한다.
   if (getCapacity().size() != getOrigin().size())
     return emitOpError("capacity must have the same rank as origin");
+  if (getTile().size() != getOrigin().size())
+    return emitOpError("tile must have the same rank as origin");
   return success();
 }
 

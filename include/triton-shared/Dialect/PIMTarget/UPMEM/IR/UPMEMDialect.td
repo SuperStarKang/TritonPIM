@@ -141,18 +141,23 @@ def UPMEM_ForeachUnitOp : UPMEM_Op<"foreach_unit", [NoTerminator]> {
 //   origin/sizes/strides = 원본 안의 영역 (pim.unit_data에서 그대로 온다)
 //   pad_to               = 결과 버퍼 shape. sizes보다 크면 남는 자리를 0으로 채운다.
 //                          덜 맡는 마지막 유닛이 여기서 균일 크기로 맞춰진다.
+//   tile                 = 유닛 버퍼를 타일 단위로 쓴다. 타일 하나가 연속이 되므로
+//                          device가 타일을 DMA 한 번으로 옮긴다. 행 단위로 두면 타일의
+//                          행 수만큼 DMA가 필요하고, 한 행이 몇십 바이트라 준비 비용이
+//                          옮기는 양보다 커진다.
 //   dedup_over           = 이 축만 다른 유닛은 같은 결과를 받는다. 그 축을 뺀 조합
 //                          개수만큼만 실제로 모으면 된다(pim.unit_data replicated_over).
 def UPMEM_StageOp : UPMEM_Op<"stage", [AttrSizedOperandSegments]> {
-  let summary = "Gather a strided region of a host buffer into a padded contiguous buffer";
+  let summary = "Gather a strided region of a host buffer into a padded tile-major buffer";
   let arguments = (ins AnyRankedOrUnrankedMemRef:$src,
                        Variadic<Index>:$origin, Variadic<Index>:$sizes,
                        Variadic<Index>:$strides, Variadic<Index>:$pad_to,
+                       DenseI64ArrayAttr:$tile,
                        OptionalAttr<StrArrayAttr>:$dedup_over);
   let results = (outs AnyMemRef:$result);
   let assemblyFormat = [{
     $src `origin` `[` $origin `]` `sizes` `[` $sizes `]`
-    `strides` `[` $strides `]` `pad_to` `[` $pad_to `]`
+    `strides` `[` $strides `]` `pad_to` `[` $pad_to `]` `tile` $tile
     attr-dict `:` type($src) `->` type($result)
   }];
   let hasVerifier = 1;
@@ -229,14 +234,17 @@ def UPMEM_ForeachGroupOp : UPMEM_Op<"foreach_group", [NoTerminator]> {
 //   capacity = 버퍼 자체의 축별 크기(upmem.gather의 것과 같다). 축을 하나 건너뛰는
 //              간격이 여기서 나온다. 유닛이 배정량보다 적게 맡으면 sizes와 달라지므로
 //              sizes로 간격을 재면 엉뚱한 자리를 읽는다.
+//   tile     = upmem.stage와 같은 뜻. 유닛 버퍼가 타일 단위로 쓰여 있으므로 되돌릴 때도
+//              같은 순서로 읽어야 한다.
 def UPMEM_UnstageOp : UPMEM_Op<"unstage", [AttrSizedOperandSegments]> {
-  let summary = "Scatter a contiguous buffer back into a strided region";
+  let summary = "Scatter a tile-major buffer back into a strided region";
   let arguments = (ins AnyMemRef:$buffer, AnyRankedOrUnrankedMemRef:$dst,
                        Variadic<Index>:$origin, Variadic<Index>:$sizes,
-                       Variadic<Index>:$strides, Variadic<Index>:$capacity);
+                       Variadic<Index>:$strides, Variadic<Index>:$capacity,
+                       DenseI64ArrayAttr:$tile);
   let assemblyFormat = [{
     $buffer `into` $dst `origin` `[` $origin `]` `sizes` `[` $sizes `]`
-    `strides` `[` $strides `]` `capacity` `[` $capacity `]`
+    `strides` `[` $strides `]` `capacity` `[` $capacity `]` `tile` $tile
     attr-dict `:` type($buffer) `,` type($dst)
   }];
   let hasVerifier = 1;

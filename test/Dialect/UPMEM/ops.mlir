@@ -40,10 +40,10 @@ func.func @matmul_kernel_i8_host(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<
     // A: 행 [pm*256, +256), 열 [kj*512, +512). y축 유닛끼리 같은 것을 받는다.
     %ar = arith.muli %pm, %c256 : index
     %ac = arith.muli %kj, %c512 : index
-    // CHECK: %[[SA:.*]] = upmem.stage %{{.*}} origin[%{{.*}}, %{{.*}}] sizes[%{{.*}}, %{{.*}}] strides[%{{.*}}, %{{.*}}] pad_to[%{{.*}}, %{{.*}}]
+    // CHECK: %[[SA:.*]] = upmem.stage %{{.*}} origin[%{{.*}}, %{{.*}}] sizes[%{{.*}}, %{{.*}}] strides[%{{.*}}, %{{.*}}] pad_to[%{{.*}}, %{{.*}}] tile array<i64: 64, 64>
     // CHECK-SAME: dedup_over = ["y"]
     %sa = upmem.stage %A origin[%ar, %ac] sizes[%c256, %c512] strides[%K, %c1]
-          pad_to[%c256, %c512] {dedup_over = ["y"]}
+          pad_to[%c256, %c512] tile array<i64: 64, 64> {dedup_over = ["y"]}
           : memref<*xi8> -> memref<256x512xi8>
     // CHECK: upmem.to_mram %{{.*}}, %[[SA]], @A_mram
     upmem.to_mram %dpu, %sa, @A_mram : memref<256x512xi8>
@@ -52,7 +52,7 @@ func.func @matmul_kernel_i8_host(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<
     %br = arith.muli %kj, %c512 : index
     %bc = arith.muli %pn, %c256 : index
     %sb = upmem.stage %B origin[%br, %bc] sizes[%c512, %c256] strides[%N, %c1]
-          pad_to[%c512, %c256] {dedup_over = ["x"]}
+          pad_to[%c512, %c256] tile array<i64: 64, 64> {dedup_over = ["x"]}
           : memref<*xi8> -> memref<512x256xi8>
     upmem.to_mram %dpu, %sb, @B_mram : memref<512x256xi8>
   }
@@ -74,9 +74,9 @@ func.func @matmul_kernel_i8_host(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<
   ^bb0(%part: memref<256x256xi32>, %pm: index, %pn: index):
     %cr = arith.muli %pm, %c256 : index
     %cc = arith.muli %pn, %c256 : index
-    // CHECK: upmem.unstage %{{.*}} into %{{.*}} origin[%{{.*}}, %{{.*}}] sizes[%{{.*}}, %{{.*}}] strides[%{{.*}}, %{{.*}}] capacity[%{{.*}}, %{{.*}}]
+    // CHECK: upmem.unstage %{{.*}} into %{{.*}} origin[%{{.*}}, %{{.*}}] sizes[%{{.*}}, %{{.*}}] strides[%{{.*}}, %{{.*}}] capacity[%{{.*}}, %{{.*}}] tile array<i64: 64, 64>
     upmem.unstage %part into %C origin[%cr, %cc] sizes[%c256, %c256] strides[%N, %c1]
-        capacity[%c256, %c256]
+        capacity[%c256, %c256] tile array<i64: 64, 64>
         : memref<256x256xi32>, memref<*xi32>
   }
   return

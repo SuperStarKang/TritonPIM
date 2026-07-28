@@ -21,7 +21,7 @@
 
 // ── device ──────────────────────────────────────────────────────────────────
 // 축 loop 상한이 host가 넣어 준 값에서 오고, 유닛 시작이 0이 되어 주소가 유닛 로컬이 된다.
-// tile은 WRAM 버퍼가 되고, 전송은 행마다 DMA 하나가 된다.
+// tile은 WRAM 버퍼가 되고, 전송은 타일마다 DMA 하나가 된다.
 // CHECK-LABEL: upmem.device_func @matmul_device
 // CHECK:         memref.alloc() : memref<8x32xi8, #upmem.space<wram>>
 // CHECK:         memref.alloc() : memref<32x32xi8, #upmem.space<wram>>
@@ -29,7 +29,7 @@
 // CHECK:         %[[TX:.*]] = upmem.get_host_var @matmul_tiles_x : index
 // CHECK:         scf.for %{{.*}} = %{{.*}} to %[[TX]]
 // CHECK:           arith.addi %c0{{.*}} {pim.unit_origin}
-// 행 loop 안에서 MRAM 위치를 구하고 그 행만 옮긴다.
+// MRAM 안의 타일 시작을 구해 그 타일을 옮긴다(2048 byte를 넘으면 행 묶음으로 쪼갠다).
 // CHECK:           scf.for
 // CHECK:             %[[SV:.*]] = memref.subview
 // CHECK:             upmem.mram_read @matmul_mram_0[%{{.*}}], %[[SV]]
@@ -49,7 +49,7 @@
 // CHECK:         upmem.foreach_unit %[[SET]] : !upmem.set axes ["x", "y", "k"] counts [2, 4, 8]
 // A는 y축 유닛끼리 같은 것을 받는다. pad_to는 sizes가 아니라 capacity다 —
 // 유닛마다 같은 바이트 수를 보내야 하므로.
-// CHECK:           %[[SA:.*]] = upmem.stage %{{.*}} origin[%{{.*}}, %{{.*}}] sizes[%{{.*}}, %{{.*}}] strides[%{{.*}}, %{{.*}}] pad_to[%{{.*}}, %{{.*}}]
+// CHECK:           %[[SA:.*]] = upmem.stage %{{.*}} origin[%{{.*}}, %{{.*}}] sizes[%{{.*}}, %{{.*}}] strides[%{{.*}}, %{{.*}}] pad_to[%{{.*}}, %{{.*}}] tile array<i64: 8, 32>
 // CHECK-SAME:        dedup_over = ["y"]
 // CHECK:           upmem.to_mram %{{.*}}, %[[SA]], @matmul_mram_0
 // CHECK:           upmem.stage
@@ -65,7 +65,7 @@
 // CHECK-SAME:      reduce_axis = "k"
 // CHECK-SAME:      reduce_count = 8
 // 되돌릴 때 읽는 범위는 실제 크기(sizes)지만 축 사이 간격은 배정량(capacity)이다.
-// CHECK:           upmem.unstage %{{.*}} into %{{.*}} origin[%{{.*}}, %{{.*}}] sizes[%{{.*}}, %{{.*}}] strides[%{{.*}}, %{{.*}}] capacity[%{{.*}}, %{{.*}}]
+// CHECK:           upmem.unstage %{{.*}} into %{{.*}} origin[%{{.*}}, %{{.*}}] sizes[%{{.*}}, %{{.*}}] strides[%{{.*}}, %{{.*}}] capacity[%{{.*}}, %{{.*}}] tile array<i64: 8, 32>
 // pim 쪽은 남지 않는다.
 // CHECK-NOT:     pim.units
 // CHECK-NOT:     pim.unit_data

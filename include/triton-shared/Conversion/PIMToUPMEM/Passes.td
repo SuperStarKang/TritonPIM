@@ -44,13 +44,23 @@ def ConvertPIMToUPMEM : Pass<"convert-pim-to-upmem", "mlir::ModuleOp"> {
       MRAM 안의 위치는 access의 축별 시작에서 나온다:
         행 r = ((origin[0] + r) × pitch[1] + origin[1]) × pitch[2] + ...
       pitch는 unit_data의 capacity에서 오며 host가 `upmem.to_host_var`로 넣어 준다.
-    지금은 tasklet 하나를 전제한다(local_lanes = 1). 여러 tasklet으로 나누려면 행 loop와
-    계산을 함께 쪼개야 하므로 별도 단계다.
+    - tasklet이 여럿이면(local-lanes > 1) 유닛이 맡은 타일을 tasklet에 나눈다.
+      병렬 grid loop들을 하나로 합친 뒤 tasklet 번호부터 tasklet 수만큼 건너뛰며 돈다.
+      합치는 이유는 loop 하나만 나누면 그 loop의 반복이 tasklet 수보다 적을 때 나머지
+      tasklet이 놀기 때문이다. 타일마다 쓰는 자리가 겹치지 않으므로 barrier가 없다.
+      대신 tile 버퍼는 tasklet마다 따로 잡는다 — 앞에 tasklet 축을 하나 더 두고
+      자기 번호로 잘라 쓴다.
   }];
   let constructor = "mlir::triton::createConvertPIMToUPMEMPass()";
   let options = [
     Option<"unitMemoryBytes", "unit-memory-bytes", "int64_t", "67108864",
            "유닛 하나의 큰 메모리 바이트. MRAM 버퍼 크기를 여기서 나눈다.">,
+    Option<"localLanes", "local-lanes", "int64_t", "1",
+           "유닛 하나가 쓰는 tasklet 수. tile 버퍼를 이만큼 복제한다.">,
+    Option<"localMemoryBytes", "local-memory-bytes", "int64_t", "49152",
+           "유닛 하나의 빠른 메모리 바이트. tile 버퍼 합계가 넘으면 실패한다.">,
+    Option<"hostThreads", "host-threads", "int64_t", "8",
+           "host가 영역을 모으고 되돌릴 때 쓰는 스레드 수. 1이면 순차.">,
   ];
   let dependentDialects = ["mlir::upmem::UPMEMDialect", "mlir::pim::PIMDialect",
                            "mlir::arith::ArithDialect", "mlir::scf::SCFDialect",

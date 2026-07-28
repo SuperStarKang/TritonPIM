@@ -91,9 +91,11 @@ struct Axis {
 // MRAM 버퍼 하나. pim.access_id로 찾는다.
 struct Buffer {
   FlatSymbolRefAttr mram;
-  // capacity[1..rank-1]. 유닛 MRAM 안에서 축 하나를 건너뛰는 간격이다. host가 넣어 준다.
+  // capacity[1..rank-1]. 유닛이 배정받은 축별 크기다. host가 넣어 준다.
   SmallVector<FlatSymbolRefAttr> pitch;
   Type elem;
+  // 이 버퍼를 읽고 쓰는 타일의 shape. 유닛 버퍼가 이 단위로 쓰여 있다.
+  SmallVector<int64_t> tile;
 };
 
 struct ConvertPIMToUPMEMPass
@@ -145,6 +147,14 @@ struct ConvertPIMToUPMEMPass
     int64_t bufferBytes = unitMemoryBytes / std::max<int64_t>(
                               1, inputs.size() + outputs.size());
 
+    // 타일 shape. 유닛 버퍼를 이 단위로 쓰면 타일 하나가 MRAM 에서 연속이 되어 DMA 가
+    // 한 번으로 끝난다. pim.access 가 정적으로 들고 있다.
+    llvm::DenseMap<int64_t, SmallVector<int64_t>> tileOf;
+    nest.walk([&](pim::AccessOp a) {
+      auto id = a->getAttrOfType<IntegerAttr>("pim.access_id");
+      tileOf[id.getInt()] = SmallVector<int64_t>(a.getSizes());
+    });
+
     llvm::DenseMap<Operation *, FlatSymbolRefAttr> mramOf;
     llvm::DenseMap<int64_t, Buffer> byAccess;
     SmallVector<pim::UnitDataOp> all(inputs);
@@ -157,7 +167,12 @@ struct ConvertPIMToUPMEMPass
                                TypeAttr::get(mramType(ud, bufferBytes)));
       Buffer info{FlatSymbolRefAttr::get(name),
                   {},
-                  cast<BaseMemRefType>(ud.getBase().getType()).getElementType()};
+                  cast<BaseMemRefType>(ud.getBase().getType()).getElementType(),
+                  tileOf[id]};
+      if (info.tile.size() != ud.getCapacity().size()) {
+        ud->emitError("no pim.access with this id inside pim.units");
+        return signalPassFailure();
+      }
       // 축 하나를 건너뛰는 간격. device가 MRAM 안의 위치를 계산하는 데 쓴다.
       for (unsigned d = 1, e = ud.getCapacity().size(); d < e; d++) {
         auto pn = StringAttr::get(
@@ -198,6 +213,8 @@ struct ConvertPIMToUPMEMPass
     }
 
     // ── host: func 몸체를 UPMEM 호출로 바꾼다 ──────────────────────────────
+    // 영역을 모으고 되돌리는 일을 몇 갈래로 나눌지. codegen이 이 값을 읽는다.
+    func->setAttr("upmem.host_threads", mb.getI64IntegerAttr(hostThreads));
     OpBuilder hb(units);
     Value set = hb.create<upmem::AllocOp>(loc, upmem::SetType::get(ctx),
                                           hb.getI64IntegerAttr(numUnits));
@@ -223,7 +240,9 @@ struct ConvertPIMToUPMEMPass
       OpBuilder b(ud);
       Value staged = b.create<upmem::StageOp>(
           loc, stagedType(ud), ud.getBase(), ud.getOrigin(), ud.getSizes(),
-          ud.getStrides(), ud.getCapacity(), ud.getReplicatedOverAttr());
+          ud.getStrides(), ud.getCapacity(),
+          b.getDenseI64ArrayAttr(byAccess[ud.getAccess()].tile),
+          ud.getReplicatedOverAttr());
       b.create<upmem::ToMRAMOp>(loc, dpu, staged, mramOf[ud]);
     }
     // 유닛마다 다른 반복 횟수를 그 DPU에 보낸다.
@@ -244,7 +263,8 @@ struct ConvertPIMToUPMEMPass
       // buildOutput이 region을 만들며 삽입 지점을 옮기므로 매번 되돌린다.
       OpBuilder::InsertionGuard guard(hb);
       if (failed(buildOutput(hb, ud, set, numUnits, units, mramOf[ud],
-                             foreach.getBody().front(), foreach)))
+                             foreach.getBody().front(), foreach,
+                             byAccess[ud.getAccess()].tile)))
         return signalPassFailure();
     }
     hb.create<upmem::FreeOp>(loc, set);
@@ -339,10 +359,38 @@ struct ConvertPIMToUPMEMPass
         v = top.create<upmem::GetHostVarOp>(loc, top.getIndexType(), sym);
       return v;
     };
+    // tasklet 이 여럿이면 tile 버퍼를 그 수만큼 복제하고 자기 번호로 잘라 쓴다.
+    // tasklet 마다 다른 tile 을 맡으므로 버퍼를 공유하면 서로 덮어쓴다.
+    Value taskletId;
+    if (localLanes > 1)
+      taskletId = top.create<upmem::TaskletIdOp>(loc, top.getIndexType());
+    int64_t wramBytes = 0;
     auto allocFor = [&](RankedTensorType t) -> Value {
-      return top.create<memref::AllocOp>(
-          loc, MemRefType::get(t.getShape(), t.getElementType(),
+      SmallVector<int64_t> shape(t.getShape());
+      if (localLanes > 1)
+        shape.insert(shape.begin(), localLanes);
+      int64_t n = 1;
+      for (int64_t s : shape)
+        n *= s;
+      wramBytes +=
+          n * std::max<int64_t>(1, t.getElementType().getIntOrFloatBitWidth() / 8);
+      Value all = top.create<memref::AllocOp>(
+          loc, MemRefType::get(shape, t.getElementType(),
                                MemRefLayoutAttrInterface(), wram));
+      if (localLanes == 1)
+        return all;
+      SmallVector<OpFoldResult> offsets(shape.size(), top.getIndexAttr(0));
+      offsets[0] = taskletId;
+      SmallVector<OpFoldResult> sizes, strides(shape.size(),
+                                               top.getIndexAttr(1));
+      for (int64_t s : shape)
+        sizes.push_back(top.getIndexAttr(s));
+      sizes[0] = top.getIndexAttr(1);
+      MemRefType mine = memref::SubViewOp::inferRankReducedResultType(
+          t.getShape(), cast<MemRefType>(all.getType()), offsets, sizes,
+          strides);
+      return top.create<memref::SubViewOp>(loc, mine, all, offsets, sizes,
+                                           strides);
     };
 
     // tensor 값 → WRAM 버퍼 대응. 정의가 사용보다 앞이므로 pre-order 로 한 번에 만든다.
@@ -377,6 +425,17 @@ struct ConvertPIMToUPMEMPass
       }
       buf[op->getResult(0)] = target;
     });
+
+    // tile 버퍼는 tasklet 마다 하나씩이라 tasklet 수만큼 곱해진다. 여기서 막지 않으면
+    // dpu-clang 이 링크 단계에서 wram 구역이 넘쳤다고 수십 줄을 쏟아 낸다. IR 을 고치기
+    // 전에 본다 — 반쯤 바뀐 IR 이 오류에 딸려 나오면 읽기 어렵다.
+    // pass option 은 그대로 스트림에 넣으면 아무것도 안 찍히므로 값을 꺼내 쓴다.
+    int64_t lanes = localLanes, budget = localMemoryBytes;
+    if (wramBytes > budget)
+      return dev->emitError("tile buffers need ")
+             << wramBytes << " byte of unit fast memory (" << lanes
+             << " tasklet(s)) but the budget is " << budget
+             << " byte; lower local_lanes or the BLOCK sizes";
 
     // linalg 를 memref 형태로 다시 만든다(결과가 없어지므로 op 을 새로 만들어야 한다).
     // 옛 op 은 아직 지우지 않는다 — 그 결과를 scf.yield 가 아직 쓰고 있다.
@@ -460,6 +519,9 @@ struct ConvertPIMToUPMEMPass
       }
     }
 
+    if (localLanes > 1)
+      distributeTasklets(dev);
+
     // 옮겨 온 loop nest 는 loop 경계와 fill 값 같은 상수를 host func 안의 것으로
     // 가리킨다. device_func 은 그 func 의 형제라 그 값들이 보이지 않으므로 다시 만든다.
     if (failed(materializeExternals(dev)))
@@ -472,6 +534,53 @@ struct ConvertPIMToUPMEMPass
     if (remain.wasInterrupted())
       return dev->emitError("device body still contains pim ops");
     return success();
+  }
+
+  // 유닛이 맡은 타일을 tasklet 에 나눈다. 병렬 grid loop 들을 하나로 합친 뒤 tasklet
+  // 번호부터 tasklet 수만큼 건너뛰며 돈다. 타일마다 쓰는 자리가 겹치지 않으므로 barrier 가
+  // 없다. loop 하나만 나누지 않는 이유는 그 loop 의 반복이 tasklet 수보다 적으면 나머지
+  // tasklet 이 놀기 때문이다 — 유닛이 맡은 타일 수는 합쳐야 제대로 나온다.
+  void distributeTasklets(upmem::DeviceFuncOp dev) {
+    SmallVector<scf::ForOp> grid;
+    dev.walk([&](scf::ForOp l) {
+      if (l->hasAttr("pim.grid_dim"))
+        grid.push_back(l);
+    });
+    if (grid.empty())
+      return;
+    // walk 는 안쪽을 먼저 담는다. 바깥부터 안쪽 순서로 되돌린다.
+    std::reverse(grid.begin(), grid.end());
+
+    OpBuilder b(grid.front());
+    Location loc = grid.front().getLoc();
+    Value total = grid.front().getUpperBound();
+    for (unsigned i = 1, e = grid.size(); i < e; i++)
+      total = b.create<arith::MulIOp>(loc, total, grid[i].getUpperBound());
+    Value tid = b.create<upmem::TaskletIdOp>(loc, b.getIndexType());
+    Value lanes = b.create<upmem::NumTaskletsOp>(loc, b.getIndexType());
+    auto flat = b.create<scf::ForOp>(loc, tid, total, lanes);
+
+    // 선형 번호를 축별 좌표로 푼다. 안쪽 축부터 나머지와 몫으로 벗겨 낸다.
+    OpBuilder fb(flat.getBody(), flat.getBody()->begin());
+    Value rest = flat.getInductionVar();
+    for (int i = grid.size() - 1; i >= 0; i--) {
+      Value ub = grid[i].getUpperBound();
+      grid[i].getInductionVar().replaceAllUsesWith(
+          fb.create<arith::RemSIOp>(loc, rest, ub));
+      rest = fb.create<arith::DivSIOp>(loc, rest, ub);
+    }
+
+    // 몸체를 바깥부터 이어 붙인다. 안쪽 loop 는 그대로 딸려 오고, 그 몸체가 다음 차례에
+    // 그 뒤로 붙은 다음 빈 loop 만 사라진다.
+    Block *to = flat.getBody();
+    for (scf::ForOp l : grid) {
+      Block *from = l.getBody();
+      to->getOperations().splice(Block::iterator(to->getTerminator()),
+                                 from->getOperations(), from->begin(),
+                                 Block::iterator(from->getTerminator()));
+    }
+    for (scf::ForOp l : grid)
+      l.erase();
   }
 
   LogicalResult materializeExternals(upmem::DeviceFuncOp dev) {
@@ -492,8 +601,11 @@ struct ConvertPIMToUPMEMPass
     return failure(res.wasInterrupted());
   }
 
-  // 타일 하나를 행마다 옮긴다. MRAM 안의 위치는 access 의 축별 시작에서 나온다.
-  //   행 r 의 위치 = ((origin[0] + r) * pitch[1] + origin[1]) * pitch[2] + ...
+  // 타일 하나를 옮긴다. upmem.stage 가 유닛 버퍼를 타일 단위로 썼으므로 타일 하나가
+  // MRAM 에서 연속이고, DMA 한 번이면 된다. 타일이 2048 byte 를 넘을 때만 행 묶음으로
+  // 쪼갠다. MRAM 안의 타일 시작은 축별 타일 번호에서 나온다:
+  //   번호[d] = origin[d] / tile[d],  축별 타일 수[d] = capacity[d] / tile[d]
+  //   시작 = ((번호[0] * 수[1] + 번호[1]) * 수[2] + ...) * 타일 원소 수
   template <typename PitchFn>
   void buildDMA(Operation *xfer, Value accessValue, Value wbuf,
                 const llvm::DenseMap<int64_t, Buffer> &byAccess, PitchFn pitchOf,
@@ -503,41 +615,64 @@ struct ConvertPIMToUPMEMPass
     const Buffer &info = byAccess.at(id.getInt());
     auto wtype = cast<MemRefType>(wbuf.getType());
     ArrayRef<int64_t> shape = wtype.getShape();
+    unsigned rank = wtype.getRank();
+
+    int64_t elemBytes = std::max<int64_t>(
+        1, wtype.getElementType().getIntOrFloatBitWidth() / 8);
+    int64_t rowElems = 1;
+    for (unsigned d = 1; d < rank; d++)
+      rowElems *= shape[d];
+    // 한 번에 옮길 행 수. 2048 byte 안에 들어가면서 행 수를 나누어떨어지게 하는 가장 큰 값.
+    int64_t perDMA = shape[0];
+    while (perDMA > 1 &&
+           (perDMA * rowElems * elemBytes > 2048 || shape[0] % perDMA))
+      perDMA--;
+    int64_t chunks = shape[0] / perDMA;
 
     OpBuilder b(xfer);
     Location loc = xfer->getLoc();
     Value zero = b.create<arith::ConstantIndexOp>(loc, 0);
     Value one = b.create<arith::ConstantIndexOp>(loc, 1);
-    Value rows = b.create<arith::ConstantIndexOp>(loc, shape[0]);
+    Value nchunks = b.create<arith::ConstantIndexOp>(loc, chunks);
 
-    auto rowLoop = b.create<scf::ForOp>(loc, zero, rows, one);
-    OpBuilder rb(rowLoop.getBody(), rowLoop.getBody()->begin());
-    Value r = rowLoop.getInductionVar();
+    auto chunkLoop = b.create<scf::ForOp>(loc, zero, nchunks, one);
+    OpBuilder rb(chunkLoop.getBody(), chunkLoop.getBody()->begin());
+    Value c = chunkLoop.getInductionVar();
 
-    Value off = rb.create<arith::AddIOp>(loc, access.getOrigin()[0], r);
-    for (unsigned d = 1, e = access.getOrigin().size(); d < e; d++)
+    auto constant = [&](int64_t v) {
+      return rb.create<arith::ConstantIndexOp>(loc, v).getResult();
+    };
+    Value off = rb.create<arith::DivSIOp>(loc, access.getOrigin()[0],
+                                          constant(shape[0]));
+    for (unsigned d = 1; d < rank; d++) {
+      Value count = rb.create<arith::DivSIOp>(loc, pitchOf(info.pitch[d - 1]),
+                                              constant(shape[d]));
       off = rb.create<arith::AddIOp>(
-          loc, rb.create<arith::MulIOp>(loc, off, pitchOf(info.pitch[d - 1])),
-          access.getOrigin()[d]);
+          loc, rb.create<arith::MulIOp>(loc, off, count),
+          rb.create<arith::DivSIOp>(loc, access.getOrigin()[d],
+                                    constant(shape[d])));
+    }
+    off = rb.create<arith::AddIOp>(
+        loc, rb.create<arith::MulIOp>(loc, off, constant(shape[0] * rowElems)),
+        rb.create<arith::MulIOp>(loc, c, constant(perDMA * rowElems)));
 
-    // 행 하나는 WRAM 에서도 MRAM 에서도 연속이라 DMA 한 번이다. 타입은 실제 영역
-    // (첫 축 크기 1, 시작이 r)에서 나와야 한다 — 타일 전체로 재면 rank 를 줄일 수 없다.
-    SmallVector<OpFoldResult> offsets(wtype.getRank(), rb.getIndexAttr(0));
-    offsets[0] = r;
-    SmallVector<OpFoldResult> sizes, strides;
+    // WRAM 쪽도 이어진 행 묶음이라 rank 를 줄이지 않는다.
+    SmallVector<OpFoldResult> offsets(rank, rb.getIndexAttr(0));
+    offsets[0] = rb.create<arith::MulIOp>(loc, c, constant(perDMA)).getResult();
+    SmallVector<OpFoldResult> sizes, strides(rank, rb.getIndexAttr(1));
     for (int64_t s : shape)
       sizes.push_back(rb.getIndexAttr(s));
-    sizes[0] = rb.getIndexAttr(1);
-    strides.assign(wtype.getRank(), rb.getIndexAttr(1));
-    SmallVector<int64_t> rowShape(shape.begin() + 1, shape.end());
-    MemRefType rowType = memref::SubViewOp::inferRankReducedResultType(
-        rowShape, wtype, offsets, sizes, strides);
-    Value row = rb.create<memref::SubViewOp>(loc, rowType, wbuf, offsets, sizes,
-                                             strides);
+    sizes[0] = rb.getIndexAttr(perDMA);
+    SmallVector<int64_t> partShape(shape);
+    partShape[0] = perDMA;
+    MemRefType partType = memref::SubViewOp::inferRankReducedResultType(
+        partShape, wtype, offsets, sizes, strides);
+    Value part = rb.create<memref::SubViewOp>(loc, partType, wbuf, offsets,
+                                              sizes, strides);
     if (isRead)
-      rb.create<upmem::MRAMReadOp>(loc, info.mram, off, row);
+      rb.create<upmem::MRAMReadOp>(loc, info.mram, off, part);
     else
-      rb.create<upmem::MRAMWriteOp>(loc, row, info.mram, off);
+      rb.create<upmem::MRAMWriteOp>(loc, part, info.mram, off);
   }
 
   // tensor iter_arg 를 없앤 loop 로 바꾼다. 버퍼가 loop 를 관통하므로 값을 나르지 않는다.
@@ -561,7 +696,7 @@ struct ConvertPIMToUPMEMPass
   LogicalResult buildOutput(OpBuilder &b, pim::UnitDataOp ud, Value set,
                             int64_t numUnits, pim::UnitsOp units,
                             FlatSymbolRefAttr mram, Block &unitBlock,
-                            Operation *foreach) {
+                            Operation *foreach, ArrayRef<int64_t> tile) {
     MLIRContext *ctx = b.getContext();
     Location loc = ud.getLoc();
     unsigned rank = ud.getCapacity().size();
@@ -640,7 +775,8 @@ struct ConvertPIMToUPMEMPass
     // capacity는 gather가 회수한 버퍼의 shape 그대로다. 유닛 좌표와 무관해서 위에서
     // foreach 밖으로 옮겨 만들었으므로 여기서 그대로 쓸 수 있다.
     gbuilder.create<upmem::UnstageOp>(loc, gb->getArgument(0), ud.getBase(),
-                                      origin, sizes, strides, capacity);
+                                      origin, sizes, strides, capacity,
+                                      gbuilder.getDenseI64ArrayAttr(tile));
     return success();
   }
 };

@@ -38,7 +38,7 @@ func.func @kernel(%A: memref<*xi8>, %C: memref<*xi32>, %lda: index, %ldc: index)
     %r = arith.muli %pm, %c16 : index
     %c = arith.muli %kj, %c16 : index
     %sa = upmem.stage %A origin[%r, %c] sizes[%c16, %c16] strides[%lda, %c1]
-          pad_to[%c16, %c16] {dedup_over = ["k"]}
+          pad_to[%c16, %c16] tile array<i64: 8, 16> {dedup_over = ["k"]}
           : memref<*xi8> -> memref<?x?xi8>
     upmem.to_mram %dpu, %sa, @A_mram : memref<?x?xi8>
     upmem.to_host_var %dpu, %c8, @tiles_x : index
@@ -51,7 +51,7 @@ func.func @kernel(%A: memref<*xi8>, %C: memref<*xi32>, %lda: index, %ldc: index)
   ^bb0(%part: memref<?x?xi32>, %pm: index):
     %cr = arith.muli %pm, %c16 : index
     upmem.unstage %part into %C origin[%cr, %c0] sizes[%c16, %c16] strides[%ldc, %c1]
-        capacity[%c16, %c16]
+        capacity[%c16, %c16] tile array<i64: 8, 16>
         : memref<?x?xi32>, memref<*xi32>
   }
   return

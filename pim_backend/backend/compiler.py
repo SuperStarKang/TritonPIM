@@ -20,11 +20,13 @@ from dataclasses import dataclass
 from typing import Tuple, Dict
 from types import ModuleType
 from pathlib import Path
+import contextlib
 import hashlib
 import functools
 import os
 import re
 import json
+import sys
 import tempfile
 import subprocess
 
@@ -48,6 +50,52 @@ def _run_opt(mlir_text: str, passes: list) -> str:
         Path(src).write_text(mlir_text)
         subprocess.check_call([opt, src, *passes, "-o", dst])
         return Path(dst).read_text()
+
+
+# ── 경고 감추기 (지우기 쉽게 여기에 모아 둔다) ──────────────────────────────────
+# 지우려면: 아래 블록(_KNOWN_WARNING ~ _ttir_to_ttsharedir)을 통째로 지우고, add_stages의
+# ttsharedir 줄을 cpu_compiler._ttir_to_ttsharedir(src)로 되돌리고, import contextlib / sys를
+# 지운다. 컴파일 결과에는 영향이 없다 — stderr만 걸러 낸다.
+#
+# TritonToStructured의 prepass는 loop iter-arg인 정수 tensor마다 tts.get_structured_state를
+# 넣어 보고, 그것이 주소 계산에 안 쓰이면 canonicalize가 되돌린다(TritonToStructuredPass.cpp 주석).
+# 누산기 tensor가 정확히 그 경우라 정수 GEMM마다 이 경고가 뜬다. 되돌리기가 정상 동작이므로
+# 이 경고 하나만 감춘다 — 다른 진단이 하나라도 섞이면 통째로 내보낸다.
+_KNOWN_WARNING = "Rewriting GetStructuredStateOp failed."
+
+
+def _noise_only(text: str) -> bool:
+    for line in text.splitlines():
+        if ("error:" in line or "remark:" in line
+                or ("warning:" in line and _KNOWN_WARNING not in line)):
+            return False
+    return True
+
+
+@contextlib.contextmanager
+def _filtered_stderr():
+    # triton-shared-opt은 subprocess라 stderr가 터미널로 곧장 나간다. Python 층의
+    # redirect_stderr로는 못 잡으므로 파일 서술자를 바꾼다. finally라 실패해도 되돌아오고,
+    # 그때는 감출 수 없는 진단이 섞여 있으므로 그대로 보인다.
+    saved = os.dup(2)
+    buf = tempfile.TemporaryFile()
+    os.dup2(buf.fileno(), 2)
+    try:
+        yield
+    finally:
+        os.dup2(saved, 2)
+        os.close(saved)
+        buf.seek(0)
+        text = buf.read().decode("utf-8", "replace")
+        buf.close()
+        if text and not _noise_only(text):
+            sys.stderr.write(text)
+
+
+def _ttir_to_ttsharedir(ttir) -> str:
+    with _filtered_stderr():
+        return cpu_compiler._ttir_to_ttsharedir(ttir)
+# ── 경고 감추기 끝 ─────────────────────────────────────────────────────────────
 
 
 def _run_translate(mlir_text: str, which: str) -> str:
@@ -98,9 +146,13 @@ def _ttsharedir_to_pim_common(ttshared: str, options) -> str:
 
 
 def _pim_common_to_upmem(pim_common: str, options) -> str:
-    # MRAM 버퍼 크기를 유닛 메모리에서 나눠 정한다(Conversion/PIMToUPMEM 참고).
+    # MRAM 버퍼 크기를 유닛 메모리에서 나눠 정하고, tile 버퍼를 tasklet 수만큼 복제한다
+    # (Conversion/PIMToUPMEM 참고). local_lanes는 여기와 -DNR_TASKLETS 양쪽에 쓰인다.
     return _run_opt(pim_common,
-                    [f"--convert-pim-to-upmem=unit-memory-bytes={options.unit_memory_bytes}"])
+                    [f"--convert-pim-to-upmem=unit-memory-bytes={options.unit_memory_bytes} "
+                     f"local-lanes={options.local_lanes} "
+                     f"local-memory-bytes={options.local_memory_bytes} "
+                     f"host-threads={options.host_threads}"])
 
 
 def _upmem_to_artifact(upmem_ir: str, metadata) -> bytes:
@@ -173,7 +225,10 @@ class PIMOptions:
     device_id: int = 0
     # 기계 — 이름을 target 중립으로 둔다(UPMEM에서는 유닛=DPU, 빠른 메모리=WRAM).
     num_units: int = 2048        # 물리 유닛 개수. split의 곱이 이보다 크면 컴파일 시점에 실패.
-    local_memory_bytes: int = 64 * 1024        # 유닛당 빠른 메모리. co_resident 합계가 넘으면 실패.
+    # 유닛당 빠른 메모리. tile 버퍼 합계 × local_lanes가 넘으면 실패한다. UPMEM의 물리 WRAM은
+    # 64 KB지만 tasklet 스택과 런타임도 여기 살므로 커널이 써도 되는 몫은 그보다 작다.
+    local_memory_bytes: int = 48 * 1024
+    host_threads: int = 8        # host가 영역을 모으고 되돌릴 때 쓰는 스레드 수. 1이면 순차.
     # 유닛당 큰 메모리. target이 버퍼 크기를 여기서 나눈다. UPMEM의 물리 MRAM은 64 MB지만
     # DPU 런타임도 MRAM에 자리를 잡으므로 전부를 나눠 주면 링커가 넘친다. 커널이 써도 되는
     # 몫이라는 뜻이라 물리 크기보다 작게 둔다.
@@ -236,7 +291,7 @@ class PIMBackend(BaseBackend):
         # ttir/ttsharedir/pim_common은 target-neutral이라 공유하고, 뒤 두 stage만 target로 분기한다.
         # 마지막 stage 이름은 binary_ext('pimobj')와 일치해야 CompiledKernel이 kernel을 찾는다.
         stages["ttir"] = lambda src, metadata: cpu_compiler.CPUBackend.make_ttir(src, metadata, options)
-        stages["ttsharedir"] = lambda src, metadata: cpu_compiler._ttir_to_ttsharedir(src)
+        stages["ttsharedir"] = lambda src, metadata: _ttir_to_ttsharedir(src)
         stages["pim_common"] = lambda src, metadata: _ttsharedir_to_pim_common(src, options)
         # target 분기: 변환(target_ir)과 codegen(pimobj)만 target마다 다르다(DESIGN 19).
         # __post_init__은 pim_target is None만 막으므로, 미지원 값은 여기서 fail-fast한다(fallback 금지).
