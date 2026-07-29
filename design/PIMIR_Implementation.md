@@ -920,12 +920,14 @@ UPMEM WRAM이 64 KB이므로 `1664 ≤ 65536` 판정이 바로 된다. `--pim-pa
 `pim_backend/backend/compiler.py`의 `PIMOptions`.
 
 ```python
-target: str = None                   # "upmem" | "aimx" — 없으면 즉시 에러
+pim_target: str = None               # "upmem" | "aimx" — 없으면 즉시 에러
 device_id: int = 0
 
 # 기계 — 이름을 target 중립으로 둔다 (UPMEM에서는 유닛=DPU, 빠른 메모리=WRAM)
 num_units: int = 2048
-local_memory_bytes: int = 64 * 1024
+local_memory_bytes: int = 48 * 1024
+unit_memory_bytes: int = 32 * 1024 * 1024
+host_threads: int = 8
 
 # 분할 — 지금은 사용자가, 나중에는 autotune이
 split_m: int = 1
@@ -933,6 +935,14 @@ split_n: int = 1
 split_k: int = 1
 local_lanes: int = 1                 # 유닛 내부 병렬 수
 ```
+
+이름이 `target`이면 안 된다. Triton이 metadata를 `{"target": GPUTarget,
+**options.__dict__}`로 만들어서 같은 이름의 옵션이 GPUTarget을 덮어쓰고,
+`CompiledKernel`이 그것을 다시 읽는다.
+
+`local_memory_bytes`와 `unit_memory_bytes`가 물리 크기보다 작은 이유는 **커널이 써도
+되는 몫**이라는 뜻이기 때문이다. target이 이 값들을 어떻게 쓰는지는
+`UPMEMTarget_Implementation.md` §4, §8에 있다.
 
 전부 `PIMOptions.hash()`가 `__dict__` 전체를 쓰므로 컴파일 캐시 키에 들어간다.
 기계 값을 바꾸면 재컴파일된다.
