@@ -216,9 +216,9 @@ struct ConvertPIMToUPMEMPass
     // 영역을 모으고 되돌리는 일을 몇 갈래로 나눌지. codegen이 이 값을 읽는다.
     func->setAttr("upmem.host_threads", mb.getI64IntegerAttr(hostThreads));
     OpBuilder hb(units);
-    Value set = hb.create<upmem::AllocOp>(loc, upmem::SetType::get(ctx),
-                                          hb.getI64IntegerAttr(numUnits));
-    hb.create<upmem::LoadProgramOp>(loc, set, FlatSymbolRefAttr::get(devName));
+    Value set = hb.create<upmem::AcquireOp>(loc, upmem::SetType::get(ctx),
+                                            hb.getI64IntegerAttr(numUnits),
+                                            FlatSymbolRefAttr::get(devName));
 
     auto foreach = hb.create<upmem::ForeachUnitOp>(loc, set, units.getAxes(),
                                                    units.getCountsAttr());
@@ -267,7 +267,6 @@ struct ConvertPIMToUPMEMPass
                              byAccess[ud.getAccess()].tile)))
         return signalPassFailure();
     }
-    hb.create<upmem::FreeOp>(loc, set);
 
     // pim.unit_data 는 여기서 한 번에 지운다. 위의 stage/to_host_var 가 이 op 의
     // origin·sizes·capacity 를 계속 읽으므로 그 전에 지우면 해제된 op 을 읽게 된다.

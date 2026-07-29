@@ -10,8 +10,8 @@ upmem.host_var @pitch_a : index
 
 // ── host ────────────────────────────────────────────────────────────────────
 // HOST: extern "C" void kernel(int8_t* a0, int32_t* a1, int64_t a2, int64_t a3)
-// HOST: dpu_alloc(4
-// HOST: dpu_load(_set, DPU_BINARY, NULL)
+// 확보와 적재는 런타임이 한 번만 한다.
+// HOST: _set = pim_acquire(4, DPU_BINARY);
 // 유닛 좌표는 선형 번호에서 자리값으로 푼다.
 // HOST: for (int64_t _u = 0; _u < 4; ++_u)
 // staging: dedup 축을 뺀 조합마다 한 번씩만 만들고, 남는 자리는 0이다.
@@ -31,8 +31,7 @@ func.func @kernel(%A: memref<*xi8>, %C: memref<*xi32>, %lda: index, %ldc: index)
   %c1 = arith.constant 1 : index
   %c8 = arith.constant 8 : index
   %c16 = arith.constant 16 : index
-  %set = upmem.alloc 4 : !upmem.set
-  upmem.load_program %set, @kernel_device : !upmem.set
+  %set = upmem.acquire 4, @kernel_device : !upmem.set
   upmem.foreach_unit %set : !upmem.set axes ["x", "k"] counts [2, 2] {
   ^bb0(%dpu: !upmem.unit, %pm: index, %kj: index):
     %r = arith.muli %pm, %c16 : index

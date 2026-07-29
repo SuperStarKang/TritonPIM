@@ -26,10 +26,8 @@ func.func @matmul_kernel_i8_host(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<
   %c512 = arith.constant 512 : index
   %c32_i32 = arith.constant 32 : i32
 
-  // CHECK: %[[SET:.*]] = upmem.alloc 2048 : !upmem.set
-  %set = upmem.alloc 2048 : !upmem.set
-  // CHECK: upmem.load_program %[[SET]], @matmul_kernel_i8_device
-  upmem.load_program %set, @matmul_kernel_i8_device : !upmem.set
+  // CHECK: %[[SET:.*]] = upmem.acquire 2048, @matmul_kernel_i8_device : !upmem.set
+  %set = upmem.acquire 2048, @matmul_kernel_i8_device : !upmem.set
   // CHECK: upmem.broadcast %[[SET]], @tiles_m
   upmem.broadcast %set, @tiles_m, %c32_i32 : !upmem.set, i32
 

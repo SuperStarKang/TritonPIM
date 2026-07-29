@@ -17,7 +17,8 @@ def ConvertPIMToUPMEM : Pass<"convert-pim-to-upmem", "mlir::ModuleOp"> {
     - `upmem.host_var` = 유닛이 실제로 도는 횟수. 축마다 하나다.
 
     host(원래 func 몸체를 대신한다):
-    - `upmem.alloc` + `upmem.load_program`
+    - `upmem.acquire`: 유닛을 확보하고 device 프로그램을 적재한다. 커널을 부를 때마다
+      다시 할 일이 아니라 런타임이 쥐고 있다가 다시 준다. 그래서 짝이 되는 반납이 없다.
     - `upmem.foreach_unit`: 유닛마다 doing 것. pim.units 몸체의 좌표 계산을 그대로
       옮겨 온다.
       - `direction = "in"` unit_data → `upmem.stage` + `upmem.to_mram`.

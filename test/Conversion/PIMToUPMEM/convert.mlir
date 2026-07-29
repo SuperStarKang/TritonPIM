@@ -44,8 +44,8 @@
 
 // ── host ────────────────────────────────────────────────────────────────────
 // CHECK-LABEL: func.func @matmul
-// CHECK:         %[[SET:.*]] = upmem.alloc 64 : !upmem.set
-// CHECK:         upmem.load_program %[[SET]], @matmul_device
+// 확보와 적재는 한 op이다. 런타임이 같은 유닛 수·같은 프로그램이면 쥐고 있던 것을 준다.
+// CHECK:         %[[SET:.*]] = upmem.acquire 64, @matmul_device : !upmem.set
 // CHECK:         upmem.foreach_unit %[[SET]] : !upmem.set axes ["x", "y", "k"] counts [2, 4, 8]
 // A는 y축 유닛끼리 같은 것을 받는다. pad_to는 sizes가 아니라 capacity다 —
 // 유닛마다 같은 바이트 수를 보내야 하므로.

@@ -36,6 +36,11 @@ import triton.backends.triton_shared.driver as cpu_driver
 os.environ.setdefault("UPMEM_PROFILE", "chipId=0x42")
 
 
+# ── PIM_TIMING (임시): 마지막 launch의 단계별 시간(ms). 지울 때 이 표시를 찾으면 된다.
+TIMING_STAGES = ("stage", "h2d", "kernel", "d2h", "combine")
+timing = [0.0] * len(TIMING_STAGES)
+
+
 def _dpu_host_flags():
     # host.cpp(C++)가 libdpu를 링크할 때 쓰는 플래그. dpu-pkg-config가 표준 제공원.
     if shutil.which("dpu-pkg-config"):
@@ -169,6 +174,10 @@ class PIMLauncher(object):
         call = [ctypes.c_void_p(args[i].data_ptr()) if p else ctypes.c_int32(int(args[i]))
                 for i, p in zip(self.arg_indices, self.arg_is_pointer)]
         fn(*call, ctypes.c_int32(gridX), ctypes.c_int32(gridY), ctypes.c_int32(gridZ))
+
+        # ── PIM_TIMING (임시): 생성된 host 코드가 단계별 시간을 전역 배열에 남긴다.
+        # 성능 판단이 끝나면 이 블록과 위의 PIM_TIMING 정의, UPMEMToHost.cpp의 같은 표시를 지운다.
+        timing[:] = list((ctypes.c_double * len(TIMING_STAGES)).in_dll(lib, "pim_timing_ms"))
 
         if launch_exit_hook is not None:
             launch_exit_hook(launch_metadata)

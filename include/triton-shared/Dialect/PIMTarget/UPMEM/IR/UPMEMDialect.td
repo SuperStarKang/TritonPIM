@@ -98,19 +98,21 @@ def UPMEM_HostVarOp : UPMEM_Op<"host_var", [Symbol]> {
 // Host 쪽
 //===----------------------------------------------------------------------===//
 
-// dpu_alloc. num_units = pim.units counts의 곱.
-def UPMEM_AllocOp : UPMEM_Op<"alloc"> {
-  let summary = "Allocate a set of DPUs";
-  let arguments = (ins I64Attr:$num_units);
+// DPU를 확보하고 device 프로그램을 적재한다. num_units = pim.units counts의 곱이고
+// kernel은 upmem.device_func 심볼이다.
+//
+// 확보와 적재를 한 op으로 두는 이유: 둘 다 커널을 부를 때마다 다시 할 일이 아니다.
+// dpu_alloc은 수백 ms, dpu_load는 수십 ms가 드는데 둘 다 데이터와 무관하다. 그래서
+// 런타임이 같은 유닛 수·같은 프로그램이면 쥐고 있던 것을 그대로 준다. 나눠 두면
+// "이번에는 확보만 다시" 같은 것을 표현할 수 있는데, 그런 경우가 없다.
+//
+// 짝이 되는 반납 op이 없는 것도 같은 이유다. 다음 호출이 다시 쓰므로 놓을 자리가
+// 프로세스 끝뿐이고, 그것은 런타임이 한다.
+def UPMEM_AcquireOp : UPMEM_Op<"acquire"> {
+  let summary = "Reserve a set of DPUs with the device program loaded";
+  let arguments = (ins I64Attr:$num_units, FlatSymbolRefAttr:$kernel);
   let results = (outs UPMEM_SetType:$set);
-  let assemblyFormat = "$num_units attr-dict `:` type($set)";
-}
-
-// dpu_load. kernel은 upmem.device_func 심볼.
-def UPMEM_LoadProgramOp : UPMEM_Op<"load_program"> {
-  let summary = "Load the device program into every DPU of the set";
-  let arguments = (ins UPMEM_SetType:$set, FlatSymbolRefAttr:$kernel);
-  let assemblyFormat = "$set `,` $kernel attr-dict `:` type($set)";
+  let assemblyFormat = "$num_units `,` $kernel attr-dict `:` type($set)";
 }
 
 // dpu_broadcast_to. 모든 DPU에 같은 값을 넣는다.
@@ -184,13 +186,6 @@ def UPMEM_ToHostVarOp : UPMEM_Op<"to_host_var"> {
 // dpu_launch(SYNCHRONOUS).
 def UPMEM_LaunchOp : UPMEM_Op<"launch"> {
   let summary = "Run the loaded program on every DPU and wait";
-  let arguments = (ins UPMEM_SetType:$set);
-  let assemblyFormat = "$set attr-dict `:` type($set)";
-}
-
-// dpu_free. 확보한 유닛을 놓는다. alloc과 짝이며, 없으면 부를 때마다 유닛이 샌다.
-def UPMEM_FreeOp : UPMEM_Op<"free"> {
-  let summary = "Release the allocated set of DPUs";
   let arguments = (ins UPMEM_SetType:$set);
   let assemblyFormat = "$set attr-dict `:` type($set)";
 }

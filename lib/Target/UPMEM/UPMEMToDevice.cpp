@@ -208,6 +208,11 @@ struct DeviceEmitter {
     std::string acc = CEmitter::scalarType(c.getElementType(), false);
     std::string an = e.name(mm.getInputs()[0]), bn = e.name(mm.getInputs()[1]),
                 cn = e.name(mm.getOutputs()[0]);
+
+    // 곱셈은 C 의 `*` 그대로 둔다. DPU 에 32비트 곱셈기가 없어 built_ins.h 의
+    // __builtin_mul_sl_sl_rrr(아래 16비트끼리 곱하는 한 명령)로 바꿔 봤는데 두 배 느려졌다.
+    // 그 매크로가 인라인 어셈이라 최적화기가 안을 못 보고, 그 자리에서 loop 펼치기와
+    // 레지스터 재사용이 막힌다. i8 피연산자면 clang 이 이미 좁은 곱셈을 낸다.
     e.indent(depth);
     os() << "for (int32_t _m = 0; _m < " << M << "; ++_m)\n";
     e.indent(depth + 1);
