@@ -1,5 +1,5 @@
 // UPMEM IR이 host C++ / DPU C 소스로 나오는지 확인한다.
-// 예시는 유닛 4개(x축 2 × k축 2)로 나눈 아주 작은 GEMM이다.
+// 예시는 device 4개(x축 2 × y축 2)로 나눈 아주 작은 GEMM이다.
 // RUN: triton-shared-translate --upmem-to-host   %s | FileCheck %s --check-prefix=HOST
 // RUN: triton-shared-translate --upmem-to-device %s | FileCheck %s --check-prefix=DEVICE
 
@@ -17,27 +17,30 @@ upmem.host_var @pitch_a : index
 // staging: dedup 축을 뺀 조합마다 한 번씩만 만들고, 남는 자리는 0이다.
 // HOST: calloc(2, sizeof(int8_t*))
 // HOST: calloc(
+// 부분 타일도 돌되 원본 범위를 넘는 원소는 건너뛴다.
+// HOST: for (int64_t _t0 = 0; _t0 < (({{.*}} + 7) / 8); ++_t0)
+// HOST: if (_t0 * 8 + _e0 < {{.*}} && _t1 * 16 + _e1 < {{.*}})
+// MRAM 심볼 크기는 상수인데 배정량은 런타임 값이라 전송 직전에 확인한다.
+// HOST: if ({{.*}}_bytes > 4096) {
 // HOST: dpu_prepare_xfer
 // HOST: dpu_push_xfer(_set, DPU_XFER_TO_DPU, "A_mram"
 // HOST: dpu_push_xfer(_set, DPU_XFER_TO_DPU, "tiles_x"
 // HOST: dpu_launch(_set, DPU_SYNCHRONOUS)
 // HOST: dpu_push_xfer(_set, DPU_XFER_FROM_DPU, "C_mram"
-// k축 2개를 더해 합친 뒤 되돌린다.
-// HOST: for (int64_t _g = 0; _g < 2; ++_g)
-// HOST: for (int64_t _j = 1; _j < 2; ++_j)
-// HOST: {{.*}} +=
+// device마다 자기 버퍼를 원본으로 되돌린다.
+// HOST: for (int64_t _g = 0; _g < 4; ++_g)
 func.func @kernel(%A: memref<*xi8>, %C: memref<*xi32>, %lda: index, %ldc: index) {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c8 = arith.constant 8 : index
   %c16 = arith.constant 16 : index
   %set = upmem.acquire 4, @kernel_device : !upmem.set
-  upmem.foreach_unit %set : !upmem.set axes ["x", "k"] counts [2, 2] {
-  ^bb0(%dpu: !upmem.unit, %pm: index, %kj: index):
+  upmem.foreach_unit %set : !upmem.set axes ["x", "y"] counts [2, 2] {
+  ^bb0(%dpu: !upmem.unit, %pm: index, %pn: index):
     %r = arith.muli %pm, %c16 : index
-    %c = arith.muli %kj, %c16 : index
+    %c = arith.muli %pn, %c16 : index
     %sa = upmem.stage %A origin[%r, %c] sizes[%c16, %c16] strides[%lda, %c1]
-          pad_to[%c16, %c16] tile array<i64: 8, 16> {dedup_over = ["k"]}
+          pad_to[%c16, %c16] tile array<i64: 8, 16> {dedup_over = ["y"]}
           : memref<*xi8> -> memref<?x?xi8>
     upmem.to_mram %dpu, %sa, @A_mram : memref<?x?xi8>
     upmem.to_host_var %dpu, %c8, @tiles_x : index
@@ -45,9 +48,8 @@ func.func @kernel(%A: memref<*xi8>, %C: memref<*xi32>, %lda: index, %ldc: index)
   upmem.launch %set : !upmem.set
   %parts = upmem.gather %set, @C_mram capacity[%c16, %c16]
            : !upmem.set -> memref<4x?x?xi32>
-  upmem.foreach_group %parts : memref<4x?x?xi32> axes ["x"] counts [2]
-      {reduce_axis = "k", reduce_count = 2 : i64, combine = "add"} {
-  ^bb0(%part: memref<?x?xi32>, %pm: index):
+  upmem.foreach_group %parts : memref<4x?x?xi32> axes ["x", "y"] counts [2, 2] {
+  ^bb0(%part: memref<?x?xi32>, %pm: index, %pn: index):
     %cr = arith.muli %pm, %c16 : index
     upmem.unstage %part into %C origin[%cr, %c0] sizes[%c16, %c16] strides[%ldc, %c1]
         capacity[%c16, %c16] tile array<i64: 8, 16>

@@ -36,10 +36,10 @@ func.func @masked(%A: memref<*xf32>, %C: memref<*xf32>, %e: index, %pad: f32) {
 }
 
 // 로드는 valid+pad clause를 달고 올라간다.
-// CHECK:      pim.access %arg0 offset %{{.*}} sizes [128] strides[%{{.*}}] origin[%{{.*}}] valid[%arg2] pad %arg3
+// CHECK:      pim.access %arg0 offset %{{.*}} sizes [128] strides[%{{.*}}] valid[%arg2] pad %arg3
 // CHECK:      pim.load
 // 저장은 valid clause만(채움값 없음).
-// CHECK:      pim.access %arg1 offset %{{.*}} sizes [128] strides[%{{.*}}] origin[%{{.*}}] valid[%arg2]
+// CHECK:      pim.access %arg1 offset %{{.*}} sizes [128] strides[%{{.*}}] valid[%arg2]
 // CHECK:      pim.store
 
 // 버퍼 관용구는 전부 사라진다.

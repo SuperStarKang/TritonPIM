@@ -7,24 +7,30 @@
 namespace mlir {
 namespace triton {
 
+#define GEN_PASS_DECL_PIMNORMALIZEADDRESS
 #define GEN_PASS_DECL_CONVERTTTSHAREDTOPIM
-#define GEN_PASS_DECL_PIMBUILDGRID
-#define GEN_PASS_DECL_PIMREMOVEREDUNDANTTRANSFERS
-#define GEN_PASS_DECL_PIMNORMALIZEACCUMULATOR
-#define GEN_PASS_DECL_PIMANALYZEREUSE
-#define GEN_PASS_DECL_PIMANALYZETRANSFER
-#define GEN_PASS_DECL_PIMPARTITION
-#define GEN_PASS_DECL_PIMCLASSIFYCOMPUTE
+#define GEN_PASS_DECL_PIMBUILDLOGICALGRID
+#define GEN_PASS_DECL_PIMRECOVERACCESSORIGIN
+#define GEN_PASS_DECL_PIMFORMCOMPUTE
+#define GEN_PASS_DECL_PIMSETTARGETPROFILE
+#define GEN_PASS_DECL_PIMMAPCORES
+#define GEN_PASS_DECL_PIMFORMEXECUTIONWAVES
+#define GEN_PASS_DECL_PIMMAPDEVICES
+#define GEN_PASS_DECL_PIMPLACEDATA
+#define GEN_PASS_DECL_PIMVERIFY
 #include "triton-shared/Conversion/TTSharedToPIM/Passes.h.inc"
 
+std::unique_ptr<OperationPass<ModuleOp>> createPIMNormalizeAddressPass();
 std::unique_ptr<OperationPass<ModuleOp>> createConvertTTSharedToPIMPass();
-std::unique_ptr<OperationPass<ModuleOp>> createPIMBuildGridPass();
-std::unique_ptr<OperationPass<ModuleOp>> createPIMRemoveRedundantTransfersPass();
-std::unique_ptr<OperationPass<ModuleOp>> createPIMNormalizeAccumulatorPass();
-std::unique_ptr<OperationPass<ModuleOp>> createPIMAnalyzeReusePass();
-std::unique_ptr<OperationPass<ModuleOp>> createPIMAnalyzeTransferPass();
-std::unique_ptr<OperationPass<ModuleOp>> createPIMPartitionPass();
-std::unique_ptr<OperationPass<ModuleOp>> createPIMClassifyComputePass();
+std::unique_ptr<OperationPass<ModuleOp>> createPIMBuildLogicalGridPass();
+std::unique_ptr<OperationPass<ModuleOp>> createPIMRecoverAccessOriginPass();
+std::unique_ptr<OperationPass<ModuleOp>> createPIMFormComputePass();
+std::unique_ptr<OperationPass<ModuleOp>> createPIMSetTargetProfilePass();
+std::unique_ptr<OperationPass<ModuleOp>> createPIMMapCoresPass();
+std::unique_ptr<OperationPass<ModuleOp>> createPIMFormExecutionWavesPass();
+std::unique_ptr<OperationPass<ModuleOp>> createPIMMapDevicesPass();
+std::unique_ptr<OperationPass<ModuleOp>> createPIMPlaceDataPass();
+std::unique_ptr<OperationPass<ModuleOp>> createPIMVerifyPass();
 
 } // namespace triton
 } // namespace mlir

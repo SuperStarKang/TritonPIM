@@ -8,9 +8,12 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
 //===----------------------------------------------------------------------===//
-// PIM dialect / types / ops 선언 (TableGen 생성물 포함)
+// PIM dialect / attributes / types / ops 선언 (TableGen 생성물 포함)
 //===----------------------------------------------------------------------===//
 #include "triton-shared/Dialect/PIM/IR/PIMDialect.h.inc"
+
+#define GET_ATTRDEF_CLASSES
+#include "triton-shared/Dialect/PIM/IR/PIMAttrs.h.inc"
 
 #define GET_TYPEDEF_CLASSES
 #include "triton-shared/Dialect/PIM/IR/PIMTypes.h.inc"

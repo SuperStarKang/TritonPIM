@@ -1,4 +1,4 @@
-// PIM dialect 메모리 op의 parse/print roundtrip 확인.
+// PIM dialect op의 parse/print roundtrip 확인.
 // RUN: triton-shared-opt %s | triton-shared-opt | FileCheck %s
 
 // CHECK-LABEL: func.func @access_load_store
@@ -6,14 +6,13 @@ func.func @access_load_store(%A: memref<*xf32>, %C: memref<*xf32>) {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
 
-  // CHECK: pim.access %{{.*}} offset %{{.*}} sizes [32] strides[%{{.*}}] : memref<*xf32> -> !pim.access
-  %da = pim.access %A offset %c0 sizes [32] strides [%c1]
+  // CHECK: pim.access %{{.*}} offset %{{.*}} sizes [32] strides[%{{.*}}] {{.*}} : memref<*xf32> -> !pim.access
+  %da = pim.access %A offset %c0 sizes [32] strides [%c1] {id = 0 : i64}
       : memref<*xf32> -> !pim.access
   // CHECK: pim.load %{{.*}} : !pim.access -> tensor<32xf32>
   %v = pim.load %da : !pim.access -> tensor<32xf32>
 
-  // CHECK: pim.access %{{.*}} offset %{{.*}} sizes [32] strides[%{{.*}}]
-  %dc = pim.access %C offset %c0 sizes [32] strides [%c1]
+  %dc = pim.access %C offset %c0 sizes [32] strides [%c1] {id = 1 : i64}
       : memref<*xf32> -> !pim.access
   // CHECK: pim.store %{{.*}}, %{{.*}} : tensor<32xf32>, !pim.access
   pim.store %v, %dc : tensor<32xf32>, !pim.access
@@ -21,55 +20,71 @@ func.func @access_load_store(%A: memref<*xf32>, %C: memref<*xf32>) {
 }
 
 // CHECK-LABEL: func.func @access_clauses
-func.func @access_clauses(%A: memref<*xf32>, %e: index, %pad: f32, %idx: tensor<8xi32>) {
+func.func @access_clauses(%A: memref<*xf32>, %e: index, %pad: f32) {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
 
-  // ⑤ mask 로드: valid + pad clause.
+  // mask 로드: valid + pad clause.
   // CHECK: pim.access %{{.*}} offset %{{.*}} sizes [128] strides[%{{.*}}] valid[%{{.*}}] pad %{{.*}} : f32
   %dm = pim.access %A offset %c0 sizes [128] strides [%c1] valid [%e] pad %pad : f32
-      : memref<*xf32> -> !pim.access
+      {id = 0 : i64} : memref<*xf32> -> !pim.access
 
-  // ⑤ mask 저장: valid만(pad 없음) — 독립 그룹이라 valid가 단독으로 찍혀야 한다.
-  // CHECK: pim.access %{{.*}} offset %{{.*}} sizes [128] strides[%{{.*}}] valid[%{{.*}}] : memref<*xf32>
-  %ds = pim.access %A offset %c0 sizes [128] strides [%c1] valid [%e]
-      : memref<*xf32> -> !pim.access
-
-  // ⑥ row-gather: gather_dim + index clause.
-  // CHECK: pim.access %{{.*}} offset %{{.*}} sizes [8, 8] strides[%{{.*}}, %{{.*}}] gather 0 index %{{.*}} : tensor<8xi32>
-  %dg = pim.access %A offset %c0 sizes [8, 8] strides [%c1, %c1] gather 0 index %idx : tensor<8xi32>
+  // 축별 시작 위치를 아는 access: origin clause.
+  // CHECK: pim.access %{{.*}} offset %{{.*}} sizes [128] strides[%{{.*}}] origin[%{{.*}}]
+  %do = pim.access %A offset %c0 sizes [128] strides [%c1] origin [%c0] {id = 1 : i64}
       : memref<*xf32> -> !pim.access
   return
 }
 
-// CHECK-LABEL: func.func @copy
-func.func @copy(%A: memref<*xf32>, %C: memref<*xf32>) {
+// device region과 배치. block argument는 이 device의 partition 좌표다.
+// CHECK-LABEL: func.func @device_place
+func.func @device_place(%A: memref<*xi8>, %C: memref<*xi32>, %ex: index, %ey: index) {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
-  %ds = pim.access %A offset %c0 sizes [32] strides [%c1] : memref<*xf32> -> !pim.access
-  %dd = pim.access %C offset %c0 sizes [32] strides [%c1] : memref<*xf32> -> !pim.access
-  // CHECK: pim.copy %{{.*}}, %{{.*}} : !pim.access, !pim.access
-  pim.copy %ds, %dd : !pim.access, !pim.access
+  %c32 = arith.constant 32 : index
+
+  // CHECK: pim.device #pim.device_mapping<axes = ["output_row_tile", "output_column_tile"], partitions = array<i64: 2, 4>> extents [%{{.*}}, %{{.*}}]
+  pim.device #pim.device_mapping<axes = ["output_row_tile", "output_column_tile"],
+                                 partitions = array<i64: 2, 4>>
+      extents [%ex, %ey] {
+  ^bb0(%px: index, %py: index):
+    // CHECK: pim.place %{{.*}} start[%{{.*}}, %{{.*}}] size[%{{.*}}, %{{.*}}] capacity[%{{.*}}, %{{.*}}] strides[%{{.*}}, %{{.*}}]
+    // CHECK-SAME: replicated_over = ["output_column_tile"]
+    pim.place %A start[%c0, %c0] size[%c32, %c32] capacity[%c32, %c32]
+        strides[%c32, %c1]
+        {direction = "in", access = 0 : i64,
+         mapping = #pim.place_mapping<axis_sources = ["output_row_tile", ""]>,
+         replicated_over = ["output_column_tile"]} : memref<*xi8>
+    // CHECK: pim.place %{{.*}} start[%{{.*}}, %{{.*}}] size[%{{.*}}, %{{.*}}]
+    pim.place %C start[%c0, %c0] size[%c32, %c32] capacity[%c32, %c32]
+        strides[%c32, %c1]
+        {direction = "out", access = 1 : i64,
+         mapping = #pim.place_mapping<axis_sources = ["output_row_tile",
+                                                      "output_column_tile"]>} : memref<*xi32>
+    scf.for %i = %c0 to %c32 step %c1 {
+    } {pim.axis = "output_row_tile"}
+  }
   return
 }
 
-// CHECK-LABEL: func.func @gather_scatter
-func.func @gather_scatter(%A: memref<*xf32>, %C: memref<*xf32>, %idx: tensor<64xi32>) {
-  // CHECK: pim.gather %{{.*}} index %{{.*}} : memref<*xf32>, tensor<64xi32> -> tensor<64xf32>
-  %v = pim.gather %A index %idx : memref<*xf32>, tensor<64xi32> -> tensor<64xf32>
-  // CHECK: pim.scatter %{{.*}}, %{{.*}} index %{{.*}} : tensor<64xf32>, memref<*xf32>, tensor<64xi32>
-  pim.scatter %v, %C index %idx : tensor<64xf32>, memref<*xf32>, tensor<64xi32>
-  return
-}
-
-// CHECK-LABEL: func.func @gather_scatter_masked
-func.func @gather_scatter_masked(%A: memref<*xf32>, %C: memref<*xf32>, %idx: tensor<64xi32>,
-                                 %mask: tensor<64xi1>, %def: f32) {
-  // CHECK: pim.gather %{{.*}} index %{{.*}} mask %{{.*}} : tensor<64xi1> other %{{.*}} : f32 : memref<*xf32>, tensor<64xi32> -> tensor<64xf32>
-  %v = pim.gather %A index %idx mask %mask : tensor<64xi1> other %def : f32
-      : memref<*xf32>, tensor<64xi32> -> tensor<64xf32>
-  // CHECK: pim.scatter %{{.*}}, %{{.*}} index %{{.*}} mask %{{.*}} : tensor<64xi1> : tensor<64xf32>, memref<*xf32>, tensor<64xi32>
-  pim.scatter %v, %C index %idx mask %mask : tensor<64xi1>
-      : tensor<64xf32>, memref<*xf32>, tensor<64xi32>
-  return
+// 기계 profile은 module에, core mapping은 func에 붙는다.
+// CHECK: pim.target_profile = #pim.target_profile<target = "upmem"
+module attributes {
+    pim.target_profile = #pim.target_profile<
+        target = "upmem", number_of_pim_devices = 2048,
+        pim_core_shape = array<i64: 1>,
+        number_of_parallel_lanes_per_pim_core = 16,
+        parallel_execution_kind = "multithread",
+        requires_uniform_instruction_sequence = false,
+        usable_bank_capacity_bytes = 33554432,
+        usable_local_capacity_bytes = 49152>,
+    pim.upmem_ext = #pim.upmem_ext<number_of_devices_per_transfer_group = 64>} {
+  // CHECK: pim.core_mapping = #pim.core_mapping<core_axis_roles = ["none"], tile_footprint = array<i64: 1>, lanes = 16, lane_axis_role = "whole_tile">
+  func.func @profiled() attributes {
+      pim.core_mapping = #pim.core_mapping<core_axis_roles = ["none"],
+                                           tile_footprint = array<i64: 1>,
+                                           lanes = 16,
+                                           lane_axis_role = "whole_tile">} {
+    return
+  }
 }

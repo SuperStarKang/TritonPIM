@@ -128,17 +128,11 @@ LogicalResult ForeachUnitOp::verify() {
 }
 
 LogicalResult ForeachGroupOp::verify() {
-  // 합쳐진 버퍼 하나 다음에 축별 좌표.
+  // 버퍼 하나 다음에 축별 좌표.
   if (failed(verifyForeachBody(*this, getBody(), getAxes(), getCounts(), 1)))
     return failure();
   if (!isa<MemRefType>(getBody().front().getArgument(0).getType()))
-    return emitOpError("first body argument must be the reduced buffer (memref)");
-  // 축약 축과 결합 연산자는 쌍이다. 한쪽만 있으면 무엇을 어떻게 합칠지 정할 수 없다.
-  if (static_cast<bool>(getReduceAxisAttr()) !=
-      static_cast<bool>(getCombineAttr()))
-    return emitOpError("reduce_axis and combine must be set together");
-  if (!getReduceAxisAttr() && getReduceCount() != 1)
-    return emitOpError("reduce_count > 1 requires reduce_axis");
+    return emitOpError("first body argument must be the device buffer (memref)");
   return success();
 }
 

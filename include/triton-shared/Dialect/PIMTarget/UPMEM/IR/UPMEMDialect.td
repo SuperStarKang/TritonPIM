@@ -10,11 +10,11 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 //===----------------------------------------------------------------------===//
 // UPMEM dialect — UPMEM DPU 실행 모델.
 //
-// PIM IR의 유닛 형태(pim.units + pim.unit_data)를 UPMEM 하드웨어에 맞춘 것이다.
+// Placed PIM IR(pim.device + pim.place)을 UPMEM 하드웨어에 맞춘 것이다.
 // PIM IR이 답하지 않는 것을 여기서 정한다:
 //   - 메모리 계층 (host DRAM → MRAM → WRAM 3단)
 //   - 계층 사이 전송 단위 (DMA: 8 byte 정렬, 한 번에 2048 byte 이하, 연속 영역만)
-//   - 유닛 내부 병렬 (tasklet: 독립 스레드, barrier로 동기화)
+//   - 유닛 내부 병렬 (tasklet: 독립 스레드, 서로 겹치지 않는 타일을 맡는다)
 //   - 원본 레이아웃 → 유닛 레이아웃 재배치 (stage/unstage)
 //
 // codegen은 이 IR을 그대로 옮긴다. op의 파라미터가 나올 코드를 유일하게 정해야 하며,
@@ -76,7 +76,7 @@ def UPMEM_UnitType : UPMEM_Type<"Unit", "unit"> {
 // 모듈 수준 선언 — host와 device가 이름으로 공유하는 것들.
 //===----------------------------------------------------------------------===//
 
-// 유닛의 MRAM 버퍼. device에서는 전역 배열(__mram_noinit)이고 host에서는 전송 대상
+// device의 MRAM 버퍼. device 코드에서는 전역 배열(__mram_noinit)이고 host에서는 전송 대상
 // 이름이다. 크기는 유닛 하나가 받는 최대 영역이며, push_xfer가 모든 DPU에 같은 바이트
 // 수를 요구하므로 덜 맡는 유닛도 이 크기로 잡는다.
 def UPMEM_MRAMOp : UPMEM_Op<"mram", [Symbol]> {
@@ -86,8 +86,8 @@ def UPMEM_MRAMOp : UPMEM_Op<"mram", [Symbol]> {
   let hasVerifier = 1;
 }
 
-// host가 값을 넣어 주는 device 스칼라(__host). 유닛 좌표, 유닛이 실제로 도는 횟수,
-// 문제 크기 등 device가 알아야 하는 수가 여기로 온다.
+// host가 값을 넣어 주는 device 스칼라(__host). device가 실제로 도는 횟수, MRAM 안의 축
+// 간격, 커널 인자에서 나오는 loop 상한 등 device가 알아야 하는 수가 여기로 온다.
 def UPMEM_HostVarOp : UPMEM_Op<"host_var", [Symbol]> {
   let summary = "Device scalar the host writes before launch";
   let arguments = (ins SymbolNameAttr:$sym_name, TypeAttrOf<AnyType>:$type);
@@ -98,7 +98,7 @@ def UPMEM_HostVarOp : UPMEM_Op<"host_var", [Symbol]> {
 // Host 쪽
 //===----------------------------------------------------------------------===//
 
-// DPU를 확보하고 device 프로그램을 적재한다. num_units = pim.units counts의 곱이고
+// DPU를 확보하고 device 프로그램을 적재한다. num_units = device partition 수의 곱이고
 // kernel은 upmem.device_func 심볼이다.
 //
 // 확보와 적재를 한 op으로 두는 이유: 둘 다 커널을 부를 때마다 다시 할 일이 아니다.
@@ -115,17 +115,9 @@ def UPMEM_AcquireOp : UPMEM_Op<"acquire"> {
   let assemblyFormat = "$num_units `,` $kernel attr-dict `:` type($set)";
 }
 
-// dpu_broadcast_to. 모든 DPU에 같은 값을 넣는다.
-def UPMEM_BroadcastOp : UPMEM_Op<"broadcast"> {
-  let summary = "Write the same scalar into every DPU";
-  let arguments = (ins UPMEM_SetType:$set, FlatSymbolRefAttr:$var, AnyType:$value);
-  let assemblyFormat =
-      "$set `,` $var `,` $value attr-dict `:` type($set) `,` type($value)";
-}
-
 // DPU_FOREACH. 몸체가 유닛 하나에 대한 host 작업(영역 모으기 + MRAM 전송)이다.
 // block argument는 그 DPU 핸들 다음 축별 좌표다(axes 순서).
-// counts는 pim.units의 것을 그대로 옮긴 값이고, 곱이 alloc의 num_units와 같아야 한다.
+// counts는 #pim.device_mapping의 partition 수를 그대로 옮긴 값이고, 곱이 alloc의 num_units와 같아야 한다.
 def UPMEM_ForeachUnitOp : UPMEM_Op<"foreach_unit", [NoTerminator]> {
   let summary = "Host loop over the DPUs of a set";
   let arguments = (ins UPMEM_SetType:$set, StrArrayAttr:$axes,
@@ -140,7 +132,7 @@ def UPMEM_ForeachUnitOp : UPMEM_Op<"foreach_unit", [NoTerminator]> {
 
 // 원본 버퍼의 strided 영역을 연속 버퍼로 모은다. MRAM DMA가 연속 영역만 다루고
 // push_xfer가 모든 DPU에 같은 바이트 수를 요구하므로, 이 재배치가 반드시 필요하다.
-//   origin/sizes/strides = 원본 안의 영역 (pim.unit_data에서 그대로 온다)
+//   origin/sizes/strides = 원본 안의 영역 (pim.place에서 그대로 온다)
 //   pad_to               = 결과 버퍼 shape. sizes보다 크면 남는 자리를 0으로 채운다.
 //                          덜 맡는 마지막 유닛이 여기서 균일 크기로 맞춰진다.
 //   tile                 = 유닛 버퍼를 타일 단위로 쓴다. 타일 하나가 연속이 되므로
@@ -148,7 +140,7 @@ def UPMEM_ForeachUnitOp : UPMEM_Op<"foreach_unit", [NoTerminator]> {
 //                          행 수만큼 DMA가 필요하고, 한 행이 몇십 바이트라 준비 비용이
 //                          옮기는 양보다 커진다.
 //   dedup_over           = 이 축만 다른 유닛은 같은 결과를 받는다. 그 축을 뺀 조합
-//                          개수만큼만 실제로 모으면 된다(pim.unit_data replicated_over).
+//                          개수만큼만 실제로 모으면 된다(pim.place replicated_over).
 def UPMEM_StageOp : UPMEM_Op<"stage", [AttrSizedOperandSegments]> {
   let summary = "Gather a strided region of a host buffer into a padded tile-major buffer";
   let arguments = (ins AnyRankedOrUnrankedMemRef:$src,
@@ -174,8 +166,8 @@ def UPMEM_ToMRAMOp : UPMEM_Op<"to_mram"> {
 }
 
 // 유닛마다 다른 스칼라를 그 DPU의 host 변수에 넣는다. foreach_unit 몸체에서만 쓴다.
-// broadcast와 나누는 이유: 유닛이 실제로 도는 횟수는 마지막 유닛에서 작아지므로
-// 모든 DPU에 같은 값을 보낼 수 없다.
+// 유닛이 실제로 도는 횟수는 맡은 타일 수만큼이라 유닛마다 다르므로 집합 단위 전송으로는
+// 보낼 수 없다.
 def UPMEM_ToHostVarOp : UPMEM_Op<"to_host_var"> {
   let summary = "Write a per-DPU scalar into that DPU's host variable";
   let arguments = (ins UPMEM_UnitType:$unit, AnyType:$value,
@@ -205,17 +197,12 @@ def UPMEM_GatherOp : UPMEM_Op<"gather"> {
   }];
 }
 
-// 출력 그룹 위를 돈다. 그룹 하나는 결합 축만 다른 유닛들의 묶음이다.
-// reduce_axis/combine/reduce_count가 있으면 그 묶음을 먼저 합친 결과를 몸체에 준다.
-// 없으면(축약 축을 안 쪼갠 경우) 유닛 하나의 버퍼가 그대로 온다.
-// block argument는 합쳐진 버퍼 다음 축별 좌표다.
+// 출력 device 위를 돈다. 몸체가 device 하나의 버퍼를 원본으로 되돌리는 일이다.
+// block argument는 그 버퍼 다음 축별 좌표다.
 def UPMEM_ForeachGroupOp : UPMEM_Op<"foreach_group", [NoTerminator]> {
-  let summary = "Host loop over output groups, reducing partial results first";
+  let summary = "Host loop over the output buffer of each DPU";
   let arguments = (ins AnyMemRef:$parts, StrArrayAttr:$axes,
-                       DenseI64ArrayAttr:$counts,
-                       OptionalAttr<StrAttr>:$reduce_axis,
-                       DefaultValuedAttr<I64Attr, "1">:$reduce_count,
-                       OptionalAttr<StrAttr>:$combine);
+                       DenseI64ArrayAttr:$counts);
   let regions = (region SizedRegion<1>:$body);
   let assemblyFormat = [{
     $parts `:` type($parts) `axes` $axes `counts` $counts
@@ -280,12 +267,6 @@ def UPMEM_GetHostVarOp : UPMEM_Op<"get_host_var", [Pure]> {
   let arguments = (ins FlatSymbolRefAttr:$var);
   let results = (outs AnyType:$result);
   let assemblyFormat = "$var attr-dict `:` type($result)";
-}
-
-// barrier_wait. tasklet들이 공유 WRAM 버퍼를 함께 채우거나 읽을 때 필요하다.
-def UPMEM_BarrierOp : UPMEM_Op<"barrier"> {
-  let summary = "Synchronize all tasklets on this DPU";
-  let assemblyFormat = "attr-dict";
 }
 
 // mram_read. MRAM의 연속 구간을 WRAM 버퍼로 옮긴다.

@@ -98,7 +98,7 @@ def _build_pim_so(host_src: str, device_src: str, local_lanes: int) -> str:
         elf_path = cache.put(Path(elf_tmp).read_bytes(), "device.elf", binary=True)
 
         # host.cpp → host.so : DPU_BINARY 매크로를 캐시의 device.elf 절대경로로 덮어쓴다.
-        # -fopenmp: split_k>1일 때 host reduce(tree)의 `#pragma omp parallel for`용. 없으면 pragma 무시되어 순차 실행.
+        # -fopenmp: 영역을 모으고 되돌리는 `#pragma omp parallel for`용. 없으면 pragma 무시되어 순차 실행.
         # pim_runtime.h(-I backend_dir) + libpim_runtime.so(전체 경로로 링크 + rpath) → 모든 host.so가
         #   같은 런타임 인스턴스를 공유(persistent set 캐시).
         backend_dir = os.path.dirname(os.path.abspath(__file__))
@@ -130,16 +130,13 @@ class PIMLauncher(object):
 
     def __init__(self, src, metadata):
         # 생성된 host 함수의 시그니처는 "커널의 비-constexpr 인자를 원래 순서대로" 다음
-        # "num_programs(x,y,z)"다. --pim-build-grid가 program_id 인자를 지우고 num_programs만
+        # "num_programs(x,y,z)"다. --pim-build-logical-grid가 program_id 인자를 지우고 num_programs만
         # 남기기 때문이다. 그래서 인자 위치를 특정 커널 모양에 맞춰 박지 않고 시그니처에서 읽는다.
         cst_key = lambda i: src.fn.arg_names.index(i) if isinstance(i, str) else i
         signature = {cst_key(k): v for k, v in src.signature.items()}
         self.arg_indices = [i for i, ty in sorted(signature.items()) if ty != "constexpr"]
         self.arg_is_pointer = [signature[i][0] == "*" for i in self.arg_indices]
-        # local_lanes(=NR_TASKLETS): device 빌드 파라미터. PIMOptions 필드라 metadata에 들어온다.
-        self.local_lanes = metadata.local_lanes
-        # pim_target: 런타임에 빌드 툴체인을 고르는 분기 키. local_lanes와 같은 PIMOptions 필드라
-        # 같은 경로로 metadata에 들어온다("upmem" | "aimx").
+        # pim_target: 런타임에 빌드 툴체인을 고르는 분기 키. PIMOptions 필드라 metadata에 들어온다.
         self.pim_target = metadata.pim_target
 
     def __call__(self, gridX, gridY, gridZ, stream, cu_function,
@@ -151,7 +148,8 @@ class PIMLauncher(object):
         # 빌드 단계만 분기하고, 아래 dlopen→ctypes 호출은 stub이 같은 (A,B,C,M,N,K) C ABI를
         # 노출한다는 전제로 공유한다(AiMX가 다른 인자를 요구하면 그때 호출부도 분기).
         if self.pim_target == "upmem":
-            so_path = _build_pim_so(bundle["host"], bundle["device"], self.local_lanes)
+            # NR_TASKLETS는 컴파일러가 lane 예산 안에서 고른 값이다. 번들에 실려 온다.
+            so_path = _build_pim_so(bundle["host"], bundle["device"], bundle["lanes"])
         elif self.pim_target == "aimx":
             so_path = _build_aimx_so(bundle["stub"], bundle["descriptors"])
         else:

@@ -28,7 +28,6 @@ public:
     return n;
   }
   void bind(Value v, StringRef n) { names[v] = n.str(); }
-  bool bound(Value v) const { return names.count(v); }
 
   void indent(unsigned n) { os.indent(n * 2); }
 
@@ -86,6 +85,31 @@ public:
       else
         return op->emitError("unsupported constant");
       os << ";\n";
+      return success();
+    }
+    if (auto cmp = dyn_cast<arith::CmpIOp>(op)) {
+      const char *sym = "==";
+      switch (cmp.getPredicate()) {
+      case arith::CmpIPredicate::eq: sym = "=="; break;
+      case arith::CmpIPredicate::ne: sym = "!="; break;
+      case arith::CmpIPredicate::slt:
+      case arith::CmpIPredicate::ult: sym = "<"; break;
+      case arith::CmpIPredicate::sle:
+      case arith::CmpIPredicate::ule: sym = "<="; break;
+      case arith::CmpIPredicate::sgt:
+      case arith::CmpIPredicate::ugt: sym = ">"; break;
+      case arith::CmpIPredicate::sge:
+      case arith::CmpIPredicate::uge: sym = ">="; break;
+      }
+      binary(std::string("A ") + sym + " B");
+      return success();
+    }
+    if (auto sel = dyn_cast<arith::SelectOp>(op)) {
+      indent(depth);
+      os << scalarType(sel.getResult().getType(), hostSide) << " "
+         << name(sel.getResult()) << " = " << name(sel.getCondition()) << " ? "
+         << name(sel.getTrueValue()) << " : " << name(sel.getFalseValue())
+         << ";\n";
       return success();
     }
     if (isa<arith::AddIOp>(op))

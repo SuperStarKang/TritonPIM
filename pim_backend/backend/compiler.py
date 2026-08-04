@@ -107,58 +107,76 @@ def _run_translate(mlir_text: str, which: str) -> str:
         return subprocess.check_output([tr, which, src]).decode("utf-8")
 
 
-# TTSharedIR → PIM Common IR 파이프라인 (Design §20). 각 pass를 한 줄씩 두어, 실험 시 필요 없는
-# 단계는 그 줄을 주석(#) 처리해 껐다 켰다 할 수 있다. 순서 의미는 각 줄 주석 참고.
-# local_lanes(유닛 내부 병렬)와 fusion은 target 관심사라 이 단계에서 하지 않는다.
-# 순서 규칙: IR을 바꾸는 패스를 전부 돌린 뒤 분석 패스를 전부 돌린다(Design §20.2). 분석 결과는
-# IR의 최종 모습을 기술해야 하므로, IR을 바꾸는 패스가 뒤에 오면 그 기술이 낡는다.
-# --pim-partition만 예외다 — 분석이 낸 pim.split_axes를 입력으로 쓰므로 분석 뒤에 올 수밖에 없다.
+# target 마다 고정된 기계 값. 나머지는 PIMOptions 에서 온다.
+# bank/local 용량이 음수면 미측정이라는 뜻이라 profile 에 필드가 생기지 않고, 그 값을
+# 필요로 하는 검사에 도달하는 순간 진단이 된다.
+_TARGET_PROFILE = {
+    "upmem": {
+        "pim_core_shape": "1",
+        "parallel_execution_kind": "multithread",
+        "uniform_instruction_sequence": "false",
+        "devices_per_transfer_group": 64,
+    },
+    "aimx": {
+        "pim_core_shape": "8,16",
+        "parallel_execution_kind": "simd",
+        "uniform_instruction_sequence": "true",
+        "devices_per_transfer_group": 0,
+    },
+}
+
+
+# TTSharedIR → Placed PIM IR 파이프라인. 각 pass 를 한 줄씩 두어 실험 시 그 줄을 주석 처리해
+# 껐다 켰다 할 수 있다.
 PIM_COMMON_PASSES = [
-    # --- 변환 ---
-    "--convert-ttshared-to-pim",          # 메모리 접근을 pim.access/load/store로 변환
-    "--pim-build-grid",                   # program_id 인자를 grid loop로 세운다. instance 사이 관계를 IR에서 보려면 필요하고, 뒤 분석이 grid loop를 전제한다
-    "-cse",                               # Pure한 pim.access(와 중복 상수) 병합 → "같은 access"를 SSA 동일성으로 판별(중복 전송 제거의 선행 조건)
-    "-loop-invariant-code-motion",        # 루프 불변 연산(주소 계산 arith, Pure한 pim.access)을 루프 밖으로. access가 밖에 있어야 그 load를 뺄 수 있다
-    "--pim-remove-redundant-transfers",   # load hoisting, load-store를 copy로, 반복 load/RAW 재사용
-    "-canonicalize",                      # 죽은 pim.load/access(결과 미사용) 정리(DCE)
-    "--pim-normalize-accumulator",        # matmul(outs=0)+add를 matmul(outs=누산기)로. tile 하나와 tile만큼의 덧셈이 사라지고, 상주량이 실제와 맞게 된다
-    # --- 분석 ---
-    "--pim-analyze-reuse",                # grid 축↔access 의존 분석(execution_model/grid_dims/role/invariant). 전송량 식이 invariant를 입력으로 쓴다
-    "--pim-analyze-transfer",             # access별 tile 바이트와 유닛당 상주량. hoisting이 끝난 뒤라야 어느 tile이 어느 블록에 있는지 확정된다
-    # --- 분할 ---
-    # 반복 공간을 유닛 수만큼 나눠 유닛 형태를 만든다. pim.split_axes를 입력으로 쓰므로 분석 뒤다.
-    # splits는 그 목록 순서(grid 축 중첩 순서 다음 reduction 축)라 split_m/n/k가 그대로 맞는다.
-    # 앞선 pim.co_resident로 유닛 용량을, splits의 곱으로 유닛 개수를 여기서 확인한다.
-    "--pim-partition=splits={splits} num-units={num_units} local-memory-bytes={local_memory_bytes}",
-    "-cse",                               # 분할이 access마다 주소식을 따로 복제하므로 여기서 합친다
-    "-canonicalize",                      # 중복 상수와 접히는 산술 정리
-    # --- 태그 ---
-    "--pim-classify-compute",             # 연산 종류 태그(pim.op). 모든 구조 변형 뒤 맨 마지막(late)에 돌려 태그가 안 낡게
+    "--pim-normalize-address",     # 주소 재귀를 닫힌 형태로. 이것 없이는 뒤의 origin 복원이 전부 실패한다
+    "-cse",
+    "-loop-invariant-code-motion",
+    "-canonicalize",               # (iv - 0) / 1 같은 잉여 산술을 상수로 확정한다
+    "--convert-ttshared-to-pim",   # 메모리 접근을 pim.access/load/store 로
+    "--pim-build-logical-grid",    # source grid 를 logical tile loop nest 로
+    "--pim-recover-access-origin", # access 의 축별 origin 을 logical 좌표로 채운다
+    "--pim-form-compute",          # 누산기를 matmul 의 outs 로 통합
+    "{profile}",                   # 기계 profile 부착. 여기부터 profile 을 읽는다
+    "--pim-map-cores",             # logical 차원 ↔ PIM Core topology, lane 수 선택
+    "--pim-form-execution-waves",  # core footprint 로 wave 구성
+    "--pim-map-devices",           # wave 를 PIM Device 에 균형 분배
+    "--pim-place-data",            # 최종 region·replication·capacity materialize
+    "--pim-verify",                # 공통 fail-fast 검증
+    "-cse",
+    "-canonicalize",
 ]
 
 
+def _profile_pass(options) -> str:
+    t = _TARGET_PROFILE[options.pim_target]
+    bank = options.unit_memory_bytes if options.pim_target == "upmem" else -1
+    local = options.local_memory_bytes if options.pim_target == "upmem" else 0
+    return ("--pim-set-target-profile="
+            f"target={options.pim_target} "
+            f"number-of-pim-devices={options.num_units} "
+            f"pim-core-shape={t['pim_core_shape']} "
+            f"number-of-parallel-lanes-per-pim-core={options.local_lanes} "
+            f"parallel-execution-kind={t['parallel_execution_kind']} "
+            f"requires-uniform-instruction-sequence={t['uniform_instruction_sequence']} "
+            f"usable-bank-capacity-bytes={bank} "
+            f"usable-local-capacity-bytes={local} "
+            f"devices-per-transfer-group={t['devices_per_transfer_group']}")
+
+
 def _ttsharedir_to_pim_common(ttshared: str, options) -> str:
-    # 파이프라인 구성과 각 단계 의미는 PIM_COMMON_PASSES 정의 참고(줄 주석으로 토글).
-    splits = "{},{},{}".format(options.split_m, options.split_n, options.split_k)
-    return _run_opt(ttshared, [p.format(splits=splits, num_units=options.num_units,
-                                        local_memory_bytes=options.local_memory_bytes)
-                               for p in PIM_COMMON_PASSES])
+    profile = _profile_pass(options)
+    return _run_opt(ttshared, [p.format(profile=profile) for p in PIM_COMMON_PASSES])
 
 
 def _pim_common_to_upmem(pim_common: str, options) -> str:
-    # MRAM 버퍼 크기를 유닛 메모리에서 나눠 정하고, tile 버퍼를 tasklet 수만큼 복제한다
-    # (Conversion/PIMToUPMEM 참고). local_lanes는 여기와 -DNR_TASKLETS 양쪽에 쓰인다.
+    # 기계 값은 전부 profile 에서 읽는다. host 스레드 수만 lowering policy 라 옵션으로 준다.
     return _run_opt(pim_common,
-                    [f"--convert-pim-to-upmem=unit-memory-bytes={options.unit_memory_bytes} "
-                     f"local-lanes={options.local_lanes} "
-                     f"local-memory-bytes={options.local_memory_bytes} "
-                     f"host-threads={options.host_threads}"])
+                    [f"--convert-pim-to-upmem=host-threads={options.host_threads}"])
 
 
 def _upmem_to_artifact(upmem_ir: str, metadata) -> bytes:
     # UPMEM IR → host.cpp / device.c 소스를 생성해 번들로 묶는다. 컴파일은 launcher가 한다.
-    # local_lanes(=NR_TASKLETS)는 device 빌드 파라미터라 번들에 넣지 않는다 — PIMOptions 필드라
-    # 자동으로 metadata에 포함되고, launcher가 metadata.local_lanes를 읽어 -DNR_TASKLETS로 쓴다.
     host_src = _run_translate(upmem_ir, "--upmem-to-host")
     device_src = _run_translate(upmem_ir, "--upmem-to-device")
     # launcher가 호출할 host 진입 함수 이름을 metadata.name으로 넘긴다.
@@ -167,7 +185,13 @@ def _upmem_to_artifact(upmem_ir: str, metadata) -> bytes:
     if not match:
         raise RuntimeError("generated host.cpp에서 진입 함수를 찾지 못함")
     metadata["name"] = match.group(1)
-    return json.dumps({"host": host_src, "device": device_src}).encode("utf-8")
+    # 실제로 쓰는 tasklet 수. --pim-map-cores가 lane 예산 안에서 고른 값이라 요청값과
+    # 다를 수 있고, launcher는 이 값을 -DNR_TASKLETS로 써야 IR과 device 빌드가 맞는다.
+    lanes = re.search(r'// pim\.lanes = (\d+)', device_src)
+    if not lanes:
+        raise RuntimeError("generated device.c에서 tasklet 수를 찾지 못함")
+    return json.dumps({"host": host_src, "device": device_src,
+                       "lanes": int(lanes.group(1))}).encode("utf-8")
 
 
 # ── AiMX target 경로 (UPMEM helper와 평행) ───────────────────────────────────
@@ -233,10 +257,7 @@ class PIMOptions:
     # DPU 런타임도 MRAM에 자리를 잡으므로 전부를 나눠 주면 링커가 넘친다. 커널이 써도 되는
     # 몫이라는 뜻이라 물리 크기보다 작게 둔다.
     unit_memory_bytes: int = 32 * 1024 * 1024
-    split_m: int = 1             # M축 inter-unit SPLIT 수. split_m×split_n×split_k = DPU 개수.
-    split_n: int = 1             # N축 inter-unit SPLIT 수. 1이면 해당 축 미분배(기존 동작).
-    split_k: int = 1             # K축 inter-unit SPLIT 수. >1이면 한 출력 타일을 여러 DPU가 K분담 → host reduce.
-    local_lanes: int = 1         # DPU 내부 intra-unit 병렬 수(=NR_TASKLETS). 1이면 단일 tasklet.
+    local_lanes: int = 1         # DPU 내부 intra-unit 병렬 lane 능력값. 실제 값은 lane 예산이 정한다.
 
     def __post_init__(self):
         # target 없이 PIM을 쓰는 것은 의도된 사용이 아니므로 기본값으로 때우지 않고 바로 터뜨린다.

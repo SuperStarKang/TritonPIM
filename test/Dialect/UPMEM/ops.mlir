@@ -24,13 +24,9 @@ func.func @matmul_kernel_i8_host(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<
   %c1 = arith.constant 1 : index
   %c256 = arith.constant 256 : index
   %c512 = arith.constant 512 : index
-  %c32_i32 = arith.constant 32 : i32
 
   // CHECK: %[[SET:.*]] = upmem.acquire 2048, @matmul_kernel_i8_device : !upmem.set
   %set = upmem.acquire 2048, @matmul_kernel_i8_device : !upmem.set
-  // CHECK: upmem.broadcast %[[SET]], @tiles_m
-  upmem.broadcast %set, @tiles_m, %c32_i32 : !upmem.set, i32
-
   // 입력은 유닛마다 영역이 다르므로 region 안에서 좌표로 계산한다.
   // CHECK: upmem.foreach_unit %[[SET]] : !upmem.set axes ["x", "y", "k"] counts [4, 32, 16]
   upmem.foreach_unit %set : !upmem.set axes ["x", "y", "k"] counts [4, 32, 16] {
@@ -96,7 +92,7 @@ upmem.device_func @matmul_kernel_i8_device {
   // CHECK: %[[NT:.*]] = upmem.num_tasklets : index
   %nt = upmem.num_tasklets : index
 
-  // WRAM 타일 버퍼. 합계 128 + 512 + 1024 = 1664 B로 pim.co_resident와 맞는다.
+  // WRAM 타일 버퍼. 합계 128 + 512 + 1024 = 1664 B.
   // CHECK: memref.alloc() : memref<8x16xi8, #upmem.space<wram>>
   %aw = memref.alloc() : memref<8x16xi8, #upmem.space<wram>>
   %bw = memref.alloc() : memref<16x32xi8, #upmem.space<wram>>
@@ -112,12 +108,9 @@ upmem.device_func @matmul_kernel_i8_device {
         upmem.mram_read @A_mram[%ao], %aw : memref<8x16xi8, #upmem.space<wram>>
         %bo = arith.muli %k, %c16 : index
         upmem.mram_read @B_mram[%bo], %bw : memref<16x32xi8, #upmem.space<wram>>
-        // CHECK: upmem.barrier
-        upmem.barrier
         linalg.matmul ins(%aw, %bw : memref<8x16xi8, #upmem.space<wram>>,
                                      memref<16x32xi8, #upmem.space<wram>>)
                       outs(%acc : memref<8x32xi32, #upmem.space<wram>>)
-        upmem.barrier
       }
       // CHECK: upmem.mram_write %{{.*}}, @C_mram[%{{.*}}] : memref<8x32xi32, #upmem.space<wram>>
       %co = arith.muli %tm, %c32 : index

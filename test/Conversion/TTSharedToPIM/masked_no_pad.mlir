@@ -21,7 +21,7 @@ func.func @masked_no_pad(%A: memref<*xf32>, %e: index) -> tensor<1024xf32> {
 }
 
 // 채움값이 없으므로 valid 만 있고 pad 는 없다.
-// CHECK:      pim.access %arg0 offset %{{.*}} sizes [1024] strides[%{{.*}}] origin[%{{.*}}] valid[%arg1] : memref<*xf32>
+// CHECK:      pim.access %arg0 offset %{{.*}} sizes [1024] strides[%{{.*}}] valid[%arg1] {{.*}} : memref<*xf32>
 // CHECK:      pim.load
 
 // 버퍼 관용구는 전부 사라진다.

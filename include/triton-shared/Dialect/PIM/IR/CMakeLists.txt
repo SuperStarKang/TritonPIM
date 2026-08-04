@@ -1,6 +1,8 @@
 set(LLVM_TARGET_DEFINITIONS PIMDialect.td)
 mlir_tablegen(PIMDialect.h.inc -gen-dialect-decls -dialect=pim)
 mlir_tablegen(PIMDialect.cpp.inc -gen-dialect-defs -dialect=pim)
+mlir_tablegen(PIMAttrs.h.inc -gen-attrdef-decls -attrdefs-dialect=pim)
+mlir_tablegen(PIMAttrs.cpp.inc -gen-attrdef-defs -attrdefs-dialect=pim)
 mlir_tablegen(PIMTypes.h.inc -gen-typedef-decls -typedefs-dialect=pim)
 mlir_tablegen(PIMTypes.cpp.inc -gen-typedef-defs -typedefs-dialect=pim)
 mlir_tablegen(PIMOps.h.inc -gen-op-decls)
