@@ -216,6 +216,13 @@ struct DeviceEmitter {
     os() << "for (int32_t _n = 0; _n < " << N << "; ++_n) {\n";
     e.indent(depth + 2);
     os() << acc << " _s = " << cn << "[_m * " << N << " + _n];\n";
+    // K 는 tile 의 BK 라 컴파일 시점 상수다. clang 은 BK 가 16 을 넘으면 이 loop 를 스스로
+    // 펼치지 않는데, 남겨 두면 곱셈 하나당 명령 수가 두 배가 된다. IRAM 이 넘지 않을
+    // 범위에서만 펼치라고 적는다.
+    if (K <= 64) {
+      e.indent(depth + 2);
+      os() << "#pragma unroll\n";
+    }
     e.indent(depth + 2);
     os() << "for (int32_t _k = 0; _k < " << K << "; ++_k)\n";
     e.indent(depth + 3);

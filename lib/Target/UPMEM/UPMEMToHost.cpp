@@ -338,14 +338,17 @@ struct HostEmitter {
              ") / " + std::to_string(tile[d]) + ")";
     };
     // 바깥 타일 loop들을 묶어 host 스레드에 나눈다. 스레드 팀을 만드는 비용이 고정이라
-    // 타일이 스레드 수보다 적으면 나누지 않는다.
+    // 옮길 원소가 적으면 나누지 않는다. 타일 수가 아니라 원소 수로 재야 한다.
     if (threads > 1) {
+      int64_t tileElems = 1;
+      for (int64_t t : tile)
+        tileElems *= t;
       e.indent(depth);
       os() << "#pragma omp parallel for collapse(" << rank << ") num_threads("
            << threads << ") if(";
       for (unsigned d = 0; d < rank; d++)
         os() << (d ? " * " : "") << tileCount(d);
-      os() << " > " << threads << ")\n";
+      os() << " * " << tileElems << " > " << threads * 512 << ")\n";
     }
     for (unsigned d = 0; d < rank; d++) {
       e.indent(depth + d);
@@ -475,6 +478,12 @@ struct HostEmitter {
     }
     e.indent(depth);
     os() << "}\n";
+    // 되돌리기가 끝났으므로 회수 버퍼를 놓는다.
+    e.indent(depth);
+    os() << "for (int64_t _u = 0; _u < " << rt.getShape()[0] << "; ++_u) free("
+         << parts << "[_u]);\n";
+    e.indent(depth);
+    os() << "free(" << parts << ");\n";
     mark(4, depth);  // PIM_TIMING: 부분합 결합과 되돌리기
     return success();
   }
