@@ -63,12 +63,9 @@ def PIM_TargetProfileAttr : PIM_Attr<"TargetProfile", "target_profile"> {
   let assemblyFormat = "`<` struct(params) `>`";
 }
 
-// UPMEM 확장. 공통 pass 가 읽지 않는 target 파라미터가 여기 온다.
-def PIM_UPMEMExtAttr : PIM_Attr<"UPMEMExt", "upmem_ext"> {
-  let summary = "UPMEM-specific target parameters";
-  let parameters = (ins "int64_t":$number_of_devices_per_transfer_group);
-  let assemblyFormat = "`<` struct(params) `>`";
-}
+// target 확장 attribute 는 두지 않는다. 공통 pass 가 target 이름의 attribute 를 읽으면
+// 이 dialect 가 target 무관하다는 전제가 깨지고, 공통 pass 가 읽지 않는 값이면 target IR 에
+// 두면 된다. 공통 pass 가 정말로 필요로 하는 기계 값은 위 target_profile 의 필드가 된다.
 
 // pim.device 의 필수 파라미터. logical 축마다 device partition 수 하나다.
 def PIM_DeviceMappingAttr : PIM_Attr<"DeviceMapping", "device_mapping"> {

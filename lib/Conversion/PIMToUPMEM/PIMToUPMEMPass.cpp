@@ -122,7 +122,6 @@ struct ConvertPIMToUPMEMPass
     // profile은 여기서 소비된다. 남겨 두면 target IR이 여전히 PIM을 가리키게 되고,
     // 뒤 단계가 기계 값을 다시 읽을 수 있다는 오해를 만든다.
     getOperation()->removeAttr("pim.target_profile");
-    getOperation()->removeAttr("pim.upmem_ext");
     getOperation().walk(
         [](func::FuncOp f) { f->removeAttr("pim.core_mapping"); });
   }

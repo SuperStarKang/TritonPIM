@@ -41,11 +41,6 @@ struct PIMSetTargetProfilePass
             b.getBoolAttr(uniformInstructionSequence),
             optional(usableBankCapacityBytes),
             optional(usableLocalCapacityBytes)));
-
-    if (devicesPerTransferGroup > 0)
-      module->setAttr("pim.upmem_ext",
-                      pim::UPMEMExtAttr::get(&getContext(),
-                                             devicesPerTransferGroup));
   }
 };
 

@@ -42,7 +42,8 @@ def _translate_path() -> str:
 
 
 def _run_opt(mlir_text: str, passes: list) -> str:
-    # triton-shared-opt로 PIM/UPMEM 변환 pass를 적용한다.
+    # triton-shared-opt로 변환 pass를 적용한다. 어떤 pass를 돌릴지는 호출자가 정하므로
+    # 이 함수는 target을 모른다.
     opt = cpu_compiler._get_triton_shared_opt_path()
     with tempfile.TemporaryDirectory() as tmp:
         src = os.path.join(tmp, "in.mlir")
@@ -99,7 +100,8 @@ def _ttir_to_ttsharedir(ttir) -> str:
 
 
 def _run_translate(mlir_text: str, which: str) -> str:
-    # triton-shared-translate로 UPMEM IR을 host/device 소스로 번역한다.
+    # triton-shared-translate로 target IR을 소스로 번역한다. which(--<target>-to-*)는
+    # 호출자가 정하므로 이 함수도 target을 모른다.
     tr = _translate_path()
     with tempfile.TemporaryDirectory() as tmp:
         src = os.path.join(tmp, "in.mlir")
@@ -108,20 +110,24 @@ def _run_translate(mlir_text: str, which: str) -> str:
 
 
 # target 마다 고정된 기계 값. 나머지는 PIMOptions 에서 온다.
-# bank/local 용량이 음수면 미측정이라는 뜻이라 profile 에 필드가 생기지 않고, 그 값을
-# 필요로 하는 검사에 도달하는 순간 진단이 된다.
+# capacity 는 (usable_bank_capacity_bytes, usable_local_capacity_bytes) 를 옵션에서 뽑는다.
+# 음수면 미측정이라는 뜻이라 profile 에 필드가 생기지 않고, 그 값을 필요로 하는 검사에
+# 도달하는 순간 진단이 된다. 0 은 그 저장소가 존재하지 않는다는 뜻이다.
+# target 고유 값은 전부 여기 한 곳에 있다 — 아래 코드에는 target 이름 분기가 없다.
 _TARGET_PROFILE = {
     "upmem": {
         "pim_core_shape": "1",
         "parallel_execution_kind": "multithread",
         "uniform_instruction_sequence": "false",
-        "devices_per_transfer_group": 64,
+        # 유닛=DPU, 큰 메모리=MRAM, 빠른 메모리=WRAM 이라 둘 다 옵션 값이 그대로 온다.
+        "capacity": lambda o: (o.unit_memory_bytes, o.local_memory_bytes),
     },
     "aimx": {
         "pim_core_shape": "8,16",
         "parallel_execution_kind": "simd",
         "uniform_instruction_sequence": "true",
-        "devices_per_transfer_group": 0,
+        # bank 용량은 아직 미측정(음수), core 별 local storage 는 없다(0).
+        "capacity": lambda o: (-1, 0),
     },
 }
 
@@ -150,8 +156,7 @@ PIM_COMMON_PASSES = [
 
 def _profile_pass(options) -> str:
     t = _TARGET_PROFILE[options.pim_target]
-    bank = options.unit_memory_bytes if options.pim_target == "upmem" else -1
-    local = options.local_memory_bytes if options.pim_target == "upmem" else 0
+    bank, local = t["capacity"](options)
     return ("--pim-set-target-profile="
             f"target={options.pim_target} "
             f"number-of-pim-devices={options.num_units} "
@@ -160,8 +165,7 @@ def _profile_pass(options) -> str:
             f"parallel-execution-kind={t['parallel_execution_kind']} "
             f"requires-uniform-instruction-sequence={t['uniform_instruction_sequence']} "
             f"usable-bank-capacity-bytes={bank} "
-            f"usable-local-capacity-bytes={local} "
-            f"devices-per-transfer-group={t['devices_per_transfer_group']}")
+            f"usable-local-capacity-bytes={local}")
 
 
 def _ttsharedir_to_pim_common(ttshared: str, options) -> str:

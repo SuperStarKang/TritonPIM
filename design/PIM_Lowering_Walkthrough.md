@@ -215,7 +215,7 @@ size = 72, tile = 32
 ```
 host                                              device (DPU 2048 대)
 ────                                              ─────────────────────
-pim_acquire(2048, "kernel.dpu")
+upmem_acquire(2048, "kernel.dpu")
    └ 런타임이 쥐고 있던 집합을 그대로 준다
 
 DPU_FOREACH _u = 0 .. 2047                        (아직 안 돈다)
@@ -419,8 +419,7 @@ module attributes {
     pim_core_shape = [1], number_of_parallel_lanes_per_pim_core = 1,
     parallel_execution_kind = "multithread",
     requires_uniform_instruction_sequence = false,
-    usable_bank_capacity_bytes = 33554432, usable_local_capacity_bytes = 49152>,
-  pim.upmem_ext = #pim.upmem_ext<number_of_devices_per_transfer_group = 64>}
+    usable_bank_capacity_bytes = 33554432, usable_local_capacity_bytes = 49152>}
 ```
 
 ```mlir
@@ -670,7 +669,7 @@ int main() {
 ### `host.cpp`
 
 ```c
-_set = pim_acquire(2048, DPU_BINARY);
+_set = upmem_acquire(2048, DPU_BINARY);
 
 int8_t** _s0 = (int8_t**)calloc(64, sizeof(int8_t*));   // A: 행 partition 수만큼만
 int8_t** _s1 = (int8_t**)calloc(32, sizeof(int8_t*));   // B: 열 partition 수만큼만

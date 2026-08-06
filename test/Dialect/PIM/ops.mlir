@@ -77,8 +77,7 @@ module attributes {
         parallel_execution_kind = "multithread",
         requires_uniform_instruction_sequence = false,
         usable_bank_capacity_bytes = 33554432,
-        usable_local_capacity_bytes = 49152>,
-    pim.upmem_ext = #pim.upmem_ext<number_of_devices_per_transfer_group = 64>} {
+        usable_local_capacity_bytes = 49152>} {
   // CHECK: pim.core_mapping = #pim.core_mapping<core_axis_roles = ["none"], tile_footprint = array<i64: 1>, lanes = 16, lane_axis_role = "whole_tile">
   func.func @profiled() attributes {
       pim.core_mapping = #pim.core_mapping<core_axis_roles = ["none"],

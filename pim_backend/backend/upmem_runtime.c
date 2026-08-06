@@ -1,4 +1,4 @@
-#include "pim_runtime.h"
+#include "upmem_runtime.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -19,16 +19,16 @@ static struct dpu_set_t g_set;
 static char g_loaded[1024];  // 현재 적재된 binary 경로 (reload 필요 판단용)
 static int g_atexit_done = 0;
 
-static void pim_free_set(void) {
+static void upmem_free_set(void) {
     if (g_have) {
         DPU_ASSERT(dpu_free(g_set));
         g_have = 0;
     }
 }
 
-struct dpu_set_t pim_acquire(uint32_t num_units, const char *binary_path) {
+struct dpu_set_t upmem_acquire(uint32_t num_units, const char *binary_path) {
     if (!g_atexit_done) {
-        atexit(pim_free_set);
+        atexit(upmem_free_set);
         g_atexit_done = 1;
     }
 
@@ -43,7 +43,7 @@ struct dpu_set_t pim_acquire(uint32_t num_units, const char *binary_path) {
     }
 
     // 처음이거나 num_units이 다르면 기존 set을 비우고 새로 예약+적재.
-    pim_free_set();
+    upmem_free_set();
     DPU_ASSERT(dpu_alloc(num_units, NULL, &g_set));
     DPU_ASSERT(dpu_load(g_set, binary_path, NULL));
     g_num_units = num_units;

@@ -81,8 +81,8 @@ def PIMFormCompute : Pass<"pim-form-compute", "mlir::ModuleOp"> {
 def PIMSetTargetProfile : Pass<"pim-set-target-profile", "mlir::ModuleOp"> {
   let summary = "Attach the common machine profile to the module";
   let description = [{
-    `#pim.target_profile` 과 target 확장을 module 에 붙인다. 이 pass 앞의 어떤 pass 도
-    profile 을 읽지 않고, 뒤의 pass 는 전부 이 attribute 에서만 기계 값을 얻는다.
+    `#pim.target_profile` 을 module 에 붙인다. 이 pass 앞의 어떤 pass 도 profile 을 읽지
+    않고, 뒤의 pass 는 전부 이 attribute 에서만 기계 값을 얻는다.
     usable-*-capacity-bytes 를 음수로 주면 그 필드를 만들지 않는다(미측정). 0 은 그
     저장소가 존재하지 않는다는 뜻이라 해당 검사가 생략되고, 미측정은 그 값을 필요로
     하는 검사에 도달하는 순간 진단이 된다.
@@ -105,8 +105,6 @@ def PIMSetTargetProfile : Pass<"pim-set-target-profile", "mlir::ModuleOp"> {
            "33554432", "PIM Core 하나의 attached bank 중 커널 몫. 음수면 미측정.">,
     Option<"usableLocalCapacityBytes", "usable-local-capacity-bytes", "int64_t",
            "49152", "PIM Core 하나의 local storage 중 커널 몫. 음수면 미측정.">,
-    Option<"devicesPerTransferGroup", "devices-per-transfer-group", "int64_t", "0",
-           "UPMEM 확장의 transfer group 크기. 0 이면 확장을 붙이지 않는다.">,
   ];
   let dependentDialects = ["mlir::pim::PIMDialect"];
 }
@@ -144,8 +142,6 @@ def PIMMapDevices : Pass<"pim-map-devices", "mlir::ModuleOp"> {
     logical 축마다 device partition 수를 정하고 loop nest 를 `pim.device` region 으로 감싼다.
     explicit_k_partition 은 나누지 않는다(단계 1). 남은 device 수는 정사각에 가깝게
     인수분해한다 — tile 개수가 런타임이라 컴파일 시점에는 그것 말고 고를 근거가 없다.
-    UPMEM 확장의 transfer group 크기가 있으면 동률 후보 중 column partition 수가 그 값의
-    배수인 쪽을 고른다.
     각 loop 를 balanced block 으로 좁힌다. 몫과 나머지로 나누어 나머지 partition 이 하나씩
     더 맡으므로 꼬리에서 device 가 놀지 않고, 축마다 연속 구간 하나가 유지된다.
     device 안에서 좌표를 0 부터 세고, 전역 좌표는 몸체 첫머리에서 다시 만들어

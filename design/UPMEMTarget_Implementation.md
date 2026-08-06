@@ -63,7 +63,7 @@ device.elf + host.so
 한 번의 커널 호출이 하는 일이다. 괄호 안은 `PIM_TIMING` 계측의 칸 이름이다.
 
 ```
-pim_acquire(units, elf)          런타임이 쥐고 있던 집합을 준다 (계측 밖)
+upmem_acquire(units, elf)          런타임이 쥐고 있던 집합을 준다 (계측 밖)
    │
 유닛 좌표 loop                    원본에서 유닛 몫을 모아 연속 버퍼로            (stage)
    │
@@ -106,7 +106,7 @@ dpu_push_xfer(FROM_DPU)          출력 버퍼를 집합 전체에서 회수    
 
 | op | C 대응 |
 | --- | --- |
-| `upmem.acquire` | `pim_acquire(n, DPU_BINARY)` — 확보 + 적재 |
+| `upmem.acquire` | `upmem_acquire(n, DPU_BINARY)` — 확보 + 적재 |
 | `upmem.foreach_unit` | 유닛 좌표 loop (준비) + `DPU_FOREACH` (전송) |
 | `upmem.stage` | 원본의 strided 영역 → 타일 단위 연속 버퍼 |
 | `upmem.to_mram` | `dpu_prepare_xfer` + `dpu_push_xfer(TO_DPU)` |
@@ -330,10 +330,10 @@ WRAM 버퍼를 전역으로 빼는 이유는 둘이다. 유닛 메모리가 작�
 
 ## 6. 런타임과 빌드
 
-### 6.1 `pim_runtime.c` — 집합 하나를 쥐고 있는다
+### 6.1 `upmem_runtime.c` — 집합 하나를 쥐고 있는다
 
 ```c
-struct dpu_set_t pim_acquire(uint32_t num_units, const char *binary_path);
+struct dpu_set_t upmem_acquire(uint32_t num_units, const char *binary_path);
 ```
 
 | 상황 | 하는 일 |
@@ -352,13 +352,13 @@ struct dpu_set_t pim_acquire(uint32_t num_units, const char *binary_path);
 ```
 device.c → device.elf   dpu-upmem-dpurte-clang -O2 -DNR_TASKLETS=<local_lanes>
 host.cpp → host.so      g++ -O2 -std=c++17 -fPIC -shared -fopenmp
-                        -DDPU_BINARY="<elf 절대경로>" libpim_runtime.so -Wl,-rpath,...
+                        -DDPU_BINARY="<elf 절대경로>" libupmem_runtime.so -Wl,-rpath,...
 ```
 
 `-O2`가 device에 필요하다. clang 기본인 `-O0`이면 MAC loop가 최적화되지 않아 약 두 배
 느리다.
 
-`libpim_runtime.so`는 내용 해시를 키로 **한 번만** 빌드한다. 모든 `host.so`가 같은
+`libupmem_runtime.so`는 내용 해시를 키로 **한 번만** 빌드한다. 모든 `host.so`가 같은
 경로의 `.so`를 링크해야 동적 로더가 하나만 적재하고, 그래야 집합 캐시 전역이
 프로세스에서 공유된다. 이것이 지속 집합의 핵심이다.
 
@@ -494,7 +494,7 @@ lib/Target/UPMEM/
 pim_backend/backend/
   compiler.py                 파이프라인과 옵션
   driver.py                   빌드와 실행
-  pim_runtime.c / .h          지속 집합
+  upmem_runtime.c / .h          지속 집합
 
 test/Dialect/UPMEM/ops.mlir                 dialect 왕복
 test/Conversion/PIMToUPMEM/convert.mlir     변환

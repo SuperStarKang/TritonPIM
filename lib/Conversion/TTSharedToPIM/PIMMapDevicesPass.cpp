@@ -19,17 +19,14 @@ namespace triton {
 namespace {
 
 // n을 두 인수로 가른다. tile 개수가 런타임이라 컴파일 시점에는 정사각에 가까운 것 말고
-// 고를 근거가 없다. 동률이면 column partition 수가 transfer group 크기의 배수인 쪽이다.
-static std::pair<int64_t, int64_t> factorize(int64_t n, int64_t group) {
+// 고를 근거가 없다.
+static std::pair<int64_t, int64_t> factorize(int64_t n) {
   int64_t bestRow = n, bestColumn = 1;
   for (int64_t c = 1; c * c <= n; c++) {
     if (n % c)
       continue;
     int64_t r = n / c;
-    int64_t score = r - c, bestScore = bestRow - bestColumn;
-    bool better = score < bestScore ||
-                  (score == bestScore && group > 0 && c % group == 0);
-    if (better) {
+    if (r - c < bestRow - bestColumn) {
       bestRow = r;
       bestColumn = c;
     }
@@ -87,16 +84,11 @@ struct PIMMapDevicesPass
           "pim-map-devices: the module has no #pim.target_profile");
       return signalPassFailure();
     }
-    int64_t group = 0;
-    if (auto ext = getOperation()->getAttrOfType<pim::UPMEMExtAttr>(
-            "pim.upmem_ext"))
-      group = ext.getNumberOfDevicesPerTransferGroup();
     getOperation().walk(
-        [&](func::FuncOp func) { mapFunc(func, profile, group); });
+        [&](func::FuncOp func) { mapFunc(func, profile); });
   }
 
-  void mapFunc(func::FuncOp func, pim::TargetProfileAttr profile,
-               int64_t group) {
+  void mapFunc(func::FuncOp func, pim::TargetProfileAttr profile) {
     // walk 기본값은 post-order라 안쪽 loop부터 방문하므로 pre-order를 명시한다.
     SmallVector<scf::ForOp> loops;
     SmallVector<Attribute> names;
@@ -121,7 +113,7 @@ struct PIMMapDevicesPass
     if (tileAxes.size() == 1) {
       partitions[tileAxes[0]] = devices;
     } else if (tileAxes.size() >= 2) {
-      auto [row, column] = factorize(devices, group);
+      auto [row, column] = factorize(devices);
       partitions[tileAxes[0]] = row;
       partitions[tileAxes[1]] = column;
     }

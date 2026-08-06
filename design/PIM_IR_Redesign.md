@@ -1454,7 +1454,7 @@ TRITON_KERNEL_DUMP=1 TRITON_DUMP_DIR=$DUMP TRITON_ALWAYS_COMPILE=1 \
 | nonzero pad | 세 커널이 전부 `other=0`이다 | `calloc` 기구로 안 나오므로 별도 채우기가 필요하다 (§6.3) |
 | AttAcc full attention | reduction·softmax·group accumulator·barrier가 필요하다 | Phase 2. `pim.contract` 도입 시점과 맞물린다 |
 | `pim.co_locate` | 세 커널에서 유도된다 (§7.2) | fused attention에서 K와 V가 서로 다른 contraction의 피연산자가 될 때 |
-| PyTorch 그래프 계층 | 코드 0줄이고 런타임·emitter가 데이터 비상주로 설계돼 있다 | `driver.py:174`, `pim_runtime.c:6-14`, `UPMEMToHost.cpp:179-181` |
+| PyTorch 그래프 계층 | 코드 0줄이고 런타임·emitter가 데이터 비상주로 설계돼 있다 | `driver.py:174`, `upmem_runtime.c:6-14`, `UPMEMToHost.cpp:179-181` |
 
 ---
 

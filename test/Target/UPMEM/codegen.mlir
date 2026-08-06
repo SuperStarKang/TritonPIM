@@ -9,9 +9,11 @@ upmem.host_var @tiles_x : index
 upmem.host_var @pitch_a : index
 
 // ── host ────────────────────────────────────────────────────────────────────
+// 런타임 헤더는 UPMEM target의 것이고, driver가 -I로 잡아 주는 이름과 같아야 한다.
+// HOST: #include "upmem_runtime.h"
 // HOST: extern "C" void kernel(int8_t* a0, int32_t* a1, int64_t a2, int64_t a3)
 // 확보와 적재는 런타임이 한 번만 한다.
-// HOST: _set = pim_acquire(4, DPU_BINARY);
+// HOST: _set = upmem_acquire(4, DPU_BINARY);
 // 유닛 좌표는 선형 번호에서 자리값으로 푼다.
 // HOST: for (int64_t _u = 0; _u < 4; ++_u)
 // staging: dedup 축을 뺀 조합마다 한 번씩만 만들고, 남는 자리는 0이다.
