@@ -270,6 +270,10 @@ class CPUBackend(BaseBackend):
     def hash(self):
         return self.target
 
-    # The CPU backend does not use any extra python modules, return an empty dictionary
+    # triton/language/extra/libdevice.py 는 이름만 있는 빈 스텁이고, 백엔드가 여기서 실제
+    # 구현을 끼워 넣는다(nvidia 는 CUDA libdevice 를 준다). 비워 두면 커널이 libdevice.exp 를
+    # 부를 때 None 이 돌아오고 그 다음 연산에서 죽는다. torch.compile 이 만든 CPU Triton
+    # 커널은 libdevice 를 무조건 쓰므로 이 자리가 채워져야 그 경로가 선다.
     def get_module_map(self) -> Dict[str, ModuleType]:
-        return {}
+        from triton.backends.triton_shared import libdevice
+        return {"triton.language.extra.libdevice": libdevice}

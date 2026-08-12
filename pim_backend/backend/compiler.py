@@ -286,8 +286,28 @@ class PIMBackend(BaseBackend):
     def __init__(self, target: GPUTarget) -> None:
         super().__init__(target)
 
+    # 인덕터 경로에는 launch kwarg를 끼워 넣을 자리가 없다. triton.compile에 넘어가는 옵션은
+    # _create_compile_options(_inductor/runtime/triton_heuristics.py:804-812)가 만드는
+    # 화이트리스트(num_warps/num_stages/debug/sanitize_overflow)뿐이라, PIM 고유 옵션은
+    # 통로가 없다. 그래서 env를 통로로 하나 더 연다.
+    #
+    # fallback이 아니다 — env가 없으면 pim_target은 여전히 None이고 __post_init__이 그대로
+    # 터진다. 손으로 띄우는 경로(launch kwarg)가 있으면 그쪽이 이긴다(아래 update 순서).
+    _ENV_OPTIONS = {
+        "pim_target": ("PIM_TARGET", str),
+        "num_units": ("PIM_NUM_UNITS", int),
+        "local_lanes": ("PIM_LOCAL_LANES", int),
+        "local_memory_bytes": ("PIM_LOCAL_MEMORY_BYTES", int),
+        "unit_memory_bytes": ("PIM_UNIT_MEMORY_BYTES", int),
+        "host_threads": ("PIM_HOST_THREADS", int),
+    }
+
     def parse_options(self, opts) -> PIMOptions:
         args = {'arch': self.target.arch}
+        for field, (env, cast) in self._ENV_OPTIONS.items():
+            value = os.environ.get(env)
+            if value is not None:
+                args[field] = cast(value)
         args.update({k: opts[k] for k in PIMOptions.__dataclass_fields__.keys() if k in opts})
         return PIMOptions(**args)
 
