@@ -10,9 +10,9 @@
 #   3) host.so를 dlopen해 <kernel>_host(A,B,C)를 ctypes로 호출
 # CPULauncher가 launcher .so를 컴파일·로드하는 패턴을 PIM 런타임 glue에 맞게 옮긴 것.
 #
-# target 분기: 위 1~2(빌드)는 target마다 다르다(upmem=dpu-clang/libdpu, aimx=descriptor runtime).
-# 3(dlopen→ctypes 호출)은 stub이 같은 C ABI를 노출한다는 전제로 공유한다. aimx 빌드는 seam만
-# 잡아 두었고(_build_aimx_so) 실제 구현은 별도 서버/브랜치에서 채운다.
+# target 분기: 위 1~2(빌드)는 target마다 다르다(upmem=dpu-clang/libdpu, aimx=g++/libpim).
+# 3(dlopen→ctypes 호출)은 stub이 같은 C ABI를 노출한다는 전제로 공유한다.
+# aimx는 device 프로그램이 없다 — descriptor chain 자체가 프로그램이라 stub 하나만 빌드한다.
 #
 # UPMEM 전용 코드는 전부 _upmem_ 접두사 함수 안에 있다. 그 밖의 코드는 target을 모르며,
 # 벤더 어휘(dpu/mram/tasklet 등)를 쓰지 않는다. target을 추가할 때는 _build_<target>_so 하나와
@@ -35,10 +35,18 @@ from triton.backends.compiler import GPUTarget
 import triton.backends.triton_shared.driver as cpu_driver
 
 
-# ── PIM_TIMING (임시): 마지막 launch의 단계별 시간(ms). 지울 때 이 표시를 찾으면 된다.
-# 생성된 host 코드가 이 배열을 export하는 target에서만 채워진다(지금은 upmem뿐).
-TIMING_STAGES = ("stage", "h2d", "kernel", "d2h", "combine")
-timing = [0.0] * len(TIMING_STAGES)
+# ── PIM_TIMING (임시): 마지막 launch의 단계별 시간(ms)과 그 단계 이름.
+# 지울 때 이 표시를 찾으면 된다. 두 target의 단계 이름이 다르므로 launch마다 다시 놓는다.
+_STAGE_NAMES = {
+    "upmem": ("stage", "h2d", "kernel", "d2h", "combine"),
+    "aimx": ("alloc", "build", "stage", "invoke", "unstage"),
+}
+TIMING_STAGES = _STAGE_NAMES["upmem"]
+timing = [0.0] * 5
+# 마지막 launch의 pim_exec 호출 수. aimx만 낸다(upmem은 0으로 둔다). execution tile 하나의
+# throughput은 invoke 시간을 이 값으로 나눠야 나오는데, host에서 tile 산술을 다시 하면
+# device 분할 규칙이 바뀔 때마다 어긋난다.
+invokes = 0
 
 
 def _upmem_host_flags():
@@ -125,16 +133,73 @@ def _build_upmem_so(host_src: str, device_src: str, local_lanes: int) -> str:
     return so_path
 
 
-def _build_aimx_so(stub_src: str, descriptors: str) -> str:
-    # AiMX runtime stub(C++) + descriptor stream을 .so로 빌드해 경로를 돌려준다.
-    # _build_upmem_so의 캐시 패턴(소스 해시 키)을 그대로 따를 예정이다.
+def _aimx_include_dirs():
+    # 생성된 stub이 쓰는 두 헤더의 자리.
+    #   pim.h       — libpim이 export하는 것 (설치본은 /usr/include)
+    #   pim_math.h  — pim_isa_32_t / PIM_RD_INSTR_MC / pim_exec. 설치되지 않는 소스 트리 헤더라
+    #                 경로를 받아야 한다. 짐작하지 않고 없으면 그 자리에서 터뜨린다.
+    root = os.getenv("AIMX_PIM_SW", "")
+    if not root:
+        raise RuntimeError(
+            "AIMX_PIM_SW가 설정되지 않았습니다. pim_sw 소스 트리의 경로를 넣어 주십시오 "
+            "(예: export AIMX_PIM_SW=$HOME/pim_aimx_sw/pim_sw). "
+            "생성된 stub이 pim_math.h를 include하는데 이 헤더는 설치되지 않습니다.")
+    math_dir = os.path.join(root, "src", "pim_math_src")
+    if not os.path.isfile(os.path.join(math_dir, "pim_math.h")):
+        raise RuntimeError(f"{math_dir}/pim_math.h가 없습니다. AIMX_PIM_SW를 확인해 주십시오.")
+    return [math_dir, os.path.join(root, "include")]
+
+
+def _build_aimx_so(stub_src: str, descriptors: str, base_fpga: int) -> str:
+    # AiMX runtime stub(C++) + descriptor program(C 헤더)을 .so로 빌드해 경로를 돌려준다.
+    # _build_upmem_so의 캐시 패턴(소스 해시 키)을 그대로 따른다.
     #
-    # 지금은 경로(seam)만 잡아 둔 상태 — AiMX runtime API·descriptor 포맷·링크 라이브러리·컴파일러가
-    # 아직 정해지지 않아 실제 빌드 커맨드를 쓸 수 없다. upmem 경로로 fallback하지 않고 여기서
-    # 명시적으로 터뜨린다(CLAUDE.md fallback 금지). 실제 구현은 별도 서버/브랜치에서 채운다(B1.4/B1.5).
-    raise NotImplementedError(
-        "AiMX launcher build 미구현 — descriptor 포맷/runtime API 확정 후 _build_aimx_so를 채울 것 "
-        "(DESIGN 13.3/13.5, IMPLEMENT B1.4/B1.5)")
+    # descriptor 쪽은 별도 .so가 아니라 stub이 include하는 헤더다 — program 하나가 함수
+    # 하나이고 stub이 launch당 한 번만 부르므로 나눌 이유가 없다.
+    includes = _aimx_include_dirs()
+    backend_dir = os.path.dirname(os.path.abspath(__file__))
+    # aimx_runtime.h 내용을 키에 넣는다. 생성된 소스는 그대로인데 이 헤더만 고치는 경우가
+    # 있고(런타임 선언·매크로), 키에 없으면 옛 .so가 그대로 재사용된다.
+    runtime_h = Path(os.path.join(backend_dir, "aimx_runtime.h")).read_text()
+    # base_fpga는 소스가 아니라 -D로 들어가므로 키에 따로 넣어야 한다.
+    key = hashlib.sha256(
+        (stub_src + descriptors + "|" + "|".join(includes) + "|" + runtime_h
+         + f"|fpga={base_fpga}").encode("utf-8")).hexdigest()
+    cache = get_cache_manager(key)
+    so_name = "pim_host.so"
+    so_path = cache.get_file(so_name)
+    if so_path is not None:
+        return so_path
+
+    with tempfile.TemporaryDirectory() as tmp:
+        Path(os.path.join(tmp, "aimx_descriptors.h")).write_text(descriptors)
+        stub_cpp = os.path.join(tmp, "stub.cpp")
+        Path(stub_cpp).write_text(stub_src)
+        so_tmp = os.path.join(tmp, so_name)
+        # pim_math.h는 C로 쓰였고 C++로 읽으면 걸리는 곳이 셋 있다. 셋 다 우리가 부르지 않는
+        # 코드(decode_opcode의 진단 문자열)라 진단만 끈다.
+        #   -Wno-unused-function : 쓰지 않는 static inline stub이 여럿이다
+        #   -Wno-narrowing       : case (CODE_READ) 같은 0xdeadbea1 라벨이 int로 좁혀진다
+        #   -Wno-write-strings   : char* 반환에 문자열 상수를 쓴다
+        # -lm: libpim.so가 pow를 미해결 심볼로 남긴다.
+        # -fopenmp: 생성된 stub이 PIM Device마다 host thread 하나를 띄운다. 이것 없이는
+        # pragma가 무시되어 조용히 순차 실행이 되므로 옵션이 아니라 필수다.
+        # -O3: stage/unstage의 변환 loop이 원소 단위라 벡터화 여부가 곧 host 시간이다.
+        # -O2는 -ftree-vectorize를 매우 보수적으로만 쓰고, stride가 런타임 값인 loop을
+        # stride-1 판으로 복제하는 -fversion-loops-for-strides는 -O3에서만 켜진다.
+        subprocess.check_call(
+            ["g++", "-O3", "-std=c++17", "-fPIC", "-shared", "-fopenmp",
+             f"-DAIMX_BASE_FPGA={int(base_fpga)}",
+             "-Wno-unused-function", "-Wno-narrowing", "-Wno-write-strings",
+             f"-I{tmp}", f"-I{backend_dir}", *[f"-I{d}" for d in includes],
+             stub_cpp, "-lpim", "-lpthread", "-lm", "-o", so_tmp])
+        so_path = cache.put(Path(so_tmp).read_bytes(), so_name, binary=True)
+        # 생성된 소스를 .so 옆에 남긴다. 하드웨어에서 답이 틀릴 때 볼 곳이 여기뿐이다
+        # (descriptor 주소식과 stage/unstage 인덱싱이 전부 이 두 파일에 있다).
+        cache.put(stub_src, "stub.cpp", binary=False)
+        cache.put(descriptors, "aimx_descriptors.h", binary=False)
+
+    return so_path
 
 
 class PIMLauncher(object):
@@ -162,7 +227,8 @@ class PIMLauncher(object):
             # NR_TASKLETS는 컴파일러가 lane 예산 안에서 고른 값이다. 번들에 실려 온다.
             so_path = _build_upmem_so(bundle["host"], bundle["device"], bundle["lanes"])
         elif self.pim_target == "aimx":
-            so_path = _build_aimx_so(bundle["stub"], bundle["descriptors"])
+            so_path = _build_aimx_so(bundle["stub"], bundle["descriptors"],
+                                     bundle["base_fpga"])
         else:
             raise ValueError(f"Unsupported PIM target '{self.pim_target}'.")
 
@@ -185,14 +251,15 @@ class PIMLauncher(object):
         fn(*call, ctypes.c_int32(gridX), ctypes.c_int32(gridY), ctypes.c_int32(gridZ))
 
         # ── PIM_TIMING (임시): 생성된 host 코드가 단계별 시간을 전역 배열에 남긴다.
-        # 성능 판단이 끝나면 이 블록과 위의 PIM_TIMING 정의, UPMEMToHost.cpp의 같은 표시를 지운다.
-        # 이 전역은 UPMEMToHost.cpp가 내는 것이므로 target 분기 안에 둔다. 밖에 두면 이 배열을
-        # 내지 않는 target의 .so에서 in_dll이 ValueError를 던져 launch 자체가 실패한다.
-        if self.pim_target == "upmem":
-            timing[:] = list((ctypes.c_double * len(TIMING_STAGES)).in_dll(lib, "pim_timing_ms"))
-        else:
-            # 앞선 다른 커널의 값을 그 target의 것처럼 읽지 않도록 지운다.
-            timing[:] = [0.0] * len(TIMING_STAGES)
+        # 성능 판단이 끝나면 이 블록과 위의 PIM_TIMING 정의, UPMEMToHost.cpp / AiMXToRuntimeStub.cpp의
+        # 같은 표시를 지운다. 단계 이름은 target마다 다르므로 같이 놓는다.
+        global TIMING_STAGES, invokes
+        TIMING_STAGES = _STAGE_NAMES[self.pim_target]
+        timing[:] = list((ctypes.c_double * 5).in_dll(lib, "pim_timing_ms"))
+        # 이 전역은 AiMXToRuntimeStub.cpp만 낸다. upmem .so에서 in_dll을 부르면
+        # ValueError로 launch 자체가 실패하므로 target을 보고 부른다.
+        invokes = (ctypes.c_uint64.in_dll(lib, "pim_invoke_count").value
+                   if self.pim_target == "aimx" else 0)
 
         if launch_exit_hook is not None:
             launch_exit_hook(launch_metadata)

@@ -21,6 +21,7 @@ from typing import Tuple, Dict
 from types import ModuleType
 from pathlib import Path
 import contextlib
+import glob
 import hashlib
 import functools
 import os
@@ -109,6 +110,28 @@ def _run_translate(mlir_text: str, which: str) -> str:
         return subprocess.check_output([tr, which, src]).decode("utf-8")
 
 
+# AiMX FPGA 하나가 커널에 내주는 PIM DRAM 예산 (byte).
+#
+# **보수적으로 선언한 값이다.** 진짜 용량은 driver 가 찍는 BAR 길이에서 읽는다:
+#   sudo dmesg | grep -E "PIM_MEM_[0-9]+\] BAR #4"
+# 할당을 키워 가며 재는 방법은 성립하지 않는다 — pim_malloc 은 1 MB 부터 16 GB 까지
+# 전부 '성공' 하고(주소만 떼어 준다) 진짜 실패하면 NULL 대신 프로세스를 죽인다.
+# 기본 execution tile(m=16, k=4096, n=4096)이 약 36.6 MB 이므로 이 값으로 tile 이
+# 줄어들지 않는다. 더 큰 tile 을 쓰려면 실제 BAR 길이로 올린다.
+AIMX_DEVICE_DRAM_BYTES = 1 << 30
+
+
+def _aimx_device_count() -> int:
+    # 런타임(init_mpim_drv)이 /dev/pl_dma<i> 를 i = 0..totalDevNum-1 로 연다. 그러니
+    # 그 node 를 세는 것이 런타임이 보는 개수와 같은 값이다. 감지에 실패하면 1 로
+    # 때우지 않고 멈춘다 — 조용히 FPGA 한 장만 쓰는 것이 가장 알아채기 어렵다.
+    n = len(glob.glob("/dev/pl_dma[0-9]*"))
+    if n == 0:
+        raise RuntimeError(
+            "/dev/pl_dma* 가 없습니다. pim_drv 가 올라와 있는지 확인해 주십시오. "
+            "개수를 직접 주려면 num_units 옵션을 쓰십시오.")
+    return n
+
 # target 마다 고정된 기계 값. 나머지는 PIMOptions 에서 온다.
 # capacity 는 (usable_bank_capacity_bytes, usable_local_capacity_bytes) 를 옵션에서 뽑는다.
 # 음수면 미측정이라는 뜻이라 profile 에 필드가 생기지 않고, 그 값을 필요로 하는 검사에
@@ -119,15 +142,36 @@ _TARGET_PROFILE = {
         "pim_core_shape": "1",
         "parallel_execution_kind": "multithread",
         "uniform_instruction_sequence": "false",
+        # PIM Device = DPU. 옵션이 0 이면 이 값을 물리 개수로 본다.
+        "devices": lambda o: o.num_units or 2048,
+        # DPU 는 수천 개라 정사각에 가까운 분할이 맞다. 우선순위를 두지 않는다.
+        "device_axis_priority": "",
+        # DPU 는 tile 하나를 통째로 맡으므로 분할 눈금이 따로 없다.
+        "device_axis_granularity": lambda o: "",
         # 유닛=DPU, 큰 메모리=MRAM, 빠른 메모리=WRAM 이라 둘 다 옵션 값이 그대로 온다.
         "capacity": lambda o: (o.unit_memory_bytes, o.local_memory_bytes),
     },
     "aimx": {
-        "pim_core_shape": "8,16",
+        # PIM Device = FPGA 1개, 그 안에 PIM Core 1개다. lane 4096 개는 주소 decoding 이
+        # 정하는 고정된 갈래라 compiler 가 배정할 대상이 아니므로 topology 는 [1] 이다.
+        "pim_core_shape": "1",
         "parallel_execution_kind": "simd",
         "uniform_instruction_sequence": "true",
-        # bank 용량은 아직 미측정(음수), core 별 local storage 는 없다(0).
-        "capacity": lambda o: (-1, 0),
+        "lanes": 4096,      # NUM_BANKS * NUM_CHANNELS * ALU_SIZE
+        # PIM Device = FPGA 1 장. 옵션이 0 이면 이 머신에 실제로 있는 개수를 센다.
+        "devices": lambda o: o.num_units or _aimx_device_count(),
+        # device 축은 열부터 쪼갠다. 행을 쪼개면 B 가 device 수만큼 복제되는데 B 가 가장
+        # 큰 buffer 다. 열을 쪼개면 A 가 복제되지만 A 는 이미 n loop 때문에 device 안에서
+        # 여러 번 올라가므로 전체 전송량이 늘지 않는다 (설계 §6.1).
+        "device_axis_priority": "output_column_tile,output_row_tile",
+        # 그리고 그 축은 execution tile 눈금으로만 자른다. device 하나가 n 방향으로
+        # 소비하는 단위는 n_t = min(4096*ceil(N/4096), n_max) 라 언제나 4096 의 배수다.
+        # 그보다 잘게 자르면 마지막 tile 이 절반만 유효한 채로 온전히 실행된다. batch 와는
+        # 무관하다 — 출력 block 폭 4096/batch 는 execution tile **안**의 눈금이다.
+        "device_axis_granularity": lambda o: "output_column_tile:4096",
+        # core 별 local storage 는 없다(0). bank 예산은 선언 상수다 — pim_malloc 은
+        # 실패해도 NULL 을 돌려주지 않고 프로세스를 죽이므로 재 보는 방법이 없다.
+        "capacity": lambda o: (AIMX_DEVICE_DRAM_BYTES, 0),
     },
 }
 
@@ -146,7 +190,7 @@ PIM_COMMON_PASSES = [
     "{profile}",                   # 기계 profile 부착. 여기부터 profile 을 읽는다
     "--pim-map-cores",             # logical 차원 ↔ PIM Core topology, lane 수 선택
     "--pim-form-execution-waves",  # core footprint 로 wave 구성
-    "--pim-map-devices",           # wave 를 PIM Device 에 균형 분배
+    "{map_devices}",               # wave 를 PIM Device 에 균형 분배
     "--pim-place-data",            # 최종 region·replication·capacity materialize
     "--pim-verify",                # 공통 fail-fast 검증
     "-cse",
@@ -159,9 +203,9 @@ def _profile_pass(options) -> str:
     bank, local = t["capacity"](options)
     return ("--pim-set-target-profile="
             f"target={options.pim_target} "
-            f"number-of-pim-devices={options.num_units} "
+            f"number-of-pim-devices={t['devices'](options)} "
             f"pim-core-shape={t['pim_core_shape']} "
-            f"number-of-parallel-lanes-per-pim-core={options.local_lanes} "
+            f"number-of-parallel-lanes-per-pim-core={t.get('lanes', options.local_lanes)} "
             f"parallel-execution-kind={t['parallel_execution_kind']} "
             f"requires-uniform-instruction-sequence={t['uniform_instruction_sequence']} "
             f"usable-bank-capacity-bytes={bank} "
@@ -169,8 +213,14 @@ def _profile_pass(options) -> str:
 
 
 def _ttsharedir_to_pim_common(ttshared: str, options) -> str:
+    t = _TARGET_PROFILE[options.pim_target]
     profile = _profile_pass(options)
-    return _run_opt(ttshared, [p.format(profile=profile) for p in PIM_COMMON_PASSES])
+    opts = [("device-axis-priority", t["device_axis_priority"]),
+            ("device-axis-granularity", t["device_axis_granularity"](options))]
+    given = " ".join(f"{k}={v}" for k, v in opts if v)
+    map_devices = "--pim-map-devices" + (f"={given}" if given else "")
+    return _run_opt(ttshared, [p.format(profile=profile, map_devices=map_devices)
+                               for p in PIM_COMMON_PASSES])
 
 
 def _pim_common_to_upmem(pim_common: str, options) -> str:
@@ -202,30 +252,39 @@ def _upmem_to_artifact(upmem_ir: str, metadata) -> bytes:
 # 아래 두 함수는 _pim_common_to_upmem / _upmem_to_artifact의 AiMX 쌍둥이다. 구조·시그니처는
 # 동일하고 target 고유 문자열(pass 이름·translate 이름·번들 키)만 다르다. 호출하는 배관
 # (_run_opt / _run_translate)은 target-neutral이라 그대로 재사용한다.
-#
-# 지금은 경로(seam)만 만들어 둔 상태다. AiMX 변환 pass(--convert-pim-to-aimx)와
-# translate(--aimx-to-*)는 아직 triton-shared-opt/-translate에 없으므로, target="aimx"로
-# 실행하면 이 함수들이 호출하는 subprocess가 그 자리에서 fail한다(의도된 fail-fast, fallback 없음).
-# 실제 C++ 구현(dialect/legalize/codegen)은 별도 서버/브랜치에서 채운다(IMPLEMENT B1.2/B1.4).
 
-def _pim_common_to_aimx(pim_common: str) -> str:
-    # 같은 target-neutral PIM IR을 AiMX IR로 변환한다 (Conversion/PIMToAiMX, B1.2).
-    return _run_opt(pim_common, ["--convert-pim-to-aimx"])
+# AiMX는 두 단계로 내린다. 첫 단계가 execution tile·padding·배치를 정하고(level 1),
+# 두 번째가 그 tile 모양에서 descriptor program을 펼친다(level 2). 두 단계를 나누는 이유는
+# level 1이 tile마다 반복되고 level 2가 launch당 한 번만 펼쳐지기 때문이다 — 그 구분이
+# IR에 보이지 않으면 chain 재사용이 codegen이 몰래 하는 결정이 된다.
+def _aimx_passes(options):
+    # execution tile 은 Triton의 @triton.autotune으로 흔들 수 없다(그쪽은 BLOCK_*만 본다).
+    # 그래서 backend option으로 두고 여기서 pass에 그대로 넘긴다 — 설계 §12.4.
+    tile = (f"--convert-pim-to-aimx=group-m={options.group_m} tile-k={options.tile_k} "
+            f"tile-n={options.tile_n} batch={options.batch}")
+    # 0이면 profile의 usable_bank_capacity_bytes를 쓴다. sweep이 실제 예산을 재려고
+    # 이것만 흔드는 경우가 있어 따로 둔다.
+    if options.bank_capacity_bytes:
+        tile += f" bank-capacity-bytes={options.bank_capacity_bytes}"
+    return [tile, "--aimx-lower-matmul", "-cse", "-canonicalize"]
 
 
-def _aimx_to_artifact(aimx_ir: str, metadata) -> bytes:
-    # AiMX IR → runtime stub(C++) + descriptor stream을 생성해 번들로 묶는다 (Target/AiMX, B1.4).
+def _pim_common_to_aimx(pim_common: str, options) -> str:
+    return _run_opt(pim_common, _aimx_passes(options))
+
+
+def _aimx_to_artifact(aimx_ir: str, metadata, options) -> bytes:
+    # AiMX IR → runtime stub(C++) + descriptor program(C 헤더)을 생성해 번들로 묶는다.
     # upmem과 동일하게, launcher가 호출할 진입 함수 이름을 stub에서 파싱해 metadata["name"]에 채운다.
-    # (runtime stub은 extern "C" void <name>(...) 진입점을 emit해야 이 파싱이 성립 — 평행 구조의 계약.)
-    # 주의: descriptor가 binary 포맷으로 확정되면 utf-8 디코드하는 _run_translate로는 못 받으므로,
-    #       그때 binary용 translate 헬퍼가 필요하다(포맷 확정 전이라 지금은 텍스트로 둔다, B1.4).
     stub_src = _run_translate(aimx_ir, "--aimx-to-runtime-stub")
     descriptors = _run_translate(aimx_ir, "--aimx-to-descriptors")
     match = re.search(r'extern "C" void (\w+)\(', stub_src)
     if not match:
         raise RuntimeError("generated AiMX stub에서 진입 함수를 찾지 못함")
     metadata["name"] = match.group(1)
-    return json.dumps({"stub": stub_src, "descriptors": descriptors}).encode("utf-8")
+    # base_fpga는 컴파일이 아니라 빌드 때 -D로 들어간다. launcher가 읽도록 번들에 싣는다.
+    return json.dumps({"stub": stub_src, "descriptors": descriptors,
+                       "base_fpga": options.base_fpga}).encode("utf-8")
 
 
 @dataclass(frozen=True)
@@ -252,7 +311,30 @@ class PIMOptions:
     pim_target: str = None       # "upmem" | "aimx" — 누락 시 아래에서 즉시 에러 (fallback 없음)
     device_id: int = 0
     # 기계 — 이름을 target 중립으로 둔다(UPMEM에서는 유닛=DPU, 빠른 메모리=WRAM).
-    num_units: int = 2048        # 물리 유닛 개수. split의 곱이 이보다 크면 컴파일 시점에 실패.
+    # 물리 PIM Device 개수. 0이면 target이 정한다 — upmem은 2048, aimx는 이 머신에
+    # 실제로 있는 FPGA 개수(/dev/pl_dma*)를 센다. split의 곱이 이보다 크면 컴파일 시점에 실패.
+    num_units: int = 0
+    # 몇 번 카드부터 쓰는가. 런타임은 fpga_id로 pl_dma[id]를 **경계 검사 없이** 인덱싱하므로
+    # [base_fpga, base_fpga + num_units)가 [0, 감지된 개수) 안에 있어야 한다. 생성된 stub이
+    # init_pim_drv()가 돌려준 개수와 대조해 어기면 즉시 멈춘다.
+    base_fpga: int = 0
+    # execution tile. tile_k/tile_n은 실제 tile 모양이 아니라 **buffer 상한**이고, 실제
+    # 모양은 문제 크기가 정하는 런타임 값이다(설계 §6.1). batch는 출력 block을
+    # batch x (4096/batch)로 자르는 값이고 {1,2,4,8}만 legal하다 — 이것이 곧 arithmetic
+    # intensity라 단일 device 성능을 지배한다.
+    #
+    # m 방향은 크기가 아니라 **Triton block 묶음 수**로 준다. m_t = BLOCK_M * group_m이라
+    # BLOCK_M=8이면 group_m=5가 곧 m_t=40이다. 반대로 크기를 주고 BLOCK_M 경계로 올리면
+    # m_t가 언제나 BLOCK_M의 배수로 튀어 그런 값을 만들 수 없다.
+    group_m: int = 1
+    tile_k: int = 32768
+    tile_n: int = 4096
+    # 0이면 pass가 Triton block이 허락하는 최대값을 고른다. BLOCK 16/16/16이면 8이고,
+    # batch=1 대비 3.4배로 실측된다. 고정값을 박으면 BLOCK_K=64 같은 흔한 값이 컴파일
+    # 오류가 되므로 기본값은 값이 아니라 규칙이다.
+    batch: int = 0
+    # PIM DRAM 예산. 0이면 profile의 usable_bank_capacity_bytes를 쓴다.
+    bank_capacity_bytes: int = 0
     # 유닛당 빠른 메모리. tile 버퍼 합계 × local_lanes가 넘으면 실패한다. UPMEM의 물리 WRAM은
     # 64 KB지만 tasklet 스택과 런타임도 여기 살므로 커널이 써도 되는 몫은 그보다 작다.
     local_memory_bytes: int = 48 * 1024
@@ -324,8 +406,8 @@ class PIMBackend(BaseBackend):
             stages["target_ir"] = lambda src, metadata: _pim_common_to_upmem(src, options)
             stages["pimobj"] = lambda src, metadata: _upmem_to_artifact(src, metadata)
         elif options.pim_target == "aimx":
-            stages["target_ir"] = lambda src, metadata: _pim_common_to_aimx(src)
-            stages["pimobj"] = lambda src, metadata: _aimx_to_artifact(src, metadata)
+            stages["target_ir"] = lambda src, metadata: _pim_common_to_aimx(src, options)
+            stages["pimobj"] = lambda src, metadata: _aimx_to_artifact(src, metadata, options)
         else:
             raise ValueError(
                 f"Unsupported PIM target '{options.pim_target}'. Supported: 'upmem', 'aimx'.")

@@ -65,3 +65,22 @@ int64_t mlir::pim::localTileBytes(Operation *scope) {
   }
   return bytes;
 }
+
+void mlir::pim::collectDrivers(Value v, ArrayRef<scf::ForOp> loops,
+                               llvm::SmallPtrSetImpl<Operation *> &drivers) {
+  SmallVector<Value> work{v};
+  llvm::DenseSet<Value> seen;
+  while (!work.empty()) {
+    Value c = work.pop_back_val();
+    if (!seen.insert(c).second)
+      continue;
+    if (auto ba = dyn_cast<BlockArgument>(c)) {
+      for (scf::ForOp l : loops)
+        if (ba == l.getInductionVar())
+          drivers.insert(l);
+      continue;
+    }
+    if (Operation *def = c.getDefiningOp())
+      work.append(def->getOperands().begin(), def->getOperands().end());
+  }
+}
