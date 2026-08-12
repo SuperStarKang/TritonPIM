@@ -18,10 +18,12 @@
 #include "triton-shared/Conversion/TritonToLinalgExperimental/Passes.h"
 #include "triton-shared/Conversion/TritonToStructured/Passes.h"
 #include "triton-shared/Conversion/TritonToUnstructured/Passes.h"
+#include "triton-shared/Conversion/PIMToAiMX/Passes.h"
 #include "triton-shared/Conversion/PIMToUPMEM/Passes.h"
 #include "triton-shared/Conversion/TTSharedToPIM/Passes.h"
 #include "triton-shared/Conversion/UnstructuredToMemref/Passes.h"
 #include "triton-shared/Dialect/PIM/IR/PIMDialect.h"
+#include "triton-shared/Dialect/PIMTarget/AiMX/IR/AiMXDialect.h"
 #include "triton-shared/Dialect/PIMTarget/UPMEM/IR/UPMEMDialect.h"
 #include "triton-shared/Dialect/TPtr/IR/TPtrDialect.h"
 #include "triton-shared/Dialect/TritonStructured/IR/TritonStructuredDialect.h"
@@ -54,11 +56,14 @@ inline void registerTritonSharedDialects(mlir::DialectRegistry &registry) {
   mlir::triton::registerPIMPlaceDataPass();
   mlir::triton::registerPIMVerifyPass();
   mlir::triton::registerConvertPIMToUPMEMPass();
+  mlir::triton::registerConvertPIMToAiMXPass();
+  mlir::triton::registerAiMXLowerMatmulPass();
   mlir::triton::registerAddLLVMDebugInfoPass();
 
   // TODO: register Triton & TritonGPU passes
   registry.insert<
       mlir::pim::PIMDialect, mlir::upmem::UPMEMDialect,
+      mlir::aimx::AiMXDialect,
       mlir::tptr::TPtrDialect, mlir::ptr::PtrDialect,
       mlir::ttx::TritonTilingExtDialect, mlir::tts::TritonStructuredDialect,
       mlir::triton::TritonDialect, mlir::cf::ControlFlowDialect,

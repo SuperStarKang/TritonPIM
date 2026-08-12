@@ -1,5 +1,6 @@
 #include "triton-shared/Conversion/TTSharedToPIM/TTSharedToPIM.h"
 #include "triton-shared/Dialect/PIM/IR/PIMDialect.h"
+#include "triton-shared/Dialect/PIM/IR/PIMUtils.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -45,31 +46,12 @@ static Value rebuild(OpBuilder &b, Value v, IRMapping &map, Operation *nest) {
 }
 
 // v가 유도변수를 쓰는 loop들.
-static void collectDrivers(Value v, ArrayRef<scf::ForOp> loops,
-                           llvm::SmallPtrSetImpl<Operation *> &drivers) {
-  SmallVector<Value> work{v};
-  llvm::DenseSet<Value> seen;
-  while (!work.empty()) {
-    Value c = work.pop_back_val();
-    if (!seen.insert(c).second)
-      continue;
-    if (auto ba = dyn_cast<BlockArgument>(c)) {
-      for (scf::ForOp l : loops)
-        if (ba == l.getInductionVar())
-          drivers.insert(l);
-      continue;
-    }
-    if (Operation *def = c.getDefiningOp())
-      work.append(def->getOperands().begin(), def->getOperands().end());
-  }
-}
-
 // 좌표에 무관하고 상수도 아닌 값인가. mask 식에서 원본 버퍼의 크기만 이 성질을 갖는다.
 static bool isExtentCandidate(Value v, ArrayRef<scf::ForOp> loops) {
   if (getConstantIntValue(v))
     return false;
   llvm::SmallPtrSet<Operation *, 4> drivers;
-  collectDrivers(v, loops, drivers);
+  pim::collectDrivers(v, loops, drivers);
   return drivers.empty();
 }
 
@@ -241,7 +223,7 @@ struct PIMPlaceDataPass
                << d << " cannot be rebuilt from the device coordinate";
 
       llvm::SmallPtrSet<Operation *, 4> drivers;
-      collectDrivers(access.getOrigin()[d], loops, drivers);
+      pim::collectDrivers(access.getOrigin()[d], loops, drivers);
       Value tile = b.create<arith::ConstantIndexOp>(loc, access.getSizes()[d]);
       Value trips, capacityTiles;
       bool first = true;
@@ -303,13 +285,13 @@ struct PIMPlaceDataPass
     SmallVector<Attribute> replicated;
     if (!isOutput) {
       llvm::SmallPtrSet<Operation *, 4> used;
-      collectDrivers(access.getOffset(), loops, used);
+      pim::collectDrivers(access.getOffset(), loops, used);
       for (Value v : access.getStrides())
-        collectDrivers(v, loops, used);
+        pim::collectDrivers(v, loops, used);
       for (Value v : access.getValid())
-        collectDrivers(v, loops, used);
+        pim::collectDrivers(v, loops, used);
       if (Value pad = access.getPad())
-        collectDrivers(pad, loops, used);
+        pim::collectDrivers(pad, loops, used);
       for (scf::ForOp l : loops) {
         const LoopRange &r = ranges.find(l)->second;
         if (r.axis && !used.contains(l))

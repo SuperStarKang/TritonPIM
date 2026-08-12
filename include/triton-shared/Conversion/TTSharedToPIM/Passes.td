@@ -142,11 +142,28 @@ def PIMMapDevices : Pass<"pim-map-devices", "mlir::ModuleOp"> {
     logical 축마다 device partition 수를 정하고 loop nest 를 `pim.device` region 으로 감싼다.
     explicit_k_partition 은 나누지 않는다(단계 1). 남은 device 수는 정사각에 가깝게
     인수분해한다 — tile 개수가 런타임이라 컴파일 시점에는 그것 말고 고를 근거가 없다.
+    다만 **어느 축이 싼지는 tile 개수와 무관하게 정해진다.** 축 하나를 쪼개면 그 축에
+    불변인 입력이 device 수만큼 복제되기 때문이다(§pim-place-data 의 replicated_over).
+    그 순서를 device-axis-priority 로 받는다.
     각 loop 를 balanced block 으로 좁힌다. 몫과 나머지로 나누어 나머지 partition 이 하나씩
     더 맡으므로 꼬리에서 device 가 놀지 않고, 축마다 연속 구간 하나가 유지된다.
     device 안에서 좌표를 0 부터 세고, 전역 좌표는 몸체 첫머리에서 다시 만들어
     `pim.device_origin` 표시를 단다.
   }];
+  let options = [
+    Option<"deviceAxisPriority", "device-axis-priority", "std::string", "\"\"",
+           "먼저 쪼갤 logical 축 이름을 쉼표로 나열한다. 앞에 적힌 축이 인수분해의 "
+           "큰 인수를 받는다. 축마다 복제되는 피연산자가 다르므로 어느 축이 싼지는 "
+           "target 이 안다 — matmul 은 output_row_tile 을 쪼개면 B 가, "
+           "output_column_tile 을 쪼개면 A 가 device 수만큼 복제된다. "
+           "비우면 logical 축 순서 그대로 정사각에 가깝게 나눈다.">,
+    Option<"deviceAxisGranularity", "device-axis-granularity", "std::string",
+           "\"\"", "축을 자를 때 지킬 최소 단위를 <축이름>:<원소수> 로, 쉼표로 "
+           "나열한다. 눈금보다 잘게 자르면 경계에 걸친 실행 단위가 양쪽 device 에서 "
+           "각각 통째로 실행되어 총 일감이 늘어난다. 눈금을 주면 균등 대신 눈금 "
+           "배수로 나누고 나머지는 앞쪽 device 가 하나씩 더 맡는다. tile 하나가 몇 "
+           "원소인지는 pim.access 의 sizes 에서 읽는다.">,
+  ];
   let constructor = "mlir::triton::createPIMMapDevicesPass()";
   let dependentDialects = ["mlir::pim::PIMDialect", "mlir::arith::ArithDialect",
                            "mlir::scf::SCFDialect"];
