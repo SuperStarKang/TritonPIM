@@ -76,4 +76,14 @@ def execution_tile(M, N, K, *,
     if parts:
         opts["device_axis_partitions"] = ",".join(
             f"{a}:{p}" for a, p in parts.items())
+    # 상한 자체도 kwargs 로 나른다 — 공통 pass 가 #pim.execution_tile 로 IR 에 부착하고,
+    # upmem 은 출력 상한을 시간 창(round)으로 소비한다. 분할을 이 helper 로 유도했다면
+    # 배정 == 상한이라 창은 1개로 퇴화한다. 분할을 더 줄이면(축을 안 나누면) 같은 상한이
+    # 창 여러 개를 만든다.
+    if tile_m is not None:
+        opts["tile_m"] = tile_m
+    if tile_n is not None:
+        opts["tile_n"] = tile_n
+    if tile_k is not None:
+        opts["tile_k"] = tile_k
     return opts

@@ -132,28 +132,6 @@ struct ConvertPIMToUPMEMPass
     if (failed(checkLegality()))
       return signalPassFailure();
 
-    // round(시간 창) 옵션. 값이 없으면 창 1개 — 배정 전체가 한 번에 상주(기존 동작).
-    roundAxis = StringRef();
-    roundWindow = 0;
-    if (!roundTiles.empty()) {
-      auto [name, count] = StringRef(roundTiles).split(':');
-      if (count.empty() || count.getAsInteger(10, roundWindow) ||
-          roundWindow < 1) {
-        getOperation()->emitError(
-            "convert-pim-to-upmem: round-tiles must be <axis>:<tiles>, got \"")
-            << roundTiles << "\"";
-        return signalPassFailure();
-      }
-      if (name == "explicit_k_partition") {
-        getOperation()->emitError(
-            "convert-pim-to-upmem: rounds along explicit_k_partition are not "
-            "supported — partial sums would have to be reloaded across "
-            "rounds");
-        return signalPassFailure();
-      }
-      roundAxis = name;
-    }
-
     SmallVector<pim::DeviceOp> devices;
     getOperation().walk([&](pim::DeviceOp d) { devices.push_back(d); });
     for (pim::DeviceOp d : devices)
@@ -167,8 +145,6 @@ struct ConvertPIMToUPMEMPass
   }
 
   pim::TargetProfileAttr profile;
-  StringRef roundAxis;   // 창 축 이름. 비어 있으면 round 없음.
-  int64_t roundWindow;   // 창 하나의 tile 수 (창 축 방향)
 
   // UPMEM으로 내릴 수 있는 profile인지 진입 즉시 확인한다.
   LogicalResult checkLegality() {
@@ -232,23 +208,47 @@ struct ConvertPIMToUPMEMPass
     for (int64_t c : device.getMapping().getPartitions().asArrayRef())
       numUnits *= c;
 
+    // 타일 shape. device 버퍼를 이 단위로 쓰면 타일 하나가 MRAM에서 연속이 되어 DMA가
+    // 한 번으로 끝난다. pim.access가 정적으로 들고 있다.
+    llvm::DenseMap<int64_t, SmallVector<int64_t>> tileOf;
+    nest.walk([&](pim::AccessOp a) {
+      tileOf[a.getId()] = SmallVector<int64_t>(a.getSizes());
+    });
+
     // ── round(시간 창) 문맥 ────────────────────────────────────────────────
+    // 시간 창은 공통 IR 의 #pim.execution_tile 상한에서 온다. 출력 축 상한(m 또는 n)
+    // 하나가 창 축이 되고, 창의 tile 수 = 상한 / 그 축의 group tile 원소수다. 배정이
+    // 상한 안이면 round 수가 1 로 퇴화한다. k 상한은 시간 창이 아니다 — 공간 분할
+    // (SPLIT_K)이 소비하고, k 창은 부분합 재적재가 필요해 만들지 않는다.
     // 창 축에 매인 place(B·C)는 round 마다 창을 재전송하고, 매이지 않은 place(A)는
     // 한 번만 보낸다. 매였는지는 영역 식이 창 축 좌표 인자에 닿는가로 가른다.
     int64_t roundAxisIdx = -1;
+    int64_t roundWindow = 0; // 창의 tile 수
     llvm::DenseMap<Operation *, int> windowAxisOf; // place → 창에 매인 buffer 축
-    if (roundWindow) {
+    auto tiles =
+        device->getAttrOfType<pim::ExecutionTileAttr>("pim.execution_tile");
+    if (tiles && (tiles.getM() > 0 || tiles.getN() > 0)) {
+      if (tiles.getM() > 0 && tiles.getN() > 0) {
+        device->emitError(
+            "convert-pim-to-upmem: both output caps of the execution tile are "
+            "set; windowing runs along one output axis only");
+        return signalPassFailure();
+      }
+      int64_t cap = tiles.getM() > 0 ? tiles.getM() : tiles.getN();
+      StringRef axisName =
+          tiles.getM() > 0 ? "output_row_tile" : "output_column_tile";
       for (auto [i, a] : llvm::enumerate(device.getMapping().getAxes()))
-        if (cast<StringAttr>(a).getValue() == roundAxis)
+        if (cast<StringAttr>(a).getValue() == axisName)
           roundAxisIdx = i;
       if (roundAxisIdx < 0) {
-        device->emitError("convert-pim-to-upmem: round axis ")
-            << roundAxis << " is not an axis of this kernel";
+        device->emitError("convert-pim-to-upmem: the execution tile cap names ")
+            << axisName << " but this kernel has no such axis";
         return signalPassFailure();
       }
       Value warg = deviceBody->getArgument(roundAxisIdx);
       SmallVector<pim::PlaceOp> places(inputs);
       places.append(outputs);
+      int64_t elems = 0;
       for (pim::PlaceOp place : places) {
         int found = -1;
         for (unsigned d = 0, e = place.getCapacity().size(); d < e; d++) {
@@ -258,20 +258,42 @@ struct ConvertPIMToUPMEMPass
             continue;
           if (found >= 0) {
             place->emitError(
-                "convert-pim-to-upmem: two buffer axes follow the round axis, "
-                "so a round window is not a single rectangle");
+                "convert-pim-to-upmem: two buffer axes follow the window "
+                "axis, so a round window is not a single rectangle");
             return signalPassFailure();
           }
           found = d;
         }
         if (place.getDirection() == "out" && found < 0) {
           place->emitError(
-              "convert-pim-to-upmem: the output does not follow the round "
+              "convert-pim-to-upmem: the output does not follow the window "
               "axis, so every round would rewrite the same region");
           return signalPassFailure();
         }
         windowAxisOf[place] = found;
+        if (found >= 0) {
+          int64_t sz = tileOf[place.getAccess()][found];
+          if (elems && elems != sz) {
+            place->emitError(
+                "convert-pim-to-upmem: the windowed buffers disagree on the "
+                "tile size along the window axis");
+            return signalPassFailure();
+          }
+          elems = sz;
+        }
       }
+      if (!elems) {
+        device->emitError(
+            "convert-pim-to-upmem: no buffer follows the window axis");
+        return signalPassFailure();
+      }
+      if (cap % elems != 0) {
+        device->emitError("convert-pim-to-upmem: the execution tile cap (")
+            << cap << " elements) is not a multiple of the group tile ("
+            << elems << " elements) along the window axis";
+        return signalPassFailure();
+      }
+      roundWindow = cap / elems;
     }
     auto windowAxis = [&](pim::PlaceOp p) -> int {
       auto it = windowAxisOf.find(p);
@@ -285,13 +307,6 @@ struct ConvertPIMToUPMEMPass
     all.append(outputs);
     int64_t bufferBytes = profile.getUsableBankCapacityBytes().getInt() /
                           std::max<int64_t>(1, all.size());
-
-    // 타일 shape. device 버퍼를 이 단위로 쓰면 타일 하나가 MRAM에서 연속이 되어 DMA가
-    // 한 번으로 끝난다. pim.access가 정적으로 들고 있다.
-    llvm::DenseMap<int64_t, SmallVector<int64_t>> tileOf;
-    nest.walk([&](pim::AccessOp a) {
-      tileOf[a.getId()] = SmallVector<int64_t>(a.getSizes());
-    });
 
     llvm::DenseMap<Operation *, FlatSymbolRefAttr> mramOf;
     llvm::DenseMap<int64_t, Buffer> byAccess;

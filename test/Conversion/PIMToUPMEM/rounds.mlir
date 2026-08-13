@@ -1,7 +1,8 @@
-// round(시간 창): 창 축(output_column_tile)에 매인 B·C 는 round 마다 재전송·재수거되고,
+// round(시간 창): 공통 IR 의 #pim.execution_tile 출력 상한(n=64원소 = tile 2개)이
+// 창이 된다. 창 축(output_column_tile)에 매인 B·C 는 round 마다 재전송·재수거되고,
 // 매이지 않은 A 는 첫 foreach 에서 한 번만 전송된다. launch 는 round 마다 1회이고
 // device 바이너리는 변하지 않는다(loop 상한이 host 변수).
-// RUN: triton-shared-opt "--convert-pim-to-upmem=round-tiles=output_column_tile:2" %s | FileCheck %s
+// RUN: triton-shared-opt --pim-form-execution-tiles=tile-n=64 --convert-pim-to-upmem %s | FileCheck %s
 
 // A(mram_0)만 첫 foreach 에서 전송된다. 창 축의 반복 횟수는 여기서 보내지 않고,
 // B(mram_1)의 전송도 여기 없다.

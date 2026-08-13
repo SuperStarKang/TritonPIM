@@ -40,19 +40,18 @@ def ConvertPIMToUPMEM : Pass<"convert-pim-to-upmem", "mlir::ModuleOp"> {
     - tasklet 이 여럿이면 device 가 맡은 타일을 tasklet 에 나눈다. 병렬 축 loop 들을 하나로
       합친 뒤 tasklet 번호부터 tasklet 수만큼 건너뛰며 돈다. 타일마다 쓰는 자리가 겹치지
       않으므로 barrier 가 없다. tile 버퍼는 tasklet 마다 따로 잡는다.
+
+    시간(창) 분할은 공통 IR 의 `#pim.execution_tile` 상한에서 온다. 출력 상한
+    (m 또는 n 중 하나)이 창 축이 되고, 창의 tile 수 = 상한 / 그 축의 group tile
+    원소수다. 배정이 상한 안이면 창 1개로 퇴화하고, 넘으면 round 마다
+    [창 재전송 → launch → 창 회수]를 반복한다. 창 축에 매이지 않은 입력(matmul 의
+    A)은 한 번만 전송된다. device 바이너리는 loop 상한이 host 변수로 오므로 창이
+    있어도 변하지 않는다.
   }];
   let constructor = "mlir::triton::createConvertPIMToUPMEMPass()";
   let options = [
     Option<"hostThreads", "host-threads", "int64_t", "8",
            "host가 영역을 모으고 되돌릴 때 쓰는 스레드 수. 1이면 순차.">,
-    Option<"roundTiles", "round-tiles", "std::string", "\"\"",
-           "execution tile 을 시간 창(round)으로 나눈다: <출력축>:<창의 tile 수>. "
-           "창 축에 매이지 않은 입력(matmul 의 A)은 한 번만 전송하고, 매인 버퍼"
-           "(B·C)는 round 마다 창을 재전송·재수거한다. device 바이너리는 loop "
-           "상한이 host 변수로 오므로 변하지 않는다. round 수 = "
-           "ceildiv(창 축의 배정량, 창)이고 덜 맡은 device 는 꼬리 round 에서 "
-           "0 회를 돈다. explicit_k_partition 은 부분합을 round 사이에 재적재해야 "
-           "해서 지원하지 않는다(진단). 빈 값이면 창 1개(기존 동작)다.">,
   ];
   let dependentDialects = ["mlir::upmem::UPMEMDialect", "mlir::pim::PIMDialect",
                            "mlir::arith::ArithDialect", "mlir::scf::SCFDialect",
