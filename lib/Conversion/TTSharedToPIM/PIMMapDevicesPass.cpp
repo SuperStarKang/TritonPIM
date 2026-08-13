@@ -96,27 +96,6 @@ static void narrowLoop(OpBuilder &b, scf::ForOp loop, Value index,
   local.replaceAllUsesExcept(global, scaled);
 }
 
-// 이 축이 tile 하나에서 옮기는 원소 수. pim.access 의 sizes 가 그 값이고, 어느 차원인지는
-// origin 을 이 loop 가 모는가로 가른다 — pim-place-data 가 region 을 만들 때 쓰는 판정과
-// 같은 것이다. 축을 모는 차원이 여럿인데 크기가 다르면 답이 하나가 아니므로 0 을 돌려준다.
-static int64_t tileElements(scf::ForOp axis, ArrayRef<scf::ForOp> loops) {
-  int64_t elems = 0;
-  bool conflict = false;
-  axis.walk([&](pim::AccessOp a) {
-    ArrayRef<int64_t> sizes = a.getSizes();
-    for (unsigned d = 0, e = sizes.size(); d < e; d++) {
-      llvm::SmallPtrSet<Operation *, 4> drivers;
-      pim::collectDrivers(a.getOrigin()[d], loops, drivers);
-      if (drivers.size() != 1 || !drivers.contains(axis))
-        continue;
-      if (elems && elems != sizes[d])
-        conflict = true;
-      elems = sizes[d];
-    }
-  });
-  return conflict ? 0 : elems;
-}
-
 struct PIMMapDevicesPass
     : public mlir::triton::impl::PIMMapDevicesBase<PIMMapDevicesPass> {
   using PIMMapDevicesBase::PIMMapDevicesBase;
@@ -232,7 +211,7 @@ struct PIMMapDevicesPass
             axis = i;
         if (axis < 0)
           continue; // 이 커널에 없는 축이다
-        int64_t perTile = tileElements(loops[axis], loops);
+        int64_t perTile = pim::tileElementsAlong(loops[axis], loops);
         if (perTile <= 0)
           return func->emitError("pim-map-devices: cannot tell how many "
                                  "elements one ")

@@ -209,6 +209,30 @@ def PIMMapDevices : Pass<"pim-map-devices", "mlir::ModuleOp"> {
                            "mlir::scf::SCFDialect"];
 }
 
+def PIMFormExecutionTiles : Pass<"pim-form-execution-tiles", "mlir::ModuleOp"> {
+  let summary = "Attach the element-count caps of one device's resident share";
+  let description = [{
+    execution tile 의 상한(원소 단위)을 `#pim.execution_tile` 로 pim.device 에
+    부착한다 — 데이터 3계층의 셋째 층을 공통 IR 에서 완결하는 pass 다. 공간 분할
+    (#pim.device_mapping)은 pim-map-devices 가 이미 정했고, 이 상한은 시간(창)
+    분할의 근거가 된다: target lowering 이 자기 실행 모델(UPMEM 의 round, AiMX 의
+    pim_exec 창)로 옮기고, 배정이 상한 안이면 창은 하나로 퇴화한다.
+    각 상한은 그 축의 group tile 원소수의 배수여야 한다(창 경계는 tile 위) — 아니면
+    진단이다. 상한이 붙는 축이 커널에 없어도 진단이다. 전부 0 이면 항등이다.
+  }];
+  let options = [
+    Option<"tileM", "tile-m", "int64_t", "0",
+           "output_row_tile 방향 상한 (원소). 0 = 무제한">,
+    Option<"tileN", "tile-n", "int64_t", "0",
+           "output_column_tile 방향 상한 (원소). 0 = 무제한">,
+    Option<"tileK", "tile-k", "int64_t", "0",
+           "explicit_k_partition 방향 상한 (원소). 0 = 무제한. 시간 창이 아니라 "
+           "공간 분할(SPLIT_K)이 소비하는 값이다">,
+  ];
+  let constructor = "mlir::triton::createPIMFormExecutionTilesPass()";
+  let dependentDialects = ["mlir::pim::PIMDialect"];
+}
+
 def PIMPlaceData : Pass<"pim-place-data", "mlir::ModuleOp"> {
   let summary = "Materialize the final region, replication, and capacity of each buffer";
   let description = [{

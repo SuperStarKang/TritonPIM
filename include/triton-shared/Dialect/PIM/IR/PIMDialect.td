@@ -90,6 +90,17 @@ def PIM_GroupExecutionAttr : PIM_Attr<"GroupExecution", "group_execution"> {
   let assemblyFormat = "`<` struct(params) `>`";
 }
 
+// execution tile 의 상한 (원소 단위) — 데이터 3계층의 셋째 층. device 하나가 한 번에
+// 상주시키는 몫의 상한이고, 0 은 그 축을 자르지 않는다는 뜻이다. 공간 분할은
+// #pim.device_mapping 이, 시간(창) 분할은 이 상한이 정한다 — 배정이 상한 안이면 창은
+// 하나로 퇴화한다. target lowering 이 자기 실행 모델(UPMEM 의 round / AiMX 의
+// pim_exec 창)로 옮긴다. --pim-form-execution-tiles 가 pim.device 에 부착한다.
+def PIM_ExecutionTileAttr : PIM_Attr<"ExecutionTile", "execution_tile"> {
+  let summary = "Element-count caps of one device's resident share";
+  let parameters = (ins "int64_t":$m, "int64_t":$n, "int64_t":$k);
+  let assemblyFormat = "`<` struct(params) `>`";
+}
+
 // pim.place 가 어떤 logical 축을 따라 나뉘었는지 적는 정적 metadata. 버퍼 축마다
 // 하나이고, 나뉘지 않은 축은 "" 다. 검증과 진단에만 쓰이고 target lowering 은 읽지 않는다.
 def PIM_PlaceMappingAttr : PIM_Attr<"PlaceMapping", "place_mapping"> {

@@ -16,6 +16,7 @@ namespace triton {
 #define GEN_PASS_DECL_PIMSETTARGETPROFILE
 #define GEN_PASS_DECL_PIMPLANGROUPEXECUTION
 #define GEN_PASS_DECL_PIMMAPDEVICES
+#define GEN_PASS_DECL_PIMFORMEXECUTIONTILES
 #define GEN_PASS_DECL_PIMPLACEDATA
 #define GEN_PASS_DECL_PIMVERIFY
 #include "triton-shared/Conversion/TTSharedToPIM/Passes.h.inc"
@@ -29,6 +30,7 @@ std::unique_ptr<OperationPass<ModuleOp>> createPIMFormBlockGroupsPass();
 std::unique_ptr<OperationPass<ModuleOp>> createPIMSetTargetProfilePass();
 std::unique_ptr<OperationPass<ModuleOp>> createPIMPlanGroupExecutionPass();
 std::unique_ptr<OperationPass<ModuleOp>> createPIMMapDevicesPass();
+std::unique_ptr<OperationPass<ModuleOp>> createPIMFormExecutionTilesPass();
 std::unique_ptr<OperationPass<ModuleOp>> createPIMPlaceDataPass();
 std::unique_ptr<OperationPass<ModuleOp>> createPIMVerifyPass();
 

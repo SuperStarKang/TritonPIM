@@ -66,6 +66,25 @@ int64_t mlir::pim::localTileBytes(Operation *scope) {
   return bytes;
 }
 
+int64_t mlir::pim::tileElementsAlong(scf::ForOp axis,
+                                     ArrayRef<scf::ForOp> loops) {
+  int64_t elems = 0;
+  bool conflict = false;
+  axis.walk([&](pim::AccessOp a) {
+    ArrayRef<int64_t> sizes = a.getSizes();
+    for (unsigned d = 0, e = sizes.size(); d < e; d++) {
+      llvm::SmallPtrSet<Operation *, 4> drivers;
+      collectDrivers(a.getOrigin()[d], loops, drivers);
+      if (drivers.size() != 1 || !drivers.contains(axis))
+        continue;
+      if (elems && elems != sizes[d])
+        conflict = true;
+      elems = sizes[d];
+    }
+  });
+  return conflict ? 0 : elems;
+}
+
 void mlir::pim::collectDrivers(Value v, ArrayRef<scf::ForOp> loops,
                                llvm::SmallPtrSetImpl<Operation *> &drivers) {
   SmallVector<Value> work{v};

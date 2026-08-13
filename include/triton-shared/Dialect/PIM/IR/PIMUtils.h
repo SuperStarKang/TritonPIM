@@ -32,6 +32,12 @@ int64_t localTileBytes(Operation *scope);
 void collectDrivers(Value v, ArrayRef<scf::ForOp> loops,
                     llvm::SmallPtrSetImpl<Operation *> &drivers);
 
+// 이 축 loop 가 tile 하나에서 옮기는 원소 수. pim.access 의 sizes 가 그 값이고, 어느
+// 차원인지는 origin 을 이 loop 가 단독으로 모는가로 가른다. 축을 모는 차원이 여럿인데
+// 크기가 다르면 답이 하나가 아니므로 0 을 돌려준다. pim-map-devices(분할 눈금)와
+// pim-form-execution-tiles(상한 검증)가 같은 판정을 쓴다.
+int64_t tileElementsAlong(scf::ForOp axis, ArrayRef<scf::ForOp> loops);
+
 } // namespace pim
 } // namespace mlir
 
