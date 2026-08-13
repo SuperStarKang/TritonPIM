@@ -30,6 +30,8 @@ struct HostEmitter {
   raw_ostream &os() { return e.os; }
 
   unsigned stageId = 0;
+  // 전송 배열 이름. round loop 안에 foreach 가 또 나오므로 함수 전체에서 유일해야 한다.
+  unsigned xferId = 0;
   // 영역을 모으고 되돌리는 일을 몇 갈래로 나눌지. --convert-pim-to-upmem이 정해 준다.
   int64_t threads = 1;
 
@@ -47,8 +49,9 @@ struct HostEmitter {
          << "  return ts.tv_sec * 1e3 + ts.tv_nsec * 1e-6;\n"
          << "}\n"
          << "static double _pim_last;\n"
+         // round 가 있으면 단계가 반복되므로 덮어쓰지 않고 누적한다. 진입 시 0 이다.
          << "static void _pim_mark(int slot) {\n"
-         << "  double t = _pim_now(); pim_timing_ms[slot] = t - _pim_last; _pim_last = t;\n"
+         << "  double t = _pim_now(); pim_timing_ms[slot] += t - _pim_last; _pim_last = t;\n"
          << "}\n\n";
   }
 
@@ -114,6 +117,7 @@ struct HostEmitter {
     }
     os() << ") {\n";
     os() << "  struct dpu_set_t _set, _dpu;\n  uint32_t _idx;\n";
+    os() << "  memset(pim_timing_ms, 0, sizeof pim_timing_ms);  // PIM_TIMING\n";
     os() << "  _pim_last = _pim_now();  // PIM_TIMING\n";
     if (failed(emitBlock(host.getBody().front(), 1)))
       return failure();
@@ -144,6 +148,25 @@ struct HostEmitter {
       mark(2, depth);  // PIM_TIMING: 유닛 실행
       return success();
     }
+    // round(시간 창) loop. 값을 나르지 않는 단순 반복만 다룬다.
+    if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+      if (forOp.getNumResults() != 0)
+        return forOp->emitError(
+            "upmem-to-host: a host loop cannot carry values");
+      std::string iv = e.name(forOp.getInductionVar());
+      e.indent(depth);
+      os() << "for (int64_t " << iv << " = " << e.name(forOp.getLowerBound())
+           << "; " << iv << " < " << e.name(forOp.getUpperBound()) << "; " << iv
+           << " += " << e.name(forOp.getStep()) << ") {\n";
+      if (failed(emitBlock(*forOp.getBody(), depth + 1)))
+        return failure();
+      e.indent(depth);
+      os() << "}\n";
+      return success();
+    }
+    if (isa<scf::YieldOp>(op))
+      return success();
+
     if (auto fe = dyn_cast<upmem::ForeachUnitOp>(op))
       return emitForeachUnit(fe, depth);
     if (auto g = dyn_cast<upmem::GatherOp>(op))
@@ -204,7 +227,7 @@ struct HostEmitter {
     for (Operation &op : body) {
       if (auto to = dyn_cast<upmem::ToMRAMOp>(&op)) {
         auto t = cast<MemRefType>(to.getBuffer().getType());
-        std::string arr = "_p" + std::to_string(xfers.size());
+        std::string arr = "_p" + std::to_string(xferId++);
         std::string ct = CEmitter::scalarType(t.getElementType(), true);
         e.indent(depth);
         os() << ct << "** " << arr << " = (" << ct << "**)malloc(" << units
@@ -213,7 +236,7 @@ struct HostEmitter {
         os() << "int64_t " << arr << "_n[" << units << "];\n";
         xfers.push_back({arr, to.getDst().str(), arr + "_n[0]", false});
       } else if (auto tv = dyn_cast<upmem::ToHostVarOp>(&op)) {
-        std::string arr = "_p" + std::to_string(xfers.size());
+        std::string arr = "_p" + std::to_string(xferId++);
         std::string ct = CEmitter::scalarType(tv.getValue().getType(), false);
         e.indent(depth);
         os() << ct << " " << arr << "[" << units << "];\n";

@@ -252,9 +252,12 @@ def _ttsharedir_to_pim_common(ttshared: str, options) -> str:
 
 
 def _pim_common_to_upmem(pim_common: str, options) -> str:
-    # 기계 값은 전부 profile 에서 읽는다. host 스레드 수만 lowering policy 라 옵션으로 준다.
-    return _run_opt(pim_common,
-                    [f"--convert-pim-to-upmem=host-threads={options.host_threads}"])
+    # 기계 값은 전부 profile 에서 읽는다. host 스레드 수와 round(시간 창)만 lowering
+    # policy 라 옵션으로 준다.
+    opt = f"--convert-pim-to-upmem=host-threads={options.host_threads}"
+    if options.round_tiles:
+        opt += f" round-tiles={options.round_tiles}"
+    return _run_opt(pim_common, [opt])
 
 
 def _upmem_to_artifact(upmem_ir: str, metadata) -> bytes:
@@ -389,6 +392,10 @@ class PIMOptions:
     # explicit_k_partition 을 나누려면 kernel 이 K 를 연속 구간으로 갈라야 한다
     # (split_k.py 의 blocked 형태) — cyclic 분할은 pim-place-data 가 진단한다.
     device_axis_partitions: str = ""
+    # round(시간 창, upmem 전용): "<출력축>:<창의 tile 수>". DPU 배정량이 MRAM 몫을
+    # 넘을 때 창 단위로 [재전송 → launch → 회수]를 반복한다. 창 축에 매이지 않은
+    # 입력(matmul 의 A)은 한 번만 전송된다. 빈 값이면 창 1개(기존 동작).
+    round_tiles: str = ""
     # lane 실행 형태 (multithread target 전용, --pim-plan-group-execution lane-mode 로 간다).
     # whole_tile: lane 이 서로 다른 tile 을 통째로 맡는다 — 지금까지의 동작.
     # output_row: lane 들이 한 tile 을 출력 행으로 나눠 함께 계산한다. 버퍼가 한 벌이라
