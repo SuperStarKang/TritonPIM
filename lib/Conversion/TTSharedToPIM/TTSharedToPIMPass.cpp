@@ -6,218 +6,253 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/IR/Builders.h"
-#include "mlir/IR/BuiltinOps.h"
-#include "mlir/IR/BuiltinTypes.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallPtrSet.h"
 
 using namespace mlir;
 
 // GEN_PASS_DEF가 생성하는 impl::...Base는 mlir::triton 네임스페이스 안에 있어야 한다.
 namespace mlir {
 namespace triton {
-#define GEN_PASS_DEF_BUILDPIMOFFLOAD
+#define GEN_PASS_DEF_CONVERTTTSHAREDTOPIM
 #include "triton-shared/Conversion/TTSharedToPIM/Passes.h.inc"
 } // namespace triton
 } // namespace mlir
 
 namespace {
 
-// tt.dot은 triton-to-linalg가 linalg.matmul로 낮춘다(별도 marker attribute는 붙지 않는다).
-// MVP는 커널당 dot 1개(단일 tile)를 가정하므로 첫 linalg.matmul을 그대로 집는다.
-static linalg::MatmulOp findMatmul(func::FuncOp func) {
-  linalg::MatmulOp found;
-  func.walk([&](linalg::MatmulOp op) {
-    found = op;
-    return WalkResult::interrupt();
-  });
-  return found;
+// OpFoldResult(상수 또는 SSA)를 index Value로. 상수면 arith.constant를 만든다.
+static Value toIndex(OpBuilder &b, Location loc, OpFoldResult ofr) {
+  if (auto v = dyn_cast<Value>(ofr))
+    return v;
+  int64_t c = cast<IntegerAttr>(cast<Attribute>(ofr)).getInt();
+  return b.create<arith::ConstantIndexOp>(loc, c);
 }
 
-// dynamic memref(src)에서 static 크기 [size0,size1]의 타일을 dynamic offset [off0,off1]로 떠낸다.
-// strides는 1(연속 타일). 결과 타입은 빌더가 src 레이아웃으로부터 추론한다(strided<[?,1],offset:?>).
-static Value makeTileSubview(OpBuilder &b, Location loc, Value src, Value off0,
-                             Value off1, int64_t size0, int64_t size1) {
-  SmallVector<OpFoldResult, 2> offsets{off0, off1};
-  SmallVector<OpFoldResult, 2> sizes{b.getIndexAttr(size0), b.getIndexAttr(size1)};
-  SmallVector<OpFoldResult, 2> strides{b.getIndexAttr(1), b.getIndexAttr(1)};
-  return b.create<memref::SubViewOp>(loc, src, offsets, sizes, strides);
+static SmallVector<Value> toIndices(OpBuilder &b, Location loc,
+                                    ArrayRef<OpFoldResult> ofrs) {
+  SmallVector<Value> vs;
+  for (OpFoldResult o : ofrs)
+    vs.push_back(toIndex(b, loc, o));
+  return vs;
 }
 
-// pim.compute의 region 본문을 채운다 (faithful-body, 한 유닛의 로컬 슬라이스 계산).
-//
-// block arg %a=[Mu,K], %b=[K,Nu], %c=[Mu,Nu]. Mu/Nu/K는 런타임(host scatter가 결정)이라
-// block arg의 dim에서 읽는다. BLOCK_M/N/K는 Triton constexpr이므로 루프 step·누산기 크기로
-// 상수로 박힌다.
-//
-// 구조 = device.c가 만드는 루프 nest와 1:1: tm/tn(복원된 grid) → BLOCK_M×BLOCK_N 누산기 →
-// K-loop(BLOCK_K 청크) in-place 누적 → 누산기를 C 타일로 copy. program_id 전역 오프셋은
-// 본문에서 사라지고 tm/tn 루프로 흡수된다(분배층으로 이동, DESIGN 4.1 ②).
-// accElemTy = 누산기/출력(C) element type. 입력(A/B) type은 block arg(%a/%b)에서 추론되므로
-// (subview가 source memref 타입을 따름) 별도 인자 없이 mixed(int8 입력 + int32 누적)도 표현된다.
-static void buildGemmBody(OpBuilder &b, Location loc, Block *body, int64_t blockM,
-                          int64_t blockN, int64_t blockK, Type accElemTy) {
-  b.setInsertionPointToStart(body);
-  Value a = body->getArgument(0);
-  Value bMat = body->getArgument(1);
-  Value c = body->getArgument(2);
-
-  Value c0 = b.create<arith::ConstantIndexOp>(loc, 0);
-  Value c1 = b.create<arith::ConstantIndexOp>(loc, 1);
-  Value stepM = b.create<arith::ConstantIndexOp>(loc, blockM);
-  Value stepN = b.create<arith::ConstantIndexOp>(loc, blockN);
-  Value stepK = b.create<arith::ConstantIndexOp>(loc, blockK);
-  Value zero = b.create<arith::ConstantOp>(loc, cast<TypedAttr>(b.getZeroAttr(accElemTy)));
-
-  // 유닛이 맡은 로컬 슬라이스 크기(런타임). %a=[Mu,K], %c=[Mu,Nu].
-  Value mu = b.create<memref::DimOp>(loc, a, c0);
-  Value kDim = b.create<memref::DimOp>(loc, a, c1);
-  Value nu = b.create<memref::DimOp>(loc, c, c1);
-
-  auto accTy = MemRefType::get({blockM, blockN}, accElemTy);
-
-  // grid(M) 복원: pid_m*BLOCK_M 전역 오프셋이 이 루프로 들어옴.
-  b.create<scf::ForOp>(
-      loc, c0, mu, stepM, ValueRange{},
-      [&](OpBuilder &nb, Location lm, Value tm, ValueRange) {
-        // grid(N) 복원: pid_n*BLOCK_N 전역 오프셋이 이 루프로.
-        nb.create<scf::ForOp>(
-            lm, c0, nu, stepN, ValueRange{},
-            [&](OpBuilder &nb2, Location ln, Value tn, ValueRange) {
-              // BLOCK_M×BLOCK_N 누산기(device_local). K-loop 동안 in-place 누적.
-              Value acc = nb2.create<memref::AllocOp>(ln, accTy);
-              nb2.create<linalg::FillOp>(ln, ValueRange{zero}, ValueRange{acc});
-              // K-loop 보존: BLOCK_K 청크를 스트리밍하며 누적.
-              nb2.create<scf::ForOp>(
-                  ln, c0, kDim, stepK, ValueRange{},
-                  [&](OpBuilder &nb3, Location lk, Value kc, ValueRange) {
-                    Value at = makeTileSubview(nb3, lk, a, tm, kc, blockM, blockK);
-                    Value bt = makeTileSubview(nb3, lk, bMat, kc, tn, blockK, blockN);
-                    // linalg.matmul(memref)은 outs에 in-place 누적(C += A*B).
-                    nb3.create<linalg::MatmulOp>(lk, ValueRange{at, bt},
-                                                 ValueRange{acc});
-                    nb3.create<scf::YieldOp>(lk);
-                  });
-              // 누산기를 이 유닛의 C 타일로 기록.
-              Value cv = makeTileSubview(nb2, ln, c, tm, tn, blockM, blockN);
-              nb2.create<memref::CopyOp>(ln, acc, cv);
-              nb2.create<scf::YieldOp>(ln);
-            });
-        nb.create<scf::YieldOp>(lm);
-      });
+// alloc 사용처 중 bufferization.to_tensor를 찾는다(로드 관용구의 끝).
+// bufferization dialect에 링크 의존을 만들지 않으려 op 이름으로 확인한다.
+static Operation *findToTensor(memref::AllocOp alloc) {
+  for (Operation *u : alloc->getUsers())
+    if (u->getName().getStringRef() == "bufferization.to_tensor")
+      return u;
+  return nullptr;
 }
 
-// split factor로부터 vendor-neutral mapping_policy를 정한다(DESIGN 11.4). split_k>1이면
-// reduction(reduce 존재)이 특징이라 reduction_k_partitioned로 표기한다(출력 분배와 병행 가능).
-static std::string mappingPolicy(unsigned splitM, unsigned splitN, unsigned splitK) {
-  if (splitK > 1)
-    return "reduction_k_partitioned";
-  if (splitM > 1 && splitN > 1)
-    return "output_2d_partitioned";
-  if (splitM > 1)
-    return "output_m_partitioned";
-  if (splitN > 1)
-    return "output_n_partitioned";
-  return "none";
+// alloc을 outs로 채우는 linalg.fill을 찾는다(mask의 padding 값).
+static linalg::FillOp findFill(memref::AllocOp alloc) {
+  for (Operation *u : alloc->getUsers())
+    if (auto f = dyn_cast<linalg::FillOp>(u))
+      return f;
+  return nullptr;
 }
 
-struct BuildPIMOffloadPass
-    : public mlir::triton::impl::BuildPIMOffloadBase<BuildPIMOffloadPass> {
-  using BuildPIMOffloadBase::BuildPIMOffloadBase;
+// alloc이 두 개 이상의 copy 대상으로 채워지면 wrap-around 로드다. 하나의 pim.access로
+// 표현할 수 없고, masked walk가 두 copy를 각각 매치해 공유 alloc을 이중 erase하면
+// double free가 나므로 여기서 감지한다.
+static bool isWrapAroundBuffer(memref::AllocOp alloc) {
+  int copyTargets = 0;
+  for (Operation *u : alloc->getUsers()) {
+    auto sv = dyn_cast<memref::SubViewOp>(u);
+    if (!sv)
+      continue;
+    for (Operation *su : sv->getUsers())
+      if (auto c = dyn_cast<memref::CopyOp>(su))
+        if (c.getTarget() == sv.getResult()) {
+          copyTargets++;
+          break;
+        }
+  }
+  return copyTargets > 1;
+}
+
+struct ConvertTTSharedToPIMPass
+    : public mlir::triton::impl::ConvertTTSharedToPIMBase<ConvertTTSharedToPIMPass> {
+  using ConvertTTSharedToPIMBase::ConvertTTSharedToPIMBase;
 
   void runOnOperation() override {
-    getOperation().walk([&](func::FuncOp func) {
-      if (linalg::MatmulOp matmul = findMatmul(func))
-        rewriteToFaithfulGemm(func, matmul);
+    WalkResult res = getOperation().walk([&](func::FuncOp func) {
+      if (func.getBody().empty())
+        return WalkResult::advance();
+      raiseFunc(func);
+      return succeeded(checkResidual(func)) ? WalkResult::advance()
+                                            : WalkResult::interrupt();
     });
+    if (res.wasInterrupted())
+      signalPassFailure();
   }
 
-  // faithful-body 변환 (DESIGN 4.1/10.2):
-  // - 본문을 erase하지 않고, memory_region/transfer/tile_plan/launch를 합성한 뒤
-  //   계산 본문은 pim.compute region에 (로컬 슬라이스 기준으로) 보존한다.
-  // - BLOCK_M/N/K는 matmul operand/result shape에서 읽는다 (Triton constexpr 타일 크기).
-  //   (operand0 = A tile [BLOCK_M, BLOCK_K], result = C tile [BLOCK_M, BLOCK_N])
-  // - 전체 M/N/K는 IR에 박지 않는다 (본문 block arg의 런타임 dim, host는 launcher에서 받음).
-  // - A/B/C는 함수 인자 앞 3개로 가정.
-  // - split_m/n은 pass 옵션(=compile option). vendor가 M/N축을 유닛에 분배할 때 쓴다.
-  //
-  // faithful-body: legalize가 이 본문을 device_func로 옮기고, UPMEMToDevice가 본문의 gemm nest에서
-  // BLOCK을 읽어 device.c를 생성한다(O1.4a). device.c emission은 아직 gemm 템플릿이라 비-gemm 본문
-  // 충실 번역은 O1.4b. gemm 결과는 동일(M6 유지).
-  void rewriteToFaithfulGemm(func::FuncOp func, linalg::MatmulOp matmul) {
-    auto lhsTy = cast<RankedTensorType>(matmul->getOperand(0).getType());
-    auto resTy = cast<RankedTensorType>(matmul->getResult(0).getType());
-    int64_t blockM = resTy.getDimSize(0);
-    int64_t blockN = resTy.getDimSize(1);
-    int64_t blockK = lhsTy.getDimSize(1);
-    // 입력(A/B)과 누적/출력(C) element type을 따로 — fp32면 둘 다 f32(기존), int8 gemm이면
-    // 입력 i8 + 누적 i32(mixed). vendor codegen이 이 타입들을 IR에서 읽어 C 타입을 정한다.
-    Type inElemTy = lhsTy.getElementType();
-    Type accElemTy = resTy.getElementType();
+  // 메모리 접근 관용구를 pim.access + pim.load/store로 끌어올려 staging 버퍼를 없앤다.
+  // scf.for와 program_id 식은 건드리지 않고, 계산(named linalg)도 그대로 둔다.
+  void raiseFunc(func::FuncOp func) {
+    OpBuilder b(func.getContext());
+    int64_t nextId = 0;
 
-    Value A = func.getArgument(0);
-    Value B = func.getArgument(1);
-    Value C = func.getArgument(2);
+    auto makeAccess = [&](Location loc, Value base, Value offset,
+                          ValueRange strides, ArrayRef<int64_t> sizes,
+                          ValueRange valid, Value pad) {
+      // origin 은 --pim-recover-access-origin 이 채운다.
+      return b.create<pim::AccessOp>(loc, pim::AccessType::get(b.getContext()),
+                                     base, offset, ValueRange{}, strides,
+                                     b.getDenseI64ArrayAttr(sizes), valid, pad,
+                                     b.getI64IntegerAttr(nextId++));
+    };
 
-    // 기존 본문을 뒤에서부터 모두 지운다 (사용처를 먼저 지워 use-def 위반 방지).
-    // block 인자(A,B,C,...)는 유지된다. 보존할 "본문"은 단일-tile·program_id 주소라 그대로
-    // 옮길 수 없고, 아래에서 유닛-로컬 nest로 재구성한다(program_id를 분배층으로 들어올림).
-    Block &entry = func.getBody().front();
-    while (!entry.empty())
-      entry.back().erase();
+    // 같은 reinterpret_cast를 load와 store가 함께 쓰면 하나의 pim.access를 공유한다.
+    llvm::DenseMap<Operation *, Value> access;
+    auto getAccess = [&](memref::ReinterpretCastOp rc) -> Value {
+      auto it = access.find(rc);
+      if (it != access.end())
+        return it->second;
+      // 삽입 위치는 guard로 되돌린다. 여기서 옮긴 위치가 남으면 바깥 create가 rc 자리에
+      // op을 만들고, store에서는 그것이 곧 dominance 위반이다.
+      OpBuilder::InsertionGuard guard(b);
+      b.setInsertionPoint(rc);
+      Location loc = rc.getLoc();
+      Value a = makeAccess(loc, rc.getSource(),
+                           toIndex(b, loc, rc.getMixedOffsets()[0]),
+                           toIndices(b, loc, rc.getMixedStrides()),
+                           rc.getStaticSizes(), {}, Value());
+      access[rc] = a;
+      return a;
+    };
 
-    OpBuilder b = OpBuilder::atBlockBegin(&entry);
-    Location loc = func.getLoc();
-    auto regionTy = pim::RegionType::get(b.getContext());
-    auto tpTy = pim::TilePlanType::get(b.getContext());
-    auto egTy = pim::ExecGroupType::get(b.getContext());
+    SmallVector<Operation *> dead;  // 반드시 죽는 관용구 op (사용처→정의 순으로 쌓는다)
+    SmallVector<Operation *> roots; // reinterpret_cast 등 use_empty일 때만 지운다
 
-    // 세 buffer 모두 host에 있다가 transfer로 device_global로 올라간다(DESIGN 10.5).
-    Value aReg = b.create<pim::MemoryRegionOp>(loc, regionTy, A, "host", "row_major",
-                                               "input_activation");
-    Value bReg = b.create<pim::MemoryRegionOp>(loc, regionTy, B, "host", "row_major",
-                                               "weight");
-    Value cReg = b.create<pim::MemoryRegionOp>(loc, regionTy, C, "host", "row_major",
-                                               "output");
+    // mask 로드: reinterpret_cast + alloc + (fill?) + subview×2 + copy
+    //          → pim.access{valid, pad?} + pim.load.
+    func.walk([&](memref::CopyOp copy) {
+      auto vsub = copy.getSource().getDefiningOp<memref::SubViewOp>();
+      auto bsub = copy.getTarget().getDefiningOp<memref::SubViewOp>();
+      if (!vsub || !bsub)
+        return;
+      auto rc = vsub.getSource().getDefiningOp<memref::ReinterpretCastOp>();
+      auto alloc = bsub.getSource().getDefiningOp<memref::AllocOp>();
+      if (!rc || !alloc)
+        return;
+      if (isWrapAroundBuffer(alloc)) {
+        copy->emitError("wrap-around load (two disjoint regions from `% M`/`% N` "
+                        "index wrapping) is unsupported on PIM; rewrite the kernel "
+                        "to mask the boundary (`mask=`/`other=`) instead of modulo "
+                        "indexing");
+        signalPassFailure();
+        return;
+      }
+      Operation *toTensor = findToTensor(alloc);
+      if (!toTensor)
+        return;
+      linalg::FillOp fill = findFill(alloc); // 없을 수 있다(채움값 없는 마스크 로드).
+      b.setInsertionPoint(toTensor);
+      Location loc = toTensor->getLoc();
+      Value d = makeAccess(loc, rc.getSource(),
+                           toIndex(b, loc, rc.getMixedOffsets()[0]),
+                           toIndices(b, loc, rc.getMixedStrides()),
+                           rc.getStaticSizes(),
+                           toIndices(b, loc, vsub.getMixedSizes()),
+                           fill ? fill.getInputs()[0] : Value());
+      Value v = b.create<pim::LoadOp>(loc, toTensor->getResult(0).getType(), d);
+      toTensor->getResult(0).replaceAllUsesWith(v);
+      dead.append({toTensor, copy.getOperation(), vsub.getOperation(),
+                   bsub.getOperation(), alloc.getOperation()});
+      if (fill)
+        dead.push_back(isa<scf::IfOp>(fill->getParentOp()) ? fill->getParentOp()
+                                                           : fill.getOperation());
+      roots.push_back(rc);
+    });
 
-    Value tp = b.create<pim::TilePlanOp>(loc, tpTy, blockM, blockN, blockK,
-                                         /*split_m=*/(uint64_t)splitM,
-                                         /*split_n=*/(uint64_t)splitN,
-                                         /*split_k=*/(uint64_t)splitK);
-    // 유닛 분배 정책(DESIGN 10.2): split로 mapping_policy 결정, num_units=split_m*split_n*split_k,
-    // local_lanes는 option(DESIGN 16). gemm은 weight(B)가 상주 입력.
-    Value eg = b.create<pim::ExecutionGroupOp>(
-        loc, egTy, mappingPolicy(splitM, splitN, splitK),
-        /*num_units=*/(uint64_t)splitM * (uint64_t)splitN * (uint64_t)splitK,
-        /*local_lanes=*/(uint64_t)localLanes, /*stationary_data=*/"B");
+    // 기본 로드: copy(reinterpret_cast → alloc) + to_tensor(alloc) → pim.load.
+    func.walk([&](memref::CopyOp copy) {
+      auto rc = copy.getSource().getDefiningOp<memref::ReinterpretCastOp>();
+      auto alloc = copy.getTarget().getDefiningOp<memref::AllocOp>();
+      if (!rc || !alloc)
+        return;
+      Operation *toTensor = findToTensor(alloc);
+      if (!toTensor)
+        return;
+      b.setInsertionPoint(toTensor);
+      Value v = b.create<pim::LoadOp>(toTensor->getLoc(),
+                                      toTensor->getResult(0).getType(),
+                                      getAccess(rc));
+      toTensor->getResult(0).replaceAllUsesWith(v);
+      dead.append({toTensor, copy.getOperation(), alloc.getOperation()});
+    });
 
-    b.create<pim::TransferOp>(loc, aReg, "host", "device_global");
-    b.create<pim::TransferOp>(loc, bReg, "host", "device_global");
+    // 저장: materialize_in_destination(value, dest) → pim.store.
+    // dest가 reinterpret_cast면 tile 저장, subview(reinterpret_cast)면 masked 저장이다.
+    func.walk([&](Operation *op) {
+      if (op->getName().getStringRef() !=
+          "bufferization.materialize_in_destination")
+        return;
+      Value dest = op->getOperand(1);
+      if (auto rc = dest.getDefiningOp<memref::ReinterpretCastOp>()) {
+        b.setInsertionPoint(op);
+        b.create<pim::StoreOp>(op->getLoc(), op->getOperand(0), getAccess(rc));
+        dead.push_back(op);
+        return;
+      }
+      auto sub = dest.getDefiningOp<memref::SubViewOp>();
+      auto es = op->getOperand(0).getDefiningOp<tensor::ExtractSliceOp>();
+      if (!sub || !es)
+        return;
+      auto rc = sub.getSource().getDefiningOp<memref::ReinterpretCastOp>();
+      if (!rc)
+        return;
+      b.setInsertionPoint(op);
+      Location loc = op->getLoc();
+      Value d = makeAccess(loc, rc.getSource(),
+                           toIndex(b, loc, rc.getMixedOffsets()[0]),
+                           toIndices(b, loc, rc.getMixedStrides()),
+                           rc.getStaticSizes(),
+                           toIndices(b, loc, es.getMixedSizes()), Value());
+      b.create<pim::StoreOp>(loc, es.getSource(), d);
+      dead.append({op, es.getOperation(), sub.getOperation()});
+      roots.push_back(rc);
+    });
 
-    // pim.compute를 먼저 빈 region으로 만들고, 그 다음 entry의 나머지(transfer/launch/return)를
-    // 채운다. 본문 region은 별도 builder로 채워 entry의 insertion을 흐트러뜨리지 않는다.
-    auto compute =
-        b.create<pim::ComputeOp>(loc, aReg, bReg, cReg, eg, tp, "gemm");
+    // 죽은 관용구 op을 먼저 지우고(사용처→정의 순), 그다음 빈 root를 지운다.
+    // erased 집합으로 이중 erase를 막는다.
+    llvm::SmallPtrSet<Operation *, 32> erased;
+    for (Operation *op : dead)
+      if (erased.insert(op).second)
+        op->erase();
+    for (Operation *op : roots)
+      if (!erased.contains(op) && op->use_empty()) {
+        erased.insert(op);
+        op->erase();
+      }
+    for (auto &kv : access)
+      if (!erased.contains(kv.first) && kv.first->use_empty())
+        kv.first->erase();
+  }
 
-    b.create<pim::TransferOp>(loc, cReg, "device_global", "host");
-    b.create<pim::LaunchOp>(loc, func.getName(), vendor, /*device_id=*/0);
-    b.create<func::ReturnOp>(loc);
-
-    // region block arg는 유닛-로컬 슬라이스(dynamic memref). operand의 region 핸들과 별개.
-    // %a/%b = 입력타입(inElemTy), %c = 누적/출력타입(accElemTy) — mixed dtype을 그대로 표현.
-    auto kDyn = ShapedType::kDynamic;
-    auto inTy = MemRefType::get({kDyn, kDyn}, inElemTy);
-    auto accTy = MemRefType::get({kDyn, kDyn}, accElemTy);
-    SmallVector<Location, 3> argLocs(3, loc);
-    OpBuilder bodyBuilder(b.getContext());
-    Block *body = bodyBuilder.createBlock(&compute.getBody(), {},
-                                          {inTy, inTy, accTy}, argLocs);
-    buildGemmBody(bodyBuilder, loc, body, blockM, blockN, blockK, accElemTy);
+  // 변환하지 못한 메모리 접근이 남았는지 본다. 남으면 뒤의 배치 pass가 그 버퍼를
+  // 보지 못한 채 조용히 부분 배치를 만든다.
+  LogicalResult checkResidual(func::FuncOp func) {
+    WalkResult res = func.walk([&](Operation *op) {
+      Dialect *dialect = op->getDialect();
+      StringRef d = dialect ? dialect->getNamespace() : StringRef();
+      if (d != "memref" && d != "bufferization")
+        return WalkResult::advance();
+      op->emitError("convert-ttshared-to-pim: this memory access pattern is not "
+                    "supported on PIM and was left unconverted");
+      return WalkResult::interrupt();
+    });
+    return failure(res.wasInterrupted());
   }
 };
 
 } // namespace
 
 std::unique_ptr<OperationPass<ModuleOp>>
-mlir::triton::createBuildPIMOffloadPass() {
-  return std::make_unique<BuildPIMOffloadPass>();
+mlir::triton::createConvertTTSharedToPIMPass() {
+  return std::make_unique<ConvertTTSharedToPIMPass>();
 }

@@ -5,3 +5,5 @@ build/*
 .vscode/*
 /python/examples/test_core.py
 /python/examples/test_annotations.py
+
+/pim_backend/examples

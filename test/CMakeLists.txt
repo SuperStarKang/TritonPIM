@@ -12,6 +12,8 @@ configure_lit_site_cfg(
 
 set(TRITON_SHARED_TEST_DEPENDS
   triton-shared-opt
+  # test/Target/* 이 이 도구를 RUN 줄에서 부른다.
+  triton-shared-translate
 )
 
 set(FILECHECK_PATH "${LLVM_LIBRARY_DIR}/../bin/FileCheck")

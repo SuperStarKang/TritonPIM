@@ -14,5 +14,6 @@ add_triton_library(UPMEMTranslation
   MLIRLinalgDialect
   MLIRMemRefDialect
   MLIRSCFDialect
+  MLIRTensorDialect
   UPMEMIR
 )

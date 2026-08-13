@@ -1,0 +1,13 @@
+set(LLVM_TARGET_DEFINITIONS AiMXDialect.td)
+mlir_tablegen(AiMXDialect.h.inc -gen-dialect-decls -dialect=aimx)
+mlir_tablegen(AiMXDialect.cpp.inc -gen-dialect-defs -dialect=aimx)
+mlir_tablegen(AiMXEnums.h.inc -gen-enum-decls)
+mlir_tablegen(AiMXEnums.cpp.inc -gen-enum-defs)
+mlir_tablegen(AiMXAttrs.h.inc -gen-attrdef-decls -attrdefs-dialect=aimx)
+mlir_tablegen(AiMXAttrs.cpp.inc -gen-attrdef-defs -attrdefs-dialect=aimx)
+mlir_tablegen(AiMXTypes.h.inc -gen-typedef-decls -typedefs-dialect=aimx)
+mlir_tablegen(AiMXTypes.cpp.inc -gen-typedef-defs -typedefs-dialect=aimx)
+mlir_tablegen(AiMXOps.h.inc -gen-op-decls)
+mlir_tablegen(AiMXOps.cpp.inc -gen-op-defs)
+
+add_public_tablegen_target(AiMXTableGen)

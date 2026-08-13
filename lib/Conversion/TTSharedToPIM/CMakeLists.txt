@@ -1,5 +1,16 @@
 add_triton_library(TTSharedToPIM
+  PIMNormalizeAddressPass.cpp
   TTSharedToPIMPass.cpp
+  PIMBuildLogicalGridPass.cpp
+  PIMRecoverAccessOriginPass.cpp
+  PIMFormComputePass.cpp
+  PIMFormBlockGroupsPass.cpp
+  PIMSetTargetProfilePass.cpp
+  PIMPlanGroupExecutionPass.cpp
+  PIMMapDevicesPass.cpp
+  PIMFormExecutionTilesPass.cpp
+  PIMPlaceDataPass.cpp
+  PIMVerifyPass.cpp
 
   DEPENDS
   PIMTableGen
@@ -13,6 +24,7 @@ add_triton_library(TTSharedToPIM
   MLIRSCFDialect
   MLIRMemRefDialect
   MLIRLinalgDialect
+  MLIRTensorDialect
   MLIRFuncDialect
   PIMIR
 )

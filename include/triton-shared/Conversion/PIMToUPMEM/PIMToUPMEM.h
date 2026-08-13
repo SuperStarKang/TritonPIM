@@ -7,10 +7,10 @@
 namespace mlir {
 namespace triton {
 
-#define GEN_PASS_DECL_LEGALIZEPIMTOUPMEM
+#define GEN_PASS_DECL_CONVERTPIMTOUPMEM
 #include "triton-shared/Conversion/PIMToUPMEM/Passes.h.inc"
 
-std::unique_ptr<OperationPass<ModuleOp>> createLegalizePIMToUPMEMPass();
+std::unique_ptr<OperationPass<ModuleOp>> createConvertPIMToUPMEMPass();
 
 } // namespace triton
 } // namespace mlir

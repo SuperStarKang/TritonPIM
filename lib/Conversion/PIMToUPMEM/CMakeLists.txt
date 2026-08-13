@@ -10,6 +10,9 @@ add_triton_library(PIMToUPMEM
   MLIRIR
   MLIRPass
   MLIRTransforms
+  MLIRArithDialect
+  MLIRSCFDialect
+  MLIRMemRefDialect
   MLIRFuncDialect
   PIMIR
   UPMEMIR

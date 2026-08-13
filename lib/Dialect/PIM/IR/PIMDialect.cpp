@@ -1,6 +1,6 @@
 #include "triton-shared/Dialect/PIM/IR/PIMDialect.h"
 
-// 생성된 op builder / type printer-parser가 사용하는 헤더들.
+// 생성된 op builder / attribute·type printer-parser가 사용하는 헤더들.
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/DialectImplementation.h"
 #include "llvm/ADT/TypeSwitch.h"
@@ -8,8 +8,12 @@
 using namespace mlir;
 using namespace mlir::pim;
 
-// Dialect 생성 시점에 type과 op를 등록한다.
+// Dialect 생성 시점에 attribute와 type과 op를 등록한다.
 void PIMDialect::initialize() {
+  addAttributes<
+#define GET_ATTRDEF_LIST
+#include "triton-shared/Dialect/PIM/IR/PIMAttrs.cpp.inc"
+      >();
   addTypes<
 #define GET_TYPEDEF_LIST
 #include "triton-shared/Dialect/PIM/IR/PIMTypes.cpp.inc"
@@ -21,8 +25,11 @@ void PIMDialect::initialize() {
 }
 
 //===----------------------------------------------------------------------===//
-// TableGen'd type / op / dialect 정의
+// TableGen'd attribute / type / op / dialect 정의
 //===----------------------------------------------------------------------===//
+
+#define GET_ATTRDEF_CLASSES
+#include "triton-shared/Dialect/PIM/IR/PIMAttrs.cpp.inc"
 
 #define GET_TYPEDEF_CLASSES
 #include "triton-shared/Dialect/PIM/IR/PIMTypes.cpp.inc"
@@ -31,3 +38,48 @@ void PIMDialect::initialize() {
 #include "triton-shared/Dialect/PIM/IR/PIMOps.cpp.inc"
 
 #include "triton-shared/Dialect/PIM/IR/PIMDialect.cpp.inc"
+
+//===----------------------------------------------------------------------===//
+// Verifiers
+//===----------------------------------------------------------------------===//
+
+LogicalResult AccessOp::verify() {
+  int64_t rank = getSizes().size();
+  if (static_cast<int64_t>(getStrides().size()) != rank)
+    return emitOpError("strides count must equal sizes rank");
+  if (!getValid().empty() && static_cast<int64_t>(getValid().size()) != rank)
+    return emitOpError("valid count must equal sizes rank");
+  // 분해가 안 되면 아예 비운다. 부분 origin은 금지한다.
+  if (!getOrigin().empty() && static_cast<int64_t>(getOrigin().size()) != rank)
+    return emitOpError("origin count must equal sizes rank");
+  // pad(채움값)는 valid(mask)와 함께만 의미가 있다.
+  if (getPad() && getValid().empty())
+    return emitOpError("pad requires valid");
+  return success();
+}
+
+LogicalResult DeviceOp::verify() {
+  DeviceMappingAttr mapping = getMapping();
+  size_t n = mapping.getAxes().size();
+  if (mapping.getPartitions().size() != n)
+    return emitOpError("mapping must have one partition count per axis");
+  if (getAxisExtents().size() != n)
+    return emitOpError("axis_extents must have one entry per axis");
+  if (getBody().front().getNumArguments() != n)
+    return emitOpError("body must take one partition coordinate per axis");
+  return success();
+}
+
+LogicalResult PlaceOp::verify() {
+  size_t rank = getStart().size();
+  if (getSize().size() != rank || getCapacity().size() != rank ||
+      getStrides().size() != rank)
+    return emitOpError(
+        "start, size, capacity, and strides must have the same rank");
+  if (getMapping().getAxisSources().size() != rank)
+    return emitOpError("mapping must have one axis source per buffer axis");
+  StringRef dir = getDirection();
+  if (dir != "in" && dir != "out")
+    return emitOpError("direction must be \"in\" or \"out\"");
+  return success();
+}
