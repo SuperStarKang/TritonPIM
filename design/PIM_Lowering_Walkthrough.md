@@ -757,7 +757,7 @@ K device partition 을 1 로 고정하므로 A·B 의 K 영역이 연속이고, 
 | f16 을 쓰는 커널 | DPU 에 f16 이 없어 WRAM 버퍼를 낼 수 없다 |
 | PIM Core 가 여럿인 target | `--pim-map-cores` 가 진단 |
 | wave 당 tile 이 둘 이상 | `--pim-form-execution-waves` 가 진단 |
-| k device partition > 1 | `--pim-place-data` 가 진단 |
+| k device partition > 1 | blocked 분할 kernel + `device-axis-partitions` 로 지원. cyclic 분할은 `--pim-place-data` 가 진단 |
 | 0 이 아닌 pad | `--pim-verify` 가 진단 |
 
 아래 넷은 설계상 Phase 2 로 미룬 것이고, 전부 조용히 틀리지 않고 진단으로 막힌다.

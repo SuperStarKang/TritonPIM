@@ -155,6 +155,9 @@ _TARGET_PROFILE = {
         # block group: WRAM 상주 단위로 묶는 tile 수. 1,1 이면 항등(기존 동작).
         "block_group": lambda o: (f"group-m={o.group_m} group-n={o.group_n}"
                                   if o.group_m != 1 or o.group_n != 1 else ""),
+        # 축별 device 분할의 명시 지정. 빈 값이면 자동 인수분해(기존 동작). 형상이
+        # 작아 group 수 < DPU 수일 때 explicit_k_partition 을 나눠 점유율을 채운다.
+        "device_axis_partitions": lambda o: o.device_axis_partitions,
         # 유닛=DPU, 큰 메모리=MRAM, 빠른 메모리=WRAM 이라 둘 다 옵션 값이 그대로 온다.
         "capacity": lambda o: (o.unit_memory_bytes, o.local_memory_bytes),
     },
@@ -182,6 +185,8 @@ _TARGET_PROFILE = {
         # AiMX 의 묶음은 target lowering 의 execution tile 이 담당한다(group_m 은
         # --convert-pim-to-aimx 로 간다). 공통 block group pass 는 항등으로 지난다.
         "block_group": lambda o: "",
+        # AiMX 는 priority/granularity 로 나눈다. 명시 분할은 쓰지 않는다.
+        "device_axis_partitions": lambda o: "",
         # core 별 local storage 는 없다(0). bank 예산은 선언 상수다 — pim_malloc 은
         # 실패해도 NULL 을 돌려주지 않고 프로세스를 죽이므로 재 보는 방법이 없다.
         "capacity": lambda o: (AIMX_DEVICE_DRAM_BYTES, 0),
@@ -230,7 +235,8 @@ def _ttsharedir_to_pim_common(ttshared: str, options) -> str:
     t = _TARGET_PROFILE[options.pim_target]
     profile = _profile_pass(options)
     opts = [("device-axis-priority", t["device_axis_priority"]),
-            ("device-axis-granularity", t["device_axis_granularity"](options))]
+            ("device-axis-granularity", t["device_axis_granularity"](options)),
+            ("device-axis-partitions", t["device_axis_partitions"](options))]
     given = " ".join(f"{k}={v}" for k, v in opts if v)
     map_devices = "--pim-map-devices" + (f"={given}" if given else "")
     lane_mode = t["lane_mode"](options)
@@ -369,6 +375,11 @@ class PIMOptions:
     # 몫이라는 뜻이라 물리 크기보다 작게 둔다.
     unit_memory_bytes: int = 32 * 1024 * 1024
     local_lanes: int = 1         # DPU 내부 intra-unit 병렬 lane 능력값. 실제 값은 lane 예산이 정한다.
+    # 축별 device 분할의 명시 지정: "<축>:<개수>,..." (예:
+    # "output_column_tile:128,explicit_k_partition:16"). 빈 값이면 자동 인수분해.
+    # explicit_k_partition 을 나누려면 kernel 이 K 를 연속 구간으로 갈라야 한다
+    # (split_k.py 의 blocked 형태) — cyclic 분할은 pim-place-data 가 진단한다.
+    device_axis_partitions: str = ""
     # lane 실행 형태 (multithread target 전용, --pim-map-cores lane-mode 로 간다).
     # whole_tile: lane 이 서로 다른 tile 을 통째로 맡는다 — 지금까지의 동작.
     # output_row: lane 들이 한 tile 을 출력 행으로 나눠 함께 계산한다. 버퍼가 한 벌이라
