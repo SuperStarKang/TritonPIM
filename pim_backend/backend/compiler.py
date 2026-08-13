@@ -152,6 +152,9 @@ _TARGET_PROFILE = {
         # lane 수만큼 복제한다. output_row 는 lane 들이 한 tile 을 출력 행으로 나눠
         # 함께 계산한다 — 버퍼가 한 벌이라 tile 을 키워도 lane 수가 줄지 않는다.
         "lane_mode": lambda o: o.lane_mode,
+        # block group: WRAM 상주 단위로 묶는 tile 수. 1,1 이면 항등(기존 동작).
+        "block_group": lambda o: (f"group-m={o.group_m} group-n={o.group_n}"
+                                  if o.group_m != 1 or o.group_n != 1 else ""),
         # 유닛=DPU, 큰 메모리=MRAM, 빠른 메모리=WRAM 이라 둘 다 옵션 값이 그대로 온다.
         "capacity": lambda o: (o.unit_memory_bytes, o.local_memory_bytes),
     },
@@ -176,6 +179,9 @@ _TARGET_PROFILE = {
         # simd 는 lane 협력이 하드웨어에 내장돼 있어 pim-map-cores 가 옵션을 읽지
         # 않는다. 빈 값이면 옵션을 붙이지 않는다.
         "lane_mode": lambda o: "",
+        # AiMX 의 묶음은 target lowering 의 execution tile 이 담당한다(group_m 은
+        # --convert-pim-to-aimx 로 간다). 공통 block group pass 는 항등으로 지난다.
+        "block_group": lambda o: "",
         # core 별 local storage 는 없다(0). bank 예산은 선언 상수다 — pim_malloc 은
         # 실패해도 NULL 을 돌려주지 않고 프로세스를 죽이므로 재 보는 방법이 없다.
         "capacity": lambda o: (AIMX_DEVICE_DRAM_BYTES, 0),
@@ -194,6 +200,7 @@ PIM_COMMON_PASSES = [
     "--pim-build-logical-grid",    # source grid 를 logical tile loop nest 로
     "--pim-recover-access-origin", # access 의 축별 origin 을 logical 좌표로 채운다
     "--pim-form-compute",          # 누산기를 matmul 의 outs 로 통합
+    "{form_block_groups}",         # 이웃 tile 을 block group(상주 단위)으로 묶는다. 1,1 이면 항등
     "{profile}",                   # 기계 profile 부착. 여기부터 profile 을 읽는다
     "{map_cores}",                 # logical 차원 ↔ PIM Core topology, lane 수 선택
     "--pim-form-execution-waves",  # core footprint 로 wave 구성
@@ -228,7 +235,11 @@ def _ttsharedir_to_pim_common(ttshared: str, options) -> str:
     map_devices = "--pim-map-devices" + (f"={given}" if given else "")
     lane_mode = t["lane_mode"](options)
     map_cores = "--pim-map-cores" + (f"=lane-mode={lane_mode}" if lane_mode else "")
-    return _run_opt(ttshared, [p.format(profile=profile, map_cores=map_cores,
+    bg = t["block_group"](options)
+    form_block_groups = "--pim-form-block-groups" + (f"={bg}" if bg else "")
+    return _run_opt(ttshared, [p.format(profile=profile,
+                                        form_block_groups=form_block_groups,
+                                        map_cores=map_cores,
                                         map_devices=map_devices)
                                for p in PIM_COMMON_PASSES])
 
@@ -337,6 +348,10 @@ class PIMOptions:
     # BLOCK_M=8이면 group_m=5가 곧 m_t=40이다. 반대로 크기를 주고 BLOCK_M 경계로 올리면
     # m_t가 언제나 BLOCK_M의 배수로 튀어 그런 값을 만들 수 없다.
     group_m: int = 1
+    # upmem 은 같은 뜻의 묶음을 공통 pass(--pim-form-block-groups)가 한다:
+    # group_m × group_n 개의 tile 이 block group 하나(WRAM 상주 단위)가 된다.
+    # group_n 은 upmem 만 읽는다. 1,1 이면 항등이다.
+    group_n: int = 1
     tile_k: int = 32768
     tile_n: int = 4096
     # 0이면 pass가 Triton block이 허락하는 최대값을 고른다. BLOCK 16/16/16이면 8이고,

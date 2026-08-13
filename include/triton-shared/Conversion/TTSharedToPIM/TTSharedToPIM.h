@@ -12,6 +12,7 @@ namespace triton {
 #define GEN_PASS_DECL_PIMBUILDLOGICALGRID
 #define GEN_PASS_DECL_PIMRECOVERACCESSORIGIN
 #define GEN_PASS_DECL_PIMFORMCOMPUTE
+#define GEN_PASS_DECL_PIMFORMBLOCKGROUPS
 #define GEN_PASS_DECL_PIMSETTARGETPROFILE
 #define GEN_PASS_DECL_PIMMAPCORES
 #define GEN_PASS_DECL_PIMFORMEXECUTIONWAVES
@@ -25,6 +26,7 @@ std::unique_ptr<OperationPass<ModuleOp>> createConvertTTSharedToPIMPass();
 std::unique_ptr<OperationPass<ModuleOp>> createPIMBuildLogicalGridPass();
 std::unique_ptr<OperationPass<ModuleOp>> createPIMRecoverAccessOriginPass();
 std::unique_ptr<OperationPass<ModuleOp>> createPIMFormComputePass();
+std::unique_ptr<OperationPass<ModuleOp>> createPIMFormBlockGroupsPass();
 std::unique_ptr<OperationPass<ModuleOp>> createPIMSetTargetProfilePass();
 std::unique_ptr<OperationPass<ModuleOp>> createPIMMapCoresPass();
 std::unique_ptr<OperationPass<ModuleOp>> createPIMFormExecutionWavesPass();

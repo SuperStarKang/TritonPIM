@@ -109,6 +109,35 @@ def PIMSetTargetProfile : Pass<"pim-set-target-profile", "mlir::ModuleOp"> {
   let dependentDialects = ["mlir::pim::PIMDialect"];
 }
 
+def PIMFormBlockGroups : Pass<"pim-form-block-groups", "mlir::ModuleOp"> {
+  let summary = "Bundle neighbouring logical tiles into one block group";
+  let description = [{
+    이웃한 logical tile 을 출력 축 방향으로 묶어 큰 tile 하나처럼 만든다. 축 loop 는
+    group 좌표가 되고(상한 = ceildiv(tiles, g)), 몸체 첫머리에서 첫 tile 좌표(iv·g)를
+    복원해 기존 origin 산술에 잇는다. pim.access 의 sizes 와 tile tensor 는 group
+    크기로 커진다. 묶음의 경계는 언제나 tile 경계 위다 — tile 을 가르지 않는다.
+
+    왜 묶는가: 기계의 상주 단위(local storage 에 한 번에 올라가는 working set)는
+    Triton BLOCK 과 무관하게 크고, 묶인 tile 들은 같은 입력 조각을 공유하므로
+    (matmul 의 행 방향 이웃은 B 를, 열 방향 이웃은 A 를) 상주 중 재사용이 늘어난다.
+    몇 개를 묶을지는 target 의 정책이라 옵션으로 받고, 기본 1 이면 항등이다.
+
+    마지막 group 이 부분이면 기존 부분 tile 과 같은 방식으로 처리된다 — 배치가
+    원본 크기로 잘리고(pim-place-data 의 clamp) host 가 남는 자리에 0 을 채운다.
+    valid(mask)는 건드리지 않는다 — 소비자는 pim-place-data 의 원본 크기 복원뿐이고
+    그 판정은 식의 구조만 본다.
+  }];
+  let options = [
+    Option<"groupM", "group-m", "int64_t", "1",
+           "output_row_tile 방향으로 묶는 tile 수">,
+    Option<"groupN", "group-n", "int64_t", "1",
+           "output_column_tile 방향으로 묶는 tile 수">,
+  ];
+  let constructor = "mlir::triton::createPIMFormBlockGroupsPass()";
+  let dependentDialects = ["mlir::pim::PIMDialect", "mlir::arith::ArithDialect",
+                           "mlir::scf::SCFDialect"];
+}
+
 def PIMMapCores : Pass<"pim-map-cores", "mlir::ModuleOp"> {
   let summary = "Map logical dimensions onto the PIM Core topology and pick the lane count";
   let description = [{

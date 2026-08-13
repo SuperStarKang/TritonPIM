@@ -4,6 +4,7 @@ add_triton_library(TTSharedToPIM
   PIMBuildLogicalGridPass.cpp
   PIMRecoverAccessOriginPass.cpp
   PIMFormComputePass.cpp
+  PIMFormBlockGroupsPass.cpp
   PIMSetTargetProfilePass.cpp
   PIMMapCoresPass.cpp
   PIMFormExecutionWavesPass.cpp
