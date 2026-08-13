@@ -259,6 +259,16 @@ def UPMEM_NumTaskletsOp : UPMEM_Op<"num_tasklets", [Pure]> {
   let assemblyFormat = "attr-dict `:` type($result)";
 }
 
+// barrier_wait. 모든 tasklet이 이 지점에 도달할 때까지 기다린다.
+// 협력 lane 모드(lane_axis_role = "output_row")에서 공유 WRAM 버퍼의 적재와 소비를
+// 가른다 — 적재 뒤의 barrier는 "전부 실렸다"를, 계산 뒤의 barrier는 "전부 읽었다"를
+// 보장한다. tasklet이 하나거나 whole_tile 모드면 --convert-pim-to-upmem이 이 op을
+// 만들지 않는다(타일마다 쓰는 자리가 겹치지 않아 동기화가 필요 없다).
+def UPMEM_BarrierOp : UPMEM_Op<"barrier"> {
+  let summary = "Wait until every tasklet reaches this point";
+  let assemblyFormat = "attr-dict";
+}
+
 // upmem.host_var 읽기. device 코드에서는 전역 변수 참조 하나다.
 // 유닛이 실제로 도는 횟수가 이 통로로 온다 — 그래서 device는 자기 좌표를 몰라도
 // [0, tiles)만 돌면 되고, 마지막 유닛이 덜 맡는 것도 값 하나로 표현된다.
