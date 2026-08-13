@@ -178,8 +178,10 @@ def PIMMapDevices : Pass<"pim-map-devices", "mlir::ModuleOp"> {
   let summary = "Distribute logical tiles over PIM Devices and build the pim.device region";
   let description = [{
     logical 축마다 device partition 수를 정하고 loop nest 를 `pim.device` region 으로 감싼다.
-    explicit_k_partition 은 나누지 않는다(단계 1). 남은 device 수는 정사각에 가깝게
-    인수분해한다 — tile 개수가 런타임이라 컴파일 시점에는 그것 말고 고를 근거가 없다.
+    explicit_k_partition 은 자동 인수분해에서는 나누지 않지만, device-axis-partitions 로
+    명시하면 나눌 수 있다 — 그때 K 영역이 연속인지는 pim-place-data 가 판정한다.
+    자동 인수분해는 device 수를 정사각에 가깝게 가른다 — tile 개수가 런타임이라
+    컴파일 시점에는 그것 말고 고를 근거가 없다.
     다만 **어느 축이 싼지는 tile 개수와 무관하게 정해진다.** 축 하나를 쪼개면 그 축에
     불변인 입력이 device 수만큼 복제되기 때문이다(§pim-place-data 의 replicated_over).
     그 순서를 device-axis-priority 로 받는다.
@@ -201,6 +203,13 @@ def PIMMapDevices : Pass<"pim-map-devices", "mlir::ModuleOp"> {
            "각각 통째로 실행되어 총 일감이 늘어난다. 눈금을 주면 균등 대신 눈금 "
            "배수로 나누고 나머지는 앞쪽 device 가 하나씩 더 맡는다. tile 하나가 몇 "
            "원소인지는 pim.access 의 sizes 에서 읽는다.">,
+    Option<"deviceAxisPartitions", "device-axis-partitions", "std::string",
+           "\"\"", "축별 device partition 수를 <축이름>:<개수> 로, 쉼표로 나열한다. "
+           "주면 자동 인수분해를 통째로 대체한다. explicit_k_partition 도 나눌 수 "
+           "있다 — 단 kernel 이 K 를 연속 구간으로 갈라야 하며(blocked 분할), 그 "
+           "판정은 pim-place-data 가 한다. 나열되지 않은 축은 1 이고, 곱이 PIM "
+           "Device 수를 넘으면 진단이다. tile 수는 런타임이라 어느 축을 얼마나 "
+           "나눌지는 형상을 아는 쪽(사용자·autotuner)이 정한다.">,
   ];
   let constructor = "mlir::triton::createPIMMapDevicesPass()";
   let dependentDialects = ["mlir::pim::PIMDialect", "mlir::arith::ArithDialect",

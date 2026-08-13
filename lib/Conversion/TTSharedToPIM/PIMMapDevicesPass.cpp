@@ -150,8 +150,9 @@ struct PIMMapDevicesPass
     if (loops.empty())
       return success();
 
-    // explicit K 분할은 device 축이 아니다. A·B의 K 영역이 연속으로 남아 일반 cyclic
-    // placement 없이 배치된다.
+    // 자동 인수분해에서 explicit K 분할은 device 축이 아니다 — A·B의 K 영역이 연속으로
+    // 남아 일반 cyclic placement 없이 배치된다. 명시 분할(device-axis-partitions)로는
+    // 나눌 수 있고, 그때의 연속성은 pim-place-data가 판정한다.
     SmallVector<unsigned> tileAxes;
     for (auto [i, n] : llvm::enumerate(names))
       if (cast<StringAttr>(n) != "explicit_k_partition")
@@ -180,7 +181,30 @@ struct PIMMapDevicesPass
 
     SmallVector<int64_t> partitions(loops.size(), 1);
     int64_t devices = profile.getNumberOfPimDevices();
-    if (tileAxes.size() == 1) {
+    if (!deviceAxisPartitions.empty()) {
+      // 명시 분할은 자동 인수분해를 통째로 대체한다. tile 수가 런타임이라 자동으로는
+      // 형상에 맞출 수 없는 것(작은 M, k 분할)을 형상을 아는 쪽이 지정하는 통로다.
+      SmallVector<StringRef> entries;
+      StringRef(deviceAxisPartitions).split(entries, ',', -1, /*KeepEmpty=*/false);
+      for (StringRef entry : entries) {
+        auto [name, count] = entry.trim().split(':');
+        int64_t n = 0;
+        if (count.trim().getAsInteger(10, n) || n < 1)
+          return func->emitError("pim-map-devices: device-axis-partitions "
+                                 "entry \"")
+                 << entry << "\" is not <axis>:<count>";
+        for (auto [i, nm] : llvm::enumerate(names))
+          if (cast<StringAttr>(nm).getValue() == name.trim())
+            partitions[i] = n;
+        // 이 커널에 없는 축은 넘어간다 (granularity 와 같은 규약).
+      }
+      int64_t product = 1;
+      for (int64_t p : partitions)
+        product *= p;
+      if (product > devices)
+        return func->emitError("pim-map-devices: the explicit partitions need ")
+               << product << " PIM Devices but the machine has " << devices;
+    } else if (tileAxes.size() == 1) {
       partitions[tileAxes[0]] = devices;
     } else if (tileAxes.size() >= 2) {
       auto [row, column] = factorize(devices);
