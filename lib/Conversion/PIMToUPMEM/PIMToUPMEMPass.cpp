@@ -159,6 +159,10 @@ struct ConvertPIMToUPMEMPass
       return signalPassFailure();
     }
     int64_t lanes = cores.getLanes();
+    // 협력 lane 모드: lane들이 tile 하나를 출력 행으로 나눠 함께 계산한다. 버퍼는 한 벌,
+    // 적재는 분담, 경계는 barrier다. lane이 하나면 나눌 것이 없어 기존 경로와 같다.
+    bool rowSplit =
+        lanes > 1 && cores.getLaneAxisRole().getValue() == "output_row";
 
     // ── 입력 모으기 ────────────────────────────────────────────────────────
     SmallVector<pim::PlaceOp> inputs, outputs;
@@ -320,7 +324,7 @@ struct ConvertPIMToUPMEMPass
       place.erase();
 
     device.erase();
-    if (failed(convertDevice(dev, byAccess, lanes, tb, dpu, base)))
+    if (failed(convertDevice(dev, byAccess, lanes, rowSplit, tb, dpu, base)))
       return signalPassFailure();
   }
 
@@ -396,8 +400,8 @@ struct ConvertPIMToUPMEMPass
   //  - pim.access는 MRAM 안의 위치를 정하는 식이 되고 op 자체는 사라진다.
   LogicalResult convertDevice(upmem::DeviceFuncOp dev,
                               const llvm::DenseMap<int64_t, Buffer> &byAccess,
-                              int64_t lanes, OpBuilder &tb, Value dpu,
-                              StringRef base) {
+                              int64_t lanes, bool rowSplit, OpBuilder &tb,
+                              Value dpu, StringRef base) {
     Block *body = &dev.getBody().front();
     OpBuilder top(body, body->begin());
     Location loc = dev.getLoc();
@@ -411,19 +415,20 @@ struct ConvertPIMToUPMEMPass
         v = top.create<upmem::GetHostVarOp>(loc, top.getIndexType(), sym);
       return v;
     };
-    // tasklet이 여럿이면 tile 버퍼를 그 수만큼 복제하고 자기 번호로 잘라 쓴다.
-    // tasklet마다 다른 tile을 맡으므로 버퍼를 공유하면 서로 덮어쓴다.
+    // whole_tile: tasklet마다 다른 tile을 맡으므로 tile 버퍼를 그 수만큼 복제하고 자기
+    // 번호로 잘라 쓴다 — 공유하면 서로 덮어쓴다. rowSplit(output_row): 전원이 같은 tile을
+    // 계산하므로 버퍼는 한 벌이고, 겹쳐 쓰지 않도록 계산과 저장을 출력 행으로 가른다.
     Value taskletId;
     if (lanes > 1)
       taskletId = top.create<upmem::TaskletIdOp>(loc, top.getIndexType());
     auto allocFor = [&](RankedTensorType t) -> Value {
       SmallVector<int64_t> shape(t.getShape());
-      if (lanes > 1)
+      if (lanes > 1 && !rowSplit)
         shape.insert(shape.begin(), lanes);
       Value all = top.create<memref::AllocOp>(
           loc, MemRefType::get(shape, t.getElementType(),
                                MemRefLayoutAttrInterface(), wram));
-      if (lanes == 1)
+      if (lanes == 1 || rowSplit)
         return all;
       SmallVector<OpFoldResult> offsets(shape.size(), top.getIndexAttr(0));
       offsets[0] = taskletId;
@@ -449,17 +454,80 @@ struct ConvertPIMToUPMEMPass
       return root ? buf.lookup(root) : Value();
     };
 
+    // 협력 모드의 출력 행 slice. 버퍼마다 한 번만 만들어 재사용한다. 행 수가 lane 수로
+    // 나누어떨어져야 slice가 정적 shape이 된다 — 아니면 진단을 낸다(자투리 행을 특정
+    // tasklet에 몰아주는 동적 shape은 codegen이 다루지 않는다).
+    llvm::DenseMap<Value, Value> rowSlices;
+    auto rowSliceOf = [&](Value bufv, Operation *at) -> Value {
+      Value &slot = rowSlices[bufv];
+      if (slot)
+        return slot;
+      auto t = dyn_cast<MemRefType>(bufv.getType());
+      if (!t) {
+        at->emitError("convert-pim-to-upmem: expected a WRAM tile buffer "
+                      "operand when splitting by output rows");
+        return Value();
+      }
+      int64_t rows = t.getShape()[0];
+      if (rows % lanes != 0) {
+        at->emitError("convert-pim-to-upmem: the tile has ")
+            << rows << " output rows, which " << lanes
+            << " cooperating tasklets cannot split evenly; pick a lane count "
+               "that divides the row count";
+        return Value();
+      }
+      int64_t rowsPerLane = rows / lanes;
+      Value offset0 = top.create<arith::MulIOp>(
+          loc, taskletId,
+          top.create<arith::ConstantIndexOp>(loc, rowsPerLane));
+      SmallVector<OpFoldResult> offsets(t.getRank(), top.getIndexAttr(0));
+      offsets[0] = offset0;
+      SmallVector<OpFoldResult> sizes, strides(t.getRank(), top.getIndexAttr(1));
+      for (int64_t s : t.getShape())
+        sizes.push_back(top.getIndexAttr(s));
+      sizes[0] = top.getIndexAttr(rowsPerLane);
+      SmallVector<int64_t> shape(t.getShape());
+      shape[0] = rowsPerLane;
+      MemRefType mine = memref::SubViewOp::inferRankReducedResultType(
+          shape, t, offsets, sizes, strides);
+      slot = top.create<memref::SubViewOp>(loc, mine, bufv, offsets, sizes,
+                                           strides);
+      return slot;
+    };
+
     // linalg를 memref 형태로 다시 만든다(결과가 없어지므로 op을 새로 만들어야 한다).
     // 옛 op은 아직 지우지 않는다 — 그 결과를 scf.yield가 아직 쓰고 있다.
     SmallVector<Operation *> oldCompute;
-    dev.walk([&](linalg::LinalgOp linalgOp) {
+    WalkResult computeRes = dev.walk([&](linalg::LinalgOp linalgOp) {
       Operation *op = linalgOp;
       if (op->getNumResults() != 1 || !bufferOf(op->getResult(0)))
-        return;
+        return WalkResult::advance();
       OpBuilder b(op);
       SmallVector<Value> operands;
       for (Value v : op->getOperands())
         operands.push_back(bufferOf(v) ? bufferOf(v) : v);
+      if (rowSplit) {
+        // 전원이 같은 tile을 계산하므로 각자 자기 출력 행만 맡는다. 어느 피연산자를
+        // 가르는지는 op마다 정해져 있다 — matmul은 A와 누산기의 행이 출력 행과 같은
+        // 축이고 B는 전 행이 필요하다. 그 밖의 계산은 가르는 규칙이 없으므로 진단이다.
+        if (isa<linalg::FillOp>(op)) {
+          if (!(operands[1] = rowSliceOf(operands[1], op)))
+            return WalkResult::interrupt();
+        } else if (isa<linalg::MatmulOp>(op)) {
+          if (!(operands[0] = rowSliceOf(operands[0], op)))
+            return WalkResult::interrupt();
+          if (!(operands[2] = rowSliceOf(operands[2], op)))
+            return WalkResult::interrupt();
+          // 공유 피연산자(B)의 적재가 전부 끝난 뒤에만 계산을 시작한다.
+          b.create<upmem::BarrierOp>(op->getLoc());
+        } else {
+          op->emitError(
+              "convert-pim-to-upmem: cooperating tasklets "
+              "(lane_axis_role = output_row) can split only matmul and fill "
+              "by output rows");
+          return WalkResult::interrupt();
+        }
+      }
       OperationState st(op->getLoc(), op->getName());
       st.addOperands(operands);
       st.addAttributes(op->getAttrs());
@@ -467,19 +535,36 @@ struct ConvertPIMToUPMEMPass
       for (Region &r : op->getRegions())
         r.cloneInto(st.addRegion(), map);
       b.create(st);
+      // 다음 반복의 적재가 공유 피연산자를 덮어쓰기 전에 전원의 소비가 끝나야 한다.
+      if (rowSplit && isa<linalg::MatmulOp>(op))
+        b.create<upmem::BarrierOp>(op->getLoc());
       oldCompute.push_back(op);
+      return WalkResult::advance();
     });
+    if (computeRes.wasInterrupted())
+      return failure();
 
-    // 전송을 DMA로 내린다.
+    // 전송을 DMA로 내린다. 협력 모드에서는 chunk를 tasklet이 나눠 옮긴다.
     SmallVector<Operation *> oldLoads, oldStores;
     dev.walk([&](Operation *op) {
       if (auto load = dyn_cast<pim::LoadOp>(op)) {
         buildDMA(load, load.getAccess(), bufferOf(load.getResult()), byAccess,
-                 pitchOf, /*isRead=*/true);
+                 pitchOf, /*isRead=*/true, rowSplit, taskletId, lanes);
         oldLoads.push_back(op);
       } else if (auto store = dyn_cast<pim::StoreOp>(op)) {
+        // 협력 모드의 저장도 chunk 분담이라 다른 tasklet의 행을 읽는다. 앞 barrier는
+        // 전 행의 계산이 끝났음을(matmul이 없는 적재→저장 커널의 경로도 여기서 닫힌다),
+        // 뒤 barrier는 다음 tile의 fill이 누산기를 덮기 전에 저장이 끝났음을 보장한다.
+        if (rowSplit) {
+          OpBuilder b(store);
+          b.create<upmem::BarrierOp>(store.getLoc());
+        }
         buildDMA(store, store.getAccess(), bufferOf(store.getValue()), byAccess,
-                 pitchOf, /*isRead=*/false);
+                 pitchOf, /*isRead=*/false, rowSplit, taskletId, lanes);
+        if (rowSplit) {
+          OpBuilder b(store);
+          b.create<upmem::BarrierOp>(store.getLoc());
+        }
         oldStores.push_back(op);
       }
     });
@@ -525,7 +610,9 @@ struct ConvertPIMToUPMEMPass
       }
     }
 
-    if (lanes > 1)
+    // whole_tile만 tile을 tasklet에 나눈다. 협력 모드는 전원이 같은 tile 순서를 돌며
+    // 안에서 행과 chunk를 나눴다.
+    if (lanes > 1 && !rowSplit)
       distributeTasklets(dev);
 
     // 옮겨 온 loop nest는 loop 경계와 fill 값 같은 상수를 host func 안의 것으로
@@ -639,7 +726,7 @@ struct ConvertPIMToUPMEMPass
   template <typename PitchFn>
   void buildDMA(Operation *xfer, Value accessValue, Value wbuf,
                 const llvm::DenseMap<int64_t, Buffer> &byAccess, PitchFn pitchOf,
-                bool isRead) {
+                bool isRead, bool distribute, Value taskletId, int64_t lanes) {
     auto access = accessValue.getDefiningOp<pim::AccessOp>();
     const Buffer &info = byAccess.at(access.getId());
     ArrayRef<int64_t> tile = info.tile;
@@ -669,7 +756,14 @@ struct ConvertPIMToUPMEMPass
     Value one = b.create<arith::ConstantIndexOp>(loc, 1);
     Value nchunks = b.create<arith::ConstantIndexOp>(loc, chunks);
 
-    auto chunkLoop = b.create<scf::ForOp>(loc, zero, nchunks, one);
+    // 협력 모드에서는 chunk를 tasklet 번호부터 tasklet 수만큼 건너뛰며 나눠 옮긴다.
+    // 서로 다른 chunk라 겹쳐 쓰지 않고, 적재/소비의 경계는 호출자가 barrier로 닫는다.
+    Value lb = zero, step = one;
+    if (distribute) {
+      lb = taskletId;
+      step = b.create<arith::ConstantIndexOp>(loc, lanes);
+    }
+    auto chunkLoop = b.create<scf::ForOp>(loc, lb, nchunks, step);
     OpBuilder rb(chunkLoop.getBody(), chunkLoop.getBody()->begin());
     Value c = chunkLoop.getInductionVar();
 
