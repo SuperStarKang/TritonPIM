@@ -132,6 +132,10 @@ def PIMFormBlockGroups : Pass<"pim-form-block-groups", "mlir::ModuleOp"> {
            "output_row_tile 방향으로 묶는 tile 수">,
     Option<"groupN", "group-n", "int64_t", "1",
            "output_column_tile 방향으로 묶는 tile 수">,
+    Option<"groupK", "group-k", "int64_t", "1",
+           "reduction 방향으로 묶는 tile 수. 출력 축이 아니라 reduction loop 를 "
+           "넓힌다 — 누산기는 그대로고 A·B strip 의 K 변만 커져서, local 적재 "
+           "한 번이 담는 K 조각이 길어지고 DMA 준비·동기화 횟수가 준다.">,
   ];
   let constructor = "mlir::triton::createPIMFormBlockGroupsPass()";
   let dependentDialects = ["mlir::pim::PIMDialect", "mlir::arith::ArithDialect",

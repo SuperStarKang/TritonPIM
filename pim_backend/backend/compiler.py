@@ -152,9 +152,10 @@ _TARGET_PROFILE = {
         # lane 수만큼 복제한다. output_row 는 lane 들이 한 tile 을 출력 행으로 나눠
         # 함께 계산한다 — 버퍼가 한 벌이라 tile 을 키워도 lane 수가 줄지 않는다.
         "lane_mode": lambda o: o.lane_mode,
-        # block group: WRAM 상주 단위로 묶는 tile 수. 1,1 이면 항등(기존 동작).
-        "block_group": lambda o: (f"group-m={o.group_m} group-n={o.group_n}"
-                                  if o.group_m != 1 or o.group_n != 1 else ""),
+        # block group: WRAM 상주 단위로 묶는 tile 수. 전부 1 이면 항등(기존 동작).
+        "block_group": lambda o: (
+            f"group-m={o.group_m} group-n={o.group_n} group-k={o.group_k}"
+            if o.group_m != 1 or o.group_n != 1 or o.group_k != 1 else ""),
         # 축별 device 분할의 명시 지정. 빈 값이면 자동 인수분해(기존 동작). 형상이
         # 작아 group 수 < DPU 수일 때 explicit_k_partition 을 나눠 점유율을 채운다.
         "device_axis_partitions": lambda o: o.device_axis_partitions,
@@ -355,9 +356,12 @@ class PIMOptions:
     # m_t가 언제나 BLOCK_M의 배수로 튀어 그런 값을 만들 수 없다.
     group_m: int = 1
     # upmem 은 같은 뜻의 묶음을 공통 pass(--pim-form-block-groups)가 한다:
-    # group_m × group_n 개의 tile 이 block group 하나(WRAM 상주 단위)가 된다.
-    # group_n 은 upmem 만 읽는다. 1,1 이면 항등이다.
+    # group_m × group_n 개의 tile 이 block group 하나(WRAM 상주 단위)가 되고,
+    # group_k 는 reduction 방향 strip — WRAM 적재 한 번이 담는 K tile 수다
+    # (누산기는 그대로고 A·B strip 의 K 변만 커진다). group_n/group_k 는 upmem 만
+    # 읽는다. 전부 1 이면 항등이다.
     group_n: int = 1
+    group_k: int = 1
     tile_k: int = 32768
     tile_n: int = 4096
     # 0이면 pass가 Triton block이 허락하는 최대값을 고른다. BLOCK 16/16/16이면 8이고,

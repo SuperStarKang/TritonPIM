@@ -107,17 +107,26 @@ static void collectAddends(Value v, SmallVectorImpl<Value> &terms) {
   terms.push_back(v);
 }
 
-// 항이 유도변수에 곱하는 정적 계수. index_cast 를 벗기고 muli 의 상수 쪽을 읽는다.
-// 곱이 없으면 유도변수 그대로일 때만 1 이다.
+// 항이 유도변수에 곱하는 정적 계수. index_cast 를 벗기고 muli 사슬의 상수들을 곱해
+// 내려간다 — group-k 가 끼면 유도변수 사용처가 muli(muli(iv, g), tile) 꼴이 된다.
+// 유도변수까지 상수 곱으로만 이어지지 않으면 알 수 없다.
 static std::optional<int64_t> stepOfTerm(Value term) {
   while (auto c = term.getDefiningOp<arith::IndexCastOp>())
     term = c.getIn();
+  if (isa<BlockArgument>(term))
+    return 1;
   auto mul = term.getDefiningOp<arith::MulIOp>();
   if (!mul)
-    return isa<BlockArgument>(term) ? std::optional<int64_t>(1) : std::nullopt;
-  if (std::optional<int64_t> c = getConstantIntValue(mul.getRhs()))
-    return c;
-  return getConstantIntValue(mul.getLhs());
+    return std::nullopt;
+  if (std::optional<int64_t> c = getConstantIntValue(mul.getRhs())) {
+    std::optional<int64_t> rest = stepOfTerm(mul.getLhs());
+    return rest ? std::optional<int64_t>(*c * *rest) : std::nullopt;
+  }
+  if (std::optional<int64_t> c = getConstantIntValue(mul.getLhs())) {
+    std::optional<int64_t> rest = stepOfTerm(mul.getRhs());
+    return rest ? std::optional<int64_t>(*c * *rest) : std::nullopt;
+  }
+  return std::nullopt;
 }
 
 // 좌표는 loop 고유 타입으로 두고 배치 산술은 index로 한다. 축 loop는 index이고 reduction

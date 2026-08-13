@@ -2,10 +2,23 @@
 // tile tensor 가 group 크기로 커진다. 경계는 언제나 tile 경계 위다.
 // RUN: triton-shared-opt --pim-form-block-groups %s | FileCheck %s --check-prefix=IDENT
 // RUN: triton-shared-opt "--pim-form-block-groups=group-m=2 group-n=2" %s | FileCheck %s
+// RUN: triton-shared-opt --pim-form-block-groups=group-k=2 %s | FileCheck %s --check-prefix=GK
 
-// 기본값 1,1 은 항등이다.
+// 기본값(전부 1)은 항등이다.
 // IDENT: sizes [8, 32]
 // IDENT: tensor<8x32xi32>
+
+// group-k 는 reduction loop 를 넓힌다: 상한은 그 loop 앞에서 반으로 줄고, A·B 의
+// K 변만 커진다 — 누산기(8×32)는 그대로다.
+// GK:      arith.ceildivsi
+// GK:      scf.for %[[Z:.*]] = %{{.*}} iter_args
+// GK:        arith.muli %[[Z]], %{{.*}}
+// GK:        sizes [8, 64]
+// GK:        pim.load %{{.*}} : !pim.access -> tensor<8x64xi8>
+// GK:        sizes [64, 32]
+// GK:        pim.load %{{.*}} : !pim.access -> tensor<64x32xi8>
+// GK:        outs(%{{.*}} : tensor<8x32xi32>)
+// GK:      sizes [8, 32]
 
 // 축 loop: 상한 = ceildiv(tiles, 2), 몸체 첫머리가 첫 tile 좌표(iv·2)를 복원한다.
 // 새 상한 둘은 반드시 nest 밖(가장 바깥 축 loop 앞)에 있어야 한다 — pim-map-devices 가
