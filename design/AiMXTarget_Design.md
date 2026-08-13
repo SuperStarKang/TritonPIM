@@ -452,6 +452,21 @@ execution tile (m_t × k_t × n_t)
 
 ### 2.4 크기 규칙 (legality)
 
+> **2026-08-13 — Triton block 조건이 거부에서 padding으로 바뀌었다.** 계층이
+> **Triton block → block group → execution tile**로 명시되었다. block group은
+> Triton block 정수 개를 하드웨어 실행 단위(output block 높이 `batch`, 폭
+> `4096/batch`, reduction step `256/batch`)의 정수 배에 채운 것이고, 딱 맞지 않으면
+> 남는 자리를 stage가 0으로 채운다 — 그 몫의 lane과 reduction step이 노는 것이
+> 비용이고, `--convert-pim-to-aimx`가 remark로 비율을 알린다. 아래 표의 조건은 이제
+> **물리 크기**(`#aimx.tile_group`의 `execution`)에 대한 것이며, 물리 크기는 구성상
+> 언제나 만족한다: m은 `lcm(BLOCK_M, batch)`(padding 항상 0, `m_t = group-m * lcm`),
+> n·k는 Triton block 묶음을 하드웨어 단위로 올림한 것이다. k tile의 눈금은 block
+> group과 vecA 적재 단위 256의 lcm이다. host 좌표(loop 전진 폭, stage/unstage의
+> origin·sizes)는 **유효 크기**로 세고, PIM DRAM·chain은 물리 크기만 본다 —
+> `aimx.stage`/`aimx.unstage`의 `group_rows`/`group_cols`(`[useful, phys]`)가 그
+> 주기 배치다. batch 자동 선택(§2.5)도 "나눠떨어지는 최대"에서 "padding 0인 값 중
+> 최대, 없으면 노는 비율 최소"로 바뀌었다.
+
 배수 조건을 어기면 **오류가 아니라 조용한 오답**이 난다. 전부 진단으로 막아야 한다.
 
 | 축 | 배수 조건 | 어기면 | 유래 |

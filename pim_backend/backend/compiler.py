@@ -398,8 +398,9 @@ class PIMOptions:
     # init_pim_drv()가 돌려준 개수와 대조해 어기면 즉시 멈춘다.
     base_fpga: int = 0
     # 출력 block 을 batch x (4096/batch)로 자르는 값, {1,2,4,8}만 legal — 이것이 곧
-    # arithmetic intensity 다. 0이면 pass가 Triton block 이 허락하는 최대값을 고른다.
-    # 고정값을 박으면 BLOCK_K=64 같은 흔한 값이 컴파일 오류가 되므로 기본값은 규칙이다.
+    # arithmetic intensity 다. 0이면 pass가 block group padding이 0인 값 중 최대를
+    # 고르고, 전부 padding이 남으면 노는 비율이 최소인 값을 고른다 — BLOCK이 눈금을
+    # 나누지 못해도 컴파일 오류가 아니라 padding이고, pass가 remark로 노는 비율을 알려 준다.
     batch: int = 0
     # PIM DRAM 예산. 0이면 profile의 usable_bank_capacity_bytes를 쓴다.
     bank_capacity_bytes: int = 0

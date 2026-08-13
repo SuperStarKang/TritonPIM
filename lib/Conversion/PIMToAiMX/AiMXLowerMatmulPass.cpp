@@ -7,6 +7,9 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Twine.h"
 
+#include <algorithm>
+#include <numeric>
+
 using namespace mlir;
 
 namespace mlir {
@@ -94,11 +97,28 @@ struct AiMXLowerMatmulPass
         return signalPassFailure();
       }
       int64_t batch = tiling.getBatch();
+      ArrayRef<int64_t> blk = group.getBlock().asArrayRef();
+      ArrayRef<int64_t> grp = group.getGroup().asArrayRef();
       ArrayRef<int64_t> exec = group.getExecution().asArrayRef();
-      if (exec.size() != 3 || exec[0] != tiling.getMT() ||
-          exec[1] != aimx::kLanes / batch || exec[2] != aimx::kRegSize / batch) {
-        f->emitError("aimx-lower-matmul: #aimx.tile_group execution disagrees "
-                     "with #aimx.tiling");
+      if (blk.size() != 3 || grp.size() != 3 || exec.size() != 3) {
+        f->emitError("aimx-lower-matmul: #aimx.tile_group needs three axes");
+        return signalPassFailure();
+      }
+      // execution 은 block group 의 물리 크기다: m 은 lcm(BLOCK_M, batch) (padding 0),
+      // n·k 는 Triton block grp[i] 개를 하드웨어 단위로 올림한 것. 남는 자리는
+      // padding 인데 stage 가 0 을 채우는 데이터 문제라, 이 pass 의 program 은 물리
+      // 눈금만 보면 된다 — 여기서는 두 attribute 가 같은 그림에서 나왔는지만 대조한다.
+      auto ru = [](int64_t a, int64_t u) { return (a + u - 1) / u * u; };
+      int64_t hwN = aimx::kLanes / batch, hwK = aimx::kRegSize / batch;
+      int64_t mGroup = std::lcm(blk[0], batch);
+      if (exec[0] != mGroup || grp[0] != mGroup / blk[0] ||
+          tiling.getMT() % mGroup != 0 ||
+          grp[1] != std::max<int64_t>(1, hwN / blk[1]) ||
+          exec[1] != ru(grp[1] * blk[1], hwN) ||
+          grp[2] != std::max<int64_t>(1, hwK / blk[2]) ||
+          exec[2] != ru(grp[2] * blk[2], hwK)) {
+        f->emitError("aimx-lower-matmul: #aimx.tile_group disagrees with "
+                     "#aimx.tiling");
         return signalPassFailure();
       }
       buildRelayout(mb, f.getName(), tiling);

@@ -6,10 +6,12 @@
 
 // 이 attribute는 **할당된 buffer의 모양**이다. --aimx-lower-matmul이 여기서 읽는 것은
 // batch 하나뿐이고, 나머지는 descriptor program의 인자로 런타임에 들어간다.
+// 계층은 Triton block → block group → execution tile이다. group이 block group당
+// Triton block 수, execution이 block group의 물리 크기다(m은 lcm(BLOCK_M, batch),
+// n·k는 Triton block 묶음을 하드웨어 단위로 올림한 것).
 // batch는 기본값 0(자동)이라 pass가 고른다. BLOCK_N=32는 4096/8=512를, BLOCK_K=32는
-// 256/8=32를 나누므로 legal한 최대값 8이 뽑힌다.
-// m_t는 크기를 요청해서 나온 값이 아니라 **Triton block 묶음**이다:
-// m_t = BLOCK_M(32) * group-m(기본값 1) = 32. group의 첫 칸이 언제나 group-m과 같다.
+// 256/8=32를 나누므로 block group에 padding이 없고, padding 0인 값 중 최대 8이 뽑힌다.
+// m_t = execution[0] * group-m(기본값 1) = lcm(32, 8) * 1 = 32.
 // CHECK-LABEL: func.func @matmul
 // CHECK-SAME:    aimx.tile_group = #aimx.tile_group<block = [32, 32, 32], group = [1, 16, 1], execution = [32, 512, 32]>
 // CHECK-SAME:    aimx.tiling = #aimx.tiling<batch = 8, m_t = 32, k_t = 32768, n_t = 4096, padded_k = 32768, padded_n = 4096, transposed = false>
@@ -38,15 +40,17 @@
 // 바깥이고, 훨씬 작은 A는 안쪽에서 m마다 올라간다. k가 상한(32768) 안이면 k loop은 한
 // 번만 돈다 — K가 런타임 값이라 tile 수도 런타임에 정해지고, 그래서 loop 자체는 언제나
 // 나온다.
+// padding이 없으므로 stage/unstage에 block group attr(group_rows/group_cols)가 없어야
+// 한다 — pitch 값 바로 다음이 into/타입이다.
 // CHECK:   scf.for
 // CHECK:     scf.for
-// CHECK:       aimx.stage {{.*}} pad_to[{{.*}}] pitch {{.*}} into
+// CHECK:       aimx.stage {{.*}} pad_to[{{.*}}] pitch %{{[0-9]+}} into
 // CHECK:       scf.for
-// CHECK:         aimx.stage {{.*}} pad_to[{{.*}}] pitch {{.*}} into
+// CHECK:         aimx.stage {{.*}} pad_to[{{.*}}] pitch %{{[0-9]+}} into
 // CHECK:         aimx.invoke
 // k tile은 전부 **같은 C 영역**에 쓴다 — n이나 m을 나눌 때와 다른 점이다. 그래서 두 번째
 // tile부터는 덮는 것이 아니라 이전 부분합에 더한다.
-// CHECK:         aimx.unstage {{.*}} accumulate
+// CHECK:         aimx.unstage {{.*}} accumulate %{{[0-9]+}} :
 
 // 계산은 descriptor chain이 한다. PIM 쪽도 profile도 남지 않는다.
 // CHECK-NOT: linalg.matmul

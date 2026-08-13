@@ -117,18 +117,37 @@ static LogicalResult verifyPitched(Operation *op, size_t origin, size_t sizes,
   return success();
 }
 
+// block group 주기 배치. 없는 축은 항등이므로 useful == phys 를 적는 것은 잉여다 —
+// 한 가지 철자만 허용해야 stub 이 attr 유무로 특수화할 수 있다.
+static LogicalResult verifyGroup(Operation *op, DenseI64ArrayAttr g,
+                                 StringRef name) {
+  if (!g)
+    return success();
+  ArrayRef<int64_t> v = g.asArrayRef();
+  if (v.size() != 2 || v[0] <= 0 || v[0] >= v[1])
+    return op->emitOpError(name)
+           << " must be [useful, phys] with 0 < useful < phys — a padding-free "
+              "axis carries no group attribute";
+  return success();
+}
+
 LogicalResult StageOp::verify() {
   if (failed(verifyPitched(*this, getOrigin().size(), getSizes().size(),
                            getStrides().size(), getElementType())))
     return failure();
   if (getPadTo().size() != getOrigin().size())
     return emitOpError("pad_to must have the same rank as origin");
+  if (failed(verifyGroup(*this, getGroupRowsAttr(), "group_rows")) ||
+      failed(verifyGroup(*this, getGroupColsAttr(), "group_cols")))
+    return failure();
   return success();
 }
 
 LogicalResult UnstageOp::verify() {
-  return verifyPitched(*this, getOrigin().size(), getSizes().size(),
-                       getStrides().size(), getElementType());
+  if (failed(verifyPitched(*this, getOrigin().size(), getSizes().size(),
+                           getStrides().size(), getElementType())))
+    return failure();
+  return verifyGroup(*this, getGroupColsAttr(), "group_cols");
 }
 
 LogicalResult DescriptorProgramOp::verify() {
