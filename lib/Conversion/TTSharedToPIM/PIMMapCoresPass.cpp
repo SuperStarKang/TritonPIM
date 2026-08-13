@@ -59,23 +59,34 @@ struct PIMMapCoresPass
     bool simd = profile.getParallelExecutionKind() == "simd";
     int64_t lanes = profile.getNumberOfParallelLanesPerPimCore();
     IntegerAttr local = profile.getUsableLocalCapacityBytes();
+    // simd 는 lane 협력이 하드웨어에 내장돼 있어 역할이 언제나 output_row 다.
+    // multithread 는 옵션이 역할을 정한다 — 모르는 값은 진단이다(기본값으로 때우지 않는다).
+    StringRef role = "output_row";
     if (!simd) {
-      // multithread 는 lane 마다 tile 버퍼를 복제하므로 실제 lane 수를 예산이 정한다.
-      if (!local)
-        return func->emitError(
-            "pim-map-cores: usable_local_capacity_bytes is not recorded, so the "
-            "lane budget of a multithread target cannot be decided");
-      if (local.getInt() > 0) {
-        int64_t bytes = std::max<int64_t>(1, pim::localTileBytes(func));
-        lanes = std::max<int64_t>(1, std::min(lanes, local.getInt() / bytes));
+      if (laneMode != "whole_tile" && laneMode != "output_row")
+        return func->emitError("pim-map-cores: unknown lane-mode \"")
+               << laneMode << "\"; expected \"whole_tile\" or \"output_row\"";
+      role = laneMode;
+      if (role == "whole_tile") {
+        // lane 마다 tile 버퍼를 복제하므로 실제 lane 수를 예산이 정한다.
+        if (!local)
+          return func->emitError(
+              "pim-map-cores: usable_local_capacity_bytes is not recorded, so "
+              "the lane budget of a multithread target cannot be decided");
+        if (local.getInt() > 0) {
+          int64_t bytes = std::max<int64_t>(1, pim::localTileBytes(func));
+          lanes = std::max<int64_t>(1, std::min(lanes, local.getInt() / bytes));
+        }
       }
+      // output_row 는 버퍼가 한 벌이라 lane 수가 예산과 무관하다. 능력값을 그대로 쓰고,
+      // 한 벌이 예산에 드는지는 pim-verify 가 확인한다.
     }
 
     func->setAttr("pim.core_mapping",
                   pim::CoreMappingAttr::get(
                       func.getContext(), b.getArrayAttr(roles),
                       b.getDenseI64ArrayAttr(footprint), lanes,
-                      b.getStringAttr(simd ? "output_row" : "whole_tile")));
+                      b.getStringAttr(role)));
     return success();
   }
 };

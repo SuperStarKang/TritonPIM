@@ -119,6 +119,15 @@ def PIMMapCores : Pass<"pim-map-cores", "mlir::ModuleOp"> {
     parallel_execution_kind 가 simd 면 버퍼가 lane 마다 복제되지 않으므로 능력값을 그대로 쓴다.
     PIM Core 가 여럿인 topology 는 아직 매핑하지 않고 진단을 낸다.
   }];
+  let options = [
+    Option<"laneMode", "lane-mode", "std::string", "\"whole_tile\"",
+           "multithread target 의 lane 실행 형태. whole_tile 은 lane 이 서로 다른 "
+           "tile 을 통째로 맡고 tile 버퍼가 lane 수만큼 복제된다. output_row 는 "
+           "lane 들이 한 tile 을 출력 행으로 나눠 함께 계산하고 버퍼는 한 벌만 "
+           "둔다 — lane 수가 버퍼 예산과 무관해지므로 tile 을 키울 때 쓴다. "
+           "simd target 은 이 옵션을 읽지 않는다(lane 협력이 하드웨어에 내장돼 "
+           "있어 언제나 output_row 다).">,
+  ];
   let constructor = "mlir::triton::createPIMMapCoresPass()";
   let dependentDialects = ["mlir::pim::PIMDialect"];
 }

@@ -69,7 +69,8 @@ struct PIMVerifyPass
                           "pim_core_shape");
           return WalkResult::interrupt();
         }
-      // lane 예산. simd 는 버퍼가 lane 마다 복제되지 않으므로 lane 수를 곱하지 않는다.
+      // lane 예산. simd 와 협력 모드(lane_axis_role = output_row)는 버퍼가 lane 마다
+      // 복제되지 않으므로 lane 수를 곱하지 않는다.
       if (!local) {
         func->emitError("pim-verify: usable_local_capacity_bytes is not "
                         "recorded, so the lane budget cannot be checked");
@@ -77,8 +78,10 @@ struct PIMVerifyPass
       }
       if (local.getInt() == 0)
         return WalkResult::advance();
+      bool sharedBuffers =
+          simd || cores.getLaneAxisRole().getValue() == "output_row";
       int64_t bytes = pim::localTileBytes(func);
-      int64_t need = simd ? bytes : bytes * cores.getLanes();
+      int64_t need = sharedBuffers ? bytes : bytes * cores.getLanes();
       if (need > local.getInt()) {
         func->emitError("pim-verify: tile buffers need ")
             << need << " byte of local storage but a PIM Core has "
