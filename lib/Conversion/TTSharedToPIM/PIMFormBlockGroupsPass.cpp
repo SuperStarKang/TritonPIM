@@ -72,6 +72,17 @@ struct PIMFormBlockGroupsPass
       grouped.push_back({colLoop, groupN});
     }
 
+    // 새 상한은 전부 가장 바깥 축 loop 앞에 만든다. 안쪽 loop 앞에 두면 그 값이 바깥
+    // loop 몸체 안에 갇혀서, 뒤의 pim-map-devices 가 nest 밖에서 상한을 읽을 때 지배가
+    // 깨진다 — build-logical-grid 가 상한을 전부 entry 에 만드는 것과 같은 이유다.
+    scf::ForOp outermost;
+    func.walk<WalkOrder::PreOrder>([&](scf::ForOp l) {
+      if (!l->getAttrOfType<StringAttr>("pim.axis"))
+        return WalkResult::advance();
+      outermost = l;
+      return WalkResult::interrupt();
+    });
+
     // loop 를 group 좌표로 바꾼다: 상한 = ceildiv(tiles, g), 몸체 첫머리에서 첫 tile
     // 좌표(iv·g)를 만들어 기존 사용처에 잇는다. origin 산술이 tile 좌표 위에 서 있으므로
     // 이 치환만으로 group 의 시작 위치가 맞는다.
@@ -82,7 +93,7 @@ struct PIMFormBlockGroupsPass
         return loop->emitError("pim-form-block-groups: the axis loop is not "
                                "the canonical [0, tiles) step-1 form");
       Location loc = loop.getLoc();
-      OpBuilder b(loop);
+      OpBuilder b(outermost);
       Value gOut = b.create<arith::ConstantIndexOp>(loc, g);
       Value groups =
           b.create<arith::CeilDivSIOp>(loc, loop.getUpperBound(), gOut);

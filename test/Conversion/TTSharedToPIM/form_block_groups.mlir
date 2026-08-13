@@ -8,10 +8,12 @@
 // IDENT: tensor<8x32xi32>
 
 // 축 loop: 상한 = ceildiv(tiles, 2), 몸체 첫머리가 첫 tile 좌표(iv·2)를 복원한다.
+// 새 상한 둘은 반드시 nest 밖(가장 바깥 축 loop 앞)에 있어야 한다 — pim-map-devices 가
+// nest 밖에서 상한을 읽어 extents 를 만들기 때문이다.
+// CHECK:      arith.ceildivsi
 // CHECK:      arith.ceildivsi
 // CHECK:      scf.for %[[XG:.*]] = %{{.*}} to
 // CHECK:        arith.muli %[[XG]], %{{.*}}
-// CHECK:        arith.ceildivsi
 // CHECK:        scf.for %[[YG:.*]] = %{{.*}} to
 // CHECK:          arith.muli %[[YG]], %{{.*}}
 
