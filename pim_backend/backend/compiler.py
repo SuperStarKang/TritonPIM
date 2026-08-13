@@ -148,6 +148,10 @@ _TARGET_PROFILE = {
         "device_axis_priority": "",
         # DPU 는 tile 하나를 통째로 맡으므로 분할 눈금이 따로 없다.
         "device_axis_granularity": lambda o: "",
+        # lane(tasklet) 실행 형태. whole_tile 은 lane 이 tile 을 통째로 맡고 버퍼를
+        # lane 수만큼 복제한다. output_row 는 lane 들이 한 tile 을 출력 행으로 나눠
+        # 함께 계산한다 — 버퍼가 한 벌이라 tile 을 키워도 lane 수가 줄지 않는다.
+        "lane_mode": lambda o: o.lane_mode,
         # 유닛=DPU, 큰 메모리=MRAM, 빠른 메모리=WRAM 이라 둘 다 옵션 값이 그대로 온다.
         "capacity": lambda o: (o.unit_memory_bytes, o.local_memory_bytes),
     },
@@ -169,6 +173,9 @@ _TARGET_PROFILE = {
         # 그보다 잘게 자르면 마지막 tile 이 절반만 유효한 채로 온전히 실행된다. batch 와는
         # 무관하다 — 출력 block 폭 4096/batch 는 execution tile **안**의 눈금이다.
         "device_axis_granularity": lambda o: "output_column_tile:4096",
+        # simd 는 lane 협력이 하드웨어에 내장돼 있어 pim-map-cores 가 옵션을 읽지
+        # 않는다. 빈 값이면 옵션을 붙이지 않는다.
+        "lane_mode": lambda o: "",
         # core 별 local storage 는 없다(0). bank 예산은 선언 상수다 — pim_malloc 은
         # 실패해도 NULL 을 돌려주지 않고 프로세스를 죽이므로 재 보는 방법이 없다.
         "capacity": lambda o: (AIMX_DEVICE_DRAM_BYTES, 0),
@@ -188,7 +195,7 @@ PIM_COMMON_PASSES = [
     "--pim-recover-access-origin", # access 의 축별 origin 을 logical 좌표로 채운다
     "--pim-form-compute",          # 누산기를 matmul 의 outs 로 통합
     "{profile}",                   # 기계 profile 부착. 여기부터 profile 을 읽는다
-    "--pim-map-cores",             # logical 차원 ↔ PIM Core topology, lane 수 선택
+    "{map_cores}",                 # logical 차원 ↔ PIM Core topology, lane 수 선택
     "--pim-form-execution-waves",  # core footprint 로 wave 구성
     "{map_devices}",               # wave 를 PIM Device 에 균형 분배
     "--pim-place-data",            # 최종 region·replication·capacity materialize
@@ -219,7 +226,10 @@ def _ttsharedir_to_pim_common(ttshared: str, options) -> str:
             ("device-axis-granularity", t["device_axis_granularity"](options))]
     given = " ".join(f"{k}={v}" for k, v in opts if v)
     map_devices = "--pim-map-devices" + (f"={given}" if given else "")
-    return _run_opt(ttshared, [p.format(profile=profile, map_devices=map_devices)
+    lane_mode = t["lane_mode"](options)
+    map_cores = "--pim-map-cores" + (f"=lane-mode={lane_mode}" if lane_mode else "")
+    return _run_opt(ttshared, [p.format(profile=profile, map_cores=map_cores,
+                                        map_devices=map_devices)
                                for p in PIM_COMMON_PASSES])
 
 
@@ -344,6 +354,11 @@ class PIMOptions:
     # 몫이라는 뜻이라 물리 크기보다 작게 둔다.
     unit_memory_bytes: int = 32 * 1024 * 1024
     local_lanes: int = 1         # DPU 내부 intra-unit 병렬 lane 능력값. 실제 값은 lane 예산이 정한다.
+    # lane 실행 형태 (multithread target 전용, --pim-map-cores lane-mode 로 간다).
+    # whole_tile: lane 이 서로 다른 tile 을 통째로 맡는다 — 지금까지의 동작.
+    # output_row: lane 들이 한 tile 을 출력 행으로 나눠 함께 계산한다. 버퍼가 한 벌이라
+    #             tile 을 키워도 lane 수가 줄지 않는다. 행 수가 lane 수로 나누어떨어져야 한다.
+    lane_mode: str = "whole_tile"
 
     def __post_init__(self):
         # target 없이 PIM을 쓰는 것은 의도된 사용이 아니므로 기본값으로 때우지 않고 바로 터뜨린다.
