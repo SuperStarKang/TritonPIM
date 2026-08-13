@@ -49,8 +49,7 @@ module attributes {pim.target_profile = #pim.target_profile<
 
 func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
                   %K: i32, %N: i32, %ex: index, %ey: index)
-    attributes {pim.core_mapping = #pim.core_mapping<
-        core_axis_roles = ["none"], tile_footprint = array<i64: 1>,
+    attributes {pim.group_execution = #pim.group_execution<
         lanes = 4, lane_axis_role = "output_row">} {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index

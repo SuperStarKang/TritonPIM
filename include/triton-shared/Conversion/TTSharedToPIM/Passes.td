@@ -142,15 +142,17 @@ def PIMFormBlockGroups : Pass<"pim-form-block-groups", "mlir::ModuleOp"> {
                            "mlir::scf::SCFDialect"];
 }
 
-def PIMMapCores : Pass<"pim-map-cores", "mlir::ModuleOp"> {
-  let summary = "Map logical dimensions onto the PIM Core topology and pick the lane count";
+def PIMPlanGroupExecution : Pass<"pim-plan-group-execution", "mlir::ModuleOp"> {
+  let summary = "Decide how the lanes of a PIM Core execute one block group";
   let description = [{
-    `#pim.core_mapping` 을 func 에 붙인다. core 축마다 어느 logical 차원을 맡는지,
-    logical tile 하나가 차지하는 core subset 의 shape, 그리고 실제로 쓸 lane 수다.
-    profile 의 lane 수는 능력값이고 실제 값은 local storage 예산이 정한다:
-    lanes = max(1, min(능력값, usable_local_capacity_bytes / lane당 tile 바이트)).
-    parallel_execution_kind 가 simd 면 버퍼가 lane 마다 복제되지 않으므로 능력값을 그대로 쓴다.
-    PIM Core 가 여럿인 topology 는 아직 매핑하지 않고 진단을 낸다.
+    `#pim.group_execution` 을 func 에 붙인다 — lane 수와, lane 이 block group 의
+    무엇을 나눠 갖는가다. profile 의 lane 수는 능력값이고, whole_tile(복제) 모드의
+    실제 값은 local storage 예산이 정한다:
+    lanes = max(1, min(능력값, usable_local_capacity_bytes / lane당 group 바이트)).
+    parallel_execution_kind 가 simd 면 버퍼가 lane 마다 복제되지 않으므로 능력값을
+    그대로 쓰고 역할은 언제나 output_row 다.
+    다중 core 로의 group 분배는 아직 없으므로 PIM Core 가 여럿인 topology 는 진단을
+    낸다 — 그런 target 이 오면 group 계층의 확장으로 만든다.
   }];
   let options = [
     Option<"laneMode", "lane-mode", "std::string", "\"whole_tile\"",
@@ -161,20 +163,7 @@ def PIMMapCores : Pass<"pim-map-cores", "mlir::ModuleOp"> {
            "simd target 은 이 옵션을 읽지 않는다(lane 협력이 하드웨어에 내장돼 "
            "있어 언제나 output_row 다).">,
   ];
-  let constructor = "mlir::triton::createPIMMapCoresPass()";
-  let dependentDialects = ["mlir::pim::PIMDialect"];
-}
-
-def PIMFormExecutionWaves : Pass<"pim-form-execution-waves", "mlir::ModuleOp"> {
-  let summary = "Group logical tiles into PIM Group execution waves";
-  let description = [{
-    logical tile core footprint 를 PIM Core shape 위에 겹치지 않게 놓아 wave 하나에
-    들어가는 logical tile 수를 구한다. footprint 의 각 축이 core shape 의 대응 축을
-    나누어야 한다.
-    wave 하나가 tile 하나면 이 pass 는 항등이다. 여럿이면 lockstep wave 를 세워야 하고
-    그것은 아직 만들지 않으므로 진단을 낸다.
-  }];
-  let constructor = "mlir::triton::createPIMFormExecutionWavesPass()";
+  let constructor = "mlir::triton::createPIMPlanGroupExecutionPass()";
   let dependentDialects = ["mlir::pim::PIMDialect"];
 }
 
@@ -242,9 +231,8 @@ def PIMVerify : Pass<"pim-verify", "mlir::ModuleOp"> {
     - origin 이 비어 있지 않고 rank 가 sizes 와 같다.
     - pad 가 0 이 아니면 진단(단계 1 은 pad = 0 만 지원).
     - device partition 의 곱이 PIM Device 개수를 넘지 않는다.
-    - tile_footprint 가 pim_core_shape 를 나눈다.
-    - lane 당 tile 바이트 × lane 수가 usable_local_capacity_bytes 안이다(simd 면 × 없이,
-      0 이면 생략, 미측정이면 진단).
+    - lane 당 group 바이트 × lane 수가 usable_local_capacity_bytes 안이다(simd 와
+      협력 모드는 × 없이 한 벌, 0 이면 생략, 미측정이면 진단).
     - 정적으로 아는 값끼리는 start·size·capacity 부등식을 직접 검사한다. 런타임 값이면
       배치 pass 가 clamp 식을 만들었는지 구조로 확인한다.
     - 같은 logical 축을 나누는 두 place 가 같은 분할 수를 쓴다.

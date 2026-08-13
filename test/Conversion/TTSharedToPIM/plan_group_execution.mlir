@@ -1,6 +1,6 @@
 // lane-mode 가 lane 수와 lane_axis_role 을 어떻게 정하는지 확인한다.
-// RUN: triton-shared-opt --pim-map-cores %s | FileCheck %s --check-prefix=WHOLE
-// RUN: triton-shared-opt --pim-map-cores=lane-mode=output_row %s | FileCheck %s --check-prefix=ROW
+// RUN: triton-shared-opt --pim-plan-group-execution %s | FileCheck %s --check-prefix=WHOLE
+// RUN: triton-shared-opt --pim-plan-group-execution=lane-mode=output_row %s | FileCheck %s --check-prefix=ROW
 
 // whole_tile(기본): lane 마다 tile 버퍼를 복제하므로 예산이 lane 수를 자른다.
 //   tile 바이트 = A 256 + B 1024 + 누산기 1024 = 2304 → 4096 / 2304 = 1

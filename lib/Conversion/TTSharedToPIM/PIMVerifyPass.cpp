@@ -50,25 +50,13 @@ struct PIMVerifyPass
   }
 
   LogicalResult verifyCores(pim::TargetProfileAttr profile) {
-    ArrayRef<int64_t> coreShape = profile.getPimCoreShape().asArrayRef();
     IntegerAttr local = profile.getUsableLocalCapacityBytes();
     bool simd = profile.getParallelExecutionKind() == "simd";
     WalkResult res = getOperation().walk([&](func::FuncOp func) {
-      auto cores = func->getAttrOfType<pim::CoreMappingAttr>("pim.core_mapping");
+      auto cores =
+          func->getAttrOfType<pim::GroupExecutionAttr>("pim.group_execution");
       if (!cores)
         return WalkResult::advance();
-      ArrayRef<int64_t> footprint = cores.getTileFootprint().asArrayRef();
-      if (footprint.size() != coreShape.size()) {
-        func->emitError("pim-verify: tile_footprint rank does not match "
-                        "pim_core_shape rank");
-        return WalkResult::interrupt();
-      }
-      for (auto [f, c] : llvm::zip(footprint, coreShape))
-        if (f <= 0 || c % f != 0) {
-          func->emitError("pim-verify: tile_footprint does not divide "
-                          "pim_core_shape");
-          return WalkResult::interrupt();
-        }
       // lane 예산. simd 와 협력 모드(lane_axis_role = output_row)는 버퍼가 lane 마다
       // 복제되지 않으므로 lane 수를 곱하지 않는다.
       if (!local) {

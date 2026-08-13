@@ -10,6 +10,11 @@
 # 런타임 kernel 인자다. 문제 크기를 아는 곳은 launch 지점뿐이다. 값을 직접 계산해
 # 넣고 싶으면 이 helper 를 거치지 않고 device_axis_partitions/SPLIT_K 를 그대로
 # 주면 된다 — 반환값이 정확히 그 kwargs 다.
+#
+# tile_* 의 의미는 "execution tile 상한": A(tile_m×tile_k) + B(tile_k×tile_n) +
+# C(tile_m×tile_n)이 device 의 PIM DRAM 예산 안이어야 한다. round(시간 창) 도입
+# 전에는 상한 = 배정량(초과 시 컴파일·전송 시점 진단)이고, 도입 후에는 상한 = 창
+# 크기가 된다 — 그때 tile_* 은 두 target 공통의 컴파일 옵션으로 승격된다.
 
 
 def execution_tile(M, N, K, *,

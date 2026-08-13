@@ -192,6 +192,15 @@ tile 16384개면 `trips=8` → 실제 32 KiB 대신 256 KiB를 주장하고, `up
 
 ## 2.1 3계층 정의
 
+> **2026-08-13 재구성.** 공통 pass 구조는 이제 **데이터 3계층** — block(Triton tile
+> 눈금) ⊂ block group(local 상주·계산 단위) ⊂ execution tile(PIM Device 하나가 한
+> 번에 맡는 몫) — 을 기준으로 선다. 아래의 기계 계층은 각 데이터 계층의 **소비자**로
+> 대응된다: execution tile 은 PIM Device 가, block group 은 PIM Core 가(현재 두
+> target 모두 core 1개), group 내부는 lane 이 소비한다. 그에 따라
+> `#pim.core_mapping` 은 `#pim.group_execution`(lanes, lane_axis_role)으로 바뀌었고,
+> `core_axis_roles`/`tile_footprint` 필드와 `--pim-form-execution-waves` 는 다중
+> core 로의 group 분배가 실제 target 과 함께 올 때 group 계층의 확장으로 재설계한다.
+
 ```
 System
 ├── Host

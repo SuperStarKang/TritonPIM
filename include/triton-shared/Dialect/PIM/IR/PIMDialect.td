@@ -7,8 +7,12 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 
 //===----------------------------------------------------------------------===//
 // PIM dialect — target 무관 PIM 공통 IR.
-// 공통 실행 계층은 PIM Device → PIM Group → PIM Core 이고, target 용어(DPU/tasklet/
-// MRAM/channel/bank 등)는 여기 등장하지 않는다.
+// 공통 구조는 데이터 3계층이다: block(Triton tile 눈금) ⊂ block group(local 상주·
+// 계산 단위) ⊂ execution tile(PIM Device 하나가 한 번에 맡는 몫). 기계는 각 계층의
+// 소비자로 대응된다 — execution tile 은 PIM Device 가(#pim.device_mapping),
+// block group 은 PIM Core 가(현재 두 target 모두 core 1개), group 내부는 lane 이
+// 소비한다(#pim.group_execution). target 용어(DPU/tasklet/MRAM/channel/bank 등)는
+// 여기 등장하지 않는다.
 //===----------------------------------------------------------------------===//
 
 def PIM_Dialect : Dialect {
@@ -75,13 +79,13 @@ def PIM_DeviceMappingAttr : PIM_Attr<"DeviceMapping", "device_mapping"> {
   let assemblyFormat = "`<` struct(params) `>`";
 }
 
-// logical tile 과 PIM Core topology 의 대응. core_axis_roles 와 tile_footprint 는
-// pim_core_shape 와 같은 rank 이고, 역할이 없는 core 축은 "none" 이다.
-def PIM_CoreMappingAttr : PIM_Attr<"CoreMapping", "core_mapping"> {
-  let summary = "Mapping of logical dimensions onto the PIM Core topology";
-  let parameters = (ins "::mlir::ArrayAttr":$core_axis_roles,
-                        "::mlir::DenseI64ArrayAttr":$tile_footprint,
-                        "int64_t":$lanes,
+// block group 하나를 PIM Core 의 lane 들이 어떻게 실행하는가 — lane 수와, lane 이
+// group 의 무엇을 나눠 갖는가(whole_tile: 서로 다른 group 을 통째로 / output_row:
+// 한 group 을 출력 행으로 협력). 다중 core 로의 group 분배는 그런 target 이 실제로
+// 올 때 group 계층의 확장으로 재설계한다 — 그때까지는 core 1개가 전제다.
+def PIM_GroupExecutionAttr : PIM_Attr<"GroupExecution", "group_execution"> {
+  let summary = "How the lanes of a PIM Core execute one block group";
+  let parameters = (ins "int64_t":$lanes,
                         "::mlir::StringAttr":$lane_axis_role);
   let assemblyFormat = "`<` struct(params) `>`";
 }

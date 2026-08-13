@@ -123,7 +123,7 @@ struct ConvertPIMToUPMEMPass
     // 뒤 단계가 기계 값을 다시 읽을 수 있다는 오해를 만든다.
     getOperation()->removeAttr("pim.target_profile");
     getOperation().walk(
-        [](func::FuncOp f) { f->removeAttr("pim.core_mapping"); });
+        [](func::FuncOp f) { f->removeAttr("pim.group_execution"); });
   }
 
   pim::TargetProfileAttr profile;
@@ -152,10 +152,11 @@ struct ConvertPIMToUPMEMPass
     Location loc = device.getLoc();
     Block *deviceBody = &device.getBody().front();
 
-    auto cores = func->getAttrOfType<pim::CoreMappingAttr>("pim.core_mapping");
+    auto cores =
+        func->getAttrOfType<pim::GroupExecutionAttr>("pim.group_execution");
     if (!cores) {
       func->emitError("convert-pim-to-upmem: the function has no "
-                      "#pim.core_mapping");
+                      "#pim.group_execution");
       return signalPassFailure();
     }
     int64_t lanes = cores.getLanes();

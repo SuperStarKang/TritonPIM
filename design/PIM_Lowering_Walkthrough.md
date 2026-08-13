@@ -75,8 +75,7 @@ Triton 커널 하나가 UPMEM DPU에서 도는 코드가 되기까지 각 단계
  ⑥  --pim-form-compute            누산기를 matmul 의 outs 로 통합
      ─────────────────────────────  여기까지 target 무관
  ⑦  --pim-set-target-profile      #pim.target_profile 부착
- ⑧  --pim-map-cores               logical 차원 ↔ PIM Core, lane 수
- ⑨  --pim-form-execution-waves    core footprint 로 wave 구성
+ ⑧  --pim-plan-group-execution    block group 실행 계획 — lane 수, lane 협력 방식
  ⑩  --pim-map-devices             logical tile → PIM Device 균형 분배
  ⑪  --pim-place-data              영역·용량·복제 확정
  ⑫  --pim-verify                  공통 fail-fast 검증
@@ -84,8 +83,9 @@ Triton 커널 하나가 UPMEM DPU에서 도는 코드가 되기까지 각 단계
  ⑭  --convert-pim-to-upmem        UPMEM legality gate + host/device 분리
 ```
 
-⑦ 이전의 어떤 pass 도 기계 값을 읽지 않는다. ⑧과 ⑨는 UPMEM에서 `pim_core_shape = [1]`
-이라 좌표를 만들지 않고, 표현할 수 없는 구성이면 진단을 낸다.
+⑦ 이전의 어떤 pass 도 기계 값을 읽지 않는다. ⑧은 PIM Core 가 여럿인 topology 를
+아직 지원하지 않아 그 구성이면 진단을 낸다 — 다중 core 로의 group 분배는 그런
+target 이 올 때 group 계층의 확장으로 만든다.
 
 ---
 
@@ -424,14 +424,11 @@ module attributes {
 
 ```mlir
 func.func @gemm_kernel(…) attributes {
-  pim.core_mapping = #pim.core_mapping<
-    core_axis_roles = ["none"], tile_footprint = [1],
-    lanes = 1, lane_axis_role = "whole_tile">}
+  pim.group_execution = #pim.group_execution<lanes = 1, lane_axis_role = "whole_tile">}
 ```
 
-UPMEM 은 device 당 PIM Core 가 하나라 core 축에 맡길 logical 차원이 없고
-(`core_axis_roles = ["none"]`), logical tile 하나가 core subset 전체를 차지한다
-(`tile_footprint = [1]`). 그래서 wave 하나가 tile 하나이고 ⑨는 항등이다.
+UPMEM 은 device 당 PIM Core 가 하나다. 다중 core 로의 group 분배는 그런 target 이
+올 때 group 계층의 확장으로 만든다.
 
 `lanes` 는 local storage 예산이 정한다. 이 커널의 lane 당 tile 바이트는
 A 512 + B 512 + 누산기 4096 = 5120 이므로 48 KiB 안에 9 개까지 들어가고,
@@ -541,8 +538,7 @@ pim.place %arg2 start[%25, %38] size[%32, %44] capacity[%28, %40] strides[%45, %
   origin rank == sizes rank
   pad 가 0 이 아니면 진단              (단계 1 은 pad = 0 만 지원)
   device partition 곱 ≤ PIM Device 개수
-  tile_footprint 가 pim_core_shape 를 나눈다
-  lane 당 tile 바이트 × lane 수 ≤ usable_local_capacity_bytes
+  lane 당 tile 바이트 × lane 수 ≤ usable_local_capacity_bytes (공유 모드는 한 벌)
   mask 가 있는 축의 size 가 clamp 형태다
   axis_source 가 device mapping 의 축이다
 ```
@@ -755,8 +751,7 @@ K device partition 을 1 로 고정하므로 A·B 의 K 영역이 연속이고, 
 | `matmul` + `fill` 만 남는 커널 | 통과 (`gemm.py`, `split_k.py`, `grouped_gemm.py`) |
 | dtype 변환 epilogue 가 있는 커널 | `UPMEMToDevice` 에 elementwise `linalg.generic` 의 C 형태가 없다 |
 | f16 을 쓰는 커널 | DPU 에 f16 이 없어 WRAM 버퍼를 낼 수 없다 |
-| PIM Core 가 여럿인 target | `--pim-map-cores` 가 진단 |
-| wave 당 tile 이 둘 이상 | `--pim-form-execution-waves` 가 진단 |
+| PIM Core 가 여럿인 target | `--pim-plan-group-execution` 이 진단 |
 | k device partition > 1 | blocked 분할 kernel + `device-axis-partitions` 로 지원. cyclic 분할은 `--pim-place-data` 가 진단 |
 | 0 이 아닌 pad | `--pim-verify` 가 진단 |
 

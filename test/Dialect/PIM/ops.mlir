@@ -78,12 +78,10 @@ module attributes {
         requires_uniform_instruction_sequence = false,
         usable_bank_capacity_bytes = 33554432,
         usable_local_capacity_bytes = 49152>} {
-  // CHECK: pim.core_mapping = #pim.core_mapping<core_axis_roles = ["none"], tile_footprint = array<i64: 1>, lanes = 16, lane_axis_role = "whole_tile">
+  // CHECK: pim.group_execution = #pim.group_execution<lanes = 16, lane_axis_role = "whole_tile">
   func.func @profiled() attributes {
-      pim.core_mapping = #pim.core_mapping<core_axis_roles = ["none"],
-                                           tile_footprint = array<i64: 1>,
-                                           lanes = 16,
-                                           lane_axis_role = "whole_tile">} {
+      pim.group_execution = #pim.group_execution<lanes = 16,
+                                                 lane_axis_role = "whole_tile">} {
     return
   }
 }

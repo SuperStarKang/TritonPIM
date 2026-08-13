@@ -180,7 +180,7 @@ _TARGET_PROFILE = {
         # 그보다 잘게 자르면 마지막 tile 이 절반만 유효한 채로 온전히 실행된다. batch 와는
         # 무관하다 — 출력 block 폭 4096/batch 는 execution tile **안**의 눈금이다.
         "device_axis_granularity": lambda o: "output_column_tile:4096",
-        # simd 는 lane 협력이 하드웨어에 내장돼 있어 pim-map-cores 가 옵션을 읽지
+        # simd 는 lane 협력이 하드웨어에 내장돼 있어 pim-plan-group-execution 이 옵션을 읽지
         # 않는다. 빈 값이면 옵션을 붙이지 않는다.
         "lane_mode": lambda o: "",
         # AiMX 의 묶음은 target lowering 의 execution tile 이 담당한다(group_m 은
@@ -208,9 +208,8 @@ PIM_COMMON_PASSES = [
     "--pim-form-compute",          # 누산기를 matmul 의 outs 로 통합
     "{form_block_groups}",         # 이웃 tile 을 block group(상주 단위)으로 묶는다. 1,1 이면 항등
     "{profile}",                   # 기계 profile 부착. 여기부터 profile 을 읽는다
-    "{map_cores}",                 # logical 차원 ↔ PIM Core topology, lane 수 선택
-    "--pim-form-execution-waves",  # core footprint 로 wave 구성
-    "{map_devices}",               # wave 를 PIM Device 에 균형 분배
+    "{plan_group_execution}",      # block group 실행 계획 — lane 수, lane 협력 방식
+    "{map_devices}",               # execution tile 을 PIM Device 에 균형 분배
     "--pim-place-data",            # 최종 region·replication·capacity materialize
     "--pim-verify",                # 공통 fail-fast 검증
     "-cse",
@@ -241,12 +240,13 @@ def _ttsharedir_to_pim_common(ttshared: str, options) -> str:
     given = " ".join(f"{k}={v}" for k, v in opts if v)
     map_devices = "--pim-map-devices" + (f"={given}" if given else "")
     lane_mode = t["lane_mode"](options)
-    map_cores = "--pim-map-cores" + (f"=lane-mode={lane_mode}" if lane_mode else "")
+    plan_group_execution = ("--pim-plan-group-execution"
+                            + (f"=lane-mode={lane_mode}" if lane_mode else ""))
     bg = t["block_group"](options)
     form_block_groups = "--pim-form-block-groups" + (f"={bg}" if bg else "")
     return _run_opt(ttshared, [p.format(profile=profile,
                                         form_block_groups=form_block_groups,
-                                        map_cores=map_cores,
+                                        plan_group_execution=plan_group_execution,
                                         map_devices=map_devices)
                                for p in PIM_COMMON_PASSES])
 
@@ -267,7 +267,7 @@ def _upmem_to_artifact(upmem_ir: str, metadata) -> bytes:
     if not match:
         raise RuntimeError("generated host.cpp에서 진입 함수를 찾지 못함")
     metadata["name"] = match.group(1)
-    # 실제로 쓰는 tasklet 수. --pim-map-cores가 lane 예산 안에서 고른 값이라 요청값과
+    # 실제로 쓰는 tasklet 수. --pim-plan-group-execution이 lane 예산 안에서 고른 값이라 요청값과
     # 다를 수 있고, launcher는 이 값을 -DNR_TASKLETS로 써야 IR과 device 빌드가 맞는다.
     lanes = re.search(r'// pim\.lanes = (\d+)', device_src)
     if not lanes:
@@ -346,10 +346,14 @@ class PIMOptions:
     # [base_fpga, base_fpga + num_units)가 [0, 감지된 개수) 안에 있어야 한다. 생성된 stub이
     # init_pim_drv()가 돌려준 개수와 대조해 어기면 즉시 멈춘다.
     base_fpga: int = 0
-    # execution tile. tile_k/tile_n은 실제 tile 모양이 아니라 **buffer 상한**이고, 실제
-    # 모양은 문제 크기가 정하는 런타임 값이다(설계 §6.1). batch는 출력 block을
-    # batch x (4096/batch)로 자르는 값이고 {1,2,4,8}만 legal하다 — 이것이 곧 arithmetic
-    # intensity라 단일 device 성능을 지배한다.
+    # execution tile 상한 (원소 단위) — 데이터 3계층의 셋째 층. device 하나가 한 번에
+    # 상주시키는 몫의 상한이고, A(tile_m×tile_k) + B(tile_k×tile_n) + C(tile_m×tile_n)
+    # 이 PIM DRAM 예산 안이어야 한다. 실제 모양은 문제 크기가 정하는 런타임 값이다.
+    # aimx 는 --convert-pim-to-aimx 가 tile_k/tile_n 을 소비하고(m 은 group_m 로 표현),
+    # upmem 은 launch helper(tiling.execution_tile)가 분할 유도에 쓴다 — round(시간 창)
+    # 가 생기면 upmem 도 상한으로 직접 소비한다. batch 는 aimx 전용: 출력 block 을
+    # batch x (4096/batch)로 자르는 값이고 {1,2,4,8}만 legal 하다 — 이것이 곧
+    # arithmetic intensity 라 단일 device 성능을 지배한다.
     #
     # m 방향은 크기가 아니라 **Triton block 묶음 수**로 준다. m_t = BLOCK_M * group_m이라
     # BLOCK_M=8이면 group_m=5가 곧 m_t=40이다. 반대로 크기를 주고 BLOCK_M 경계로 올리면
@@ -362,6 +366,7 @@ class PIMOptions:
     # 읽는다. 전부 1 이면 항등이다.
     group_n: int = 1
     group_k: int = 1
+    tile_m: int = 0   # 0 = 제한 없음(그 축을 자르지 않음). 지금은 upmem helper 만 읽는다.
     tile_k: int = 32768
     tile_n: int = 4096
     # 0이면 pass가 Triton block이 허락하는 최대값을 고른다. BLOCK 16/16/16이면 8이고,
@@ -384,7 +389,7 @@ class PIMOptions:
     # explicit_k_partition 을 나누려면 kernel 이 K 를 연속 구간으로 갈라야 한다
     # (split_k.py 의 blocked 형태) — cyclic 분할은 pim-place-data 가 진단한다.
     device_axis_partitions: str = ""
-    # lane 실행 형태 (multithread target 전용, --pim-map-cores lane-mode 로 간다).
+    # lane 실행 형태 (multithread target 전용, --pim-plan-group-execution lane-mode 로 간다).
     # whole_tile: lane 이 서로 다른 tile 을 통째로 맡는다 — 지금까지의 동작.
     # output_row: lane 들이 한 tile 을 출력 행으로 나눠 함께 계산한다. 버퍼가 한 벌이라
     #             tile 을 키워도 lane 수가 줄지 않는다. 행 수가 lane 수로 나누어떨어져야 한다.

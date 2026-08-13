@@ -1,5 +1,5 @@
 // 모르는 lane-mode 는 기본값으로 때우지 않고 진단이다.
-// RUN: triton-shared-opt --pim-map-cores=lane-mode=diagonal -verify-diagnostics %s
+// RUN: triton-shared-opt --pim-plan-group-execution=lane-mode=diagonal -verify-diagnostics %s
 
 module attributes {pim.target_profile = #pim.target_profile<
     target = "upmem", number_of_pim_devices = 8, pim_core_shape = array<i64: 1>,

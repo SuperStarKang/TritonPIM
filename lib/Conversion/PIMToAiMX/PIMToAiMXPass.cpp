@@ -94,7 +94,7 @@ struct ConvertPIMToAiMXPass
     // 뒤 단계가 기계 값을 다시 읽을 수 있다는 오해를 만든다.
     getOperation()->removeAttr("pim.target_profile");
     getOperation().walk(
-        [](func::FuncOp f) { f->removeAttr("pim.core_mapping"); });
+        [](func::FuncOp f) { f->removeAttr("pim.group_execution"); });
   }
 
   pim::TargetProfileAttr profile;
@@ -228,12 +228,14 @@ struct ConvertPIMToAiMXPass
     Location loc = device.getLoc();
     Block *deviceBody = &device.getBody().front();
 
-    auto cores = func->getAttrOfType<pim::CoreMappingAttr>("pim.core_mapping");
+    auto cores =
+        func->getAttrOfType<pim::GroupExecutionAttr>("pim.group_execution");
     if (!cores)
       return func->emitError(
-          "convert-pim-to-aimx: the function has no #pim.core_mapping");
+          "convert-pim-to-aimx: the function has no #pim.group_execution");
     if (cores.getLanes() != aimx::kLanes)
-      return func->emitError("convert-pim-to-aimx: --pim-map-cores chose ")
+      return func->emitError(
+                 "convert-pim-to-aimx: --pim-plan-group-execution chose ")
              << cores.getLanes() << " lanes, but AiMX always drives "
              << aimx::kLanes;
 
