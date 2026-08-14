@@ -147,6 +147,8 @@ LogicalResult UnstageOp::verify() {
   if (failed(verifyPitched(*this, getOrigin().size(), getSizes().size(),
                            getStrides().size(), getElementType())))
     return failure();
+  if (failed(verifyGroup(*this, getGroupRowsAttr(), "group_rows")))
+    return failure();
   return verifyGroup(*this, getGroupColsAttr(), "group_cols");
 }
 

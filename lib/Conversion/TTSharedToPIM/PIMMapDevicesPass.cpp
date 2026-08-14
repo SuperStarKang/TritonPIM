@@ -211,6 +211,8 @@ struct PIMMapDevicesPass
             axis = i;
         if (axis < 0)
           continue; // 이 커널에 없는 축이다
+        if (partitions[axis] < 2)
+          continue; // 눈금은 실제로 나눌 때만 의미가 있다 — 나누지 않는 축은 검사도 없다
         int64_t perTile = pim::tileElementsAlong(loops[axis], loops);
         if (perTile <= 0)
           return func->emitError("pim-map-devices: cannot tell how many "

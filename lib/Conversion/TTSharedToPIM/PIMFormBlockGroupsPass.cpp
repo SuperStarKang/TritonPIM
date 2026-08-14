@@ -27,13 +27,12 @@ struct PIMFormBlockGroupsPass
   using PIMFormBlockGroupsBase::PIMFormBlockGroupsBase;
 
   void runOnOperation() override {
-    if (groupM == 1 && groupN == 1 && groupK == 1)
-      return; // 묶지 않으면 항등이다
     if (groupM < 1 || groupN < 1 || groupK < 1) {
       getOperation()->emitError("pim-form-block-groups: group-m, group-n and "
                                 "group-k must be at least 1");
       return signalPassFailure();
     }
+    profile = pim::targetProfile(getOperation());
     WalkResult res = getOperation().walk([&](func::FuncOp func) {
       bool hasAccess = false;
       func.walk([&](pim::AccessOp) { hasAccess = true; });
@@ -46,7 +45,20 @@ struct PIMFormBlockGroupsPass
       signalPassFailure();
   }
 
+  pim::TargetProfileAttr profile;
+
+  // 계층 2 는 두 걸음이다. 사용자가 이웃 block 을 묶으면(group-m/n/k) IR 을 그 단위로
+  // 재구성하고, 그 결과 block 을 하드웨어 실행 단위(profile 의 execution_unit)에 채워
+  // #pim.block_group 으로 적는다. 눈금 없는 기계(execution_unit 없음)는 둘째 걸음이
+  // 항등이다.
   LogicalResult formGroups(func::FuncOp func) {
+    if (groupM != 1 || groupN != 1 || groupK != 1)
+      if (failed(regroup(func)))
+        return failure();
+    return fillUnits(func);
+  }
+
+  LogicalResult regroup(func::FuncOp func) {
     // 묶을 축 loop 를 이름으로 찾는다.
     scf::ForOp rowLoop, colLoop;
     func.walk<WalkOrder::PreOrder>([&](scf::ForOp l) {
@@ -192,6 +204,78 @@ struct PIMFormBlockGroupsPass
             "that is neither loaded from nor stored to a pim.access");
     for (auto &[v, root] : owner)
       Value(v).setType(newTypeOf[root]);
+    return success();
+  }
+
+  // 하드웨어 실행 단위에 block 을 채운다. 규칙은 세 축 모두 같다:
+  //   tiles = max(1, ⌊unit/block⌋), useful = tiles·block, phys = ⌈useful/unit⌉·unit
+  // 남는 자리(phys − useful)는 target 의 stage 가 0 으로 채우는 padding 이다.
+  LogicalResult fillUnits(func::FuncOp func) {
+    if (!profile || !profile.getExecutionUnit())
+      return success(); // 눈금 없는 기계 — block group 은 항등이다
+    ArrayRef<int64_t> unit = profile.getExecutionUnit().asArrayRef();
+    if (unit.size() != 3 || unit[0] < 1 || unit[1] < 1 || unit[2] < 1)
+      return func->emitError("pim-form-block-groups: execution_unit must be "
+                             "three positive values (m, n, k)");
+
+    SmallVector<scf::ForOp> loops;
+    func.walk<WalkOrder::PreOrder>([&](scf::ForOp l) { loops.push_back(l); });
+    scf::ForOp axis[3]; // m, n, k
+    for (scf::ForOp l : loops) {
+      auto a = l->getAttrOfType<StringAttr>("pim.axis");
+      if (!a)
+        continue;
+      if (a.getValue() == "output_row_tile")
+        axis[0] = l;
+      else if (a.getValue() == "output_column_tile")
+        axis[1] = l;
+    }
+    llvm::SmallPtrSet<Operation *, 4> reds;
+    func.walk([&](pim::AccessOp a) {
+      for (Value o : a.getOrigin()) {
+        llvm::SmallPtrSet<Operation *, 4> ds;
+        pim::collectDrivers(o, loops, ds);
+        for (Operation *op : ds)
+          if (!op->getAttrOfType<StringAttr>("pim.axis"))
+            reds.insert(op);
+      }
+    });
+    if (reds.size() == 1)
+      axis[2] = cast<scf::ForOp>(*reds.begin());
+    // 세 축이 다 있어야 [m, n, k] 가 성립한다. 아니면 이 커널은 이 계층을 쓰지 않는
+    // 모양이다 — attr 없이 두고, 그것을 요구하는 target lowering 이 진단한다.
+    if (!axis[0] || !axis[1] || !axis[2])
+      return success();
+
+    static const char *name[3] = {"m", "n", "k"};
+    int64_t tiles[3], useful[3], phys[3];
+    for (int i = 0; i < 3; i++) {
+      int64_t block = pim::tileElementsAlong(axis[i], loops);
+      if (block <= 0)
+        return func->emitError("pim-form-block-groups: cannot tell how many "
+                               "elements one block moves on the ")
+               << name[i] << " axis, so it cannot be filled into the "
+               << unit[i] << "-element execution unit";
+      tiles[i] = std::max<int64_t>(1, unit[i] / block);
+      useful[i] = tiles[i] * block;
+      phys[i] = (useful[i] + unit[i] - 1) / unit[i] * unit[i];
+    }
+    OpBuilder b(func.getContext());
+    func->setAttr("pim.block_group",
+                  pim::BlockGroupAttr::get(func.getContext(),
+                                           b.getDenseI64ArrayAttr(tiles),
+                                           b.getDenseI64ArrayAttr(useful),
+                                           b.getDenseI64ArrayAttr(phys)));
+    // op 가 아니라 location 에 붙인다 — op 에 붙이면 진단 엔진이 "see current
+    // operation" 으로 함수 전체를 덤프해 정보 한 줄이 화면 한 페이지가 된다.
+    if (useful[0] != phys[0] || useful[1] != phys[1] || useful[2] != phys[2])
+      emitRemark(func.getLoc(),
+                 "pim-form-block-groups: the block does not fill the "
+                 "execution unit — pad m ")
+          << phys[0] - useful[0] << "/" << phys[0] << ", n "
+          << phys[1] - useful[1] << "/" << phys[1] << ", k "
+          << phys[2] - useful[2] << "/" << phys[2]
+          << "; the padded cells do no useful work";
     return success();
   }
 };

@@ -8,10 +8,9 @@
 // CHECK: 2, 2, 2
 
 module attributes {pim.target_profile = #pim.target_profile<
-    target = "upmem", number_of_pim_devices = 8, pim_core_shape = array<i64: 1>,
+    target = "upmem", number_of_pim_devices = 8,
     number_of_parallel_lanes_per_pim_core = 1,
     parallel_execution_kind = "multithread",
-    requires_uniform_instruction_sequence = false,
     usable_bank_capacity_bytes = 3072, usable_local_capacity_bytes = 49152>} {
 
 // expected-error @below {{the explicit partitions need 64 PIM Devices but the machine has 8}}

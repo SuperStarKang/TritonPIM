@@ -28,17 +28,23 @@ struct PIMSetTargetProfilePass
     auto optional = [&](int64_t v) {
       return v < 0 ? IntegerAttr() : b.getI64IntegerAttr(v);
     };
-    SmallVector<int64_t> coreShape(pimCoreShape.begin(), pimCoreShape.end());
-    if (coreShape.empty())
-      coreShape.push_back(1);
+    // 실행 단위는 [m, n, k] 셋이거나 아예 없다. 없으면 눈금이 없는 기계다.
+    if (!executionUnit.empty() && executionUnit.size() != 3) {
+      module->emitError(
+          "pim-set-target-profile: execution-unit must be three values (m, n, "
+          "k) or absent");
+      return signalPassFailure();
+    }
+    DenseI64ArrayAttr unit;
+    if (!executionUnit.empty())
+      unit = b.getDenseI64ArrayAttr(
+          SmallVector<int64_t>(executionUnit.begin(), executionUnit.end()));
 
     module->setAttr(
         "pim.target_profile",
         pim::TargetProfileAttr::get(
             &getContext(), b.getStringAttr(target), numberOfPIMDevices,
-            b.getDenseI64ArrayAttr(coreShape), lanesPerCore,
-            b.getStringAttr(parallelExecutionKind),
-            b.getBoolAttr(uniformInstructionSequence),
+            lanesPerCore, b.getStringAttr(parallelExecutionKind), unit,
             optional(usableBankCapacityBytes),
             optional(usableLocalCapacityBytes)));
   }

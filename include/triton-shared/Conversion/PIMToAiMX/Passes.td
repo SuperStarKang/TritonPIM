@@ -24,14 +24,24 @@ def ConvertPIMToAiMX : Pass<"convert-pim-to-aimx", "mlir::ModuleOp"> {
       k_max, n_max : buffer 를 잡는 크기. compile time. 예산이 정한다
       k_t,   n_t   : descriptor program 이 실제로 도는 길이. 런타임. pim.place 에서 온다
 
-    선택 (§6.1):
-      m_t   = BLOCK_M * group-m.  **Triton block 을 묶은 것이다** — 요청한 m_t 를
-              BLOCK_M 경계로 올리는 반대 방향은 m_t 가 언제나 BLOCK_M 의 배수로 튀어
-              40, 48, 96 같은 값을 만들지 못한다
-      n_max = tile-n 을 4096 의 배수로 올린 값
-      k_max = tile-k 가 양수면 그 값(기본 32768), 0 이면 예산에 들어가는 최대값
+    선택 (§6.1): 세 계층은 전부 공통 IR 이 정한다. block group 은 `#pim.block_group`
+    (pim-form-block-groups 가 profile 의 execution_unit 에 block 을 채운 것), execution
+    tile 상한은 `#pim.execution_tile` 이다 (원소 단위, 유효 데이터 기준). batch 는
+    실행 단위의 m 이다 — profile 이 [batch, 4096/batch, 256/batch] 를 싣는다. 이 pass
+    가 하는 일은 번역뿐이다: 상한이 담는 group 수(내림, 최소 1)를 세고 그 group 들의
+    물리 크기로 buffer 를 잡는다. 세 축 모두 같은 규칙이다.
+
+      m_t   = group 수 × 물리 group 높이. 0 이면 group 하나 — 전송량 식에서 m_t 는
+              A 의 ceil(M/m_t)*m_t 항에만 나타나므로 작을수록 좋다
+      n_max = group 수 × 물리 group 폭. 0 이면 한 device 폭(pitch 눈금 4096)
+      k_max = kUnit 수 × kUnit. 0 이면 남는 예산 전부 — execution tile 은 PIM DRAM
+              에 맞게 적재된다. 상한이 예산을 넘으면 진단
       k_t   = min(256 * ceil(k / 256), k_max)                  (런타임)
       n_t   = min((4096/batch) * ceil(N / (4096/batch)), n_max)  (런타임)
+
+    상한은 유효 원소 기준이고 buffer 는 물리 크기다 — block group 에 padding 이 있으면
+    (block 이 실행 단위와 어긋날 때) host loop 은 유효 크기로 걷고 하드웨어는 물리
+    크기를 돈다. padding 이 없으면 둘이 같다.
 
     n 의 올림 단위는 4096 이 아니라 **출력 block 폭 4096/batch** 다. 그것이 하드웨어가
     한 번에 소비하는 최소 단위이고, 그보다 거칠게 올리면 남는 열이 그대로 노는 lane 이
@@ -49,8 +59,8 @@ def ConvertPIMToAiMX : Pass<"convert-pim-to-aimx", "mlir::ModuleOp"> {
     `pmm + VACC_OFFSET` 하나)라 invoke 를 건너 들고 있을 수 없어 이것은 피할 수 있는
     비용이 아니다.
 
-    그래서 `k_max` 는 예산이 허락하는 한 크게 두고(1 GiB, batch 8, m_t 16, n_max 4096
-    이면 115712), `k > k_max` 일 때만 k loop 이 두 번 이상 돈다. 그때 두 번째 tile 부터는
+    그래서 k 상한이 없으면 남는 예산 전부가 k_max 가 되고, `k > k_max` 일
+    때만 k loop 이 두 번 이상 돈다. 그때 두 번째 tile 부터는
     `aimx.unstage` 의 `accumulate` 가 1 이 되어 host 가 이전 부분합에 더한다 — host 가
     f32 면 그것이 fp32 누산이다. 현실적인 k 는 전부 한 번에 들어가므로 이 경로는
     쓰이지 않는다.
@@ -65,22 +75,6 @@ def ConvertPIMToAiMX : Pass<"convert-pim-to-aimx", "mlir::ModuleOp"> {
     Option<"bankCapacityBytes", "bank-capacity-bytes", "int64_t", "-1",
            "device 당 PIM DRAM 예산. 음수면 profile 의 "
            "usable_bank_capacity_bytes 를 쓴다.">,
-    Option<"groupM", "group-m", "int64_t", "1",
-           "execution tile 의 m 을 Triton block 몇 개로 묶을 것인가. "
-           "m_t = BLOCK_M * group-m 이다. 전송량 식에서 m_t 는 A 의 "
-           "ceil(M/m_t)*m_t 항에만 나타나므로 작을수록 좋다 — 기본값이 1 인 이유다.">,
-    Option<"tileK", "tile-k", "int64_t", "32768",
-           "B / Arel / chain buffer 를 잡는 k 상한. 256 의 배수로 올림한다. "
-           "기본값 32768 은 1 GiB 예산의 27%(277 MiB)를 쓰고 현실적인 k 를 전부 덮는다. "
-           "0 을 주면 예산에 들어가는 최대값을 고른다 — 예산 전체를 잡으므로 "
-           "예산 값이 실측된 뒤에만 쓸 것.">,
-    Option<"tileN", "tile-n", "int64_t", "4096",
-           "B / C buffer 를 잡는 n 상한. 4096 의 배수로 올림한다. 키우면 A 를 다시 "
-           "모으는 횟수가 줄고 B buffer 가 커진다.">,
-    Option<"batch", "batch", "int64_t", "0",
-           "output block 을 batch x (4096/batch) 로 자르는 값. {1,2,4,8}. "
-           "0 이면 Triton block 이 허락하는 최대값을 고른다 — batch 는 arithmetic "
-           "intensity 그 자체라 단일 device 성능을 지배한다.">,
   ];
   let dependentDialects = ["mlir::aimx::AiMXDialect", "mlir::pim::PIMDialect",
                            "mlir::arith::ArithDialect", "mlir::scf::SCFDialect",

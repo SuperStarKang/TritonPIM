@@ -4,24 +4,25 @@
 // RUN: triton-shared-opt --convert-pim-to-aimx %s | FileCheck %s
 // RUN: triton-shared-opt --convert-pim-to-aimx --aimx-lower-matmul %s | FileCheck %s --check-prefix=PROGRAM
 
-// batch는 padding 비율(padN/physN + padK/physK)로 고른다. BLOCK_N=96, BLOCK_K=24는
-// 어떤 batch에서도 padding이 남고, 비율은 b=1과 b=2가 같으므로(0.078125) 큰 쪽 2가
-// 뽑힌다. 그때 눈금은 출력 block 폭 2048, reduction step 128이다:
+// batch는 profile의 execution_unit에서 온다 — 여기서는 [2, 2048, 128] (batch 2).
+// 그 눈금에 공통 pass가 block을 채운 결과가 func의 #pim.block_group이다:
 //   n: Triton block 21개 = 2016 유효 + 32 padding = 물리 2048 (출력 block 1개)
 //   k: Triton block 5개  =  120 유효 +  8 padding = 물리 128  (reduction step 1개)
-//   m: lcm(BLOCK_M=32, batch=2) = 32 — m은 언제나 padding 0이다
+//   m: BLOCK_M=32는 단위 2의 배수 — block 1개 = 32 유효 = 물리 32, padding 0
+// 상한이 없으므로 m은 group 하나, n은 한 device 폭, k는 남는 예산 전부다:
+// 1 GiB에서 k_max = 111616 (kUnit 256의 배수), padded_k = 114688.
 // CHECK-LABEL: func.func @matmul
 // CHECK-SAME:    aimx.tile_group = #aimx.tile_group<block = [32, 96, 24], group = [1, 21, 5], execution = [32, 2048, 128]>
-// CHECK-SAME:    aimx.tiling = #aimx.tiling<batch = 2, m_t = 32, k_t = 32768, n_t = 4096, padded_k = 32768, padded_n = 4096, transposed = false>
+// CHECK-SAME:    aimx.tiling = #aimx.tiling<batch = 2, m_t = 32, k_t = 111616, n_t = 4096, padded_k = 114688, padded_n = 4096, transposed = false>
 
-// buffer 크기는 물리 크기에서 나온다. A(32*32768*2), Arel(32*32768*32),
-// B(32768*4096*2), C(32*4096*2), chain(20512 group * 512).
+// buffer 크기는 물리 크기에서 나온다. A(32*114688*2), Arel(32*111616*32),
+// B(111616*4096*2), C(32*4096*2), chain(69792 group * 512).
 // CHECK: aimx.alloc %{{.*}} bytes 196608 align 262144 kind pmm
-// CHECK: aimx.alloc %{{.*}} bytes 2097152 align 512 kind data
-// CHECK: aimx.alloc %{{.*}} bytes 33554432 align 512 kind data
-// CHECK: aimx.alloc %{{.*}} bytes 268435456 align 512 kind data
+// CHECK: aimx.alloc %{{.*}} bytes 7340032 align 512 kind data
+// CHECK: aimx.alloc %{{.*}} bytes 114294784 align 512 kind data
+// CHECK: aimx.alloc %{{.*}} bytes 914358272 align 512 kind data
 // CHECK: aimx.alloc %{{.*}} bytes 262144 align 512 kind data
-// CHECK: aimx.alloc %{{.*}} bytes 10502144 align 512 kind descriptor
+// CHECK: aimx.alloc %{{.*}} bytes 35733504 align 512 kind descriptor
 
 // padding이 있는 축만 stage/unstage가 block group 배치([useful, phys])를 싣는다.
 // B는 행(k)·열(n) 둘 다, A는 열(k)만, C는 열(n)만이다. host loop의 전진 폭은 유효
@@ -42,17 +43,20 @@
 // PROGRAM:         aimx.desc src(%{{.*}}, %{{.*}}) pitch %{{.*}} dst(%{{.*}}, %{{.*}}) pitch %{{.*}} len 4096 opcode c_mask|matmul|stride
 
 module attributes {pim.target_profile = #pim.target_profile<
-    target = "aimx", number_of_pim_devices = 1, pim_core_shape = [1],
+    target = "aimx", number_of_pim_devices = 1,
     number_of_parallel_lanes_per_pim_core = 4096,
     parallel_execution_kind = "simd",
-    requires_uniform_instruction_sequence = true,
+    execution_unit = array<i64: 2, 2048, 128>,
     usable_bank_capacity_bytes = 1073741824, usable_local_capacity_bytes = 0>} {
 
 func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
                   %K: i32, %N: i32, %ex: index, %ey: index)
-    attributes {pim.core_mapping = #pim.core_mapping<
-        core_axis_roles = ["none"], tile_footprint = [1],
-        lanes = 4096, lane_axis_role = "whole_tile">} {
+    attributes {pim.group_execution = #pim.group_execution<
+        lanes = 4096, lane_axis_role = "whole_tile">,
+        pim.block_group = #pim.block_group<
+            tiles = array<i64: 1, 21, 5>,
+            useful = array<i64: 32, 2016, 120>,
+            phys = array<i64: 32, 2048, 128>>} {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c24 = arith.constant 24 : index

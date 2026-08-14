@@ -227,6 +227,23 @@ struct ConvertPIMToUPMEMPass
     llvm::DenseMap<Operation *, int> windowAxisOf; // place → 창에 매인 buffer 축
     auto tiles =
         device->getAttrOfType<pim::ExecutionTileAttr>("pim.execution_tile");
+    if (tiles && tiles.getK() > 0) {
+      // upmem 의 k 소비는 공간 분할(SPLIT_K plane)뿐이다 — k 창은 부분합 재적재가
+      // 필요해 만들지 않는다. 축이 없으면 상한이 조용히 어겨지므로 소비자인 여기서
+      // 막는다 (공통 pass 는 reduction loop 에 상한을 붙일 수 있고, 그것을 소비하는
+      // 것은 target 의 능력이다).
+      bool hasK = false;
+      for (Attribute a : device.getMapping().getAxes())
+        if (cast<StringAttr>(a).getValue() == "explicit_k_partition")
+          hasK = true;
+      if (!hasK) {
+        device->emitError(
+            "convert-pim-to-upmem: the execution tile has a k cap, but upmem "
+            "consumes it only as a spatial split and this kernel has no "
+            "explicit_k_partition axis — the cap would be silently exceeded");
+        return signalPassFailure();
+      }
+    }
     if (tiles && (tiles.getM() > 0 || tiles.getN() > 0)) {
       if (tiles.getM() > 0 && tiles.getN() > 0) {
         device->emitError(

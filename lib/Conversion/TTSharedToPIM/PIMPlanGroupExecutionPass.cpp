@@ -42,17 +42,6 @@ struct PIMPlanGroupExecutionPass
 
   LogicalResult planFunc(func::FuncOp func, pim::TargetProfileAttr profile) {
     OpBuilder b(func.getContext());
-    // 다중 core 로의 group 분배는 아직 없다. core 1개가 전제이고, 아니면 진단이다 —
-    // 그런 target 이 실제로 오면 group 계층의 확장(group → core 격자 분배)으로 만든다.
-    int64_t cores = 1;
-    for (int64_t c : profile.getPimCoreShape().asArrayRef())
-      cores *= c;
-    if (cores != 1)
-      return func->emitError("pim-plan-group-execution: a PIM Group with ")
-             << cores
-             << " PIM Cores is not supported yet; only one core per group is "
-                "implemented";
-
     bool simd = profile.getParallelExecutionKind() == "simd";
     int64_t lanes = profile.getNumberOfParallelLanesPerPimCore();
     IntegerAttr local = profile.getUsableLocalCapacityBytes();

@@ -656,16 +656,31 @@ struct StubEmitter {
     std::string rows = e.name(op.getSizes()[0]), cols = e.name(op.getSizes()[1]);
     std::string pitch = e.name(op.getPitch());
 
+    // group_rows 가 있으면 buffer 의 행이 block group 주기로 놓여 있다 — 유효 행 i 가
+    // 물리 행 (i/useful)*phys + i%useful 이고, 각 phys 구간의 나머지 행은 padding 이라
+    // 읽지 않는다. 되읽는 길이도 물리 행 수다.
+    DenseI64ArrayAttr gRows = op.getGroupRowsAttr();
+    std::string physRows = rows;
+    std::string srcRow = i;
+    if (gRows) {
+      int64_t ur = gRows.asArrayRef()[0], pr = gRows.asArrayRef()[1];
+      physRows = "(((" + rows + " + " + std::to_string(ur - 1) + ") / " +
+                 std::to_string(ur) + ") * " + std::to_string(pr) + ")";
+      srcRow = "((" + i + " / " + std::to_string(ur) + ") * " +
+               std::to_string(pr) + " + " + i + " % " + std::to_string(ur) +
+               ")";
+    }
+
     e.indent(depth);
     os() << "{  // aimx.unstage\n";
     e.indent(depth + 1);
-    os() << "aimx_require((size_t)" << rows << " * (size_t)" << pitch << " * "
-         << bytes << "u <= (size_t)" << b.bytes
+    os() << "aimx_require((size_t)" << physRows << " * (size_t)" << pitch
+         << " * " << bytes << "u <= (size_t)" << b.bytes
          << "ull, \"unstage reads past the PIM DRAM buffer\");\n";
-    // 실제로 쓴 행까지만 되읽는다. padding 자리는 읽지 않는다.
+    // 실제로 쓴 행까지만 되읽는다. 행 group 밖의 padding 자리는 읽지 않는다.
     e.indent(depth + 1);
     os() << "datacopy_pim2cpu(" << b.host << ", (void*)" << b.va
-         << ", (int)((size_t)" << rows << " * (size_t)" << pitch << " * "
+         << ", (int)((size_t)" << physRows << " * (size_t)" << pitch << " * "
          << bytes << "), _fpga);\n";
     // stage 와 같은 이유로 행 주소를 밖으로 뺀다. group_cols 가 있으면 block group
     // 단위로 잘라 읽는다 — 유효 열 j 가 물리 칸 (j/useful)*phys + j%useful 에 있고,
@@ -678,7 +693,7 @@ struct StubEmitter {
            << "++) {\n";
       e.indent(d + 1);
       os() << "const uint16_t *" << sr << " = (const uint16_t*)" << b.host
-           << " + " << i << " * " << pitch << ";\n";
+           << " + " << srcRow << " * " << pitch << ";\n";
       e.indent(d + 1);
       os() << dstTy << " *" << dr << " = " << e.name(op.getDst()) << " + "
            << hostRow(op.getOrigin(), op.getStrides(), i) << ";\n";

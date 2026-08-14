@@ -50,18 +50,21 @@ class PIM_Attr<string name, string _mnemonic>
 //===----------------------------------------------------------------------===//
 
 // 기계 profile. --pim-set-target-profile 이 module 에 붙이고, 그 뒤의 pass 들이 읽는다.
+// 데이터 3계층이 하드웨어에서 필요로 하는 것만 담는다 — device 수(공간 분배),
+// lane 수, 축별 실행 단위(block group 의 눈금), capacity(execution tile 의 예산).
 // usable_*_capacity_bytes 는 세 상태를 구분한다: 값이 있으면 알려진 용량, 0 이면 그
 // 저장소가 존재하지 않아 검사가 성립하지 않음, 필드가 없으면 미측정이라 그 값을
 // 필요로 하는 검사에 도달하는 순간 진단을 낸다.
+// execution_unit 은 [m, n, k] 원소 단위다 — 한 번의 하드웨어 실행이 축마다 소비하는
+// 크기. 없으면 눈금이 없다는 뜻이고(어떤 크기든 그대로 소화) block group 은 항등이다.
 def PIM_TargetProfileAttr : PIM_Attr<"TargetProfile", "target_profile"> {
   let summary = "Common machine profile shared by every PIM target";
   let parameters = (ins
       "::mlir::StringAttr":$target,
       "int64_t":$number_of_pim_devices,
-      "::mlir::DenseI64ArrayAttr":$pim_core_shape,
       "int64_t":$number_of_parallel_lanes_per_pim_core,
       "::mlir::StringAttr":$parallel_execution_kind,
-      "::mlir::BoolAttr":$requires_uniform_instruction_sequence,
+      OptionalParameter<"::mlir::DenseI64ArrayAttr">:$execution_unit,
       OptionalParameter<"::mlir::IntegerAttr">:$usable_bank_capacity_bytes,
       OptionalParameter<"::mlir::IntegerAttr">:$usable_local_capacity_bytes);
   let assemblyFormat = "`<` struct(params) `>`";
@@ -87,6 +90,21 @@ def PIM_GroupExecutionAttr : PIM_Attr<"GroupExecution", "group_execution"> {
   let summary = "How the lanes of a PIM Core execute one block group";
   let parameters = (ins "int64_t":$lanes,
                         "::mlir::StringAttr":$lane_axis_role);
+  let assemblyFormat = "`<` struct(params) `>`";
+}
+
+// block group — 데이터 3계층의 둘째 층. 하드웨어 실행 단위(profile 의 execution_unit)에
+// Triton block 정수 개를 채운 것이다. 축 순서는 [m, n, k], 규칙은 세 축 모두 같다:
+//   tiles  = max(1, ⌊unit / block⌋)     block 정수 개를 단위에 채운다
+//   useful = tiles · block               실제 데이터
+//   phys   = ⌈useful / unit⌉ · unit      하드웨어가 도는 크기
+//   pad    = phys − useful               어긋남 — target 의 stage 가 0 으로 채운다
+// --pim-form-block-groups 가 func 에 부착하고 target lowering 이 소비한다.
+def PIM_BlockGroupAttr : PIM_Attr<"BlockGroup", "block_group"> {
+  let summary = "Blocks filled into one hardware execution unit, per axis";
+  let parameters = (ins "::mlir::DenseI64ArrayAttr":$tiles,
+                        "::mlir::DenseI64ArrayAttr":$useful,
+                        "::mlir::DenseI64ArrayAttr":$phys);
   let assemblyFormat = "`<` struct(params) `>`";
 }
 

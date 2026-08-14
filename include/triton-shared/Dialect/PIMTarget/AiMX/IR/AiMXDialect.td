@@ -158,21 +158,20 @@ def AiMX_TileGroupAttr : AttrDef<AiMX_Dialect, "TileGroup"> {
 
     `group` 은 block group 하나가 담는 Triton block 수 `[m, n, k]` 다.
 
-    `execution` 은 block group 의 **물리 크기**다:
-    - m: `lcm(BLOCK_M, batch)`. batch 가 선택값이라 lcm 으로 언제나 padding 0 이다
-    - n: `roundUp(group[1] * BLOCK_N, 4096/batch)`
-    - k: `roundUp(group[2] * BLOCK_K, 256/batch)`
-    n·k 는 눈금이 하드웨어 상수라 padding 이 남을 수 있고, 그 값은
+    `execution` 은 block group 의 **물리 크기**다. 세 축 모두 같은 규칙이고 값은
+    공통 `#pim.block_group` 의 phys 그대로다:
+    `execution[i] = roundUp(group[i] * block[i], unit[i])`, 단위는
+    `[batch, 4096/batch, 256/batch]`. padding 은
     `execution[i] - block[i] * group[i]` 로 유도된다 — 따로 싣지 않는다.
 
-    execution tile 은 이 block group 의 정수 배다: `m_t = group-m * execution[0]`
-    (`#aimx.tiling` 의 `m_t`) 이고, n·k 는 문제 크기가 정하는 런타임 값이라 여기
-    들어가지 않는다.
+    execution tile 은 이 block group 의 정수 배다: m 은 `#aimx.tiling` 의 `m_t` 로
+    compile time 상수이고, n·k 는 문제 크기가 정하는 런타임 값이라 여기 들어가지
+    않는다.
   }];
   // DenseI64ArrayAttr 이어야 `[a, b, c]` 로 출력되고 다시 읽힌다. ArrayRefParameter 는
   // struct(params) 안에서 대괄호 없이 나가 round-trip 이 깨진다 — 도구 사이를 MLIR
   // 텍스트로 잇고 있으므로 그러면 파이프라인이 통째로 멈춘다. #pim.target_profile 의
-  // pim_core_shape 도 같은 이유로 이 타입이다.
+  // execution_unit 도 같은 이유로 이 타입이다.
   let parameters = (ins "::mlir::DenseI64ArrayAttr":$block,
                         "::mlir::DenseI64ArrayAttr":$group,
                         "::mlir::DenseI64ArrayAttr":$execution);
@@ -273,9 +272,9 @@ def AiMX_StageOp : AiMX_Op<"stage", [AttrSizedOperandSegments]> {
 // reduction 은 vACC 안에서 끝난다 — vACC 는 출력 block 하나 깊이라 invoke 를 건너 살아남지
 // 못하므로, k 를 나누는 순간 부분합은 반드시 PIM 밖으로 나온다.
 //
-// group_cols 는 aimx.stage 와 같은 block group 주기 배치다. C 의 padding 열은 계산
-// 결과 자체가 0 이고(0 인 B 열의 곱) 여기서 읽지 않는다. 행 방향 group 이 없는 이유는
-// m 의 block group 이 lcm(BLOCK_M, batch) 라 padding 이 언제나 0 이기 때문이다.
+// group_rows / group_cols 는 aimx.stage 와 같은 block group 주기 배치다. C 의
+// padding 자리는 계산 결과 자체가 0 이고(0 인 A 행·0 인 B 열의 곱) 여기서 읽지
+// 않는다 — 행은 m group, 열은 n group 의 어긋남이다.
 def AiMX_UnstageOp : AiMX_Op<"unstage", [AttrSizedOperandSegments]> {
   let summary = "Scatter a pitched PIM DRAM array back into a strided host region";
   let arguments = (ins AiMX_BufferType:$src,
@@ -284,11 +283,13 @@ def AiMX_UnstageOp : AiMX_Op<"unstage", [AttrSizedOperandSegments]> {
                        Variadic<Index>:$strides, Index:$pitch,
                        Index:$accumulate,
                        TypeAttr:$element_type, UnitAttr:$transpose,
+                       OptionalAttr<DenseI64ArrayAttr>:$group_rows,
                        OptionalAttr<DenseI64ArrayAttr>:$group_cols);
   let assemblyFormat = [{
     $src `into` $dst `origin` `[` $origin `]` `sizes` `[` $sizes `]`
     `strides` `[` $strides `]` `pitch` $pitch `accumulate` $accumulate
-    (`group_cols` $group_cols^)? (`transpose` $transpose^)?
+    (`group_rows` $group_rows^)? (`group_cols` $group_cols^)?
+    (`transpose` $transpose^)?
     attr-dict `:` type($src) `,` type($dst)
   }];
   let hasVerifier = 1;

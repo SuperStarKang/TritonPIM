@@ -92,15 +92,13 @@ def PIMSetTargetProfile : Pass<"pim-set-target-profile", "mlir::ModuleOp"> {
     Option<"target", "target", "std::string", "\"upmem\"", "target 이름.">,
     Option<"numberOfPIMDevices", "number-of-pim-devices", "int64_t", "2048",
            "PIM Device 개수.">,
-    ListOption<"pimCoreShape", "pim-core-shape", "int64_t",
-               "PIM Group 하나의 PIM Core topology shape.">,
     Option<"lanesPerCore", "number-of-parallel-lanes-per-pim-core", "int64_t", "16",
            "PIM Core 하나의 병렬 실행 lane 능력값.">,
     Option<"parallelExecutionKind", "parallel-execution-kind", "std::string",
            "\"multithread\"", "lane 의 성격. multithread 또는 simd.">,
-    Option<"uniformInstructionSequence", "requires-uniform-instruction-sequence",
-           "bool", "false",
-           "한 PIM Group 안의 PIM Core 들이 같은 command sequence 를 요구하는가.">,
+    ListOption<"executionUnit", "execution-unit", "int64_t",
+               "축별 실행 단위 [m, n, k] (원소). 한 번의 하드웨어 실행이 소비하는 "
+               "크기다. 비우면 눈금이 없다 — block group 이 항등이다.">,
     Option<"usableBankCapacityBytes", "usable-bank-capacity-bytes", "int64_t",
            "33554432", "PIM Core 하나의 attached bank 중 커널 몫. 음수면 미측정.">,
     Option<"usableLocalCapacityBytes", "usable-local-capacity-bytes", "int64_t",
@@ -126,6 +124,17 @@ def PIMFormBlockGroups : Pass<"pim-form-block-groups", "mlir::ModuleOp"> {
     원본 크기로 잘리고(pim-place-data 의 clamp) host 가 남는 자리에 0 을 채운다.
     valid(mask)는 건드리지 않는다 — 소비자는 pim-place-data 의 원본 크기 복원뿐이고
     그 판정은 식의 구조만 본다.
+
+    묶은 뒤에는 하드웨어 실행 단위(profile 의 execution_unit [m, n, k])에 block 을
+    채워 `#pim.block_group` 을 func 에 부착한다. 규칙은 세 축 모두 같다:
+
+      tiles  = max(1, ⌊unit / block⌋)     block 정수 개를 단위에 채운다
+      useful = tiles · block               실제 데이터
+      phys   = ⌈useful / unit⌉ · unit      하드웨어가 도는 크기
+
+    배수가 안 맞으면 남는 자리(phys − useful)가 padding 이고(remark 로 알린다),
+    맞으면 padding 이 없다. execution_unit 이 없는 기계는 이 걸음이 항등이다.
+    target lowering 이 이 attr 를 소비해 buffer 와 stage 배치를 만든다.
   }];
   let options = [
     Option<"groupM", "group-m", "int64_t", "1",
@@ -226,8 +235,10 @@ def PIMFormExecutionTiles : Pass<"pim-form-execution-tiles", "mlir::ModuleOp"> {
     Option<"tileN", "tile-n", "int64_t", "0",
            "output_column_tile 방향 상한 (원소). 0 = 무제한">,
     Option<"tileK", "tile-k", "int64_t", "0",
-           "explicit_k_partition 방향 상한 (원소). 0 = 무제한. 시간 창이 아니라 "
-           "공간 분할(SPLIT_K)이 소비하는 값이다">,
+           "k 방향 상한 (원소). 0 = 무제한. explicit_k_partition 축이 있으면 그 "
+           "눈금이고(공간 분할이 소비), 없으면 reduction loop 에 붙는다 — 한 번에 "
+           "상주하는 k 구간의 상한을 target 이 자기 방식(k 창 + host 누산)으로 "
+           "소비한다. 어느 쪽도 없으면 진단이다.">,
   ];
   let constructor = "mlir::triton::createPIMFormExecutionTilesPass()";
   let dependentDialects = ["mlir::pim::PIMDialect"];
