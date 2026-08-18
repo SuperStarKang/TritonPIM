@@ -56,7 +56,11 @@ class PIM_Attr<string name, string _mnemonic>
 // 저장소가 존재하지 않아 검사가 성립하지 않음, 필드가 없으면 미측정이라 그 값을
 // 필요로 하는 검사에 도달하는 순간 진단을 낸다.
 // execution_unit 은 [m, n, k] 원소 단위다 — 한 번의 하드웨어 실행이 축마다 소비하는
-// 크기. 없으면 눈금이 없다는 뜻이고(어떤 크기든 그대로 소화) block group 은 항등이다.
+// 크기. 없으면 눈금이 없다는 뜻이고(어떤 크기든 그대로 소화) block group 은
+// local 예산(usable_local_capacity_bytes)으로 자동 산출된다.
+// lane_mode 는 multithread 기계의 lane 실행 형태다(whole_tile | output_row).
+// pim-form-block-groups(자동 group 의 예산 셈법)와 pim-plan-group-execution(lane 수)
+// 두 pass 가 같은 값을 읽어야 하므로 profile 에 둔다. simd 기계는 필드가 없다.
 def PIM_TargetProfileAttr : PIM_Attr<"TargetProfile", "target_profile"> {
   let summary = "Common machine profile shared by every PIM target";
   let parameters = (ins
@@ -64,6 +68,7 @@ def PIM_TargetProfileAttr : PIM_Attr<"TargetProfile", "target_profile"> {
       "int64_t":$number_of_pim_devices,
       "int64_t":$number_of_parallel_lanes_per_pim_core,
       "::mlir::StringAttr":$parallel_execution_kind,
+      OptionalParameter<"::mlir::StringAttr">:$lane_mode,
       OptionalParameter<"::mlir::DenseI64ArrayAttr">:$execution_unit,
       OptionalParameter<"::mlir::IntegerAttr">:$usable_bank_capacity_bytes,
       OptionalParameter<"::mlir::IntegerAttr">:$usable_local_capacity_bytes);
@@ -108,11 +113,14 @@ def PIM_BlockGroupAttr : PIM_Attr<"BlockGroup", "block_group"> {
   let assemblyFormat = "`<` struct(params) `>`";
 }
 
-// execution tile 의 상한 (원소 단위) — 데이터 3계층의 셋째 층. device 하나가 한 번에
-// 상주시키는 몫의 상한이고, 0 은 그 축을 자르지 않는다는 뜻이다. 공간 분할은
-// #pim.device_mapping 이, 시간(창) 분할은 이 상한이 정한다 — 배정이 상한 안이면 창은
-// 하나로 퇴화한다. target lowering 이 자기 실행 모델(UPMEM 의 round / AiMX 의
-// pim_exec 창)로 옮긴다. --pim-form-execution-tiles 가 pim.device 에 부착한다.
+// execution tile 의 상한 (유효 원소 단위) — 데이터 3계층의 셋째 층. device 하나가
+// launch 1회에 상주시키는 몫의 크기다. 공간 분할은 #pim.device_mapping 이, 시간(창)
+// 분할은 이 상한이 정한다 — 배정이 상한 안이면 창은 하나로 퇴화하고, k 가 상한을
+// 넘으면 창마다 부분합이 나와 host 가 누산한다. --pim-form-execution-tiles 가
+// 사용자 값(tile-m/n/k) 또는 자동 산출(m·n 은 기본 단위, k 는 남는 bank 예산 전부 —
+// target 이 등록한 footprint 로 탐색)로 채워 pim.device 에 부착한다. 0 은 그 축이
+// 커널에 없거나 산출 근거(예산·footprint)가 없다는 뜻이다. target lowering 은 이
+// 값을 읽기만 한다.
 def PIM_ExecutionTileAttr : PIM_Attr<"ExecutionTile", "execution_tile"> {
   let summary = "Element-count caps of one device's resident share";
   let parameters = (ins "int64_t":$m, "int64_t":$n, "int64_t":$k);

@@ -40,11 +40,15 @@ struct PIMSetTargetProfilePass
       unit = b.getDenseI64ArrayAttr(
           SmallVector<int64_t>(executionUnit.begin(), executionUnit.end()));
 
+    // lane_mode 는 multithread 기계에만 뜻이 있다. 비우면 필드를 만들지 않는다.
+    StringAttr mode =
+        laneMode.empty() ? StringAttr() : b.getStringAttr(laneMode);
+
     module->setAttr(
         "pim.target_profile",
         pim::TargetProfileAttr::get(
             &getContext(), b.getStringAttr(target), numberOfPIMDevices,
-            lanesPerCore, b.getStringAttr(parallelExecutionKind), unit,
+            lanesPerCore, b.getStringAttr(parallelExecutionKind), mode, unit,
             optional(usableBankCapacityBytes),
             optional(usableLocalCapacityBytes)));
   }

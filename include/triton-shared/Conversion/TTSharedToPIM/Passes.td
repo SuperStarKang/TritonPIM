@@ -96,6 +96,12 @@ def PIMSetTargetProfile : Pass<"pim-set-target-profile", "mlir::ModuleOp"> {
            "PIM Core 하나의 병렬 실행 lane 능력값.">,
     Option<"parallelExecutionKind", "parallel-execution-kind", "std::string",
            "\"multithread\"", "lane 의 성격. multithread 또는 simd.">,
+    Option<"laneMode", "lane-mode", "std::string", "\"\"",
+           "multithread 기계의 lane 실행 형태. whole_tile 은 lane 이 서로 다른 "
+           "tile 을 통째로 맡고 버퍼가 lane 수만큼 복제된다. output_row 는 lane "
+           "들이 한 tile 을 출력 행으로 나눠 협력하고 버퍼는 한 벌이다 — block "
+           "group 자동 산출(pim-form-block-groups)은 이 모드에서만 켜진다. "
+           "비우면 필드가 없다(simd 기계).">,
     ListOption<"executionUnit", "execution-unit", "int64_t",
                "축별 실행 단위 [m, n, k] (원소). 한 번의 하드웨어 실행이 소비하는 "
                "크기다. 비우면 눈금이 없다 — block group 이 항등이다.">,
@@ -125,6 +131,17 @@ def PIMFormBlockGroups : Pass<"pim-form-block-groups", "mlir::ModuleOp"> {
     valid(mask)는 건드리지 않는다 — 소비자는 pim-place-data 의 원본 크기 복원뿐이고
     그 판정은 식의 구조만 본다.
 
+    몇 개를 묶을지의 출처는 축마다 셋 중 하나다:
+    1) 사용자 값(group-m/n/k > 0) — 그대로 쓴다. 1 은 명시적 항등이다.
+    2) 자동(옵션 0) — 눈금 없는 기계(execution_unit 없음)가 협력 모드
+       (simd 또는 lane_mode = output_row)일 때, local 예산
+       (usable_local_capacity_bytes)에 들어갈 때까지 m → n → k 순서로 번갈아
+       1씩 키운다. 한 벌 기준 상주 바이트는
+         bytes(gm, gn, gk) = Σ_tile elemBytes · Π_dim (tile 크기 × 그 차원을
+         모는 축의 배수)
+       다. 조건이 아니면(눈금 있는 기계, 예산 미측정, whole_tile) 항등이다.
+    3) 눈금 있는 기계는 아래 fillUnits 가 하드웨어 실행 단위에 채운다.
+
     묶은 뒤에는 하드웨어 실행 단위(profile 의 execution_unit [m, n, k])에 block 을
     채워 `#pim.block_group` 을 func 에 부착한다. 규칙은 세 축 모두 같다:
 
@@ -137,14 +154,15 @@ def PIMFormBlockGroups : Pass<"pim-form-block-groups", "mlir::ModuleOp"> {
     target lowering 이 이 attr 를 소비해 buffer 와 stage 배치를 만든다.
   }];
   let options = [
-    Option<"groupM", "group-m", "int64_t", "1",
-           "output_row_tile 방향으로 묶는 tile 수">,
-    Option<"groupN", "group-n", "int64_t", "1",
-           "output_column_tile 방향으로 묶는 tile 수">,
-    Option<"groupK", "group-k", "int64_t", "1",
-           "reduction 방향으로 묶는 tile 수. 출력 축이 아니라 reduction loop 를 "
-           "넓힌다 — 누산기는 그대로고 A·B strip 의 K 변만 커져서, local 적재 "
-           "한 번이 담는 K 조각이 길어지고 DMA 준비·동기화 횟수가 준다.">,
+    Option<"groupM", "group-m", "int64_t", "0",
+           "output_row_tile 방향으로 묶는 tile 수. 0 = 자동, 1 = 항등">,
+    Option<"groupN", "group-n", "int64_t", "0",
+           "output_column_tile 방향으로 묶는 tile 수. 0 = 자동, 1 = 항등">,
+    Option<"groupK", "group-k", "int64_t", "0",
+           "reduction 방향으로 묶는 tile 수. 0 = 자동, 1 = 항등. 출력 축이 아니라 "
+           "reduction loop 를 넓힌다 — 누산기는 그대로고 A·B strip 의 K 변만 "
+           "커져서, local 적재 한 번이 담는 K 조각이 길어지고 DMA 준비·동기화 "
+           "횟수가 준다.">,
   ];
   let constructor = "mlir::triton::createPIMFormBlockGroupsPass()";
   let dependentDialects = ["mlir::pim::PIMDialect", "mlir::arith::ArithDialect",
@@ -155,23 +173,18 @@ def PIMPlanGroupExecution : Pass<"pim-plan-group-execution", "mlir::ModuleOp"> {
   let summary = "Decide how the lanes of a PIM Core execute one block group";
   let description = [{
     `#pim.group_execution` 을 func 에 붙인다 — lane 수와, lane 이 block group 의
-    무엇을 나눠 갖는가다. profile 의 lane 수는 능력값이고, whole_tile(복제) 모드의
-    실제 값은 local storage 예산이 정한다:
-    lanes = max(1, min(능력값, usable_local_capacity_bytes / lane당 group 바이트)).
+    무엇을 나눠 갖는가다. lane 실행 형태는 profile 의 lane_mode 필드에서 읽는다 —
+    pim-form-block-groups(자동 group 의 예산 셈법)와 같은 값을 봐야 하기 때문이다.
+    profile 의 lane 수는 능력값이고 실제 값은 모드가 정한다:
+    - whole_tile(복제): lanes = max(1, min(능력값, local 예산 / lane당 group 바이트))
+    - output_row(협력): 버퍼가 한 벌이라 예산과 무관하다. 대신 lane 들이 출력 행을
+      나눠 가지므로, group 의 출력 행 수를 나누어떨어지게 하는 능력값 이하의 최대
+      약수를 lanes 로 고른다.
     parallel_execution_kind 가 simd 면 버퍼가 lane 마다 복제되지 않으므로 능력값을
     그대로 쓰고 역할은 언제나 output_row 다.
     다중 core 로의 group 분배는 아직 없으므로 PIM Core 가 여럿인 topology 는 진단을
     낸다 — 그런 target 이 오면 group 계층의 확장으로 만든다.
   }];
-  let options = [
-    Option<"laneMode", "lane-mode", "std::string", "\"whole_tile\"",
-           "multithread target 의 lane 실행 형태. whole_tile 은 lane 이 서로 다른 "
-           "tile 을 통째로 맡고 tile 버퍼가 lane 수만큼 복제된다. output_row 는 "
-           "lane 들이 한 tile 을 출력 행으로 나눠 함께 계산하고 버퍼는 한 벌만 "
-           "둔다 — lane 수가 버퍼 예산과 무관해지므로 tile 을 키울 때 쓴다. "
-           "simd target 은 이 옵션을 읽지 않는다(lane 협력이 하드웨어에 내장돼 "
-           "있어 언제나 output_row 다).">,
-  ];
   let constructor = "mlir::triton::createPIMPlanGroupExecutionPass()";
   let dependentDialects = ["mlir::pim::PIMDialect"];
 }
@@ -221,24 +234,34 @@ def PIMMapDevices : Pass<"pim-map-devices", "mlir::ModuleOp"> {
 def PIMFormExecutionTiles : Pass<"pim-form-execution-tiles", "mlir::ModuleOp"> {
   let summary = "Attach the element-count caps of one device's resident share";
   let description = [{
-    execution tile 의 상한(원소 단위)을 `#pim.execution_tile` 로 pim.device 에
-    부착한다 — 데이터 3계층의 셋째 층을 공통 IR 에서 완결하는 pass 다. 공간 분할
-    (#pim.device_mapping)은 pim-map-devices 가 이미 정했고, 이 상한은 시간(창)
-    분할의 근거가 된다: target lowering 이 자기 실행 모델(UPMEM 의 round, AiMX 의
-    pim_exec 창)로 옮기고, 배정이 상한 안이면 창은 하나로 퇴화한다.
-    각 상한은 그 축의 group tile 원소수의 배수여야 한다(창 경계는 tile 위) — 아니면
-    진단이다. 상한이 붙는 축이 커널에 없어도 진단이다. 전부 0 이면 항등이다.
+    execution tile(device 하나가 launch 1회에 상주시키는 몫)을
+    `#pim.execution_tile` 로 pim.device 에 부착한다 — 데이터 3계층의 셋째 층을
+    공통 IR 에서 완결하는 pass 다. 공간 분할(#pim.device_mapping)은
+    pim-map-devices 가 이미 정했고, 이 상한은 시간(창) 분할의 근거가 된다:
+    target lowering 은 이 값을 읽기만 하고(UPMEM 의 창 반복, AiMX 의 buffer
+    크기), 배정이 상한 안이면 창은 하나로 퇴화한다.
+
+    축마다 출처는 둘 중 하나다:
+    1) 사용자 값(tile-m/n/k > 0) — 그대로 쓴다. 그 축의 group tile 원소수의
+       배수여야 하고(창 경계는 tile 위), 상한이 붙는 축이 커널에 없으면 진단이다.
+    2) 자동(옵션 0) — matmul 모양 커널(m·n 축 + reduction loop 하나,
+       explicit_k_partition 없음)이고 target 의 footprint spec 이 등록돼 있고
+       bank 예산이 알려져 있으면:
+         m = block group 1개, n = target 기본 단위(spec 의 preferredNGroups —
+         AiMX 는 한 device 폭), k = 남는 예산 전부 (footprint 가 k 에
+         단조증가라 이분 탐색으로 "예산에 드는 최대"를 찾는다).
+       조건 밖이면 0 을 그대로 둔다 — 전부 0 이면 attr 없이 두는 항등이다.
   }];
   let options = [
     Option<"tileM", "tile-m", "int64_t", "0",
-           "output_row_tile 방향 상한 (원소). 0 = 무제한">,
+           "output_row_tile 방향 상한 (원소). 0 = 자동">,
     Option<"tileN", "tile-n", "int64_t", "0",
-           "output_column_tile 방향 상한 (원소). 0 = 무제한">,
+           "output_column_tile 방향 상한 (원소). 0 = 자동">,
     Option<"tileK", "tile-k", "int64_t", "0",
-           "k 방향 상한 (원소). 0 = 무제한. explicit_k_partition 축이 있으면 그 "
+           "k 방향 상한 (원소). 0 = 자동. explicit_k_partition 축이 있으면 그 "
            "눈금이고(공간 분할이 소비), 없으면 reduction loop 에 붙는다 — 한 번에 "
            "상주하는 k 구간의 상한을 target 이 자기 방식(k 창 + host 누산)으로 "
-           "소비한다. 어느 쪽도 없으면 진단이다.">,
+           "소비한다.">,
   ];
   let constructor = "mlir::triton::createPIMFormExecutionTilesPass()";
   let dependentDialects = ["mlir::pim::PIMDialect"];

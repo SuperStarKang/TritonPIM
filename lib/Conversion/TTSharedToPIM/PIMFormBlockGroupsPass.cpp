@@ -27,9 +27,9 @@ struct PIMFormBlockGroupsPass
   using PIMFormBlockGroupsBase::PIMFormBlockGroupsBase;
 
   void runOnOperation() override {
-    if (groupM < 1 || groupN < 1 || groupK < 1) {
+    if (groupM < 0 || groupN < 0 || groupK < 0) {
       getOperation()->emitError("pim-form-block-groups: group-m, group-n and "
-                                "group-k must be at least 1");
+                                "group-k must be 0 (automatic) or positive");
       return signalPassFailure();
     }
     profile = pim::targetProfile(getOperation());
@@ -47,18 +47,163 @@ struct PIMFormBlockGroupsPass
 
   pim::TargetProfileAttr profile;
 
-  // 계층 2 는 두 걸음이다. 사용자가 이웃 block 을 묶으면(group-m/n/k) IR 을 그 단위로
+  // 계층 2 는 두 걸음이다. group 값(사용자 지정 또는 자동 산출)대로 IR 을 그 단위로
   // 재구성하고, 그 결과 block 을 하드웨어 실행 단위(profile 의 execution_unit)에 채워
   // #pim.block_group 으로 적는다. 눈금 없는 기계(execution_unit 없음)는 둘째 걸음이
   // 항등이다.
   LogicalResult formGroups(func::FuncOp func) {
-    if (groupM != 1 || groupN != 1 || groupK != 1)
-      if (failed(regroup(func)))
+    int64_t g[3] = {groupM, groupN, groupK}; // 0 = 자동
+    if (g[0] == 0 || g[1] == 0 || g[2] == 0)
+      if (failed(autoGroups(func, g)))
+        return failure();
+    if (g[0] != 1 || g[1] != 1 || g[2] != 1)
+      if (failed(regroup(func, g[0], g[1], g[2])))
         return failure();
     return fillUnits(func);
   }
 
-  LogicalResult regroup(func::FuncOp func) {
+  // 자동 group 산출 — "빠른 메모리에 들어갈 때까지 m → n → k 순서로 번갈아 1씩
+  // 키운다". 조건은 셋이다: 눈금 없는 기계(execution_unit 없음 — 눈금 있는 기계는
+  // fillUnits 가 담당), local 예산이 알려짐, 협력 모드(simd 또는 lane_mode =
+  // output_row — 버퍼가 한 벌이라 예산 셈법이 성립). 조건 밖이거나 셈에 필요한
+  // 정보가 없으면 자동 축을 1(항등)로 둔다 — 예산 위반 진단은 pim-verify 의 몫이다.
+  LogicalResult autoGroups(func::FuncOp func, int64_t g[3]) {
+    auto identity = [&] {
+      for (int i = 0; i < 3; i++)
+        if (g[i] == 0)
+          g[i] = 1;
+      return success();
+    };
+    if (!profile || profile.getExecutionUnit())
+      return identity();
+    IntegerAttr local = profile.getUsableLocalCapacityBytes();
+    if (!local || local.getInt() <= 0)
+      return identity();
+    bool cooperative =
+        profile.getParallelExecutionKind() == "simd" ||
+        (profile.getLaneMode() &&
+         profile.getLaneMode().getValue() == "output_row");
+    if (!cooperative)
+      return identity();
+
+    // 축 loop: m/n 은 pim.axis 이름으로, k 는 reduction loop(pim.axis 없이 origin
+    // 을 모는 loop, 하나일 때만)로 찾는다 — regroup/fillUnits 와 같은 판정이다.
+    SmallVector<scf::ForOp> loops;
+    func.walk<WalkOrder::PreOrder>([&](scf::ForOp l) { loops.push_back(l); });
+    scf::ForOp axis[3] = {};
+    for (scf::ForOp l : loops) {
+      auto a = l->getAttrOfType<StringAttr>("pim.axis");
+      if (!a)
+        continue;
+      if (a.getValue() == "output_row_tile")
+        axis[0] = l;
+      else if (a.getValue() == "output_column_tile")
+        axis[1] = l;
+    }
+    llvm::SmallPtrSet<Operation *, 4> reds;
+    func.walk([&](pim::AccessOp a) {
+      for (Value o : a.getOrigin()) {
+        llvm::SmallPtrSet<Operation *, 4> ds;
+        pim::collectDrivers(o, loops, ds);
+        for (Operation *op : ds)
+          if (!op->getAttrOfType<StringAttr>("pim.axis"))
+            reds.insert(op);
+      }
+    });
+    if (reds.size() == 1)
+      axis[2] = cast<scf::ForOp>(*reds.begin());
+
+    // access 마다 "각 차원을 어느 축이 모는가"와 원소 바이트를 모은다. 원소 타입은
+    // 그 access 를 읽고 쓰는 load/store 의 tensor 타입에서 온다.
+    struct Buf {
+      int64_t elemBytes;
+      SmallVector<std::pair<int, int64_t>, 3> dims; // {축 번호(-1=무관), tile 크기}
+    };
+    SmallVector<Buf> bufs;
+    SmallVector<scf::ForOp, 3> axisLoops;
+    for (int i = 0; i < 3; i++)
+      if (axis[i])
+        axisLoops.push_back(axis[i]);
+    bool unknown = false;
+    func.walk([&](pim::AccessOp a) {
+      Type elem;
+      for (Operation *user : a->getUsers()) {
+        if (auto load = dyn_cast<pim::LoadOp>(user))
+          elem = cast<RankedTensorType>(load.getResult().getType())
+                     .getElementType();
+        else if (auto store = dyn_cast<pim::StoreOp>(user))
+          if (!elem)
+            elem = cast<RankedTensorType>(store.getValue().getType())
+                       .getElementType();
+      }
+      if (!elem) {
+        unknown = true;
+        return;
+      }
+      Buf b;
+      b.elemBytes =
+          std::max<int64_t>(1, elem.getIntOrFloatBitWidth() / 8);
+      ArrayRef<int64_t> sizes = a.getSizes();
+      for (unsigned d = 0, e = sizes.size(); d < e; d++) {
+        llvm::SmallPtrSet<Operation *, 4> ds;
+        pim::collectDrivers(a.getOrigin()[d], axisLoops, ds);
+        int tag = -1;
+        if (ds.size() == 1)
+          for (int i = 0; i < 3; i++)
+            if (axis[i] && ds.contains(axis[i]))
+              tag = i;
+        b.dims.push_back({tag, sizes[d]});
+      }
+      bufs.push_back(b);
+    });
+    if (unknown || bufs.empty())
+      return identity();
+
+    auto bytesFor = [&](const int64_t f[3]) {
+      int64_t total = 0;
+      for (const Buf &b : bufs) {
+        int64_t elems = 1;
+        for (auto [tag, size] : b.dims)
+          elems *= size * (tag >= 0 ? f[tag] : 1);
+        total += elems * b.elemBytes;
+      }
+      return total;
+    };
+
+    // 시작값: 사용자 고정 축은 그 값, 자동 축은 1. 없는 축은 못 키운다. 시작값부터
+    // 예산을 넘으면 group 을 만들지 않는다.
+    int64_t f[3];
+    bool frozen[3];
+    for (int i = 0; i < 3; i++) {
+      f[i] = g[i] ? g[i] : 1;
+      frozen[i] = g[i] != 0 || !axis[i];
+    }
+    int64_t budget = local.getInt();
+    if (bytesFor(f) <= budget) {
+      bool grew = true;
+      while (grew) {
+        grew = false;
+        for (int i = 0; i < 3; i++) {
+          if (frozen[i])
+            continue;
+          f[i]++;
+          if (bytesFor(f) > budget) {
+            f[i]--;
+            frozen[i] = true;
+          } else {
+            grew = true;
+          }
+        }
+      }
+    }
+    for (int i = 0; i < 3; i++)
+      if (g[i] == 0)
+        g[i] = f[i];
+    return success();
+  }
+
+  LogicalResult regroup(func::FuncOp func, int64_t gM, int64_t gN,
+                        int64_t gK) {
     // 묶을 축 loop 를 이름으로 찾는다.
     scf::ForOp rowLoop, colLoop;
     func.walk<WalkOrder::PreOrder>([&](scf::ForOp l) {
@@ -71,19 +216,19 @@ struct PIMFormBlockGroupsPass
         colLoop = l;
     });
     SmallVector<std::pair<scf::ForOp, int64_t>, 2> grouped;
-    if (groupM != 1) {
+    if (gM != 1) {
       if (!rowLoop)
         return func->emitError("pim-form-block-groups: group-m is ")
-               << groupM << " but the kernel has no output_row_tile axis";
-      grouped.push_back({rowLoop, groupM});
+               << gM << " but the kernel has no output_row_tile axis";
+      grouped.push_back({rowLoop, gM});
     }
-    if (groupN != 1) {
+    if (gN != 1) {
       if (!colLoop)
         return func->emitError("pim-form-block-groups: group-n is ")
-               << groupN << " but the kernel has no output_column_tile axis";
-      grouped.push_back({colLoop, groupN});
+               << gN << " but the kernel has no output_column_tile axis";
+      grouped.push_back({colLoop, gN});
     }
-    if (groupK != 1) {
+    if (gK != 1) {
       // reduction loop 를 찾는다: pim.axis 가 없으면서 access 의 origin 을 모는 loop.
       // 정확히 하나여야 어느 loop 를 넓힐지 유일하다.
       SmallVector<scf::ForOp> all;
@@ -100,10 +245,10 @@ struct PIMFormBlockGroupsPass
       });
       if (reductions.size() != 1)
         return func->emitError("pim-form-block-groups: group-k is ")
-               << groupK << " but " << reductions.size()
+               << gK << " but " << reductions.size()
                << " reduction loops drive memory accesses; exactly one is "
                   "needed to know which loop to widen";
-      grouped.push_back({cast<scf::ForOp>(*reductions.begin()), groupK});
+      grouped.push_back({cast<scf::ForOp>(*reductions.begin()), gK});
     }
 
     // 새 상한은 전부 가장 바깥 축 loop 앞에 만든다. 안쪽 loop 앞에 두면 그 값이 바깥

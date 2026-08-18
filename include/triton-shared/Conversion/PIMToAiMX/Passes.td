@@ -26,16 +26,17 @@ def ConvertPIMToAiMX : Pass<"convert-pim-to-aimx", "mlir::ModuleOp"> {
 
     선택 (§6.1): 세 계층은 전부 공통 IR 이 정한다. block group 은 `#pim.block_group`
     (pim-form-block-groups 가 profile 의 execution_unit 에 block 을 채운 것), execution
-    tile 상한은 `#pim.execution_tile` 이다 (원소 단위, 유효 데이터 기준). batch 는
-    실행 단위의 m 이다 — profile 이 [batch, 4096/batch, 256/batch] 를 싣는다. 이 pass
-    가 하는 일은 번역뿐이다: 상한이 담는 group 수(내림, 최소 1)를 세고 그 group 들의
+    tile 은 `#pim.execution_tile` 이다 (원소 단위, 유효 데이터 기준 — 공통
+    pim-form-execution-tiles 가 사용자 값 또는 예산 탐색으로 세 축 모두 구체값을
+    확정한다. footprint 식은 AiMXFootprint.h 로 공유된다). batch 는 실행 단위의 m
+    이다 — profile 이 [batch, 4096/batch, 256/batch] 를 싣는다. 이 pass 가 하는
+    일은 번역뿐이다: 상한이 담는 group 수(내림, 최소 1)를 세고 그 group 들의
     물리 크기로 buffer 를 잡는다. 세 축 모두 같은 규칙이다.
 
-      m_t   = group 수 × 물리 group 높이. 0 이면 group 하나 — 전송량 식에서 m_t 는
-              A 의 ceil(M/m_t)*m_t 항에만 나타나므로 작을수록 좋다
-      n_max = group 수 × 물리 group 폭. 0 이면 한 device 폭(pitch 눈금 4096)
-      k_max = kUnit 수 × kUnit. 0 이면 남는 예산 전부 — execution tile 은 PIM DRAM
-              에 맞게 적재된다. 상한이 예산을 넘으면 진단
+      m_t   = group 수 × 물리 group 높이 — 전송량 식에서 m_t 는 A 의
+              ceil(M/m_t)*m_t 항에만 나타나므로 작을수록 좋다
+      n_max = group 수 × 물리 group 폭
+      k_max = kUnit 수 × kUnit. 예산 재검증(checkBudget)을 넘으면 진단
       k_t   = min(256 * ceil(k / 256), k_max)                  (런타임)
       n_t   = min((4096/batch) * ceil(N / (4096/batch)), n_max)  (런타임)
 

@@ -2,6 +2,7 @@
 #include "triton-shared/Dialect/PIM/IR/PIMDialect.h"
 #include "triton-shared/Dialect/PIM/IR/PIMUtils.h"
 #include "triton-shared/Dialect/PIMTarget/AiMX/IR/AiMXDialect.h"
+#include "triton-shared/Dialect/PIMTarget/AiMX/IR/AiMXFootprint.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -29,9 +30,6 @@ namespace triton {
 
 namespace {
 
-int64_t ceilDiv(int64_t a, int64_t b) { return (a + b - 1) / b; }
-int64_t roundUp(int64_t a, int64_t b) { return ceilDiv(a, b) * b; }
-
 bool isBatch(int64_t b) { return b == 1 || b == 2 || b == 4 || b == 8; }
 
 // block group 한 축 — 공통 #pim.block_group 에서 읽는다. Triton block 정수 개(tiles)를
@@ -45,34 +43,10 @@ struct BlockGroup {
   int64_t pad() const { return phys - useful; }
 };
 
-// execution tile 하나가 PIM DRAM 에 요구하는 바이트. §6.2 의 표 그대로다.
-struct Footprint {
-  int64_t paddedK, paddedN;
-  int64_t a, arel, b, c, chain;
-  int64_t groups; // descriptor group 수
-
-  int64_t total() const {
-    return a + arel + b + c + chain + aimx::kPMMSize;
-  }
-};
-
-Footprint footprintOf(int64_t batch, int64_t mT, int64_t kT, int64_t nT) {
-  using namespace aimx;
-  Footprint f;
-  f.paddedK = kChunk * ceilDiv(kT, kChunk);
-  f.paddedN = kChunk * ceilDiv(nT, kChunk);
-  f.a = mT * f.paddedK * kTypeSize;
-  // Arel 은 A 를 16 배로 복제한다 — vecA 가 reduction 방향으로 늘어선 A 를 원한다.
-  f.arel = mT * kT * kTypeSize * kNumChannels;
-  f.b = kT * f.paddedN * kTypeSize;
-  f.c = mT * f.paddedN * kTypeSize;
-  int64_t rows = mT / batch;                              // output block 행
-  int64_t cols = f.paddedN * batch / kLanes;              // output block 열
-  int64_t steps = kT * batch / kRegSize;                  // reduction step
-  f.groups = 2 * (kT / kRegSize) * rows + rows * cols * (2 * steps + 1);
-  f.chain = f.groups * kGroupBytes;
-  return f;
-}
+// execution tile 하나가 PIM DRAM 에 요구하는 바이트 — 공통 --pim-form-execution-tiles
+// 의 k 상한 탐색과 같은 식을 써야 하므로 AiMXFootprint.h 로 옮겼다.
+using aimx::Footprint;
+using aimx::footprintOf;
 
 // linalg.matmul 의 operand 를 pim.access 의 id 로 되짚은 결과.
 struct Roles {
@@ -263,48 +237,24 @@ struct ConvertPIMToAiMXPass
     int64_t kUnitUseful = kUnit / kGroup.phys * kGroup.useful;
 
     // 상한(유효 원소)이 담는 group 수는 내림이다(최소 1) — 상한은 넘지 않는 약속이다.
-    // host loop 은 유효 크기로 걷고 buffer 는 물리 크기로 잡는다. 상한이 없는 축(0):
-    //   m — group 하나 (최소 단위)
-    //   n — 한 device 폭 (pitch 눈금 kChunk 를 group 물리 폭으로 올린 것)
-    //   k — 남는 예산 전부 (execution tile 은 PIM DRAM 에 맞게 적재된다)
+    // host loop 은 유효 크기로 걷고 buffer 는 물리 크기로 잡는다. 세 축의 구체 수치는
+    // 공통 --pim-form-execution-tiles 가 확정했다(사용자 값 또는 예산 탐색 — footprint
+    // 식은 AiMXFootprint.h 로 공유). 이 pass 는 읽기만 하고, 예산 재검증(checkBudget)
+    // 만 방어적으로 유지한다.
     auto cap =
         device->getAttrOfType<pim::ExecutionTileAttr>("pim.execution_tile");
-    int64_t capM = cap ? cap.getM() : 0;
-    int64_t capN = cap ? cap.getN() : 0;
-    int64_t capK = cap ? cap.getK() : 0;
+    if (!cap || cap.getM() <= 0 || cap.getN() <= 0 || cap.getK() <= 0)
+      return device->emitError(
+          "convert-pim-to-aimx: #pim.execution_tile with concrete m, n, k "
+          "caps is required — run --pim-form-execution-tiles (it computes "
+          "missing caps from the profile budget)");
 
-    int64_t mCount = capM ? std::max<int64_t>(capM / mGroup.useful, 1) : 1;
+    int64_t mCount = std::max<int64_t>(cap.getM() / mGroup.useful, 1);
     int64_t mUse = mCount * mGroup.useful;
     int64_t mPhys = mCount * mGroup.phys;
-    int64_t nMax = capN
-                       ? std::max<int64_t>(capN / nGroup.useful, 1) * nGroup.phys
-                       : roundUp(aimx::kChunk, nGroup.phys);
-    int64_t kMax;
-    if (capK) {
-      kMax = std::max<int64_t>(capK / kUnitUseful, 1) * kUnit;
-    } else {
-      int64_t budget;
-      if (failed(budgetBytes(device, budget)))
-        return failure();
-      // footprint 는 k 에 단조증가라 "예산에 드는 최대 kUnit 배수" 는 이분 탐색이 정확하다.
-      auto fits = [&](int64_t units) {
-        return footprintOf(batchV, mPhys, units * kUnit, nMax).total() <=
-               budget;
-      };
-      if (!fits(1))
-        return device->emitError("convert-pim-to-aimx: even one k unit (")
-               << kUnit << " elements) does not fit the PIM DRAM budget of "
-               << budget << " byte";
-      int64_t lo = 1;
-      while (fits(lo * 2))
-        lo *= 2;
-      int64_t hi = lo * 2;
-      while (hi - lo > 1) {
-        int64_t mid = lo + (hi - lo) / 2;
-        (fits(mid) ? lo : hi) = mid;
-      }
-      kMax = lo * kUnit;
-    }
+    int64_t nMax =
+        std::max<int64_t>(cap.getN() / nGroup.useful, 1) * nGroup.phys;
+    int64_t kMax = std::max<int64_t>(cap.getK() / kUnitUseful, 1) * kUnit;
 
     Footprint fp;
     if (failed(checkBudget(device, batchV, mPhys, kMax, nMax, fp)))
