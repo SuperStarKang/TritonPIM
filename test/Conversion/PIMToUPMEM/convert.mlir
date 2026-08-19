@@ -65,16 +65,14 @@
 // CHECK-NOT:     pim.place
 
 module attributes {pim.target_profile = #pim.target_profile<
-    target = "upmem", number_of_pim_devices = 8, pim_core_shape = array<i64: 1>,
+    target = "upmem", number_of_pim_devices = 8,
     number_of_parallel_lanes_per_pim_core = 1,
     parallel_execution_kind = "multithread",
-    requires_uniform_instruction_sequence = false,
     usable_bank_capacity_bytes = 3072, usable_local_capacity_bytes = 49152>} {
 
 func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
                   %K: i32, %N: i32, %ex: index, %ey: index)
-    attributes {pim.core_mapping = #pim.core_mapping<
-        core_axis_roles = ["none"], tile_footprint = array<i64: 1>,
+    attributes {pim.group_execution = #pim.group_execution<
         lanes = 1, lane_axis_role = "whole_tile">} {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index

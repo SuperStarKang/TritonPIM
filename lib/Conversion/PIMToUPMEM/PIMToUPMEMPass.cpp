@@ -12,6 +12,7 @@
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Twine.h"
@@ -48,6 +49,23 @@ static Value cloneInto(OpBuilder &b, Value v, IRMapping &map, Operation *scope) 
   Value r = b.clone(*def, local)->getResult(cast<OpResult>(v).getResultNumber());
   map.map(v, r);
   return r;
+}
+
+// v 가 정의 사슬로 block argument arg 에 닿는가. 어느 place 가 round 창 축에 매여
+// 있는지(그 축 좌표가 영역 식에 들어가는지)를 가르는 판정이다.
+static bool dependsOnArg(Value v, Value arg) {
+  SmallVector<Value> work{v};
+  llvm::DenseSet<Value> seen;
+  while (!work.empty()) {
+    Value c = work.pop_back_val();
+    if (!seen.insert(c).second)
+      continue;
+    if (c == arg)
+      return true;
+    if (Operation *def = c.getDefiningOp())
+      work.append(def->getOperands().begin(), def->getOperands().end());
+  }
+  return false;
 }
 
 // v가 scope 안에서 정의되었는가.
@@ -100,6 +118,20 @@ struct Buffer {
   SmallVector<int64_t> tile;
 };
 
+// 시간 창 하나 — #pim.execution_tile 의 축 상한 하나가 창 하나다.
+// 출력 축 창(mappingIdx ≥ 0)은 launch 를 반복하며 배정 몫을 창 단위로 상주시키고,
+// k 창(mappingIdx < 0, kLoop)은 launch 마다 K 의 한 구간만 누적해 부분합을 낸다 —
+// host 가 창을 건너 누산한다(unstage accumulate).
+struct Window {
+  int mappingIdx = -1;      // device mapping 축 번호. k 창은 -1
+  scf::ForOp kLoop;         // k 창일 때 reduction loop
+  int64_t cap = 0;          // 상한 (원소)
+  int64_t elems = 0;        // 창 축 tile 하나의 원소 수
+  int64_t tiles = 0;        // 창의 tile 수 = cap / elems
+  Value trips;              // 축 전체 반복 횟수 (foreach 몸체 기준 값)
+  FlatSymbolRefAttr tilesVar; // 이 축의 반복 횟수 host 변수
+};
+
 struct ConvertPIMToUPMEMPass
     : public mlir::triton::impl::ConvertPIMToUPMEMBase<ConvertPIMToUPMEMPass> {
   using ConvertPIMToUPMEMBase::ConvertPIMToUPMEMBase;
@@ -123,7 +155,7 @@ struct ConvertPIMToUPMEMPass
     // 뒤 단계가 기계 값을 다시 읽을 수 있다는 오해를 만든다.
     getOperation()->removeAttr("pim.target_profile");
     getOperation().walk(
-        [](func::FuncOp f) { f->removeAttr("pim.core_mapping"); });
+        [](func::FuncOp f) { f->removeAttr("pim.group_execution"); });
   }
 
   pim::TargetProfileAttr profile;
@@ -152,13 +184,18 @@ struct ConvertPIMToUPMEMPass
     Location loc = device.getLoc();
     Block *deviceBody = &device.getBody().front();
 
-    auto cores = func->getAttrOfType<pim::CoreMappingAttr>("pim.core_mapping");
+    auto cores =
+        func->getAttrOfType<pim::GroupExecutionAttr>("pim.group_execution");
     if (!cores) {
       func->emitError("convert-pim-to-upmem: the function has no "
-                      "#pim.core_mapping");
+                      "#pim.group_execution");
       return signalPassFailure();
     }
     int64_t lanes = cores.getLanes();
+    // 협력 lane 모드: lane들이 tile 하나를 출력 행으로 나눠 함께 계산한다. 버퍼는 한 벌,
+    // 적재는 분담, 경계는 barrier다. lane이 하나면 나눌 것이 없어 기존 경로와 같다.
+    bool rowSplit =
+        lanes > 1 && cores.getLaneAxisRole().getValue() == "output_row";
 
     // ── 입력 모으기 ────────────────────────────────────────────────────────
     SmallVector<pim::PlaceOp> inputs, outputs;
@@ -185,20 +222,222 @@ struct ConvertPIMToUPMEMPass
     for (int64_t c : device.getMapping().getPartitions().asArrayRef())
       numUnits *= c;
 
-    // ── 모듈 수준 선언 ─────────────────────────────────────────────────────
-    OpBuilder mb(module.getBody(), module.getBody()->begin());
-    StringRef base = func.getName();
-    SmallVector<pim::PlaceOp> all(inputs);
-    all.append(outputs);
-    int64_t bufferBytes = profile.getUsableBankCapacityBytes().getInt() /
-                          std::max<int64_t>(1, all.size());
-
     // 타일 shape. device 버퍼를 이 단위로 쓰면 타일 하나가 MRAM에서 연속이 되어 DMA가
     // 한 번으로 끝난다. pim.access가 정적으로 들고 있다.
     llvm::DenseMap<int64_t, SmallVector<int64_t>> tileOf;
     nest.walk([&](pim::AccessOp a) {
       tileOf[a.getId()] = SmallVector<int64_t>(a.getSizes());
     });
+
+    // ── 창(시간 분할) 문맥 ─────────────────────────────────────────────────
+    // 창은 공통 IR 의 #pim.execution_tile 에서 온다. 출력 축(m·n) 창은 launch 를
+    // 반복하며 배정 몫을 창 단위로 상주시키고, k(reduction) 창은 launch 마다 K 의
+    // 한 구간만 누적해 부분합을 내며 host 가 누산한다(unstage accumulate). 배정이
+    // 상한 안이면 창 수가 런타임에 1 로 퇴화해 반복이 없던 것과 같다.
+    // host loop 순서는 n → k → m 이고, 각 place 는 자기가 매인 창 중 가장 안쪽
+    // level 에서 창을 재전송한다 — B(k·n)는 k level, A(m·k)는 m level. k 상한이
+    // 있어도 explicit_k_partition 축이 있으면 공간 분할(SPLIT_K)이 소비하므로 창을
+    // 만들지 않는다.
+    auto tiles =
+        device->getAttrOfType<pim::ExecutionTileAttr>("pim.execution_tile");
+    bool hasExplicitK = false;
+    for (Attribute a : device.getMapping().getAxes())
+      if (cast<StringAttr>(a).getValue() == "explicit_k_partition")
+        hasExplicitK = true;
+    // reduction loop: pim.axis 없이 access 의 origin 을 모는 loop, 하나일 때만.
+    scf::ForOp kLoop;
+    {
+      SmallVector<scf::ForOp> allLoops;
+      device.getBody().walk([&](scf::ForOp l) { allLoops.push_back(l); });
+      llvm::SmallPtrSet<Operation *, 4> reds;
+      device.getBody().walk([&](pim::AccessOp a) {
+        for (Value o : a.getOrigin()) {
+          llvm::SmallPtrSet<Operation *, 4> ds;
+          pim::collectDrivers(o, allLoops, ds);
+          for (Operation *op : ds)
+            if (!op->getAttrOfType<StringAttr>("pim.axis"))
+              reds.insert(op);
+        }
+      });
+      if (reds.size() == 1)
+        kLoop = cast<scf::ForOp>(*reds.begin());
+    }
+
+    SmallVector<Window> windows; // host loop 밖→안 순서: n, k, m
+    if (tiles) {
+      auto mappingWindow = [&](StringRef axisName,
+                               int64_t cap) -> LogicalResult {
+        if (cap <= 0)
+          return success();
+        int idx = -1;
+        for (auto [i, a] : llvm::enumerate(device.getMapping().getAxes()))
+          if (cast<StringAttr>(a).getValue() == axisName)
+            idx = i;
+        if (idx < 0)
+          return device->emitError(
+                     "convert-pim-to-upmem: the execution tile cap names ")
+                 << axisName << " but this kernel has no such axis";
+        Window w;
+        w.mappingIdx = idx;
+        w.cap = cap;
+        w.trips = axes[idx].trips;
+        windows.push_back(w);
+        return success();
+      };
+      if (failed(mappingWindow("output_column_tile", tiles.getN())))
+        return signalPassFailure();
+      if (tiles.getK() > 0 && !hasExplicitK) {
+        if (!kLoop) {
+          device->emitError(
+              "convert-pim-to-upmem: the execution tile has a k cap but the "
+              "kernel has neither an explicit_k_partition axis nor a single "
+              "reduction loop to window");
+          return signalPassFailure();
+        }
+        Window w;
+        w.kLoop = kLoop;
+        w.cap = tiles.getK();
+        w.trips = kLoop.getUpperBound();
+        windows.push_back(w);
+      }
+      if (failed(mappingWindow("output_row_tile", tiles.getM())))
+        return signalPassFailure();
+    }
+
+    // 각 place 가 어느 창의 어느 buffer 축에 매였는가. 출력 축 창은 영역 식이 그 축
+    // 좌표 인자에 닿는가로, k 창은 access 의 origin 을 reduction loop 가 모는가로
+    // 가른다. 창마다 place 의 축은 최대 하나여야 창이 직사각형 하나로 남는다.
+    SmallVector<pim::PlaceOp> allPlaces(inputs);
+    allPlaces.append(outputs);
+    llvm::DenseMap<Operation *, SmallVector<int, 4>> dimWinOf;
+    for (pim::PlaceOp place : allPlaces)
+      dimWinOf[place].assign(place.getCapacity().size(), -1);
+    for (unsigned wi = 0; wi < windows.size(); ++wi) {
+      Window &w = windows[wi];
+      int64_t elems = 0;
+      for (pim::PlaceOp place : allPlaces) {
+        SmallVector<int, 4> &dims = dimWinOf[place];
+        int found = -1;
+        if (w.mappingIdx >= 0) {
+          Value warg = deviceBody->getArgument(w.mappingIdx);
+          for (unsigned d = 0, e = place.getCapacity().size(); d < e; d++) {
+            if (!dependsOnArg(place.getStart()[d], warg) &&
+                !dependsOnArg(place.getSize()[d], warg) &&
+                !dependsOnArg(place.getCapacity()[d], warg))
+              continue;
+            if (found >= 0) {
+              place->emitError(
+                  "convert-pim-to-upmem: two buffer axes follow the same "
+                  "window axis, so the window is not a single rectangle");
+              return signalPassFailure();
+            }
+            found = d;
+          }
+        } else {
+          // k 창: 이 place 의 access origin 중 reduction loop 가 모는 차원.
+          pim::AccessOp access;
+          nest.walk([&](pim::AccessOp a) {
+            if (a.getId() == place.getAccess())
+              access = a;
+          });
+          if (access) {
+            SmallVector<scf::ForOp, 1> only{w.kLoop};
+            for (unsigned d = 0, e = access.getOrigin().size(); d < e; d++) {
+              llvm::SmallPtrSet<Operation *, 4> ds;
+              pim::collectDrivers(access.getOrigin()[d], only, ds);
+              if (!ds.contains(w.kLoop))
+                continue;
+              if (found >= 0) {
+                place->emitError(
+                    "convert-pim-to-upmem: two buffer axes follow the "
+                    "reduction window, so the window is not a single "
+                    "rectangle");
+                return signalPassFailure();
+              }
+              found = d;
+            }
+          }
+        }
+        if (place.getDirection() == "out" && w.mappingIdx >= 0 && found < 0) {
+          place->emitError(
+              "convert-pim-to-upmem: the output does not follow the window "
+              "axis, so every round would rewrite the same region");
+          return signalPassFailure();
+        }
+        if (found >= 0) {
+          dims[found] = wi;
+          int64_t sz = tileOf[place.getAccess()][found];
+          if (elems && elems != sz) {
+            place->emitError(
+                "convert-pim-to-upmem: the windowed buffers disagree on the "
+                "tile size along the window axis");
+            return signalPassFailure();
+          }
+          elems = sz;
+        }
+      }
+      if (!elems) {
+        device->emitError(
+            "convert-pim-to-upmem: no buffer follows a window axis");
+        return signalPassFailure();
+      }
+      if (w.cap % elems != 0) {
+        device->emitError("convert-pim-to-upmem: the execution tile cap (")
+            << w.cap << " elements) is not a multiple of the group tile ("
+            << elems << " elements) along the window axis";
+        return signalPassFailure();
+      }
+      w.elems = elems;
+      w.tiles = w.cap / elems;
+    }
+
+    // ── 모듈 수준 선언 ─────────────────────────────────────────────────────
+    OpBuilder mb(module.getBody(), module.getBody()->begin());
+    StringRef base = func.getName();
+    SmallVector<pim::PlaceOp> all(inputs);
+    all.append(outputs);
+
+    // MRAM buffer 크기. 모든 차원이 창(정적 tile 수 × tile)이나 상수로 묶이면 그
+    // 곱이 정확한 크기다 — 전 buffer 가 그러면 그 크기로 잡고 합이 예산에 드는지
+    // 여기서 확인한다. 하나라도 런타임 차원이 남으면 기존대로 예산 균등 분할 상한을
+    // 쓰고 host 가 전송 직전에 검사한다.
+    auto staticBytes = [&](pim::PlaceOp place) -> int64_t {
+      const SmallVector<int, 4> &dims = dimWinOf[place];
+      ArrayRef<int64_t> tile = tileOf[place.getAccess()];
+      int64_t elems = 1;
+      for (unsigned d = 0, e = place.getCapacity().size(); d < e; d++) {
+        if (dims[d] >= 0) {
+          elems *= windows[dims[d]].tiles * tile[d];
+          continue;
+        }
+        std::optional<int64_t> v = getConstantIntValue(place.getCapacity()[d]);
+        if (!v)
+          return -1;
+        elems *= *v;
+      }
+      Type elem =
+          cast<BaseMemRefType>(place.getBuffer().getType()).getElementType();
+      return elems * std::max<int64_t>(1, elem.getIntOrFloatBitWidth() / 8);
+    };
+    int64_t bankBudget = profile.getUsableBankCapacityBytes().getInt();
+    int64_t fallbackBytes = bankBudget / std::max<int64_t>(1, all.size());
+    llvm::DenseMap<Operation *, int64_t> bytesOf;
+    bool allStatic = true;
+    int64_t staticTotal = 0;
+    for (pim::PlaceOp place : all) {
+      int64_t b = staticBytes(place);
+      bytesOf[place] = b;
+      if (b < 0)
+        allStatic = false;
+      else
+        staticTotal += b;
+    }
+    if (allStatic && staticTotal > bankBudget) {
+      device->emitError("convert-pim-to-upmem: the execution tile needs ")
+          << staticTotal << " byte of MRAM but the budget is " << bankBudget
+          << " byte — lower tile_m, tile_n, or tile_k";
+      return signalPassFailure();
+    }
 
     llvm::DenseMap<Operation *, FlatSymbolRefAttr> mramOf;
     llvm::DenseMap<int64_t, Buffer> byAccess;
@@ -214,10 +453,13 @@ struct ConvertPIMToUPMEMPass
         place->emitError("no pim.access with this id inside pim.device");
         return signalPassFailure();
       }
-      if (failed(checkCapacity(place, info.elem, bufferBytes)))
+      int64_t bufBytes = allStatic ? bytesOf[place] : fallbackBytes;
+      if (!allStatic &&
+          failed(checkCapacity(place, info.elem, fallbackBytes,
+                               dimWinOf[place], windows, info.tile)))
         return signalPassFailure();
       mb.create<upmem::MRAMOp>(loc, name,
-                               TypeAttr::get(mramType(info.elem, bufferBytes)));
+                               TypeAttr::get(mramType(info.elem, bufBytes)));
       // 축 하나를 건너뛰는 간격. device가 MRAM 안의 위치를 계산하는 데 쓴다.
       for (unsigned d = 1, e = place.getCapacity().size(); d < e; d++) {
         auto pn = StringAttr::get(
@@ -234,6 +476,18 @@ struct ConvertPIMToUPMEMPass
       tilesVar.push_back(FlatSymbolRefAttr::get(name));
       mb.create<upmem::HostVarOp>(loc, name,
                                   TypeAttr::get(IndexType::get(ctx)));
+    }
+    // 창 축의 반복 횟수 변수. mapping 축 창은 위의 tilesVar 를 그대로 쓰고, k 창은
+    // reduction loop 상한 타입으로 하나 만든다.
+    for (Window &w : windows) {
+      if (w.mappingIdx >= 0) {
+        w.tilesVar = tilesVar[w.mappingIdx];
+        continue;
+      }
+      auto name = StringAttr::get(ctx, (base + "_tiles_k").str());
+      w.tilesVar = FlatSymbolRefAttr::get(name);
+      mb.create<upmem::HostVarOp>(
+          loc, name, TypeAttr::get(w.kLoop.getUpperBound().getType()));
     }
 
     // ── device: loop nest를 옮기고 device 로컬로 만든다 ────────────────────
@@ -256,6 +510,15 @@ struct ConvertPIMToUPMEMPass
             db.create<arith::ConstantOp>(loc, db.getIntegerAttr(t, 0))
                 .getResult());
       }
+    }
+    // k 창이 있으면 reduction loop 도 창의 tile 수만 돌게 상한을 host 변수로 돌린다.
+    // 원래 상한 사슬은 죽은 값 정리가 걷어 간다.
+    for (Window &w : windows) {
+      if (w.mappingIdx >= 0)
+        continue;
+      Value n = db.create<upmem::GetHostVarOp>(
+          loc, w.kLoop.getUpperBound().getType(), w.tilesVar);
+      w.kLoop.getUpperBoundMutable().assign(n);
     }
 
     // ── host: func 몸체를 UPMEM 호출로 바꾼다 ──────────────────────────────
@@ -283,7 +546,15 @@ struct ConvertPIMToUPMEMPass
       deviceBody->getArgument(i).replaceAllUsesWith(fuBody->getArgument(i + 1));
 
     Value dpu = fuBody->getArgument(0);
+    auto hasWindow = [&](pim::PlaceOp place) {
+      for (int wi : dimWinOf[place])
+        if (wi >= 0)
+          return true;
+      return false;
+    };
     for (pim::PlaceOp place : inputs) {
+      if (hasWindow(place))
+        continue; // 창에 매인 입력은 자기 창 level 에서 창을 다시 모은다
       OpBuilder b(place);
       Value staged = b.create<upmem::StageOp>(
           loc, stagedType(place), place.getBuffer(), place.getStart(),
@@ -292,26 +563,192 @@ struct ConvertPIMToUPMEMPass
           place.getReplicatedOverAttr());
       b.create<upmem::ToMRAMOp>(loc, dpu, staged, mramOf[place]);
     }
-    // device마다 다른 반복 횟수를 그 DPU에 보낸다.
+    // device마다 다른 반복 횟수를 그 DPU에 보낸다. 창 축의 횟수는 창마다 다르므로
+    // 그 창의 level 에서 보낸다.
     OpBuilder tb(fuBody, fuBody->end());
+    auto axisWindowed = [&](size_t i) {
+      for (const Window &w : windows)
+        if (w.mappingIdx == (int)i)
+          return true;
+      return false;
+    };
     for (auto [i, a] : llvm::enumerate(axes))
-      tb.create<upmem::ToHostVarOp>(loc, dpu, a.trips, tilesVar[i]);
-    // MRAM 안의 축 간격도 함께 보낸다.
+      if (!axisWindowed(i))
+        tb.create<upmem::ToHostVarOp>(loc, dpu, a.trips, tilesVar[i]);
+    // MRAM 안의 축 간격도 함께 보낸다. 창에 매인 축의 간격은 창 크기다 — 그 buffer 는
+    // launch 마다 창 하나만 상주하기 때문이다.
     for (pim::PlaceOp place : all) {
       const Buffer &info = byAccess[place.getAccess()];
-      for (auto [d, sym] : llvm::enumerate(info.pitch))
-        tb.create<upmem::ToHostVarOp>(loc, dpu, place.getCapacity()[d + 1], sym);
+      const SmallVector<int, 4> &dims = dimWinOf[place];
+      for (auto [d, sym] : llvm::enumerate(info.pitch)) {
+        Value v = place.getCapacity()[d + 1];
+        if (dims[d + 1] >= 0)
+          v = tb.create<arith::ConstantIndexOp>(
+              loc, windows[dims[d + 1]].tiles * info.tile[d + 1]);
+        tb.create<upmem::ToHostVarOp>(loc, dpu, v, sym);
+      }
     }
 
     hb.setInsertionPointAfter(foreach);
-    hb.create<upmem::LaunchOp>(loc, set);
-    for (pim::PlaceOp place : outputs) {
-      // buildOutput이 region을 만들며 삽입 지점을 옮기므로 매번 되돌린다.
-      OpBuilder::InsertionGuard guard(hb);
-      if (failed(buildOutput(hb, place, set, numUnits, axisNames, counts,
-                             mramOf[place], foreach,
-                             byAccess[place.getAccess()].tile)))
-        return signalPassFailure();
+    if (windows.empty()) {
+      hb.create<upmem::LaunchOp>(loc, set);
+      for (pim::PlaceOp place : outputs) {
+        // buildOutput이 region을 만들며 삽입 지점을 옮기므로 매번 되돌린다.
+        OpBuilder::InsertionGuard guard(hb);
+        if (failed(buildOutput(hb, place, set, numUnits, axisNames, counts,
+                               mramOf[place], foreach,
+                               byAccess[place.getAccess()].tile, windows,
+                               dimWinOf[place], /*roundIVs=*/{},
+                               /*accRound=*/Value())))
+          return signalPassFailure();
+      }
+    } else {
+      // 창 loop nest — 바깥 창부터 하나씩(n → k → m). 창 수 = ceildiv(축 반복
+      // 횟수, 창)이라 배정이 상한 안이면 런타임에 1 로 퇴화한다. 창마다 [창 반복
+      // 횟수 갱신 + 그 level 이 가장 안쪽 창인 place 의 재전송] foreach 를 놓고,
+      // 가장 안쪽에서 launch 와 회수를 한다.
+      Value c0 = hb.create<arith::ConstantIndexOp>(loc, 0);
+      Value c1 = hb.create<arith::ConstantIndexOp>(loc, 1);
+      SmallVector<Value> roundIVs(windows.size());
+      Value accRound; // k 창 번호 — 출력 누산의 스위치
+      OpBuilder lb = hb;
+      for (unsigned wi = 0; wi < windows.size(); ++wi) {
+        Window &w = windows[wi];
+        Value rounds;
+        if (w.mappingIdx >= 0) {
+          // 배정량(capacity)은 전 device 공통이라 창 수도 공통이고, 덜 맡은
+          // device 는 꼬리 창에서 0 회를 돈다.
+          Value wTiles = lb.create<arith::ConstantIndexOp>(loc, w.tiles);
+          Value parts = lb.create<arith::ConstantIndexOp>(
+              loc,
+              device.getMapping().getPartitions().asArrayRef()[w.mappingIdx]);
+          Value capTiles = lb.create<arith::CeilDivSIOp>(
+              loc, device.getAxisExtents()[w.mappingIdx], parts);
+          rounds = lb.create<arith::CeilDivSIOp>(loc, capTiles, wTiles);
+        } else {
+          // k 창 수 = ceildiv(reduction 반복 횟수, 창). device 좌표에 무관해야
+          // 전 device 가 같은 횟수의 launch 를 돈다.
+          IRMapping empty;
+          Value kTrips = cloneInto(lb, w.trips, empty, foreach);
+          if (!kTrips) {
+            device->emitError(
+                "convert-pim-to-upmem: the reduction trip count depends on "
+                "the device coordinate, so the k window count cannot be "
+                "computed on the host");
+            return signalPassFailure();
+          }
+          if (!isa<IndexType>(kTrips.getType()))
+            kTrips =
+                lb.create<arith::IndexCastOp>(loc, lb.getIndexType(), kTrips);
+          Value wTiles = lb.create<arith::ConstantIndexOp>(loc, w.tiles);
+          rounds = lb.create<arith::CeilDivSIOp>(loc, kTrips, wTiles);
+        }
+        auto roundLoop = lb.create<scf::ForOp>(loc, c0, rounds, c1);
+        roundIVs[wi] = roundLoop.getInductionVar();
+        if (w.mappingIdx < 0)
+          accRound = roundIVs[wi];
+        lb = OpBuilder(roundLoop.getBody(),
+                       std::prev(roundLoop.getBody()->end()));
+
+        // 이 level 의 foreach: 창 반복 횟수 갱신 + 재전송. 좌표 산술은 첫 foreach
+        // 의 식을 복제해 새 좌표 인자에 잇는다.
+        auto fu2 = lb.create<upmem::ForeachUnitOp>(loc, set, axisNames, counts);
+        Block *fu2Body;
+        {
+          OpBuilder blockBuilder(ctx);
+          fu2Body = blockBuilder.createBlock(&fu2.getBody(),
+                                             fu2.getBody().end(), argTys,
+                                             argLocs);
+        }
+        IRMapping toRound;
+        for (unsigned i = 0, e = fu2Body->getNumArguments(); i < e; i++)
+          toRound.map(fuBody->getArgument(i), fu2Body->getArgument(i));
+        Value dpu2 = fu2Body->getArgument(0);
+        OpBuilder fb(fu2Body, fu2Body->end());
+        Value zero = fb.create<arith::ConstantIndexOp>(loc, 0);
+
+        // 이 창의 반복 횟수 = clamp(trips − round·창, 0, 창).
+        Value tripsW = cloneInto(fb, w.trips, toRound, foreach);
+        if (!tripsW) {
+          device->emitError("convert-pim-to-upmem: the window axis trip count "
+                            "cannot be rebuilt in the round loop");
+          return signalPassFailure();
+        }
+        Value winTrips;
+        {
+          // reduction 상한이 index 가 아니면 index 로 셈하고 원 타입으로 돌린다.
+          Type origTy = tripsW.getType();
+          Value t = tripsW;
+          if (!isa<IndexType>(origTy))
+            t = fb.create<arith::IndexCastOp>(loc, fb.getIndexType(), t);
+          Value wTiles = fb.create<arith::ConstantIndexOp>(loc, w.tiles);
+          Value done = fb.create<arith::MulIOp>(loc, roundIVs[wi], wTiles);
+          Value left = fb.create<arith::SubIOp>(loc, t, done);
+          winTrips = fb.create<arith::MinSIOp>(
+              loc, fb.create<arith::MaxSIOp>(loc, left, zero), wTiles);
+          if (!isa<IndexType>(origTy))
+            winTrips =
+                fb.create<arith::IndexCastOp>(loc, origTy, winTrips);
+        }
+        fb.create<upmem::ToHostVarOp>(loc, dpu2, winTrips, w.tilesVar);
+
+        for (pim::PlaceOp place : inputs) {
+          const SmallVector<int, 4> &dims = dimWinOf[place];
+          // 이 place 의 가장 안쪽 창 level 이 여기인가 — 여기여야 매인 창의 좌표가
+          // 전부 정해진 상태에서 한 번만 재전송한다.
+          int deepest = -1;
+          for (int v : dims)
+            deepest = std::max(deepest, v);
+          if (deepest != (int)wi)
+            continue;
+          const Buffer &info = byAccess[place.getAccess()];
+          SmallVector<Value> start, size, strides, capacity;
+          for (unsigned d = 0, e = place.getCapacity().size(); d < e; d++) {
+            Value o = cloneInto(fb, place.getStart()[d], toRound, foreach);
+            Value s = cloneInto(fb, place.getSize()[d], toRound, foreach);
+            Value st = cloneInto(fb, place.getStrides()[d], toRound, foreach);
+            Value cp = cloneInto(fb, place.getCapacity()[d], toRound, foreach);
+            if (!o || !s || !st || !cp) {
+              place->emitError("convert-pim-to-upmem: the window region cannot "
+                               "be rebuilt in the round loop");
+              return signalPassFailure();
+            }
+            if (dims[d] >= 0) {
+              const Window &dw = windows[dims[d]];
+              Value winElems = fb.create<arith::ConstantIndexOp>(
+                  loc, dw.tiles * info.tile[d]);
+              Value shift =
+                  fb.create<arith::MulIOp>(loc, roundIVs[dims[d]], winElems);
+              o = fb.create<arith::AddIOp>(loc, o, shift);
+              s = fb.create<arith::MinSIOp>(
+                  loc,
+                  fb.create<arith::MaxSIOp>(
+                      loc, fb.create<arith::SubIOp>(loc, s, shift), zero),
+                  winElems);
+              cp = winElems;
+            }
+            start.push_back(o);
+            size.push_back(s);
+            strides.push_back(st);
+            capacity.push_back(cp);
+          }
+          Value staged = fb.create<upmem::StageOp>(
+              loc, stagedType(place), place.getBuffer(), start, size, strides,
+              capacity, fb.getDenseI64ArrayAttr(info.tile),
+              place.getReplicatedOverAttr());
+          fb.create<upmem::ToMRAMOp>(loc, dpu2, staged, mramOf[place]);
+        }
+      }
+
+      lb.create<upmem::LaunchOp>(loc, set);
+      for (pim::PlaceOp place : outputs) {
+        OpBuilder::InsertionGuard guard(lb);
+        if (failed(buildOutput(lb, place, set, numUnits, axisNames, counts,
+                               mramOf[place], foreach,
+                               byAccess[place.getAccess()].tile, windows,
+                               dimWinOf[place], roundIVs, accRound)))
+          return signalPassFailure();
+      }
     }
 
     // pim.place는 여기서 한 번에 지운다. 위의 stage/to_host_var가 이 op의
@@ -320,7 +757,7 @@ struct ConvertPIMToUPMEMPass
       place.erase();
 
     device.erase();
-    if (failed(convertDevice(dev, byAccess, lanes, tb, dpu, base)))
+    if (failed(convertDevice(dev, byAccess, lanes, rowSplit, tb, dpu, base)))
       return signalPassFailure();
   }
 
@@ -350,12 +787,18 @@ struct ConvertPIMToUPMEMPass
     return success();
   }
 
-  // UPMEM은 bank 예산을 버퍼 개수로 균등 분할한다. 총합만 보면 개별 버퍼가 넘치는
-  // 구성이 통과하므로 버퍼마다 본다. 크기가 런타임이면 여기서 증명할 수 없고, host
-  // 코드가 전송 직전에 검사한다.
-  LogicalResult checkCapacity(pim::PlaceOp place, Type elem, int64_t bufferBytes) {
+  // 균등 분할(fallback) 경로의 버퍼별 검사. 총합만 보면 개별 버퍼가 넘치는 구성이
+  // 통과하므로 버퍼마다 본다. 크기가 런타임이면 여기서 증명할 수 없고, host 코드가
+  // 전송 직전에 검사한다. 창에 매인 축은 launch 마다 창 하나만 상주한다.
+  LogicalResult checkCapacity(pim::PlaceOp place, Type elem, int64_t bufferBytes,
+                              ArrayRef<int> dimWin, ArrayRef<Window> windows,
+                              ArrayRef<int64_t> tile) {
     int64_t elems = 1;
-    for (Value c : place.getCapacity()) {
+    for (auto [d, c] : llvm::enumerate(place.getCapacity())) {
+      if (dimWin[d] >= 0) {
+        elems *= windows[dimWin[d]].tiles * tile[d];
+        continue;
+      }
       std::optional<int64_t> v = getConstantIntValue(c);
       if (!v)
         return success();
@@ -396,8 +839,8 @@ struct ConvertPIMToUPMEMPass
   //  - pim.access는 MRAM 안의 위치를 정하는 식이 되고 op 자체는 사라진다.
   LogicalResult convertDevice(upmem::DeviceFuncOp dev,
                               const llvm::DenseMap<int64_t, Buffer> &byAccess,
-                              int64_t lanes, OpBuilder &tb, Value dpu,
-                              StringRef base) {
+                              int64_t lanes, bool rowSplit, OpBuilder &tb,
+                              Value dpu, StringRef base) {
     Block *body = &dev.getBody().front();
     OpBuilder top(body, body->begin());
     Location loc = dev.getLoc();
@@ -411,19 +854,20 @@ struct ConvertPIMToUPMEMPass
         v = top.create<upmem::GetHostVarOp>(loc, top.getIndexType(), sym);
       return v;
     };
-    // tasklet이 여럿이면 tile 버퍼를 그 수만큼 복제하고 자기 번호로 잘라 쓴다.
-    // tasklet마다 다른 tile을 맡으므로 버퍼를 공유하면 서로 덮어쓴다.
+    // whole_tile: tasklet마다 다른 tile을 맡으므로 tile 버퍼를 그 수만큼 복제하고 자기
+    // 번호로 잘라 쓴다 — 공유하면 서로 덮어쓴다. rowSplit(output_row): 전원이 같은 tile을
+    // 계산하므로 버퍼는 한 벌이고, 겹쳐 쓰지 않도록 계산과 저장을 출력 행으로 가른다.
     Value taskletId;
     if (lanes > 1)
       taskletId = top.create<upmem::TaskletIdOp>(loc, top.getIndexType());
     auto allocFor = [&](RankedTensorType t) -> Value {
       SmallVector<int64_t> shape(t.getShape());
-      if (lanes > 1)
+      if (lanes > 1 && !rowSplit)
         shape.insert(shape.begin(), lanes);
       Value all = top.create<memref::AllocOp>(
           loc, MemRefType::get(shape, t.getElementType(),
                                MemRefLayoutAttrInterface(), wram));
-      if (lanes == 1)
+      if (lanes == 1 || rowSplit)
         return all;
       SmallVector<OpFoldResult> offsets(shape.size(), top.getIndexAttr(0));
       offsets[0] = taskletId;
@@ -449,17 +893,80 @@ struct ConvertPIMToUPMEMPass
       return root ? buf.lookup(root) : Value();
     };
 
+    // 협력 모드의 출력 행 slice. 버퍼마다 한 번만 만들어 재사용한다. 행 수가 lane 수로
+    // 나누어떨어져야 slice가 정적 shape이 된다 — 아니면 진단을 낸다(자투리 행을 특정
+    // tasklet에 몰아주는 동적 shape은 codegen이 다루지 않는다).
+    llvm::DenseMap<Value, Value> rowSlices;
+    auto rowSliceOf = [&](Value bufv, Operation *at) -> Value {
+      Value &slot = rowSlices[bufv];
+      if (slot)
+        return slot;
+      auto t = dyn_cast<MemRefType>(bufv.getType());
+      if (!t) {
+        at->emitError("convert-pim-to-upmem: expected a WRAM tile buffer "
+                      "operand when splitting by output rows");
+        return Value();
+      }
+      int64_t rows = t.getShape()[0];
+      if (rows % lanes != 0) {
+        at->emitError("convert-pim-to-upmem: the tile has ")
+            << rows << " output rows, which " << lanes
+            << " cooperating tasklets cannot split evenly; pick a lane count "
+               "that divides the row count";
+        return Value();
+      }
+      int64_t rowsPerLane = rows / lanes;
+      Value offset0 = top.create<arith::MulIOp>(
+          loc, taskletId,
+          top.create<arith::ConstantIndexOp>(loc, rowsPerLane));
+      SmallVector<OpFoldResult> offsets(t.getRank(), top.getIndexAttr(0));
+      offsets[0] = offset0;
+      SmallVector<OpFoldResult> sizes, strides(t.getRank(), top.getIndexAttr(1));
+      for (int64_t s : t.getShape())
+        sizes.push_back(top.getIndexAttr(s));
+      sizes[0] = top.getIndexAttr(rowsPerLane);
+      SmallVector<int64_t> shape(t.getShape());
+      shape[0] = rowsPerLane;
+      MemRefType mine = memref::SubViewOp::inferRankReducedResultType(
+          shape, t, offsets, sizes, strides);
+      slot = top.create<memref::SubViewOp>(loc, mine, bufv, offsets, sizes,
+                                           strides);
+      return slot;
+    };
+
     // linalg를 memref 형태로 다시 만든다(결과가 없어지므로 op을 새로 만들어야 한다).
     // 옛 op은 아직 지우지 않는다 — 그 결과를 scf.yield가 아직 쓰고 있다.
     SmallVector<Operation *> oldCompute;
-    dev.walk([&](linalg::LinalgOp linalgOp) {
+    WalkResult computeRes = dev.walk([&](linalg::LinalgOp linalgOp) {
       Operation *op = linalgOp;
       if (op->getNumResults() != 1 || !bufferOf(op->getResult(0)))
-        return;
+        return WalkResult::advance();
       OpBuilder b(op);
       SmallVector<Value> operands;
       for (Value v : op->getOperands())
         operands.push_back(bufferOf(v) ? bufferOf(v) : v);
+      if (rowSplit) {
+        // 전원이 같은 tile을 계산하므로 각자 자기 출력 행만 맡는다. 어느 피연산자를
+        // 가르는지는 op마다 정해져 있다 — matmul은 A와 누산기의 행이 출력 행과 같은
+        // 축이고 B는 전 행이 필요하다. 그 밖의 계산은 가르는 규칙이 없으므로 진단이다.
+        if (isa<linalg::FillOp>(op)) {
+          if (!(operands[1] = rowSliceOf(operands[1], op)))
+            return WalkResult::interrupt();
+        } else if (isa<linalg::MatmulOp>(op)) {
+          if (!(operands[0] = rowSliceOf(operands[0], op)))
+            return WalkResult::interrupt();
+          if (!(operands[2] = rowSliceOf(operands[2], op)))
+            return WalkResult::interrupt();
+          // 공유 피연산자(B)의 적재가 전부 끝난 뒤에만 계산을 시작한다.
+          b.create<upmem::BarrierOp>(op->getLoc());
+        } else {
+          op->emitError(
+              "convert-pim-to-upmem: cooperating tasklets "
+              "(lane_axis_role = output_row) can split only matmul and fill "
+              "by output rows");
+          return WalkResult::interrupt();
+        }
+      }
       OperationState st(op->getLoc(), op->getName());
       st.addOperands(operands);
       st.addAttributes(op->getAttrs());
@@ -467,19 +974,36 @@ struct ConvertPIMToUPMEMPass
       for (Region &r : op->getRegions())
         r.cloneInto(st.addRegion(), map);
       b.create(st);
+      // 다음 반복의 적재가 공유 피연산자를 덮어쓰기 전에 전원의 소비가 끝나야 한다.
+      if (rowSplit && isa<linalg::MatmulOp>(op))
+        b.create<upmem::BarrierOp>(op->getLoc());
       oldCompute.push_back(op);
+      return WalkResult::advance();
     });
+    if (computeRes.wasInterrupted())
+      return failure();
 
-    // 전송을 DMA로 내린다.
+    // 전송을 DMA로 내린다. 협력 모드에서는 chunk를 tasklet이 나눠 옮긴다.
     SmallVector<Operation *> oldLoads, oldStores;
     dev.walk([&](Operation *op) {
       if (auto load = dyn_cast<pim::LoadOp>(op)) {
         buildDMA(load, load.getAccess(), bufferOf(load.getResult()), byAccess,
-                 pitchOf, /*isRead=*/true);
+                 pitchOf, /*isRead=*/true, rowSplit, taskletId, lanes);
         oldLoads.push_back(op);
       } else if (auto store = dyn_cast<pim::StoreOp>(op)) {
+        // 협력 모드의 저장도 chunk 분담이라 다른 tasklet의 행을 읽는다. 앞 barrier는
+        // 전 행의 계산이 끝났음을(matmul이 없는 적재→저장 커널의 경로도 여기서 닫힌다),
+        // 뒤 barrier는 다음 tile의 fill이 누산기를 덮기 전에 저장이 끝났음을 보장한다.
+        if (rowSplit) {
+          OpBuilder b(store);
+          b.create<upmem::BarrierOp>(store.getLoc());
+        }
         buildDMA(store, store.getAccess(), bufferOf(store.getValue()), byAccess,
-                 pitchOf, /*isRead=*/false);
+                 pitchOf, /*isRead=*/false, rowSplit, taskletId, lanes);
+        if (rowSplit) {
+          OpBuilder b(store);
+          b.create<upmem::BarrierOp>(store.getLoc());
+        }
         oldStores.push_back(op);
       }
     });
@@ -525,7 +1049,9 @@ struct ConvertPIMToUPMEMPass
       }
     }
 
-    if (lanes > 1)
+    // whole_tile만 tile을 tasklet에 나눈다. 협력 모드는 전원이 같은 tile 순서를 돌며
+    // 안에서 행과 chunk를 나눴다.
+    if (lanes > 1 && !rowSplit)
       distributeTasklets(dev);
 
     // 옮겨 온 loop nest는 loop 경계와 fill 값 같은 상수를 host func 안의 것으로
@@ -639,7 +1165,7 @@ struct ConvertPIMToUPMEMPass
   template <typename PitchFn>
   void buildDMA(Operation *xfer, Value accessValue, Value wbuf,
                 const llvm::DenseMap<int64_t, Buffer> &byAccess, PitchFn pitchOf,
-                bool isRead) {
+                bool isRead, bool distribute, Value taskletId, int64_t lanes) {
     auto access = accessValue.getDefiningOp<pim::AccessOp>();
     const Buffer &info = byAccess.at(access.getId());
     ArrayRef<int64_t> tile = info.tile;
@@ -669,7 +1195,14 @@ struct ConvertPIMToUPMEMPass
     Value one = b.create<arith::ConstantIndexOp>(loc, 1);
     Value nchunks = b.create<arith::ConstantIndexOp>(loc, chunks);
 
-    auto chunkLoop = b.create<scf::ForOp>(loc, zero, nchunks, one);
+    // 협력 모드에서는 chunk를 tasklet 번호부터 tasklet 수만큼 건너뛰며 나눠 옮긴다.
+    // 서로 다른 chunk라 겹쳐 쓰지 않고, 적재/소비의 경계는 호출자가 barrier로 닫는다.
+    Value lb = zero, step = one;
+    if (distribute) {
+      lb = taskletId;
+      step = b.create<arith::ConstantIndexOp>(loc, lanes);
+    }
+    auto chunkLoop = b.create<scf::ForOp>(loc, lb, nchunks, step);
     OpBuilder rb(chunkLoop.getBody(), chunkLoop.getBody()->begin());
     Value c = chunkLoop.getInductionVar();
 
@@ -727,11 +1260,16 @@ struct ConvertPIMToUPMEMPass
     loop.erase();
   }
 
-  // 출력 하나: 전 device에서 회수 → 그룹마다 원본으로 되돌리기.
+  // 출력 하나: 전 device에서 회수 → 그룹마다 원본으로 되돌리기. 창에 매인 축의
+  // 회수량은 창 크기이고, 되돌릴 자리는 그 창의 round 만큼 밀린다. k 창이 있으면
+  // 회수한 것이 부분합이므로 unstage 가 첫 창(accRound == 0)은 대입, 그 뒤는
+  // 누산한다.
   LogicalResult buildOutput(OpBuilder &b, pim::PlaceOp place, Value set,
                             int64_t numUnits, ArrayAttr axes,
                             DenseI64ArrayAttr counts, FlatSymbolRefAttr mram,
-                            Operation *foreach, ArrayRef<int64_t> tile) {
+                            Operation *foreach, ArrayRef<int64_t> tile,
+                            ArrayRef<Window> windows, ArrayRef<int> dimWin,
+                            ArrayRef<Value> roundIVs, Value accRound) {
     Location loc = place.getLoc();
     unsigned rank = place.getCapacity().size();
     auto elem =
@@ -741,7 +1279,12 @@ struct ConvertPIMToUPMEMPass
     // 옮겨 만들 수 있다 — 못 옮기면 device마다 크기가 다르다는 뜻이라 회수가 성립하지 않는다.
     IRMapping empty;
     SmallVector<Value> capacity;
-    for (Value c : place.getCapacity()) {
+    for (auto [d, c] : llvm::enumerate(place.getCapacity())) {
+      if (dimWin[d] >= 0) {
+        capacity.push_back(b.create<arith::ConstantIndexOp>(
+            loc, windows[dimWin[d]].tiles * tile[d]));
+        continue;
+      }
       Value v = cloneInto(b, c, empty, foreach);
       if (!v)
         return place->emitError("output capacity depends on the device "
@@ -772,6 +1315,7 @@ struct ConvertPIMToUPMEMPass
       map.map(unitBlock.getArgument(d + 1), gb->getArgument(d + 1));
 
     OpBuilder gbuilder(gb, gb->end());
+    Value zero;
     SmallVector<Value> start, size, strides;
     for (unsigned d = 0; d < rank; d++) {
       // 좌표 계산은 이미 foreach_unit 몸체로 옮겨졌으므로 그 범위를 기준으로 본다.
@@ -781,12 +1325,26 @@ struct ConvertPIMToUPMEMPass
       if (!o || !s || !t)
         return place->emitError(
             "output region cannot be rebuilt from group coordinates");
+      if (dimWin[d] >= 0) {
+        if (!zero)
+          zero = gbuilder.create<arith::ConstantIndexOp>(loc, 0);
+        Value winElems = gbuilder.create<arith::ConstantIndexOp>(
+            loc, windows[dimWin[d]].tiles * tile[d]);
+        Value shift = gbuilder.create<arith::MulIOp>(
+            loc, roundIVs[dimWin[d]], winElems);
+        o = gbuilder.create<arith::AddIOp>(loc, o, shift);
+        s = gbuilder.create<arith::MinSIOp>(
+            loc,
+            gbuilder.create<arith::MaxSIOp>(
+                loc, gbuilder.create<arith::SubIOp>(loc, s, shift), zero),
+            winElems);
+      }
       start.push_back(o);
       size.push_back(s);
       strides.push_back(t);
     }
     gbuilder.create<upmem::UnstageOp>(loc, gb->getArgument(0), place.getBuffer(),
-                                      start, size, strides, capacity,
+                                      start, size, strides, capacity, accRound,
                                       gbuilder.getDenseI64ArrayAttr(tile));
     return success();
   }

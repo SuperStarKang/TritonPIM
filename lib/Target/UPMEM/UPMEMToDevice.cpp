@@ -19,7 +19,7 @@ using namespace mlir::upmem_codegen;
 namespace {
 
 // DPU C 커널을 낸다. 유닛 하나가 하는 일이 그대로 main()이 된다.
-// tasklet 하나를 전제한다(여러 tasklet은 --convert-pim-to-upmem이 아직 나누지 않는다).
+// tasklet 배분과 동기화는 --convert-pim-to-upmem이 IR에 확정해 두었고, 여기서는 그대로 옮긴다.
 struct DeviceEmitter {
   CEmitter e;
   DeviceEmitter(raw_ostream &os) : e(os) {}
@@ -36,7 +36,16 @@ struct DeviceEmitter {
     // 정하므로 요청값이 아니라 이 값이어야 IR과 device 빌드가 어긋나지 않는다.
     if (auto lanes = dev->getAttrOfType<IntegerAttr>("upmem.lanes"))
       os() << "// pim.lanes = " << lanes.getInt() << "\n";
-    os() << "#include <stdint.h>\n#include <mram.h>\n#include <defs.h>\n\n";
+    // barrier는 협력 lane 모드에서만 나온다. BARRIER_INIT은 전역 선언이라 쓰지 않는
+    // 커널에 두면 WRAM만 차지하므로 op이 있을 때만 낸다.
+    bool hasBarrier = false;
+    dev.walk([&](upmem::BarrierOp) { hasBarrier = true; });
+    os() << "#include <stdint.h>\n#include <mram.h>\n#include <defs.h>\n";
+    if (hasBarrier)
+      os() << "#include <barrier.h>\n";
+    os() << "\n";
+    if (hasBarrier)
+      os() << "BARRIER_INIT(pim_barrier, NR_TASKLETS);\n\n";
 
     // host가 이름으로 채우는 것들.
     for (auto mram : module.getOps<upmem::MRAMOp>()) {
@@ -123,6 +132,11 @@ struct DeviceEmitter {
     if (isa<upmem::NumTaskletsOp>(op)) {
       e.indent(depth);
       os() << "int32_t " << e.name(op->getResult(0)) << " = NR_TASKLETS;\n";
+      return success();
+    }
+    if (isa<upmem::BarrierOp>(op)) {
+      e.indent(depth);
+      os() << "barrier_wait(&pim_barrier);\n";
       return success();
     }
 
