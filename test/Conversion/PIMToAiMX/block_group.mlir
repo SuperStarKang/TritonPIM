@@ -69,7 +69,18 @@ func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
 
   pim.device #pim.device_mapping<axes = ["output_row_tile", "output_column_tile"],
                                  partitions = [1, 1]>
-      extents [%ex, %ey] {
+      extents [%ex, %ey]
+      attributes {
+        pim.execution_tile = #pim.execution_tile<m = 32, n = 4096, k = 111616>,
+        pim.device_plan = #pim.device_plan<
+            available_devices = 1,
+            axes = ["output_row_tile", "output_column_tile"],
+            active_grid = array<i64: 1, 1>,
+            execution_tile = array<i64: 32, 4096, 111616>,
+            scheduling_order = ["output_column_tile", "output_row_tile"]>,
+        pim.reduction_plan = #pim.reduction_plan<
+            spatial_partials = "none", temporal_accumulation = "host",
+            final_accumulation = "none">} {
   ^bb0(%px: index, %py: index):
     %capx = arith.ceildivsi %ex, %c1 : index
     %startx = arith.muli %px, %capx : index

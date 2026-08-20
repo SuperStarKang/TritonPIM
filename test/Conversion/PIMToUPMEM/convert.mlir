@@ -1,6 +1,15 @@
 // Placed PIM IR이 UPMEM host/device 구조로 바뀌는지 확인한다.
 // bank 예산을 3072 바이트로 주어 MRAM 크기를 눈으로 확인한다 → 버퍼 3개에 1024씩.
 // RUN: triton-shared-opt --convert-pim-to-upmem %s | FileCheck %s
+// RUN: triton-shared-opt --convert-pim-to-upmem %s | FileCheck %s --check-prefix=PIM-CLEAN
+// RUN: triton-shared-opt --convert-pim-to-upmem %s | triton-shared-translate --upmem-to-host > /dev/null
+// RUN: triton-shared-opt --convert-pim-to-upmem %s | triton-shared-translate --upmem-to-device > /dev/null
+
+// PIM-CLEAN-LABEL: module
+// PIM-CLEAN-NOT: #pim.target_profile
+// PIM-CLEAN-NOT: #pim.group_execution
+// PIM-CLEAN-NOT: #pim.block_group
+// PIM-CLEAN-NOT: #pim.execution_tile
 
 // 버퍼마다 MRAM 심볼 하나. i8은 1024개, i32는 256개다.
 // CHECK: upmem.mram @matmul_mram_0 : memref<1024xi8, #upmem.space<mram>>
@@ -73,7 +82,12 @@ module attributes {pim.target_profile = #pim.target_profile<
 func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
                   %K: i32, %N: i32, %ex: index, %ey: index)
     attributes {pim.group_execution = #pim.group_execution<
-        lanes = 1, lane_axis_role = "whole_tile">} {
+        lanes = 1, lane_axis_role = "whole_tile">,
+        pim.block_group = #pim.block_group<
+            tiles = array<i64: 1, 1, 1>,
+            useful = array<i64: 8, 32, 32>,
+            phys = array<i64: 8, 32, 32>>,
+        pim.execution_tile = #pim.execution_tile<m = 8, n = 32, k = 32>} {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c2 = arith.constant 2 : index
@@ -87,7 +101,17 @@ func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
 
   pim.device #pim.device_mapping<axes = ["output_row_tile", "output_column_tile"],
                                  partitions = array<i64: 2, 4>>
-      extents [%ex, %ey] {
+      extents [%ex, %ey]
+      attributes {
+        pim.device_plan = #pim.device_plan<
+            available_devices = 8,
+            axes = ["output_row_tile", "output_column_tile"],
+            active_grid = array<i64: 2, 4>,
+            execution_tile = array<i64: 0, 0, 0>,
+            scheduling_order = ["output_column_tile", "output_row_tile"]>,
+        pim.reduction_plan = #pim.reduction_plan<
+            spatial_partials = "none", temporal_accumulation = "none",
+            final_accumulation = "none">} {
   ^bb0(%px: index, %py: index):
     // device 범위. 실제 pass가 내는 것과 같은 모양으로 손으로 썼다.
     %capx = arith.ceildivsi %ex, %c2 : index

@@ -1,11 +1,9 @@
-// Placed PIM IR이 AiMX level 1 IR로 바뀌고, 그 tile 모양에서 descriptor program이
-// 펼쳐지는지 확인한다. buffer 크기는 compile time 상수이고, 실제 tile 모양(k_t, n_t)은
-// 런타임 값이라 IR에 상수로 나타나지 않는다.
+// Placed PIM IR이 AiMX level 1 IR로 바뀌고, 고정 execution-tile 모양에서 descriptor
+// program이 한 번 펼쳐지는지 확인한다. tail의 유효 크기는 stage/unstage만 바꾼다.
 // RUN: triton-shared-opt --convert-pim-to-aimx %s | FileCheck %s
 // RUN: triton-shared-opt --convert-pim-to-aimx --aimx-lower-matmul %s | FileCheck %s --check-prefix=PROGRAM
 
-// 이 attribute는 **할당된 buffer의 모양**이다. --aimx-lower-matmul이 여기서 읽는 것은
-// batch 하나뿐이고, 나머지는 descriptor program의 인자로 런타임에 들어간다.
+// 이 attribute는 할당된 buffer와 재사용 descriptor chain의 고정 모양이다.
 // 계층은 Triton block → block group → execution tile이고 전부 공통 IR이 정했다 —
 // block group은 func의 #pim.block_group에서, batch는 profile의 execution_unit에서
 // 온다. BLOCK 32는 실행 단위 [8, 512, 32]의 배수라 padding이 없다.
@@ -101,7 +99,18 @@ func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
 
   pim.device #pim.device_mapping<axes = ["output_row_tile", "output_column_tile"],
                                  partitions = [1, 1]>
-      extents [%ex, %ey] {
+      extents [%ex, %ey]
+      attributes {
+        pim.execution_tile = #pim.execution_tile<m = 32, n = 4096, k = 103936>,
+        pim.device_plan = #pim.device_plan<
+            available_devices = 1,
+            axes = ["output_row_tile", "output_column_tile"],
+            active_grid = array<i64: 1, 1>,
+            execution_tile = array<i64: 32, 4096, 103936>,
+            scheduling_order = ["output_column_tile", "output_row_tile"]>,
+        pim.reduction_plan = #pim.reduction_plan<
+            spatial_partials = "none", temporal_accumulation = "host",
+            final_accumulation = "none">} {
   ^bb0(%px: index, %py: index):
     // PIM Device 가 하나라 device 몫이 곧 전체다. 실제 pass 가 내는 모양 그대로 손으로 썼다.
     %capx = arith.ceildivsi %ex, %c1 : index

@@ -13,7 +13,8 @@ module attributes {pim.target_profile = #pim.target_profile<
     usable_bank_capacity_bytes = 3072, usable_local_capacity_bytes = 49152>} {
 
 func.func @split_k(%A: memref<*xi8>, %tr: index, %tc: index, %tp: index,
-                   %tk: index, %kper: index, %lda: index) {
+                   %tk: index, %kper: index, %lda: index)
+    attributes {pim.execution_tile = #pim.execution_tile<m = 0, n = 0, k = 0>} {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c2 = arith.constant 2 : index

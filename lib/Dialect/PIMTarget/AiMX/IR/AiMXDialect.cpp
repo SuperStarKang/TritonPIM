@@ -108,10 +108,10 @@ static LogicalResult verifyPitched(Operation *op, size_t origin, size_t sizes,
                                    size_t strides, Type elem) {
   if (origin != sizes || origin != strides)
     return op->emitOpError("origin, sizes, and strides must have the same rank");
-  if (origin != kPitchedRank)
-    return op->emitOpError("the PIM DRAM layout is a pitched 2-D array, so "
-                           "origin/sizes/strides must have rank ")
-           << kPitchedRank;
+  if (origin < kPitchedRank)
+    return op->emitOpError(
+        "host regions need at least row and column axes; leading axes select "
+        "an independent 2-D PIM tile");
   if (!elem.isIntOrFloat())
     return op->emitOpError("element_type must be a scalar type");
   return success();
@@ -135,8 +135,9 @@ LogicalResult StageOp::verify() {
   if (failed(verifyPitched(*this, getOrigin().size(), getSizes().size(),
                            getStrides().size(), getElementType())))
     return failure();
-  if (getPadTo().size() != getOrigin().size())
-    return emitOpError("pad_to must have the same rank as origin");
+  if (getPadTo().size() != kPitchedRank)
+    return emitOpError("pad_to describes the 2-D PIM layout and must have rank ")
+           << kPitchedRank;
   if (failed(verifyGroup(*this, getGroupRowsAttr(), "group_rows")) ||
       failed(verifyGroup(*this, getGroupColsAttr(), "group_cols")))
     return failure();

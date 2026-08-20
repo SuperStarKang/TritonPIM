@@ -1,21 +1,13 @@
-// round(시간 창): 공통 IR 의 #pim.execution_tile 출력 상한(n=64원소 = tile 2개)이
-// 창이 된다. 창 축(output_column_tile)에 매인 B·C 는 round 마다 재전송·재수거되고,
-// 매이지 않은 A 는 첫 foreach 에서 한 번만 전송된다. launch 는 round 마다 1회이고
-// device 바이너리는 변하지 않는다(loop 상한이 host 변수).
-// RUN: triton-shared-opt --pim-form-execution-tiles=tile-n=64 --convert-pim-to-upmem %s | FileCheck %s
+// 공통 planner가 만든 scheduling round를 UPMEM lowering이 그대로 소비한다.
+// acquire는 round 밖에서 한 번, foreach/stage/launch/gather는 round마다 한 번이다.
+// RUN: triton-shared-opt --convert-pim-to-upmem %s | FileCheck %s
 
-// A(mram_0)만 첫 foreach 에서 전송된다. 창 축의 반복 횟수는 여기서 보내지 않고,
-// B(mram_1)의 전송도 여기 없다.
-// CHECK: upmem.foreach_unit
-// CHECK:   upmem.to_mram %{{.*}}, %{{.*}}, @matmul_mram_0
-// CHECK:   upmem.to_host_var %{{.*}}, %{{.*}}, @matmul_tiles_output_row_tile
-// CHECK-NOT: upmem.to_mram %{{.*}}, %{{.*}}, @matmul_mram_1
-
-// round 수 = ceildiv(창 축 배정량, 창 2). 창 foreach 가 이 round 의 창 축 반복 횟수와
-// B 창을 보낸 뒤, launch → C 창 회수 → 되돌리기가 loop 안에서 반복된다.
+// Device set은 round loop 밖에서 한 번 확보한다.
+// CHECK: %[[SET:.*]] = upmem.acquire 8, @matmul_device
 // CHECK: arith.ceildivsi
 // CHECK: scf.for %{{.*}} = %{{.*}} to
-// CHECK:   upmem.foreach_unit
+// CHECK:   upmem.foreach_unit %[[SET]]
+// CHECK:     upmem.to_mram %{{.*}}, %{{.*}}, @matmul_mram_0
 // CHECK:     upmem.to_host_var %{{.*}}, %{{.*}}, @matmul_tiles_output_column_tile
 // CHECK:     upmem.stage
 // CHECK:     upmem.to_mram %{{.*}}, %{{.*}}, @matmul_mram_1
@@ -45,16 +37,33 @@ func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
   %ldb = arith.index_cast %N : i32 to index
   %kk = arith.index_cast %K : i32 to index
 
+  %ety = arith.ceildivsi %ey, %c2 : index
+  %rounds = arith.ceildivsi %ety, %c4 : index
+  scf.for %round = %c0 to %rounds step %c1 {
   pim.device #pim.device_mapping<axes = ["output_row_tile", "output_column_tile"],
                                  partitions = array<i64: 2, 4>>
-      extents [%ex, %ey] {
+      extents [%ex, %ey]
+      attributes {
+        pim.execution_tile = #pim.execution_tile<m = 0, n = 64, k = 0>,
+        pim.device_plan = #pim.device_plan<
+            available_devices = 8,
+            axes = ["output_row_tile", "output_column_tile"],
+            active_grid = array<i64: 2, 4>,
+            execution_tile = array<i64: 0, 64, 0>,
+            scheduling_order = ["output_column_tile", "output_row_tile"]>,
+        pim.reduction_plan = #pim.reduction_plan<
+            spatial_partials = "none", temporal_accumulation = "none",
+            final_accumulation = "none">} {
   ^bb0(%px: index, %py: index):
     %capx = arith.ceildivsi %ex, %c2 : index
     %startx = arith.muli %px, %capx : index
     %tripsx = arith.minsi %capx, %capx : index
-    %capy = arith.ceildivsi %ey, %c4 : index
-    %starty = arith.muli %py, %capy : index
-    %tripsy = arith.minsi %capy, %capy : index
+    %roundBase = arith.muli %round, %c4 : index
+    %tileY = arith.addi %roundBase, %py : index
+    %starty = arith.muli %tileY, %c2 : index
+    %remainingY0 = arith.subi %ey, %starty : index
+    %remainingY = arith.maxsi %remainingY0, %c0 : index
+    %tripsy = arith.minsi %c2, %remainingY : index
     %tripsk = arith.ceildivsi %kk, %c32 : index
 
     %ar = arith.muli %startx, %c8 : index
@@ -69,7 +78,7 @@ func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
 
     %bc = arith.muli %starty, %c32 : index
     %bcn = arith.muli %tripsy, %c32 : index
-    %bcc = arith.muli %capy, %c32 : index
+    %bcc = arith.muli %c2, %c32 : index
     pim.place %B start[%c0, %bc] size[%akn, %bcn] capacity[%akn, %bcc]
         strides[%ldb, %c1]
         {direction = "in", access = 1 : i64,
@@ -109,6 +118,7 @@ func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
       } {pim.axis = "output_column_tile"}
     } {pim.axis = "output_row_tile"}
   }
+  } {pim.scheduling_axis = "output_column_tile"}
   return
 }
 }

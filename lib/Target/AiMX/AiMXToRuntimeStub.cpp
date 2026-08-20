@@ -444,9 +444,15 @@ struct StubEmitter {
   // 더한다 — 원소마다 곱셈 둘을 하면 gcc 가 접근 패턴을 gather 로 보고 벡터화를
   // 포기한다. -O3 의 stride-1 loop versioning 도 이 모양이라야 걸린다.
   std::string hostRow(ValueRange origin, ValueRange strides, StringRef i) {
-    return "(" + e.name(origin[0]) + " + " + i.str() + ") * " +
-           e.name(strides[0]) + " + " + e.name(origin[1]) + " * " +
-           e.name(strides[1]);
+    unsigned rank = origin.size();
+    std::string offset = "0";
+    for (unsigned d = 0; d + 2 < rank; ++d)
+      offset += " + " + e.name(origin[d]) + " * " + e.name(strides[d]);
+    offset += " + (" + e.name(origin[rank - 2]) + " + " + i.str() +
+              ") * " + e.name(strides[rank - 2]);
+    offset += " + " + e.name(origin[rank - 1]) + " * " +
+              e.name(strides[rank - 1]);
+    return offset;
   }
 
   LogicalResult emitStage(aimx::StageOp op, unsigned depth) {
@@ -468,7 +474,9 @@ struct StubEmitter {
                            "f32, or f16 to be staged");
     std::string i = e.temp("_i"), j = e.temp("_j"), sr = e.temp("_s"),
                 dr = e.temp("_d"), base = e.temp("_b");
-    std::string rows = e.name(op.getSizes()[0]), cols = e.name(op.getSizes()[1]);
+    unsigned rank = op.getSizes().size();
+    std::string rows = e.name(op.getSizes()[rank - 2]);
+    std::string cols = e.name(op.getSizes()[rank - 1]);
     std::string padRows = e.name(op.getPadTo()[0]), pitch = e.name(op.getPitch());
     // block group 주기 배치. 없는 축은 항등이고, 둘 다 없으면 아래에서 예전 코드를
     // 그대로 낸다 — padding 없는 조합의 생성 코드가 바뀌지 않게 한다.
@@ -524,7 +532,8 @@ struct StubEmitter {
            << "++)\n";
       e.indent(depth + 3);
       os() << dr << "[" << j << "] = "
-           << toBF16(srcElem, sr + "[" + j + " * " + e.name(op.getStrides()[1]) +
+           << toBF16(srcElem, sr + "[" + j + " * " +
+                                 e.name(op.getStrides()[rank - 1]) +
                                  "]")
            << ";\n";
       e.indent(depth + 1);
@@ -597,7 +606,7 @@ struct StubEmitter {
         e.indent(depth + 4);
         os() << dr << "[" << p0 << " + " << j << "] = "
              << toBF16(srcElem, sr + "[(" + j0 + " + " + j + ") * " +
-                                    e.name(op.getStrides()[1]) + "]")
+                                    e.name(op.getStrides()[rank - 1]) + "]")
              << ";\n";
         e.indent(depth + 3);
         os() << "memset(" << dr << " + " << p0 << " + " << w << ", 0, (size_t)("
@@ -616,7 +625,7 @@ struct StubEmitter {
         e.indent(depth + 3);
         os() << dr << "[" << j << "] = "
              << toBF16(srcElem, sr + "[" + j + " * " +
-                                    e.name(op.getStrides()[1]) + "]")
+                                    e.name(op.getStrides()[rank - 1]) + "]")
              << ";\n";
         e.indent(depth + 2);
         os() << "memset(" << dr << " + " << cols << ", 0, (size_t)(" << pitch
@@ -653,7 +662,9 @@ struct StubEmitter {
                            "f32, or f16 to be unstaged");
     std::string i = e.temp("_i"), j = e.temp("_j"), sr = e.temp("_s"),
                 dr = e.temp("_d");
-    std::string rows = e.name(op.getSizes()[0]), cols = e.name(op.getSizes()[1]);
+    unsigned rank = op.getSizes().size();
+    std::string rows = e.name(op.getSizes()[rank - 2]);
+    std::string cols = e.name(op.getSizes()[rank - 1]);
     std::string pitch = e.name(op.getPitch());
 
     // group_rows 가 있으면 buffer 의 행이 block group 주기로 놓여 있다 — 유효 행 i 가
@@ -698,7 +709,8 @@ struct StubEmitter {
       os() << dstTy << " *" << dr << " = " << e.name(op.getDst()) << " + "
            << hostRow(op.getOrigin(), op.getStrides(), i) << ";\n";
       if (!gCols) {
-        std::string lhs = dr + "[" + j + " * " + e.name(op.getStrides()[1]) + "]";
+        std::string lhs = dr + "[" + j + " * " +
+                          e.name(op.getStrides()[rank - 1]) + "]";
         std::string word = sr + "[" + j + "]";
         e.indent(d + 1);
         os() << "for (int64_t " << j << " = 0; " << j << " < " << cols << "; "
@@ -711,7 +723,8 @@ struct StubEmitter {
       } else {
         int64_t uc = gCols.asArrayRef()[0], pc = gCols.asArrayRef()[1];
         std::string lhs =
-            dr + "[(" + j0 + " + " + j + ") * " + e.name(op.getStrides()[1]) +
+            dr + "[(" + j0 + " + " + j + ") * " +
+            e.name(op.getStrides()[rank - 1]) +
             "]";
         std::string word = sr + "[" + p0 + " + " + j + "]";
         e.indent(d + 1);

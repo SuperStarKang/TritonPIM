@@ -11,7 +11,9 @@
 
 // AiMX 는 열부터 쪼갠다. 행을 쪼개면 B 가 device 수만큼 복제되기 때문이다.
 // COLUMN: partitions = [1, 2]
-// COLUMN-NOT: arith.maxsi
+// COLUMN: arith.constant 256 : index
+// COLUMN: arith.ceildivsi
+// COLUMN: arith.maxsi
 
 // 눈금을 주면 tile 이 아니라 group 단위로 나눈다. tile 하나가 16 원소이므로
 // 4096 원소 = 256 tile 이 단위다. 마지막 group 이 부분일 수 있어 extent 로 자른다.
@@ -20,6 +22,8 @@
 // GRAN: arith.ceildivsi
 // GRAN: arith.maxsi
 // GRAN: arith.minsi
+// GRAN: #pim.device_plan
+// GRAN: #pim.reduction_plan
 
 module attributes {pim.target_profile = #pim.target_profile<
     target = "aimx", number_of_pim_devices = 2,
@@ -28,7 +32,8 @@ module attributes {pim.target_profile = #pim.target_profile<
     usable_bank_capacity_bytes = 1073741824, usable_local_capacity_bytes = 0>} {
 
 // tile 하나가 몇 원소인지는 pim.access 의 sizes 에서 읽는다 — 이 커널은 16 이다.
-func.func @two_axes(%C: memref<*xf32>, %tx: index, %ty: index) {
+func.func @two_axes(%C: memref<*xf32>, %tx: index, %ty: index)
+    attributes {pim.execution_tile = #pim.execution_tile<m = 16, n = 4096, k = 0>} {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c16 = arith.constant 16 : index

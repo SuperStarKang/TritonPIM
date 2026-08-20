@@ -185,6 +185,7 @@ def _aimx_profile(o) -> TargetProfile:
         execution_unit=f"{batch},{4096 // batch},{256 // batch}",
         device_axis_priority="output_column_tile,output_row_tile",
         device_axis_granularity="output_column_tile:4096",
+        device_axis_partitions=o.device_axis_partitions,
     )
 
 
@@ -214,8 +215,8 @@ PIM_COMMON_PASSES = [
     "{profile}",                   # 기계 profile 부착. 여기부터 profile 을 읽는다
     "{form_block_groups}",         # 계층 2: 사용자 묶음(group-m/n/k) + 실행 단위 채움 → #pim.block_group
     "{plan_group_execution}",      # block group 실행 계획 — lane 수, lane 협력 방식
-    "{map_devices}",               # execution tile 을 PIM Device 에 균형 분배
-    "{form_execution_tiles}",      # execution tile 상한(원소)을 device 에 부착. 전부 0 이면 항등
+    "{form_execution_tiles}",      # large-memory 예산으로 execution tile shape 을 먼저 결정
+    "{map_devices}",               # execution tile grid 를 num_units 이하 active PIM Device grid 에 scheduling
     "--pim-place-data",            # 최종 region·replication·capacity materialize
     "--pim-verify",                # 공통 fail-fast 검증
     "-cse",

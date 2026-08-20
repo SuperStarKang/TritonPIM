@@ -164,9 +164,9 @@ def AiMX_TileGroupAttr : AttrDef<AiMX_Dialect, "TileGroup"> {
     `[batch, 4096/batch, 256/batch]`. padding 은
     `execution[i] - block[i] * group[i]` 로 유도된다 — 따로 싣지 않는다.
 
-    execution tile 은 이 block group 의 정수 배다: m 은 `#aimx.tiling` 의 `m_t` 로
-    compile time 상수이고, n·k 는 문제 크기가 정하는 런타임 값이라 여기 들어가지
-    않는다.
+    execution tile은 이 block group의 정수 배이고 `#aimx.tiling`의 m_t/n_t/k_t에
+    compile time 고정된다. tail round의 실제 유효 크기는 stage/unstage operand가
+    표현하며 descriptor chain 모양은 바뀌지 않는다.
   }];
   // DenseI64ArrayAttr 이어야 `[a, b, c]` 로 출력되고 다시 읽힌다. ArrayRefParameter 는
   // struct(params) 안에서 대괄호 없이 나가 round-trip 이 깨진다 — 도구 사이를 MLIR
@@ -222,7 +222,8 @@ def AiMX_AllocOp : AiMX_Op<"alloc"> {
   let hasVerifier = 1;
 }
 
-// 원본 버퍼의 strided 영역을 PIM DRAM 의 2차원 배열로 모은다.
+// 원본 버퍼의 strided 영역 마지막 두 축을 PIM DRAM의 2차원 배열로 모은다. 앞축은
+// split-K output plane처럼 독립된 2-D slice를 선택하며 PIM layout에는 들어가지 않는다.
 // upmem.stage 와 세 가지가 다르다.
 //   1. pitch 를 받는다. descriptor 의 stride 필드가 행 간격을 읽으므로 PIM DRAM 안의
 //      layout 이 pitch 로 규정된 2차원 배열이다 (UPMEM 은 tile-major 연속 배열).
@@ -257,7 +258,8 @@ def AiMX_StageOp : AiMX_Op<"stage", [AttrSizedOperandSegments]> {
   let hasVerifier = 1;
 }
 
-// aimx.stage 의 반대. PIM DRAM 의 2차원 배열을 원본 버퍼의 strided 영역으로 되돌린다.
+// aimx.stage의 반대. PIM DRAM의 2차원 배열을 원본 버퍼 마지막 두 축으로 되돌린다.
+// 앞축이 있으면 origin/stride가 선택한 독립 slice에 쓴다.
 // 읽는 범위는 sizes 이므로 padding 자리는 읽지 않는다.
 //
 // accumulate 는 런타임 값이고 0 이 아니면 대입 대신 덧셈이다. k 를 여러 execution tile 로

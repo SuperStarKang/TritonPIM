@@ -190,9 +190,12 @@ def PIMPlanGroupExecution : Pass<"pim-plan-group-execution", "mlir::ModuleOp"> {
 }
 
 def PIMMapDevices : Pass<"pim-map-devices", "mlir::ModuleOp"> {
-  let summary = "Distribute logical tiles over PIM Devices and build the pim.device region";
+  let summary = "Schedule execution tiles over PIM Devices and build the pim.device region";
   let description = [{
-    logical 축마다 device partition 수를 정하고 loop nest 를 `pim.device` region 으로 감싼다.
+    `#pim.execution_tile` 이 먼저 결정된 뒤 logical 축마다 round 하나에서
+    동시 사용할 PIM Device 수를 정하고 loop nest 를 `pim.device` region 으로
+    감싼다. execution tile 경계를 지키며 나눈 device 배정량이 상한보다
+    크면 target lowering 이 같은 device set 을 scheduling round 별로 재사용한다.
     explicit_k_partition 은 자동 인수분해에서는 나누지 않지만, device-axis-partitions 로
     명시하면 나눌 수 있다 — 그때 K 영역이 연속인지는 pim-place-data 가 판정한다.
     자동 인수분해는 device 수를 정사각에 가깝게 가른다 — tile 개수가 런타임이라
@@ -200,10 +203,12 @@ def PIMMapDevices : Pass<"pim-map-devices", "mlir::ModuleOp"> {
     다만 **어느 축이 싼지는 tile 개수와 무관하게 정해진다.** 축 하나를 쪼개면 그 축에
     불변인 입력이 device 수만큼 복제되기 때문이다(§pim-place-data 의 replicated_over).
     그 순서를 device-axis-priority 로 받는다.
-    각 loop 를 balanced block 으로 좁힌다. 몫과 나머지로 나누어 나머지 partition 이 하나씩
-    더 맡으므로 꼬리에서 device 가 놀지 않고, 축마다 연속 구간 하나가 유지된다.
-    device 안에서 좌표를 0 부터 세고, 전역 좌표는 몸체 첫머리에서 다시 만들어
-    `pim.device_origin` 표시를 단다.
+    전체 block-group grid 를 execution-tile grid 로 먼저 자른 뒤 각 축에 대해
+      execution_tile_index = round * active_devices + device_coordinate
+    로 배치한다. execution tile 수가 active device 수보다 많으면 같은 device set을
+    여러 round에서 재사용한다. 마지막 round의 빈 device는 0회 loop인 no-op이다.
+    device 안에서 좌표를 0부터 세고, 전역 좌표는 몸체 첫머리에서 다시 만들어
+    `pim.device_origin` 표시를 단다. round loop는 pim.device 바깥 host IR에 남는다.
   }];
   let options = [
     Option<"deviceAxisPriority", "device-axis-priority", "std::string", "\"\"",
@@ -232,14 +237,13 @@ def PIMMapDevices : Pass<"pim-map-devices", "mlir::ModuleOp"> {
 }
 
 def PIMFormExecutionTiles : Pass<"pim-form-execution-tiles", "mlir::ModuleOp"> {
-  let summary = "Attach the element-count caps of one device's resident share";
+  let summary = "Choose the resident execution-tile shape of one PIM Device";
   let description = [{
     execution tile(device 하나가 launch 1회에 상주시키는 몫)을
-    `#pim.execution_tile` 로 pim.device 에 부착한다 — 데이터 3계층의 셋째 층을
-    공통 IR 에서 완결하는 pass 다. 공간 분할(#pim.device_mapping)은
-    pim-map-devices 가 이미 정했고, 이 상한은 시간(창) 분할의 근거가 된다:
-    target lowering 은 이 값을 읽기만 하고(UPMEM 의 창 반복, AiMX 의 buffer
-    크기), 배정이 상한 안이면 창은 하나로 퇴화한다.
+    `#pim.execution_tile` 로 func에 부착한다 — 데이터 3계층의 셋째 층을 공통 IR에서
+    결정하는 pass다. 이 pass가 먼저 실행되고 pim-map-devices가 전체 block-group
+    grid를 이 모양으로 자른 뒤 PIM Device에 scheduling한다. target lowering은
+    선택된 모양과 pim.place capacity를 소비할 뿐 전체 문제를 다시 분할하지 않는다.
 
     축마다 출처는 둘 중 하나다:
     1) 사용자 값(tile-m/n/k > 0) — 그대로 쓴다. 그 축의 group tile 원소수의
@@ -250,7 +254,8 @@ def PIMFormExecutionTiles : Pass<"pim-form-execution-tiles", "mlir::ModuleOp"> {
          m = block group 1개, n = target 기본 단위(spec 의 preferredNGroups —
          AiMX 는 한 device 폭), k = 남는 예산 전부 (footprint 가 k 에
          단조증가라 이분 탐색으로 "예산에 드는 최대"를 찾는다).
-       조건 밖이면 0 을 그대로 둔다 — 전부 0 이면 attr 없이 두는 항등이다.
+       explicit_k_partition 커널은 spatial/temporal reduction 정책이 필요하므로 자동
+       선택하지 않는다. 세 tile 값을 모두 명시하지 않으면 진단한다.
   }];
   let options = [
     Option<"tileM", "tile-m", "int64_t", "0",
@@ -258,10 +263,10 @@ def PIMFormExecutionTiles : Pass<"pim-form-execution-tiles", "mlir::ModuleOp"> {
     Option<"tileN", "tile-n", "int64_t", "0",
            "output_column_tile 방향 상한 (원소). 0 = 자동">,
     Option<"tileK", "tile-k", "int64_t", "0",
-           "k 방향 상한 (원소). 0 = 자동. explicit_k_partition 축이 있으면 그 "
-           "눈금이고(공간 분할이 소비), 없으면 reduction loop 에 붙는다 — 한 번에 "
-           "상주하는 k 구간의 상한을 target 이 자기 방식(k 창 + host 누산)으로 "
-           "소비한다.">,
+           "각 spatial K plane 내부 reduction 방향 상주 상한(원소). 0 = 자동. "
+           "explicit_k_partition은 독립된 spatial output 축이고 tile-k는 그 plane "
+           "내부의 temporal window다. 여러 window의 partial은 target lowering이 "
+           "같은 output plane에 host 누산한다.">,
   ];
   let constructor = "mlir::triton::createPIMFormExecutionTilesPass()";
   let dependentDialects = ["mlir::pim::PIMDialect"];
@@ -274,7 +279,8 @@ def PIMPlaceData : Pass<"pim-place-data", "mlir::ModuleOp"> {
     - start  = 축별 origin 을 이 device 의 첫 좌표에서 본 값
     - size   = (tile 수 - 1)·tile + 마지막 tile 의 valid. 경계 tile 이 원본 버퍼를
                넘지 않도록 실제 유효 범위까지 반영한 값이다.
-    - capacity = 배정량 × tile. device 불변이라 버퍼 크기가 여기서 나온다.
+    - capacity = execution tile 한 개의 고정 용량. scheduling round가 바뀌어도 같은
+                 PIM Device buffer를 재사용하므로 전체 문제 크기와 무관하다.
     입력이 어느 logical 축에 불변이면 그 축만 다른 device 들은 같은 데이터를 받으므로
     `replicated_over` 로 적는다. 끊기면 host staging 이 device 수만큼 부풀어 오른다.
   }];
@@ -289,6 +295,8 @@ def PIMVerify : Pass<"pim-verify", "mlir::ModuleOp"> {
     - origin 이 비어 있지 않고 rank 가 sizes 와 같다.
     - pad 가 0 이 아니면 진단(단계 1 은 pad = 0 만 지원).
     - device partition 의 곱이 PIM Device 개수를 넘지 않는다.
+    - `#pim.device_plan`, `#pim.execution_tile`, `#pim.reduction_plan`이 모두
+      존재하고 spatial K 축·temporal tile-k와 서로 일치한다.
     - lane 당 group 바이트 × lane 수가 usable_local_capacity_bytes 안이다(simd 와
       협력 모드는 × 없이 한 벌, 0 이면 생략, 미측정이면 진단).
     - 정적으로 아는 값끼리는 start·size·capacity 부등식을 직접 검사한다. 런타임 값이면

@@ -151,11 +151,15 @@ struct ConvertPIMToUPMEMPass
     for (pim::DeviceOp d : devices)
       convert(d);
 
-    // profile은 여기서 소비된다. 남겨 두면 target IR이 여전히 PIM을 가리키게 되고,
-    // 뒤 단계가 기계 값을 다시 읽을 수 있다는 오해를 만든다.
+    // 공통 PIM planning 속성은 여기서 모두 소비된다. 남겨 두면 target
+    // IR이 여전히 PIM dialect에 의존하고, UPMEM translator가 완전히 lowered된
+    // IR만 받는다는 경계가 깨진다.
     getOperation()->removeAttr("pim.target_profile");
-    getOperation().walk(
-        [](func::FuncOp f) { f->removeAttr("pim.group_execution"); });
+    getOperation().walk([](func::FuncOp f) {
+      f->removeAttr("pim.group_execution");
+      f->removeAttr("pim.block_group");
+      f->removeAttr("pim.execution_tile");
+    });
   }
 
   pim::TargetProfileAttr profile;
@@ -183,6 +187,25 @@ struct ConvertPIMToUPMEMPass
     MLIRContext *ctx = &getContext();
     Location loc = device.getLoc();
     Block *deviceBody = &device.getBody().front();
+
+    if (!device->getAttrOfType<pim::DevicePlanAttr>("pim.device_plan")) {
+      device->emitError(
+          "convert-pim-to-upmem: the device has no #pim.device_plan");
+      return signalPassFailure();
+    }
+    auto reduction =
+        device->getAttrOfType<pim::ReductionPlanAttr>("pim.reduction_plan");
+    if (!reduction) {
+      device->emitError(
+          "convert-pim-to-upmem: the device has no #pim.reduction_plan");
+      return signalPassFailure();
+    }
+    if (reduction.getTemporalAccumulation().getValue() != "none" &&
+        reduction.getTemporalAccumulation().getValue() != "host") {
+      device->emitError(
+          "convert-pim-to-upmem: only host temporal accumulation is supported");
+      return signalPassFailure();
+    }
 
     auto cores =
         func->getAttrOfType<pim::GroupExecutionAttr>("pim.group_execution");
@@ -236,14 +259,11 @@ struct ConvertPIMToUPMEMPass
     // 상한 안이면 창 수가 런타임에 1 로 퇴화해 반복이 없던 것과 같다.
     // host loop 순서는 n → k → m 이고, 각 place 는 자기가 매인 창 중 가장 안쪽
     // level 에서 창을 재전송한다 — B(k·n)는 k level, A(m·k)는 m level. k 상한이
-    // 있어도 explicit_k_partition 축이 있으면 공간 분할(SPLIT_K)이 소비하므로 창을
-    // 만들지 않는다.
+    // explicit_k_partition이 있어도 각 spatial plane 안의 reduction 범위가 tile-k보다
+    // 크면 temporal K window를 추가한다. temporal partial은 같은 output plane에 host
+    // 누산되고, 서로 다른 spatial plane의 최종 합산은 그 출력의 소비자가 수행한다.
     auto tiles =
         device->getAttrOfType<pim::ExecutionTileAttr>("pim.execution_tile");
-    bool hasExplicitK = false;
-    for (Attribute a : device.getMapping().getAxes())
-      if (cast<StringAttr>(a).getValue() == "explicit_k_partition")
-        hasExplicitK = true;
     // reduction loop: pim.axis 없이 access 의 origin 을 모는 loop, 하나일 때만.
     scf::ForOp kLoop;
     {
@@ -263,30 +283,13 @@ struct ConvertPIMToUPMEMPass
         kLoop = cast<scf::ForOp>(*reds.begin());
     }
 
-    SmallVector<Window> windows; // host loop 밖→안 순서: n, k, m
+    // M/N execution-tile round는 공통 pim-map-devices가 이미 pim.device 바깥에
+    // 만들었다. target lowering이 같은 축을 다시 windowing하면 각 execution tile을
+    // 전체 문제의 round 수만큼 중복 실행하게 된다. 여기에는 reduction loop 안에서만
+    // 생기는 temporal K window만 남긴다.
+    SmallVector<Window> windows;
     if (tiles) {
-      auto mappingWindow = [&](StringRef axisName,
-                               int64_t cap) -> LogicalResult {
-        if (cap <= 0)
-          return success();
-        int idx = -1;
-        for (auto [i, a] : llvm::enumerate(device.getMapping().getAxes()))
-          if (cast<StringAttr>(a).getValue() == axisName)
-            idx = i;
-        if (idx < 0)
-          return device->emitError(
-                     "convert-pim-to-upmem: the execution tile cap names ")
-                 << axisName << " but this kernel has no such axis";
-        Window w;
-        w.mappingIdx = idx;
-        w.cap = cap;
-        w.trips = axes[idx].trips;
-        windows.push_back(w);
-        return success();
-      };
-      if (failed(mappingWindow("output_column_tile", tiles.getN())))
-        return signalPassFailure();
-      if (tiles.getK() > 0 && !hasExplicitK) {
+      if (tiles.getK() > 0) {
         if (!kLoop) {
           device->emitError(
               "convert-pim-to-upmem: the execution tile has a k cap but the "
@@ -300,8 +303,6 @@ struct ConvertPIMToUPMEMPass
         w.trips = kLoop.getUpperBound();
         windows.push_back(w);
       }
-      if (failed(mappingWindow("output_row_tile", tiles.getM())))
-        return signalPassFailure();
     }
 
     // 각 place 가 어느 창의 어느 buffer 축에 매였는가. 출력 축 창은 영역 식이 그 축
@@ -523,10 +524,19 @@ struct ConvertPIMToUPMEMPass
 
     // ── host: func 몸체를 UPMEM 호출로 바꾼다 ──────────────────────────────
     func->setAttr("upmem.host_threads", mb.getI64IntegerAttr(hostThreads));
+    // 같은 PIM Device set은 모든 scheduling round에서 재사용한다. acquire를 공통
+    // scheduling loop 바깥에 두고, round 안에는 stage/launch/gather만 남긴다.
+    Operation *scheduleRoot = device;
+    while (auto round = dyn_cast_or_null<scf::ForOp>(scheduleRoot->getParentOp())) {
+      if (!round->hasAttr("pim.scheduling_axis"))
+        break;
+      scheduleRoot = round;
+    }
+    OpBuilder setup(scheduleRoot);
+    Value set = setup.create<upmem::AcquireOp>(
+        loc, upmem::SetType::get(ctx), setup.getI64IntegerAttr(numUnits),
+        FlatSymbolRefAttr::get(devName));
     OpBuilder hb(device);
-    Value set = hb.create<upmem::AcquireOp>(loc, upmem::SetType::get(ctx),
-                                            hb.getI64IntegerAttr(numUnits),
-                                            FlatSymbolRefAttr::get(devName));
 
     ArrayAttr axisNames = device.getMapping().getAxes();
     auto counts =

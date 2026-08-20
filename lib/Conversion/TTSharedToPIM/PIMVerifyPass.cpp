@@ -83,6 +83,42 @@ struct PIMVerifyPass
 
   LogicalResult verifyDevice(pim::DeviceOp device,
                              pim::TargetProfileAttr profile) {
+    auto plan =
+        device->getAttrOfType<pim::DevicePlanAttr>("pim.device_plan");
+    if (!plan)
+      return device->emitError(
+          "pim-verify: every pim.device needs #pim.device_plan");
+    auto execution =
+        device->getAttrOfType<pim::ExecutionTileAttr>("pim.execution_tile");
+    if (!execution)
+      return device->emitError(
+          "pim-verify: every pim.device needs #pim.execution_tile");
+    auto reduction =
+        device->getAttrOfType<pim::ReductionPlanAttr>("pim.reduction_plan");
+    if (!reduction)
+      return device->emitError(
+          "pim-verify: every pim.device needs #pim.reduction_plan");
+    ArrayRef<int64_t> tile = plan.getExecutionTile().asArrayRef();
+    if (tile.size() != 3 || tile[0] != execution.getM() ||
+        tile[1] != execution.getN() || tile[2] != execution.getK())
+      return device->emitError(
+          "pim-verify: device plan and execution tile disagree");
+
+    bool hasSpatialK = llvm::any_of(
+        device.getMapping().getAxes(), [](Attribute axis) {
+          return cast<StringAttr>(axis).getValue() == "explicit_k_partition";
+        });
+    if (hasSpatialK !=
+        (reduction.getSpatialPartials().getValue() ==
+         "separate_output_planes"))
+      return device->emitError(
+          "pim-verify: reduction plan spatial_partials disagrees with the "
+          "explicit_k_partition axis");
+    if (execution.getK() > 0 &&
+        reduction.getTemporalAccumulation().getValue() != "host")
+      return device->emitError(
+          "pim-verify: a finite tile-k requires host temporal accumulation");
+
     int64_t used = 1;
     for (int64_t p : device.getMapping().getPartitions().asArrayRef())
       used *= p;
