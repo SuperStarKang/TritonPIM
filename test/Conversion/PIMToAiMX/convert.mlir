@@ -2,13 +2,22 @@
 // program이 한 번 펼쳐지는지 확인한다. tail의 유효 크기는 stage/unstage만 바꾼다.
 // RUN: triton-shared-opt --convert-pim-to-aimx %s | FileCheck %s
 // RUN: triton-shared-opt --convert-pim-to-aimx --aimx-lower-matmul %s | FileCheck %s --check-prefix=PROGRAM
+// RUN: triton-shared-opt --convert-pim-to-aimx --aimx-lower-matmul %s | FileCheck %s --check-prefix=PIM-CLEAN
+// RUN: triton-shared-opt --convert-pim-to-aimx --aimx-lower-matmul %s | triton-shared-translate --aimx-to-runtime-stub > /dev/null
+// RUN: triton-shared-opt --convert-pim-to-aimx --aimx-lower-matmul %s | triton-shared-translate --aimx-to-descriptors > /dev/null
+
+// PIM-CLEAN-LABEL: module
+// PIM-CLEAN-NOT: #pim.target_profile
+// PIM-CLEAN-NOT: #pim.group_execution
+// PIM-CLEAN-NOT: #pim.block_group
+// PIM-CLEAN-NOT: #pim.execution_tile
 
 // 이 attribute는 할당된 buffer와 재사용 descriptor chain의 고정 모양이다.
 // 계층은 Triton block → block group → execution tile이고 전부 공통 IR이 정했다 —
 // block group은 func의 #pim.block_group에서, batch는 profile의 execution_unit에서
 // 온다. BLOCK 32는 실행 단위 [8, 512, 32]의 배수라 padding이 없다.
-// 상한(#pim.execution_tile)이 없으므로 m은 group 하나(32), n은 한 device 폭(4096),
-// k는 남는 예산 전부다: 1 GiB에서 k_max = 103936 (kUnit 256의 배수), padded_k = 106496.
+// 공통 pass가 자동 선택한 execution tile은 m group 하나(32), n 한 device 폭(4096),
+// k 남는 예산 전부다: 1 GiB에서 k_max = 103936 (kUnit 256의 배수), padded_k = 106496.
 // CHECK-LABEL: func.func @matmul
 // CHECK-SAME:    aimx.tile_group = #aimx.tile_group<block = [32, 32, 32], group = [1, 16, 1], execution = [32, 512, 32]>
 // CHECK-SAME:    aimx.tiling = #aimx.tiling<batch = 8, m_t = 32, k_t = 103936, n_t = 4096, padded_k = 106496, padded_n = 4096, transposed = false>
@@ -88,7 +97,9 @@ func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
         pim.block_group = #pim.block_group<
             tiles = array<i64: 1, 16, 1>,
             useful = array<i64: 32, 512, 32>,
-            phys = array<i64: 32, 512, 32>>} {
+            phys = array<i64: 32, 512, 32>>,
+        pim.execution_tile = #pim.execution_tile<
+            m = 32, n = 4096, k = 103936>} {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c32 = arith.constant 32 : index

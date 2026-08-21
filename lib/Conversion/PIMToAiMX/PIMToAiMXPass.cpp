@@ -88,13 +88,14 @@ struct ConvertPIMToAiMXPass
       if (failed(convert(d)))
         return signalPassFailure();
 
-    // profile·group_execution·block_group 은 여기서 소비된다. 남겨 두면 target IR 이
-    // 여전히 PIM 을 가리키게 되고, PIM dialect 을 모르는 translate 도구가 파싱에서
-    // 멈춘다.
+    // 공통 PIM planning 속성은 여기서 모두 소비된다. 남겨 두면 target
+    // IR이 여전히 PIM dialect에 의존하고, AiMX translator가 완전히 lowered된
+    // IR만 받는다는 경계가 깨진다.
     getOperation()->removeAttr("pim.target_profile");
     getOperation().walk([](func::FuncOp f) {
       f->removeAttr("pim.group_execution");
       f->removeAttr("pim.block_group");
+      f->removeAttr("pim.execution_tile");
     });
   }
 
