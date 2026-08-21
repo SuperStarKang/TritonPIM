@@ -444,9 +444,15 @@ struct StubEmitter {
   // 더한다 — 원소마다 곱셈 둘을 하면 gcc 가 접근 패턴을 gather 로 보고 벡터화를
   // 포기한다. -O3 의 stride-1 loop versioning 도 이 모양이라야 걸린다.
   std::string hostRow(ValueRange origin, ValueRange strides, StringRef i) {
-    return "(" + e.name(origin[0]) + " + " + i.str() + ") * " +
-           e.name(strides[0]) + " + " + e.name(origin[1]) + " * " +
-           e.name(strides[1]);
+    unsigned rank = origin.size();
+    std::string offset = "0";
+    for (unsigned d = 0; d + 2 < rank; ++d)
+      offset += " + " + e.name(origin[d]) + " * " + e.name(strides[d]);
+    offset += " + (" + e.name(origin[rank - 2]) + " + " + i.str() +
+              ") * " + e.name(strides[rank - 2]);
+    offset += " + " + e.name(origin[rank - 1]) + " * " +
+              e.name(strides[rank - 1]);
+    return offset;
   }
 
   LogicalResult emitStage(aimx::StageOp op, unsigned depth) {
@@ -468,8 +474,14 @@ struct StubEmitter {
                            "f32, or f16 to be staged");
     std::string i = e.temp("_i"), j = e.temp("_j"), sr = e.temp("_s"),
                 dr = e.temp("_d"), base = e.temp("_b");
-    std::string rows = e.name(op.getSizes()[0]), cols = e.name(op.getSizes()[1]);
+    unsigned rank = op.getSizes().size();
+    std::string rows = e.name(op.getSizes()[rank - 2]);
+    std::string cols = e.name(op.getSizes()[rank - 1]);
     std::string padRows = e.name(op.getPadTo()[0]), pitch = e.name(op.getPitch());
+    // block group 주기 배치. 없는 축은 항등이고, 둘 다 없으면 아래에서 예전 코드를
+    // 그대로 낸다 — padding 없는 조합의 생성 코드가 바뀌지 않게 한다.
+    DenseI64ArrayAttr gRows = op.getGroupRowsAttr();
+    DenseI64ArrayAttr gCols = op.getGroupColsAttr();
 
     e.indent(depth);
     os() << "{  // aimx.stage\n";
@@ -481,49 +493,147 @@ struct StubEmitter {
          << bytes << "u <= (size_t)" << b.bytes
          << "ull, \"the problem does not fit the PIM DRAM buffer "
          << "chosen at compile time — raise tile-k or tile-n\");\n";
-    // 아래 두 memset 의 길이가 여기서 음수가 아님을 확정한다. size_t 로 계산하므로
-    // 어긋나면 조용히 buffer 밖을 지운다.
-    e.indent(depth + 1);
-    os() << "aimx_require(" << cols << " <= " << pitch << " && " << rows
-         << " <= " << padRows
-         << ", \"the staged tile is wider or taller than the padded shape\");\n";
-    e.indent(depth + 1);
-    os() << "uint16_t *" << base << " = (uint16_t*)" << b.host << ";\n";
-    // padding 은 성능이 아니라 정확성 요구사항이다 — 남는 자리의 0 이 누산에 그대로
-    // 더해진다. 그러나 **남는 자리만** 채우면 된다. buffer 전체를 memset 하면 B 는
-    // launch 마다 수십 MiB 를 한 번 더 훑는 셈이고, padding 이 없을 때는 그것이 전부
-    // 헛일이다. 아래 둘은 padding 이 없으면 길이 0 이다.
-    e.indent(depth + 1);
-    os() << "for (int64_t " << i << " = 0; " << i << " < " << rows << "; " << i
-         << "++)\n";
-    e.indent(depth + 2);
-    os() << "memset(" << base << " + " << i << " * " << pitch << " + " << cols
-         << ", 0, (size_t)(" << pitch << " - " << cols << ") * " << bytes
-         << ");\n";
-    e.indent(depth + 1);
-    os() << "memset(" << base << " + " << rows << " * " << pitch
-         << ", 0, (size_t)(" << padRows << " - " << rows << ") * (size_t)"
-         << pitch << " * " << bytes << ");\n";
-    // 행 주소를 밖으로 뺀다. 안쪽은 연속(또는 고정 stride) 접근이라 벡터화가 걸린다.
-    e.indent(depth + 1);
-    os() << "for (int64_t " << i << " = 0; " << i << " < " << rows << "; " << i
-         << "++) {\n";
-    e.indent(depth + 2);
-    os() << "const " << srcTy << " *" << sr << " = " << e.name(op.getSrc())
-         << " + " << hostRow(op.getOrigin(), op.getStrides(), i) << ";\n";
-    e.indent(depth + 2);
-    os() << "uint16_t *" << dr << " = " << base << " + " << i << " * " << pitch
-         << ";\n";
-    e.indent(depth + 2);
-    os() << "for (int64_t " << j << " = 0; " << j << " < " << cols << "; " << j
-         << "++)\n";
-    e.indent(depth + 3);
-    os() << dr << "[" << j << "] = "
-         << toBF16(srcElem, sr + "[" + j + " * " + e.name(op.getStrides()[1]) +
-                               "]")
-         << ";\n";
-    e.indent(depth + 1);
-    os() << "}\n";
+    if (!gRows && !gCols) {
+      // 아래 두 memset 의 길이가 여기서 음수가 아님을 확정한다. size_t 로 계산하므로
+      // 어긋나면 조용히 buffer 밖을 지운다.
+      e.indent(depth + 1);
+      os() << "aimx_require(" << cols << " <= " << pitch << " && " << rows
+           << " <= " << padRows
+           << ", \"the staged tile is wider or taller than the padded shape\");\n";
+      e.indent(depth + 1);
+      os() << "uint16_t *" << base << " = (uint16_t*)" << b.host << ";\n";
+      // padding 은 성능이 아니라 정확성 요구사항이다 — 남는 자리의 0 이 누산에 그대로
+      // 더해진다. 그러나 **남는 자리만** 채우면 된다. buffer 전체를 memset 하면 B 는
+      // launch 마다 수십 MiB 를 한 번 더 훑는 셈이고, padding 이 없을 때는 그것이 전부
+      // 헛일이다. 아래 둘은 padding 이 없으면 길이 0 이다.
+      e.indent(depth + 1);
+      os() << "for (int64_t " << i << " = 0; " << i << " < " << rows << "; " << i
+           << "++)\n";
+      e.indent(depth + 2);
+      os() << "memset(" << base << " + " << i << " * " << pitch << " + " << cols
+           << ", 0, (size_t)(" << pitch << " - " << cols << ") * " << bytes
+           << ");\n";
+      e.indent(depth + 1);
+      os() << "memset(" << base << " + " << rows << " * " << pitch
+           << ", 0, (size_t)(" << padRows << " - " << rows << ") * (size_t)"
+           << pitch << " * " << bytes << ");\n";
+      // 행 주소를 밖으로 뺀다. 안쪽은 연속(또는 고정 stride) 접근이라 벡터화가 걸린다.
+      e.indent(depth + 1);
+      os() << "for (int64_t " << i << " = 0; " << i << " < " << rows << "; " << i
+           << "++) {\n";
+      e.indent(depth + 2);
+      os() << "const " << srcTy << " *" << sr << " = " << e.name(op.getSrc())
+           << " + " << hostRow(op.getOrigin(), op.getStrides(), i) << ";\n";
+      e.indent(depth + 2);
+      os() << "uint16_t *" << dr << " = " << base << " + " << i << " * " << pitch
+           << ";\n";
+      e.indent(depth + 2);
+      os() << "for (int64_t " << j << " = 0; " << j << " < " << cols << "; " << j
+           << "++)\n";
+      e.indent(depth + 3);
+      os() << dr << "[" << j << "] = "
+           << toBF16(srcElem, sr + "[" + j + " * " +
+                                 e.name(op.getStrides()[rank - 1]) +
+                                 "]")
+           << ";\n";
+      e.indent(depth + 1);
+      os() << "}\n";
+    } else {
+      // block group 경로. 논리(유효) index 가 물리 칸 (idx/useful)*phys + idx%useful
+      // 로 가고, 각 phys 구간의 나머지는 0 이다 — Triton block 이 하드웨어 단위를 딱
+      // 채우지 못한 어긋남이 이 0 이 된다. sizes 는 유효 단위, pad_to·pitch 는 물리
+      // 단위다.
+      int64_t ur = gRows ? gRows.asArrayRef()[0] : 1;
+      int64_t pr = gRows ? gRows.asArrayRef()[1] : 1;
+      int64_t uc = gCols ? gCols.asArrayRef()[0] : 1;
+      int64_t pc = gCols ? gCols.asArrayRef()[1] : 1;
+      auto physOf = [](const std::string &v, int64_t u, int64_t p) {
+        return "((" + v + " + " + std::to_string(u - 1) + ") / " +
+               std::to_string(u) + ") * " + std::to_string(p);
+      };
+      std::string physRows = gRows ? physOf(rows, ur, pr) : rows;
+      std::string physCols = gCols ? physOf(cols, uc, pc) : cols;
+      e.indent(depth + 1);
+      os() << "aimx_require(" << physCols << " <= " << pitch << " && "
+           << physRows << " <= " << padRows
+           << ", \"the staged tile is wider or taller than the padded shape\");\n";
+      e.indent(depth + 1);
+      os() << "uint16_t *" << base << " = (uint16_t*)" << b.host << ";\n";
+      // 유효 행이 아닌 물리 행(행 group 의 pad 자리, 유효 범위 밖)은 통째로 0 이다.
+      // 그 0 이 누산에 그대로 더해지므로 정확성 요구사항이다.
+      std::string r = e.temp("_r");
+      e.indent(depth + 1);
+      os() << "for (int64_t " << r << " = 0; " << r << " < " << padRows << "; "
+           << r << "++)\n";
+      e.indent(depth + 2);
+      if (gRows)
+        os() << "if (" << r << " % " << pr << " >= " << ur << " || (" << r
+             << " / " << pr << ") * " << ur << " + " << r << " % " << pr
+             << " >= " << rows << ")\n";
+      else
+        os() << "if (" << r << " >= " << rows << ")\n";
+      e.indent(depth + 3);
+      os() << "memset(" << base << " + " << r << " * " << pitch
+           << ", 0, (size_t)" << pitch << " * " << bytes << ");\n";
+      e.indent(depth + 1);
+      os() << "for (int64_t " << i << " = 0; " << i << " < " << rows << "; " << i
+           << "++) {\n";
+      e.indent(depth + 2);
+      os() << "const " << srcTy << " *" << sr << " = " << e.name(op.getSrc())
+           << " + " << hostRow(op.getOrigin(), op.getStrides(), i) << ";\n";
+      std::string rowIdx =
+          gRows ? "((" + i + " / " + std::to_string(ur) + ") * " +
+                      std::to_string(pr) + " + " + i + " % " +
+                      std::to_string(ur) + ")"
+                : i;
+      e.indent(depth + 2);
+      os() << "uint16_t *" << dr << " = " << base << " + " << rowIdx << " * "
+           << pitch << ";\n";
+      if (gCols) {
+        // group 단위로 자른다 — 안쪽 loop 이 연속 접근이라야 벡터화가 걸린다.
+        std::string j0 = e.temp("_g"), p0 = e.temp("_p"), w = e.temp("_w");
+        e.indent(depth + 2);
+        os() << "int64_t " << p0 << " = 0;\n";
+        e.indent(depth + 2);
+        os() << "for (int64_t " << j0 << " = 0; " << j0 << " < " << cols << "; "
+             << j0 << " += " << uc << ") {\n";
+        e.indent(depth + 3);
+        os() << "int64_t " << w << " = " << cols << " - " << j0 << " < " << uc
+             << " ? " << cols << " - " << j0 << " : " << uc << ";\n";
+        e.indent(depth + 3);
+        os() << "for (int64_t " << j << " = 0; " << j << " < " << w << "; " << j
+             << "++)\n";
+        e.indent(depth + 4);
+        os() << dr << "[" << p0 << " + " << j << "] = "
+             << toBF16(srcElem, sr + "[(" + j0 + " + " + j + ") * " +
+                                    e.name(op.getStrides()[rank - 1]) + "]")
+             << ";\n";
+        e.indent(depth + 3);
+        os() << "memset(" << dr << " + " << p0 << " + " << w << ", 0, (size_t)("
+             << pc << " - " << w << ") * " << bytes << ");\n";
+        e.indent(depth + 3);
+        os() << p0 << " += " << pc << ";\n";
+        e.indent(depth + 2);
+        os() << "}\n";
+        e.indent(depth + 2);
+        os() << "memset(" << dr << " + " << p0 << ", 0, (size_t)(" << pitch
+             << " - " << p0 << ") * " << bytes << ");\n";
+      } else {
+        e.indent(depth + 2);
+        os() << "for (int64_t " << j << " = 0; " << j << " < " << cols << "; "
+             << j << "++)\n";
+        e.indent(depth + 3);
+        os() << dr << "[" << j << "] = "
+             << toBF16(srcElem, sr + "[" + j + " * " +
+                                    e.name(op.getStrides()[rank - 1]) + "]")
+             << ";\n";
+        e.indent(depth + 2);
+        os() << "memset(" << dr << " + " << cols << ", 0, (size_t)(" << pitch
+             << " - " << cols << ") * " << bytes << ");\n";
+      }
+      e.indent(depth + 1);
+      os() << "}\n";
+    }
     e.indent(depth + 1);
     os() << "datacopy_cpu2pim((void*)" << b.va << ", " << b.host
          << ", (int)((size_t)" << padRows << " * (size_t)" << pitch << " * "
@@ -552,41 +662,92 @@ struct StubEmitter {
                            "f32, or f16 to be unstaged");
     std::string i = e.temp("_i"), j = e.temp("_j"), sr = e.temp("_s"),
                 dr = e.temp("_d");
-    std::string rows = e.name(op.getSizes()[0]), cols = e.name(op.getSizes()[1]);
+    unsigned rank = op.getSizes().size();
+    std::string rows = e.name(op.getSizes()[rank - 2]);
+    std::string cols = e.name(op.getSizes()[rank - 1]);
     std::string pitch = e.name(op.getPitch());
+
+    // group_rows 가 있으면 buffer 의 행이 block group 주기로 놓여 있다 — 유효 행 i 가
+    // 물리 행 (i/useful)*phys + i%useful 이고, 각 phys 구간의 나머지 행은 padding 이라
+    // 읽지 않는다. 되읽는 길이도 물리 행 수다.
+    DenseI64ArrayAttr gRows = op.getGroupRowsAttr();
+    std::string physRows = rows;
+    std::string srcRow = i;
+    if (gRows) {
+      int64_t ur = gRows.asArrayRef()[0], pr = gRows.asArrayRef()[1];
+      physRows = "(((" + rows + " + " + std::to_string(ur - 1) + ") / " +
+                 std::to_string(ur) + ") * " + std::to_string(pr) + ")";
+      srcRow = "((" + i + " / " + std::to_string(ur) + ") * " +
+               std::to_string(pr) + " + " + i + " % " + std::to_string(ur) +
+               ")";
+    }
 
     e.indent(depth);
     os() << "{  // aimx.unstage\n";
     e.indent(depth + 1);
-    os() << "aimx_require((size_t)" << rows << " * (size_t)" << pitch << " * "
-         << bytes << "u <= (size_t)" << b.bytes
+    os() << "aimx_require((size_t)" << physRows << " * (size_t)" << pitch
+         << " * " << bytes << "u <= (size_t)" << b.bytes
          << "ull, \"unstage reads past the PIM DRAM buffer\");\n";
-    // 실제로 쓴 행까지만 되읽는다. padding 자리는 읽지 않는다.
+    // 실제로 쓴 행까지만 되읽는다. 행 group 밖의 padding 자리는 읽지 않는다.
     e.indent(depth + 1);
     os() << "datacopy_pim2cpu(" << b.host << ", (void*)" << b.va
-         << ", (int)((size_t)" << rows << " * (size_t)" << pitch << " * "
+         << ", (int)((size_t)" << physRows << " * (size_t)" << pitch << " * "
          << bytes << "), _fpga);\n";
-    // stage 와 같은 이유로 행 주소를 밖으로 뺀다.
-    std::string lhs = dr + "[" + j + " * " + e.name(op.getStrides()[1]) + "]";
-    std::string word = sr + "[" + j + "]";
+    // stage 와 같은 이유로 행 주소를 밖으로 뺀다. group_cols 가 있으면 block group
+    // 단위로 잘라 읽는다 — 유효 열 j 가 물리 칸 (j/useful)*phys + j%useful 에 있고,
+    // pad 열은 계산 결과 자체가 0 이라 건너뛴다.
+    DenseI64ArrayAttr gCols = op.getGroupColsAttr();
+    std::string j0 = e.temp("_g"), p0 = e.temp("_p"), w = e.temp("_w");
     auto scatter = [&](unsigned d, bool accumulate) {
       e.indent(d);
       os() << "for (int64_t " << i << " = 0; " << i << " < " << rows << "; " << i
            << "++) {\n";
       e.indent(d + 1);
       os() << "const uint16_t *" << sr << " = (const uint16_t*)" << b.host
-           << " + " << i << " * " << pitch << ";\n";
+           << " + " << srcRow << " * " << pitch << ";\n";
       e.indent(d + 1);
       os() << dstTy << " *" << dr << " = " << e.name(op.getDst()) << " + "
            << hostRow(op.getOrigin(), op.getStrides(), i) << ";\n";
-      e.indent(d + 1);
-      os() << "for (int64_t " << j << " = 0; " << j << " < " << cols << "; " << j
-           << "++)\n";
-      e.indent(d + 2);
-      os() << lhs << " = "
-           << (accumulate ? addBF16(dstElem, lhs, word)
-                          : fromBF16(dstElem, word))
-           << ";\n";
+      if (!gCols) {
+        std::string lhs = dr + "[" + j + " * " +
+                          e.name(op.getStrides()[rank - 1]) + "]";
+        std::string word = sr + "[" + j + "]";
+        e.indent(d + 1);
+        os() << "for (int64_t " << j << " = 0; " << j << " < " << cols << "; "
+             << j << "++)\n";
+        e.indent(d + 2);
+        os() << lhs << " = "
+             << (accumulate ? addBF16(dstElem, lhs, word)
+                            : fromBF16(dstElem, word))
+             << ";\n";
+      } else {
+        int64_t uc = gCols.asArrayRef()[0], pc = gCols.asArrayRef()[1];
+        std::string lhs =
+            dr + "[(" + j0 + " + " + j + ") * " +
+            e.name(op.getStrides()[rank - 1]) +
+            "]";
+        std::string word = sr + "[" + p0 + " + " + j + "]";
+        e.indent(d + 1);
+        os() << "int64_t " << p0 << " = 0;\n";
+        e.indent(d + 1);
+        os() << "for (int64_t " << j0 << " = 0; " << j0 << " < " << cols << "; "
+             << j0 << " += " << uc << ") {\n";
+        e.indent(d + 2);
+        os() << "int64_t " << w << " = " << cols << " - " << j0 << " < " << uc
+             << " ? " << cols << " - " << j0 << " : " << uc << ";\n";
+        e.indent(d + 2);
+        os() << "for (int64_t " << j << " = 0; " << j << " < " << w << "; " << j
+             << "++)\n";
+        e.indent(d + 3);
+        os() << lhs << " = "
+             << (accumulate ? addBF16(dstElem, lhs, word)
+                            : fromBF16(dstElem, word))
+             << ";\n";
+        e.indent(d + 2);
+        os() << p0 << " += " << pc << ";\n";
+        e.indent(d + 1);
+        os() << "}\n";
+      }
       e.indent(d);
       os() << "}\n";
     };

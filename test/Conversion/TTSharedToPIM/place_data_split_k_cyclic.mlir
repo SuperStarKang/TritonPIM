@@ -4,14 +4,14 @@
 // RUN: triton-shared-opt "--pim-map-devices=device-axis-partitions=explicit_k_partition:2" --pim-place-data -verify-diagnostics %s
 
 module attributes {pim.target_profile = #pim.target_profile<
-    target = "upmem", number_of_pim_devices = 8, pim_core_shape = array<i64: 1>,
+    target = "upmem", number_of_pim_devices = 8,
     number_of_parallel_lanes_per_pim_core = 1,
     parallel_execution_kind = "multithread",
-    requires_uniform_instruction_sequence = false,
     usable_bank_capacity_bytes = 3072, usable_local_capacity_bytes = 49152>} {
 
 func.func @split_k_cyclic(%A: memref<*xi8>, %tr: index, %tp: index, %tk: index,
-                          %lda: index) {
+                          %lda: index)
+    attributes {pim.execution_tile = #pim.execution_tile<m = 0, n = 0, k = 0>} {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c8 = arith.constant 8 : index

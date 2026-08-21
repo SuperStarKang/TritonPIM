@@ -20,6 +20,7 @@
 
 import os
 import sys
+import time
 import json
 import shutil
 import hashlib
@@ -293,6 +294,33 @@ class PIMUtils(object):
         )
 
 
+def _pim_do_bench(fn, warmup=1, rep=3, quantiles=None, return_mode="mean", **kwargs):
+    # autotune이 config를 고를 때 쓰는 측정 함수. triton.testing.do_bench를 쓸 수 없어서 둔다 —
+    # 그쪽은 driver의 get_device_interface / get_empty_cache_for_benchmark / clear_cache를 요구하는데
+    # 셋 다 GPU driver에만 있다. PIM launch는 동기 ctypes 호출이라 event도 synchronize도 필요 없다.
+    #
+    # warmup / rep은 GPU do_bench와 뜻이 다르다 — 그쪽은 밀리초 예산이고 호출 횟수를 estimate_ms로
+    # 역산하지만, PIM은 launch 한 번이 수백 ms~수 초라 그 역산이 무의미하다. 여기서는 횟수다.
+    #
+    # warmup은 선택이 아니다. config마다 첫 호출에 device.elf 컴파일과 (num_units가 바뀌었으면)
+    # DPU set 재예약이 섞여 들어온다.
+    #
+    # 재는 것은 launch 전체(staging + h2d + kernel + d2h + combine)다. tile 크기를 바꾸면 전송량도
+    # 함께 변하므로 pim_timing_ms의 kernel 단계만 떼어 재면 최소화 대상이 어긋난다.
+    from triton.testing import _summarize_statistics
+
+    for _ in range(warmup):
+        fn()
+
+    times = []
+    for _ in range(rep):
+        start = time.perf_counter()
+        fn()
+        times.append((time.perf_counter() - start) * 1e3)
+
+    return _summarize_statistics(times, quantiles, return_mode)
+
+
 class PIMDriver(DriverBase):
 
     def __init__(self):
@@ -301,14 +329,19 @@ class PIMDriver(DriverBase):
         self.launcher_cls = PIMLauncher
         self.binary_ext = "pimobj"
 
-    # PIMDriver는 자동 선택되지 않는다. triton.runtime.driver.set_active(PIMDriver())로 명시 활성화.
+    # 기본은 자동 선택되지 않는다 — triton.runtime.driver.set_active(PIMDriver())로 명시 활성화.
+    #
+    # 다만 인덕터 경로에서는 그 자리에 끼어들 수 없다. 생성된 커널의 device type이 "cpu"가
+    # 아니면 torch가 set_driver_to_gpu()를 부르는데(_inductor/runtime/triton_heuristics.py:855),
+    # 그 함수는 backends를 훑어 is_active()가 True인 것을 스스로 고르고 못 찾으면
+    # RuntimeError를 낸다(triton_helpers.py:53-68). 그래서 env로 자동 선택 대상이 되게 연다.
+    # env가 없으면 종전과 완전히 같다(False).
     @staticmethod
     def is_active():
-        return False
+        return os.environ.get("TRITON_PIM_ACTIVE", "0") == "1"
 
     def get_benchmarker(self):
-        from triton.testing import do_bench
-        return do_bench
+        return _pim_do_bench
 
     def get_device_capability(self):
         return ("cpu", 0)

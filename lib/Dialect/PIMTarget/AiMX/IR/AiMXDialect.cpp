@@ -108,12 +108,26 @@ static LogicalResult verifyPitched(Operation *op, size_t origin, size_t sizes,
                                    size_t strides, Type elem) {
   if (origin != sizes || origin != strides)
     return op->emitOpError("origin, sizes, and strides must have the same rank");
-  if (origin != kPitchedRank)
-    return op->emitOpError("the PIM DRAM layout is a pitched 2-D array, so "
-                           "origin/sizes/strides must have rank ")
-           << kPitchedRank;
+  if (origin < kPitchedRank)
+    return op->emitOpError(
+        "host regions need at least row and column axes; leading axes select "
+        "an independent 2-D PIM tile");
   if (!elem.isIntOrFloat())
     return op->emitOpError("element_type must be a scalar type");
+  return success();
+}
+
+// block group 주기 배치. 없는 축은 항등이므로 useful == phys 를 적는 것은 잉여다 —
+// 한 가지 철자만 허용해야 stub 이 attr 유무로 특수화할 수 있다.
+static LogicalResult verifyGroup(Operation *op, DenseI64ArrayAttr g,
+                                 StringRef name) {
+  if (!g)
+    return success();
+  ArrayRef<int64_t> v = g.asArrayRef();
+  if (v.size() != 2 || v[0] <= 0 || v[0] >= v[1])
+    return op->emitOpError(name)
+           << " must be [useful, phys] with 0 < useful < phys — a padding-free "
+              "axis carries no group attribute";
   return success();
 }
 
@@ -121,14 +135,22 @@ LogicalResult StageOp::verify() {
   if (failed(verifyPitched(*this, getOrigin().size(), getSizes().size(),
                            getStrides().size(), getElementType())))
     return failure();
-  if (getPadTo().size() != getOrigin().size())
-    return emitOpError("pad_to must have the same rank as origin");
+  if (getPadTo().size() != kPitchedRank)
+    return emitOpError("pad_to describes the 2-D PIM layout and must have rank ")
+           << kPitchedRank;
+  if (failed(verifyGroup(*this, getGroupRowsAttr(), "group_rows")) ||
+      failed(verifyGroup(*this, getGroupColsAttr(), "group_cols")))
+    return failure();
   return success();
 }
 
 LogicalResult UnstageOp::verify() {
-  return verifyPitched(*this, getOrigin().size(), getSizes().size(),
-                       getStrides().size(), getElementType());
+  if (failed(verifyPitched(*this, getOrigin().size(), getSizes().size(),
+                           getStrides().size(), getElementType())))
+    return failure();
+  if (failed(verifyGroup(*this, getGroupRowsAttr(), "group_rows")))
+    return failure();
+  return verifyGroup(*this, getGroupColsAttr(), "group_cols");
 }
 
 LogicalResult DescriptorProgramOp::verify() {

@@ -1,89 +1,142 @@
-# 3계층 tiling 계산기 — 사용자가 execution tile 크기(원소 단위)로 생각하고,
-# launch kwargs(group·분할·SPLIT_K)는 여기서 유도한다.
+# Common three-level PIM planner used at a kernel launch site.
 #
-#   BLOCK_M/N/K   Triton tile 눈금            (커널 constexpr)
-#   group_m/n/k   block group = WRAM 상주 단위 (tile 개수 단위)
-#   tile_m/n/k    execution tile = DPU 하나가 맡는 영역 (원소 단위)
+#   BLOCK_M/N/K   Triton block grain
+#   group_m/n/k   block group (local-memory or hardware execution unit)
+#   tile_m/n/k    execution tile resident in one abstract PIM Device
 #
-# 왜 backend 옵션이 아니라 launch 시점 helper 인가: device 분할 수는 IR 의 컴파일
-# 시점 상수인데, tile 크기 → 분할 수 변환에는 문제 크기(M, N, K)가 필요하고 그것은
-# 런타임 kernel 인자다. 문제 크기를 아는 곳은 launch 지점뿐이다. 값을 직접 계산해
-# 넣고 싶으면 이 helper 를 거치지 않고 device_axis_partitions/SPLIT_K 를 그대로
-# 주면 된다 — 반환값이 정확히 그 kwargs 다.
-#
-# tile_* 의 의미는 "execution tile 상한": A(tile_m×tile_k) + B(tile_k×tile_n) +
-# C(tile_m×tile_n)이 device 의 PIM DRAM 예산 안이어야 한다. round(시간 창) 도입
-# 전에는 상한 = 배정량(초과 시 컴파일·전송 시점 진단)이고, 도입 후에는 상한 = 창
-# 크기가 된다 — 그때 tile_* 은 두 target 공통의 컴파일 옵션으로 승격된다.
+# Execution tiles may outnumber ``num_units`` on every spatial axis. The common
+# lowering reuses the same PIM Device set over multiple scheduling rounds.
+# ``split_k`` is the number of independent spatial partial-output planes;
+# ``tile_k`` is the resident temporal K window inside each plane.
 
 
-def execution_tile(M, N, K, *,
-                   BLOCK_M, BLOCK_N, BLOCK_K,
-                   group_m=1, group_n=1, group_k=1,
-                   tile_m=None, tile_n=None, tile_k=None,
-                   split_k=None, num_units=2048):
-    """execution tile(원소 단위)로부터 kernel launch kwargs 를 만든다.
+def _ceil_div(value, divisor):
+    return (value + divisor - 1) // divisor
 
-    tile_* 을 주지 않은 축은 나누지 않는다(그 축 전체가 각 DPU 의 몫).
-    tile_k 를 주면 SPLIT_K 가 함께 유도되므로 split-K kernel(K 를 연속 구간으로
-    가르는 blocked 형태)이어야 하고, 반환 dict 의 SPLIT_K 를 커널 constexpr 로
-    받는다. split_k 를 따로 주면 한 DPU 가 여러 k 조각(plane)을 맡는다.
+
+def _active_device_grid(M, N, K, execution_m, execution_n,
+                        spatial_planes, num_units):
+    """Choose the active M/N/K PIM Device grid of one scheduling round."""
+    execution_tiles_m = _ceil_div(M, execution_m)
+    execution_tiles_n = _ceil_div(N, execution_n)
+
+    best_grid = None
+    best_score = None
+    max_k = min(spatial_planes, num_units)
+    work = execution_tiles_m * execution_tiles_n * spatial_planes
+    for devices_k in range(1, max_k + 1):
+        output_budget = num_units // devices_k
+        for devices_m in range(
+                1, min(execution_tiles_m, output_budget) + 1):
+            max_n = min(execution_tiles_n, output_budget // devices_m)
+            for devices_n in range(1, max_n + 1):
+                rounds_m = _ceil_div(execution_tiles_m, devices_m)
+                rounds_n = _ceil_div(execution_tiles_n, devices_n)
+                rounds_k = _ceil_div(spatial_planes, devices_k)
+                rounds = rounds_m * rounds_n * rounds_k
+                active = devices_m * devices_n * devices_k
+                idle = rounds * active - work
+
+                # M 분할은 B를, N 분할은 A를 복제한다. 값은 정확한 시간 예측이
+                # 아니라 round와 idle이 같은 후보 사이의 전송량 tie-breaker다.
+                transfer_proxy = (M * K * devices_n +
+                                  K * N * devices_m +
+                                  4 * M * N * devices_k)
+                score = (rounds, idle, transfer_proxy, -active,
+                         devices_k, devices_m, devices_n)
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_grid = (devices_m, devices_n, devices_k)
+
+    assert best_grid is not None, "PIM Device grid 후보가 없습니다"
+    return best_grid
+
+
+def device_plan(M, N, K, *,
+                BLOCK_M, BLOCK_N, BLOCK_K,
+                group_m=1, group_n=1, group_k=1,
+                tile_m=None, tile_n=None, tile_k=None,
+                split_k=None, num_units=2048):
+    """Build launch options for an execution-tile PIM Device schedule.
+
+    Each scheduling round assigns at most one M/N execution tile to an abstract
+    PIM Device. More M/N tiles create more rounds over the same Device set. A
+    ``split_k`` controls independent spatial output planes, while ``tile_k``
+    controls the resident temporal window accumulated inside each plane.
     """
-    gm, gn, gk = group_m * BLOCK_M, group_n * BLOCK_N, group_k * BLOCK_K
-    parts = {}
-
-    def output_axis(tile, unit, name, axis_name):
-        if tile is None:
-            return
-        # execution tile 경계는 group 경계 위에 있어야 balanced block 배분이 성립한다.
-        assert tile % unit == 0, (
-            f"{name}({tile})은 block group의 그 방향 크기({unit})의 배수여야 합니다")
-        extent = M if axis_name == "output_row_tile" else N
-        parts[axis_name] = -(-extent // tile)  # ceildiv — 마지막 DPU 는 덜 맡는다
-
-    output_axis(tile_m, gm, "tile_m", "output_row_tile")
-    output_axis(tile_n, gn, "tile_n", "output_column_tile")
-
-    opts = dict(group_m=group_m, group_n=group_n, group_k=group_k)
+    assert tile_m is not None and tile_n is not None, (
+        "device_plan은 구체적인 tile_m과 tile_n을 필요로 합니다")
+    assert num_units > 0, "num_units는 양수여야 합니다"
+    assert min(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K,
+               group_m, group_n, group_k, tile_m, tile_n) > 0, (
+        "문제 크기, BLOCK, group, tile_m, tile_n은 모두 양수여야 합니다")
     if tile_k is not None:
-        assert tile_k % gk == 0, (
-            f"tile_k({tile_k})는 block group의 k 방향 크기({gk})의 배수여야 합니다")
-        # k 조각(plane)은 균등해야 host 합산이 성립한다 — 출력 축과 달리 꼬리가 없다.
-        assert K % tile_k == 0, f"K({K})는 tile_k({tile_k})의 배수여야 합니다"
-        pk = K // tile_k
-        sk = split_k if split_k is not None else pk
-        assert sk % pk == 0, (
-            f"SPLIT_K({sk})는 k 분할 수({pk})의 배수여야 합니다 — plane 이 DPU 에 "
-            f"통째로 배분됩니다")
-        assert (K // sk) % BLOCK_K == 0, (
-            f"각 k 조각(K/SPLIT_K = {K // sk})이 BLOCK_K({BLOCK_K}) 격자에 맞아야 "
-            f"MRAM tile 주소가 성립합니다")
-        parts["explicit_k_partition"] = pk
-        opts["SPLIT_K"] = sk
-    elif split_k is not None:
-        assert (K // split_k) % BLOCK_K == 0, (
-            f"각 k 조각(K/SPLIT_K = {K // split_k})이 BLOCK_K({BLOCK_K}) 격자에 "
-            f"맞아야 합니다")
-        opts["SPLIT_K"] = split_k
+        assert tile_k > 0, "tile_k는 양수여야 합니다"
+    if split_k is not None:
+        assert split_k > 0, "split_k는 양수여야 합니다"
 
-    total = 1
-    for p in parts.values():
-        total *= p
-    assert total <= num_units, (
-        f"분할 곱({total})이 PIM Device 수({num_units})를 넘습니다 — tile_* 을 "
-        f"키우거나 축 하나를 나누지 마십시오")
+    group_size_m = group_m * BLOCK_M
+    group_size_n = group_n * BLOCK_N
+    group_size_k = group_k * BLOCK_K
+    assert tile_m % group_size_m == 0, (
+        f"tile_m({tile_m})은 M block group 크기({group_size_m})의 배수여야 "
+        "합니다")
+    assert tile_n % group_size_n == 0, (
+        f"tile_n({tile_n})은 N block group 크기({group_size_n})의 배수여야 "
+        "합니다")
 
-    if parts:
-        opts["device_axis_partitions"] = ",".join(
-            f"{a}:{p}" for a, p in parts.items())
-    # 상한 자체도 kwargs 로 나른다 — 공통 pass 가 #pim.execution_tile 로 IR 에 부착하고,
-    # upmem 은 출력 상한을 시간 창(round)으로 소비한다. 분할을 이 helper 로 유도했다면
-    # 배정 == 상한이라 창은 1개로 퇴화한다. 분할을 더 줄이면(축을 안 나누면) 같은 상한이
-    # 창 여러 개를 만든다.
-    if tile_m is not None:
-        opts["tile_m"] = tile_m
-    if tile_n is not None:
-        opts["tile_n"] = tile_n
+    options = {
+        "group_m": group_m,
+        "group_n": group_n,
+        "group_k": group_k,
+    }
+
+    spatial_planes = 1
     if tile_k is not None:
-        opts["tile_k"] = tile_k
-    return opts
+        assert tile_k % group_size_k == 0, (
+            f"tile_k({tile_k})는 K block group 크기({group_size_k})의 배수여야 "
+            "합니다")
+        # split_k를 생략한 기존 사용법은 tile_k 하나를 spatial plane 하나로 본다.
+        # 더 큰 plane 안에서 temporal window를 사용하려면 split_k를 명시한다.
+        if split_k is None:
+            assert K % tile_k == 0, (
+                f"split_k를 생략하면 K({K})는 tile_k({tile_k})의 배수여야 합니다")
+            spatial_planes = K // tile_k
+        else:
+            spatial_planes = split_k
+        assert K % spatial_planes == 0, (
+            f"K({K})는 SPLIT_K({spatial_planes})로 나누어떨어져야 합니다")
+        local_k = K // spatial_planes
+        assert local_k % BLOCK_K == 0, (
+            f"각 K plane({local_k})이 BLOCK_K({BLOCK_K}) 격자에 "
+            "맞아야 합니다")
+        assert tile_k <= local_k, (
+            f"tile_k({tile_k})는 각 spatial K plane({local_k})보다 클 수 없습니다")
+        options["SPLIT_K"] = spatial_planes
+    else:
+        assert split_k is None, (
+            "split_k를 사용하면 spatial execution tile을 나타내는 "
+            "tile_k도 지정해야 합니다")
+
+    devices_m, devices_n, devices_k = _active_device_grid(
+        M, N, K, tile_m, tile_n, spatial_planes, num_units)
+    parts = {
+        "output_row_tile": devices_m,
+        "output_column_tile": devices_n,
+    }
+    if tile_k is not None:
+        parts["explicit_k_partition"] = devices_k
+
+    options["device_axis_partitions"] = ",".join(
+        f"{axis}:{count}" for axis, count in parts.items())
+    options["num_units"] = num_units
+    options["tile_m"] = tile_m
+    options["tile_n"] = tile_n
+    if tile_k is not None:
+        options["tile_k"] = tile_k
+    return options
+
+
+def execution_tile(*args, **kwargs):
+    """Compatibility name for :func:`device_plan`."""
+    return device_plan(*args, **kwargs)

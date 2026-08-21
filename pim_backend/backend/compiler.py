@@ -132,75 +132,73 @@ def _aimx_device_count() -> int:
             "개수를 직접 주려면 num_units 옵션을 쓰십시오.")
     return n
 
-# target 마다 고정된 기계 값. 나머지는 PIMOptions 에서 온다.
-# capacity 는 (usable_bank_capacity_bytes, usable_local_capacity_bytes) 를 옵션에서 뽑는다.
-# 음수면 미측정이라는 뜻이라 profile 에 필드가 생기지 않고, 그 값을 필요로 하는 검사에
-# 도달하는 순간 진단이 된다. 0 은 그 저장소가 존재하지 않는다는 뜻이다.
-# target 고유 값은 전부 여기 한 곳에 있다 — 아래 코드에는 target 이름 분기가 없다.
-_TARGET_PROFILE = {
-    "upmem": {
-        "pim_core_shape": "1",
-        "parallel_execution_kind": "multithread",
-        "uniform_instruction_sequence": "false",
-        # PIM Device = DPU. 옵션이 0 이면 이 값을 물리 개수로 본다.
-        "devices": lambda o: o.num_units or 2048,
-        # DPU 는 수천 개라 정사각에 가까운 분할이 맞다. 우선순위를 두지 않는다.
-        "device_axis_priority": "",
-        # DPU 는 tile 하나를 통째로 맡으므로 분할 눈금이 따로 없다.
-        "device_axis_granularity": lambda o: "",
-        # lane(tasklet) 실행 형태. whole_tile 은 lane 이 tile 을 통째로 맡고 버퍼를
-        # lane 수만큼 복제한다. output_row 는 lane 들이 한 tile 을 출력 행으로 나눠
-        # 함께 계산한다 — 버퍼가 한 벌이라 tile 을 키워도 lane 수가 줄지 않는다.
-        "lane_mode": lambda o: o.lane_mode,
-        # block group: WRAM 상주 단위로 묶는 tile 수. 전부 1 이면 항등(기존 동작).
-        "block_group": lambda o: (
-            f"group-m={o.group_m} group-n={o.group_n} group-k={o.group_k}"
-            if o.group_m != 1 or o.group_n != 1 or o.group_k != 1 else ""),
-        # 축별 device 분할의 명시 지정. 빈 값이면 자동 인수분해(기존 동작). 형상이
-        # 작아 group 수 < DPU 수일 때 explicit_k_partition 을 나눠 점유율을 채운다.
-        "device_axis_partitions": lambda o: o.device_axis_partitions,
-        # execution tile 상한(원소). #pim.execution_tile 로 IR 에 부착되고, upmem 은
-        # 출력 상한(m 또는 n 하나)을 시간 창(round)으로 소비한다.
-        "execution_tile": lambda o: (
-            f"tile-m={o.tile_m} tile-n={o.tile_n} tile-k={o.tile_k}"
-            if o.tile_m or o.tile_n or o.tile_k else ""),
-        # 유닛=DPU, 큰 메모리=MRAM, 빠른 메모리=WRAM 이라 둘 다 옵션 값이 그대로 온다.
-        "capacity": lambda o: (o.unit_memory_bytes, o.local_memory_bytes),
-    },
-    "aimx": {
-        # PIM Device = FPGA 1개, 그 안에 PIM Core 1개다. lane 4096 개는 주소 decoding 이
-        # 정하는 고정된 갈래라 compiler 가 배정할 대상이 아니므로 topology 는 [1] 이다.
-        "pim_core_shape": "1",
-        "parallel_execution_kind": "simd",
-        "uniform_instruction_sequence": "true",
-        "lanes": 4096,      # NUM_BANKS * NUM_CHANNELS * ALU_SIZE
-        # PIM Device = FPGA 1 장. 옵션이 0 이면 이 머신에 실제로 있는 개수를 센다.
-        "devices": lambda o: o.num_units or _aimx_device_count(),
-        # device 축은 열부터 쪼갠다. 행을 쪼개면 B 가 device 수만큼 복제되는데 B 가 가장
-        # 큰 buffer 다. 열을 쪼개면 A 가 복제되지만 A 는 이미 n loop 때문에 device 안에서
-        # 여러 번 올라가므로 전체 전송량이 늘지 않는다 (설계 §6.1).
-        "device_axis_priority": "output_column_tile,output_row_tile",
-        # 그리고 그 축은 execution tile 눈금으로만 자른다. device 하나가 n 방향으로
-        # 소비하는 단위는 n_t = min(4096*ceil(N/4096), n_max) 라 언제나 4096 의 배수다.
-        # 그보다 잘게 자르면 마지막 tile 이 절반만 유효한 채로 온전히 실행된다. batch 와는
-        # 무관하다 — 출력 block 폭 4096/batch 는 execution tile **안**의 눈금이다.
-        "device_axis_granularity": lambda o: "output_column_tile:4096",
-        # simd 는 lane 협력이 하드웨어에 내장돼 있어 pim-plan-group-execution 이 옵션을 읽지
-        # 않는다. 빈 값이면 옵션을 붙이지 않는다.
-        "lane_mode": lambda o: "",
-        # AiMX 의 묶음은 target lowering 의 execution tile 이 담당한다(group_m 은
-        # --convert-pim-to-aimx 로 간다). 공통 block group pass 는 항등으로 지난다.
-        "block_group": lambda o: "",
-        # AiMX 는 priority/granularity 로 나눈다. 명시 분할은 쓰지 않는다.
-        "device_axis_partitions": lambda o: "",
-        # AiMX 의 execution tile 은 아직 --convert-pim-to-aimx 의 자기 옵션으로
-        # 소비한다(공통 attr 소비로의 전환은 보류). 공통 pass 는 항등으로 지난다.
-        "execution_tile": lambda o: "",
-        # core 별 local storage 는 없다(0). bank 예산은 선언 상수다 — pim_malloc 은
-        # 실패해도 NULL 을 돌려주지 않고 프로세스를 죽이므로 재 보는 방법이 없다.
-        "capacity": lambda o: (AIMX_DEVICE_DRAM_BYTES, 0),
-    },
-}
+# target 하나의 기계 값 — 전부 단순 숫자/문자열이다. 옵션에 의존하는 값(num_units,
+# batch, 예산)은 아래 _upmem_profile/_aimx_profile 이 계산해서 채운다.
+# bank/local 바이트가 음수면 미측정이라는 뜻이라 profile 에 필드가 생기지 않고, 그 값을
+# 필요로 하는 검사에 도달하는 순간 진단이 된다. 0 은 그 저장소가 존재하지 않는다는 뜻이다.
+@dataclass
+class TargetProfile:
+    parallel_execution_kind: str   # "multithread" | "simd"
+    devices: int                   # PIM Device 개수
+    lanes: int                     # PIM Core 하나의 lane 능력값
+    bank_bytes: int                # 큰 메모리 예산 (upmem: MRAM, aimx: PIM DRAM)
+    local_bytes: int               # 빠른 메모리 예산 (upmem: WRAM, aimx: 없음 = 0)
+    lane_mode: str = ""            # multithread 전용. 빈 값 = 필드 없음(simd)
+    execution_unit: str = ""       # "m,n,k". 빈 값 = 눈금 없는 기계(block group 자동)
+    device_axis_priority: str = ""
+    device_axis_granularity: str = ""
+    device_axis_partitions: str = ""
+
+
+def _upmem_profile(o) -> TargetProfile:
+    # PIM Device = DPU. 실행 단위 눈금이 없어(execution_unit 빈 값) block group 은
+    # WRAM 예산 자동 산출이 담당하고, lane_mode 가 output_row 일 때만 켜진다.
+    # DPU 는 수천 개라 자동 인수분해는 정사각에 가깝게 나눈다(priority 없음) — 형상이
+    # 작으면 device_axis_partitions 로 tile 수에 맞춰 직접 나누는 것이 옳다.
+    return TargetProfile(
+        parallel_execution_kind="multithread",
+        devices=o.num_units or 2048,
+        lanes=o.local_lanes,
+        bank_bytes=o.unit_memory_bytes,     # mram
+        local_bytes=o.local_memory_bytes,   # wram
+        lane_mode=o.lane_mode,
+        device_axis_partitions=o.device_axis_partitions,
+    )
+
+
+def _aimx_profile(o) -> TargetProfile:
+    # PIM Device = FPGA 1장. lane 4096(NUM_BANKS*NUM_CHANNELS*ALU_SIZE)은 주소
+    # decoding 이 정하는 고정된 갈래라 compiler 가 배정할 대상이 아니다(simd).
+    # 실행 단위 [batch, 4096/batch, 256/batch]가 block group 눈금이 된다.
+    # device 축은 열부터 4096 단위로 쪼갠다 — 행을 쪼개면 가장 큰 buffer 인 B 가
+    # device 수만큼 복제된다(설계 §6.1). bank 예산은 선언 상수(pim_malloc 은 실패해도
+    # NULL 대신 프로세스를 죽여 재 보는 방법이 없다)이고, bank_capacity_bytes 옵션은
+    # 공통 pass 의 k 상한 탐색과 --convert-pim-to-aimx 재검증이 같은 값을 보도록
+    # profile 에 싣는다.
+    batch = o.batch or 8
+    return TargetProfile(
+        parallel_execution_kind="simd",
+        devices=o.num_units or _aimx_device_count(),
+        lanes=4096,
+        bank_bytes=o.bank_capacity_bytes or AIMX_DEVICE_DRAM_BYTES,
+        local_bytes=0,
+        execution_unit=f"{batch},{4096 // batch},{256 // batch}",
+        device_axis_priority="output_column_tile,output_row_tile",
+        device_axis_granularity="output_column_tile:4096",
+        device_axis_partitions=o.device_axis_partitions,
+    )
+
+
+# target 고유 값은 전부 위 두 함수에 있다 — 아래 코드에는 target 이름 분기가 없다.
+_TARGET_PROFILE = {"upmem": _upmem_profile, "aimx": _aimx_profile}
+
+
+def _axis_options(prefix: str, m: int, n: int, k: int) -> str:
+    # group-m/n/k, tile-m/n/k 를 축별로 적는다. 0 = 자동 = pass 기본값이라 적지 않는다.
+    return " ".join(s for s in (
+        f"{prefix}-m={m}" if m else "",
+        f"{prefix}-n={n}" if n else "",
+        f"{prefix}-k={k}" if k else "") if s)
 
 
 # TTSharedIR → Placed PIM IR 파이프라인. 각 pass 를 한 줄씩 두어 실험 시 그 줄을 주석 처리해
@@ -214,11 +212,11 @@ PIM_COMMON_PASSES = [
     "--pim-build-logical-grid",    # source grid 를 logical tile loop nest 로
     "--pim-recover-access-origin", # access 의 축별 origin 을 logical 좌표로 채운다
     "--pim-form-compute",          # 누산기를 matmul 의 outs 로 통합
-    "{form_block_groups}",         # 이웃 tile 을 block group(상주 단위)으로 묶는다. 1,1 이면 항등
     "{profile}",                   # 기계 profile 부착. 여기부터 profile 을 읽는다
+    "{form_block_groups}",         # 계층 2: 사용자 묶음(group-m/n/k) + 실행 단위 채움 → #pim.block_group
     "{plan_group_execution}",      # block group 실행 계획 — lane 수, lane 협력 방식
-    "{map_devices}",               # execution tile 을 PIM Device 에 균형 분배
-    "{form_execution_tiles}",      # execution tile 상한(원소)을 device 에 부착. 전부 0 이면 항등
+    "{form_execution_tiles}",      # large-memory 예산으로 execution tile shape 을 먼저 결정
+    "{map_devices}",               # execution tile grid 를 num_units 이하 active PIM Device grid 에 scheduling
     "--pim-place-data",            # 최종 region·replication·capacity materialize
     "--pim-verify",                # 공통 fail-fast 검증
     "-cse",
@@ -226,34 +224,33 @@ PIM_COMMON_PASSES = [
 ]
 
 
-def _profile_pass(options) -> str:
-    t = _TARGET_PROFILE[options.pim_target]
-    bank, local = t["capacity"](options)
+def _profile_pass(target: str, t: TargetProfile) -> str:
+    # lane_mode 는 profile 필드다 — pim-form-block-groups(자동 group 예산 셈법)와
+    # pim-plan-group-execution(lane 수)이 같은 값을 읽어야 한다. simd 는 빈 값.
     return ("--pim-set-target-profile="
-            f"target={options.pim_target} "
-            f"number-of-pim-devices={t['devices'](options)} "
-            f"pim-core-shape={t['pim_core_shape']} "
-            f"number-of-parallel-lanes-per-pim-core={t.get('lanes', options.local_lanes)} "
-            f"parallel-execution-kind={t['parallel_execution_kind']} "
-            f"requires-uniform-instruction-sequence={t['uniform_instruction_sequence']} "
-            f"usable-bank-capacity-bytes={bank} "
-            f"usable-local-capacity-bytes={local}")
+            f"target={target} "
+            f"number-of-pim-devices={t.devices} "
+            f"number-of-parallel-lanes-per-pim-core={t.lanes} "
+            f"parallel-execution-kind={t.parallel_execution_kind} "
+            + (f"lane-mode={t.lane_mode} " if t.lane_mode else "")
+            + (f"execution-unit={t.execution_unit} " if t.execution_unit else "")
+            + f"usable-bank-capacity-bytes={t.bank_bytes} "
+            f"usable-local-capacity-bytes={t.local_bytes}")
 
 
 def _ttsharedir_to_pim_common(ttshared: str, options) -> str:
-    t = _TARGET_PROFILE[options.pim_target]
-    profile = _profile_pass(options)
-    opts = [("device-axis-priority", t["device_axis_priority"]),
-            ("device-axis-granularity", t["device_axis_granularity"](options)),
-            ("device-axis-partitions", t["device_axis_partitions"](options))]
+    t = _TARGET_PROFILE[options.pim_target](options)
+    profile = _profile_pass(options.pim_target, t)
+    opts = [("device-axis-priority", t.device_axis_priority),
+            ("device-axis-granularity", t.device_axis_granularity),
+            ("device-axis-partitions", t.device_axis_partitions)]
     given = " ".join(f"{k}={v}" for k, v in opts if v)
     map_devices = "--pim-map-devices" + (f"={given}" if given else "")
-    lane_mode = t["lane_mode"](options)
-    plan_group_execution = ("--pim-plan-group-execution"
-                            + (f"=lane-mode={lane_mode}" if lane_mode else ""))
-    bg = t["block_group"](options)
+    # lane 실행 형태는 profile 로 들어갔다(_profile_pass). 이 pass 는 옵션이 없다.
+    plan_group_execution = "--pim-plan-group-execution"
+    bg = _axis_options("group", options.group_m, options.group_n, options.group_k)
     form_block_groups = "--pim-form-block-groups" + (f"={bg}" if bg else "")
-    et = t["execution_tile"](options)
+    et = _axis_options("tile", options.tile_m, options.tile_n, options.tile_k)
     form_execution_tiles = "--pim-form-execution-tiles" + (f"={et}" if et else "")
     return _run_opt(ttshared, [p.format(profile=profile,
                                         form_block_groups=form_block_groups,
@@ -299,16 +296,14 @@ def _upmem_to_artifact(upmem_ir: str, metadata) -> bytes:
 # level 1이 tile마다 반복되고 level 2가 launch당 한 번만 펼쳐지기 때문이다 — 그 구분이
 # IR에 보이지 않으면 chain 재사용이 codegen이 몰래 하는 결정이 된다.
 def _aimx_passes(options):
-    # execution tile 은 Triton의 @triton.autotune으로 흔들 수 없다(그쪽은 BLOCK_*만 본다).
-    # 그래서 backend option으로 두고 여기서 pass에 그대로 넘긴다 — 설계 §12.4.
-    # tile 상한의 공통 기본값은 0(무제한)이므로, AiMX 의 검증된 기본을 여기서 채운다.
-    tile = (f"--convert-pim-to-aimx=group-m={options.group_m} "
-            f"tile-k={options.tile_k or 32768} "
-            f"tile-n={options.tile_n or 4096} batch={options.batch}")
+    # 3계층은 공통 pass 가 이미 IR 에 새겼다 — block group 은 #pim.block_group 으로,
+    # execution tile 상한은 #pim.execution_tile 로. batch 도 profile 의 execution_unit
+    # 에 들어 있다. 여기 남는 것은 예산 하나다.
+    tile = "--convert-pim-to-aimx"
     # 0이면 profile의 usable_bank_capacity_bytes를 쓴다. sweep이 실제 예산을 재려고
     # 이것만 흔드는 경우가 있어 따로 둔다.
     if options.bank_capacity_bytes:
-        tile += f" bank-capacity-bytes={options.bank_capacity_bytes}"
+        tile += f"=bank-capacity-bytes={options.bank_capacity_bytes}"
     return [tile, "--aimx-lower-matmul", "-cse", "-canonicalize"]
 
 
@@ -348,43 +343,45 @@ class PIMOptions:
     allowed_dot_input_precisions: Tuple[str] = ("ieee", )
     sanitize_overflow: bool = True
 
-    # --- PIM 고유 옵션 ---
-    # 이름을 target으로 두면 안 된다. Triton이 metadata를 {"target": GPUTarget, **options.__dict__}
-    # 로 만들어서 같은 이름의 옵션이 GPUTarget을 덮어쓰고, CompiledKernel이 그것을 다시 읽는다.
-    pim_target: str = None       # "upmem" | "aimx" — 누락 시 아래에서 즉시 에러 (fallback 없음)
+    pim_target: str = None       # "upmem" | "aimx"
 
-    # ── 공통 (모든 PIM target) — 데이터 3계층의 손잡이 ──────────────────────────
-    # 물리 PIM Device 개수. 0이면 target이 정한다 — upmem은 2048, aimx는 이 머신에
-    # 실제로 있는 FPGA 개수(/dev/pl_dma*)를 센다. split의 곱이 이보다 크면 컴파일 시점에 실패.
+    # #devices (#dpu | #fpga)
     num_units: int = 0
-    # ② block group: local 상주 단위로 묶는 tile 수. group_m × group_n 이 출력 묶음이고
+    # block group: local 상주 단위로 묶는 tile 수. group_m × group_n 이 출력 묶음이고
     # group_k 는 reduction strip(적재 한 번이 담는 K tile 수 — 누산기는 그대로다).
-    # 전부 1 이면 항등. aimx 에서 group_m 은 execution tile 의 m 을 tile 묶음 수로
-    # 표현하는 데도 쓰인다 — m_t = BLOCK_M × group_m.
-    group_m: int = 1
-    group_n: int = 1
-    group_k: int = 1
-    # ③ execution tile 상한 (원소 단위): device 하나가 한 번에 상주시키는 몫의 상한.
-    # A(tile_m×tile_k) + B(tile_k×tile_n) + C(tile_m×tile_n) 이 PIM DRAM 예산 안이어야
-    # 한다. 0 = 무제한. 공통 pass(--pim-form-execution-tiles)가 #pim.execution_tile 로
-    # IR 에 부착하고, upmem 은 출력 상한(m 또는 n 중 하나)을 시간 창(round)으로
-    # 소비한다 — 배정이 상한 안이면 창 1개로 퇴화한다. k 상한은 공간 분할(SPLIT_K)이
-    # 소비한다. 상한 → 분할 수 변환은 문제 크기(M,N,K)를 아는 launch helper
-    # (tiling.execution_tile)의 몫이다. aimx 는 아직 자기 pass 옵션으로 소비한다.
+    # 0 = 자동: upmem - 공통 pass 가 local(WRAM) 예산에 들어갈
+    # 때까지 m → n → k 번갈아 키우고(협력 모드에서만)
+    # aimx - 실행 단위 채움이 담당하므로 항등과 같다. 값을 주면 그대로 쓴다(1 = 항등).
+    # 두 target 모두 공통 pass(--pim-form-block-groups)가 IR 수준에서 묶는다 —
+    # 지나고 나면 target lowering 이 보는 "block" 이 곧 group 이다.
+    group_m: int = 0
+    group_n: int = 0
+    group_k: int = 0
+    # ③ execution tile: device 하나가 launch 1회에 상주시키는 몫 (원소 단위).
+    # 0 = 자동: 공통 pass(--pim-form-execution-tiles)가 m·n 은 기본 단위(m: block
+    # group 1개, n: target 기본 — aimx 는 한 device 폭 4096), k 는 남는 큰 메모리
+    # 예산 전부(target 이 등록한 footprint 로 이분 탐색)로 채워 #pim.execution_tile
+    # 에 구체값으로 부착한다. 값을 주면 그대로 쓴다(축의 group 원소수 배수여야 함).
+    # target lowering 은 읽기만 한다:
+    #   upmem  창(round) 반복 — 배정이 상한 안이면 창 1개. K 가 k 상한을 넘으면
+    #          k 창마다 부분합이 나와 host 가 누산한다(unstage accumulate).
+    #   aimx   상한이 담는 block group 수 × 물리 group 크기가 m_t·n_max·k_max.
+    #          k 는 host 누산 창이라 split-K kernel 이 필요 없다.
     tile_m: int = 0
     tile_n: int = 0
     tile_k: int = 0
-    # lane 실행 형태 (multithread target 전용, --pim-plan-group-execution lane-mode).
+    # lane 실행 형태 (multithread target 전용, profile 의 lane_mode 필드로 전달).
     # whole_tile: lane 이 서로 다른 tile 을 통째로(버퍼를 lane 수만큼 복제).
-    # output_row: lane 들이 한 tile 을 출력 행으로 나눠 협력(버퍼 한 벌) — 행 수가
-    #             lane 수로 나누어떨어져야 한다.
-    lane_mode: str = "whole_tile"
-    local_lanes: int = 1         # PIM Core 내부 병렬 lane 능력값. 실제 값은 lane 예산이 정한다.
+    # output_row: lane 들이 한 tile 을 출력 행으로 나눠 협력(버퍼 한 벌) — block
+    #             group 자동 산출(WRAM 예산 채움)이 켜지는 모드라 기본값이다.
+    #             lane 수는 공통 pass 가 행 수의 약수로 정합시킨다.
+    lane_mode: str = "output_row"
+    local_lanes: int = 16        # PIM Core 내부 병렬 lane 능력값. 실제 값은 공통 pass 가 정한다.
     # 유닛당 빠른 메모리(공통 이름 — upmem 은 WRAM). 물리 64 KB 에서 스택·런타임 몫을 뺀 값.
     local_memory_bytes: int = 48 * 1024
     # 유닛당 큰 메모리(공통 이름 — upmem 은 MRAM). target 이 버퍼 수로 나눈다. 물리 64 MB
     # 에서 DPU 런타임 몫을 뺀 값이라 물리 크기보다 작다.
-    unit_memory_bytes: int = 32 * 1024 * 1024
+    unit_memory_bytes: int = 60 * 1024 * 1024
     host_threads: int = 8        # host가 영역을 모으고 되돌릴 때 쓰는 스레드 수. 1이면 순차.
     # 파생 통로: 축별 device 분할 수 "<축>:<개수>,...". tile_* 에서 helper 가 계산해
     # 채우는 값이라 직접 쓰는 것은 디버깅·재현용이다. 빈 값이면 자동 인수분해.
@@ -398,9 +395,10 @@ class PIMOptions:
     # init_pim_drv()가 돌려준 개수와 대조해 어기면 즉시 멈춘다.
     base_fpga: int = 0
     # 출력 block 을 batch x (4096/batch)로 자르는 값, {1,2,4,8}만 legal — 이것이 곧
-    # arithmetic intensity 다. 0이면 pass가 Triton block 이 허락하는 최대값을 고른다.
-    # 고정값을 박으면 BLOCK_K=64 같은 흔한 값이 컴파일 오류가 되므로 기본값은 규칙이다.
-    batch: int = 0
+    # arithmetic intensity 다. 실행 단위 [batch, 4096/batch, 256/batch]가 여기서
+    # 나온다. BLOCK 이 이 눈금의 배수가 아니면 padding 이고, 배수면 padding 이 없다 —
+    # 공통 pass 가 remark 로 노는 비율을 알려 준다.
+    batch: int = 8
     # PIM DRAM 예산. 0이면 profile의 usable_bank_capacity_bytes를 쓴다.
     bank_capacity_bytes: int = 0
 
@@ -427,8 +425,28 @@ class PIMBackend(BaseBackend):
     def __init__(self, target: GPUTarget) -> None:
         super().__init__(target)
 
+    # 인덕터 경로에는 launch kwarg를 끼워 넣을 자리가 없다. triton.compile에 넘어가는 옵션은
+    # _create_compile_options(_inductor/runtime/triton_heuristics.py:804-812)가 만드는
+    # 화이트리스트(num_warps/num_stages/debug/sanitize_overflow)뿐이라, PIM 고유 옵션은
+    # 통로가 없다. 그래서 env를 통로로 하나 더 연다.
+    #
+    # fallback이 아니다 — env가 없으면 pim_target은 여전히 None이고 __post_init__이 그대로
+    # 터진다. 손으로 띄우는 경로(launch kwarg)가 있으면 그쪽이 이긴다(아래 update 순서).
+    _ENV_OPTIONS = {
+        "pim_target": ("PIM_TARGET", str),
+        "num_units": ("PIM_NUM_UNITS", int),
+        "local_lanes": ("PIM_LOCAL_LANES", int),
+        "local_memory_bytes": ("PIM_LOCAL_MEMORY_BYTES", int),
+        "unit_memory_bytes": ("PIM_UNIT_MEMORY_BYTES", int),
+        "host_threads": ("PIM_HOST_THREADS", int),
+    }
+
     def parse_options(self, opts) -> PIMOptions:
         args = {'arch': self.target.arch}
+        for field, (env, cast) in self._ENV_OPTIONS.items():
+            value = os.environ.get(env)
+            if value is not None:
+                args[field] = cast(value)
         args.update({k: opts[k] for k in PIMOptions.__dataclass_fields__.keys() if k in opts})
         return PIMOptions(**args)
 

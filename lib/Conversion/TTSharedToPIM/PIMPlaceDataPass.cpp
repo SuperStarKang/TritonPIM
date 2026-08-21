@@ -229,6 +229,11 @@ struct PIMPlaceDataPass
 
     ArrayRef<int64_t> partitions =
         device.getMapping().getPartitions().asArrayRef();
+    auto execution =
+        device->getAttrOfType<pim::ExecutionTileAttr>("pim.execution_tile");
+    if (!execution)
+      return device->emitError(
+          "pim-place-data: the device has no #pim.execution_tile");
     llvm::DenseMap<Operation *, LoopRange> ranges;
     IRMapping firstMap;
     unsigned axisIndex = 0;
@@ -250,17 +255,30 @@ struct PIMPlaceDataPass
                         b.create<arith::CeilDivSIOp>(
                             loc, b.create<arith::SubIOp>(loc, ub, lb), step));
 
-      // 축 loop의 배정량은 tile 개수를 partition 수로 올림 나눈 값이다. 나머지 loop는
-      // device가 전부 도므로 배정량이 실제 횟수와 같다.
+      // 축 loop의 MRAM capacity는 전체 문제를 device 수로 나눈 값이 아니라 execution
+      // tile 하나의 고정 크기다. 여러 scheduling round가 같은 buffer를 재사용하므로
+      // 마지막 round의 실제 trips가 작더라도 capacity는 변하지 않는다.
       r.capacityTiles = r.trips;
       r.axis = StringAttr();
       r.partitions = 1;
       if (auto name = l->getAttrOfType<StringAttr>("pim.axis")) {
         r.axis = name;
         r.partitions = partitions[axisIndex];
-        r.capacityTiles = b.create<arith::CeilDivSIOp>(
-            loc, device.getAxisExtents()[axisIndex],
-            b.create<arith::ConstantIndexOp>(loc, r.partitions));
+        StringRef axis = name.getValue();
+        int64_t cap = axis == "output_row_tile"      ? execution.getM()
+                      : axis == "output_column_tile" ? execution.getN()
+                      : axis == "explicit_k_partition" ? execution.getK()
+                                                         : 0;
+        int64_t perTile = pim::tileElementsAlong(l, loops);
+        int64_t capacityTiles = 1;
+        if (axis != "explicit_k_partition") {
+          if (cap <= 0 || perTile <= 0 || cap % perTile != 0)
+            return l->emitError("pim-place-data: execution tile capacity for ")
+                   << axis << " is not an integer number of block groups";
+          capacityTiles = cap / perTile;
+        }
+        r.capacityTiles =
+            b.create<arith::ConstantIndexOp>(loc, capacityTiles);
         axisIndex++;
       }
       ranges[l] = r;

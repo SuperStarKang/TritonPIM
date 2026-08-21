@@ -7,6 +7,9 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Twine.h"
 
+#include <algorithm>
+#include <numeric>
+
 using namespace mlir;
 
 namespace mlir {
@@ -94,11 +97,26 @@ struct AiMXLowerMatmulPass
         return signalPassFailure();
       }
       int64_t batch = tiling.getBatch();
+      ArrayRef<int64_t> blk = group.getBlock().asArrayRef();
+      ArrayRef<int64_t> grp = group.getGroup().asArrayRef();
       ArrayRef<int64_t> exec = group.getExecution().asArrayRef();
-      if (exec.size() != 3 || exec[0] != tiling.getMT() ||
-          exec[1] != aimx::kLanes / batch || exec[2] != aimx::kRegSize / batch) {
-        f->emitError("aimx-lower-matmul: #aimx.tile_group execution disagrees "
-                     "with #aimx.tiling");
+      if (blk.size() != 3 || grp.size() != 3 || exec.size() != 3) {
+        f->emitError("aimx-lower-matmul: #aimx.tile_group needs three axes");
+        return signalPassFailure();
+      }
+      // execution 은 block group 의 물리 크기다. 세 축 모두 같은 규칙(단위에 block
+      // 정수 개를 채우고 올림)이고, 남는 자리는 padding 인데 stage 가 0 을 채우는
+      // 데이터 문제라 이 pass 의 program 은 물리 눈금만 보면 된다 — 여기서는 두
+      // attribute 가 같은 그림에서 나왔는지만 대조한다.
+      auto ru = [](int64_t a, int64_t u) { return (a + u - 1) / u * u; };
+      int64_t unit[3] = {batch, aimx::kLanes / batch, aimx::kRegSize / batch};
+      bool ok = tiling.getMT() % exec[0] == 0;
+      for (int i = 0; i < 3; i++)
+        ok = ok && grp[i] == std::max<int64_t>(1, unit[i] / blk[i]) &&
+             exec[i] == ru(grp[i] * blk[i], unit[i]);
+      if (!ok) {
+        f->emitError("aimx-lower-matmul: #aimx.tile_group disagrees with "
+                     "#aimx.tiling");
         return signalPassFailure();
       }
       buildRelayout(mb, f.getName(), tiling);

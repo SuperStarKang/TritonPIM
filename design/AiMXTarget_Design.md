@@ -452,6 +452,51 @@ execution tile (m_t × k_t × n_t)
 
 ### 2.4 크기 규칙 (legality)
 
+> **2026-08-13 — Triton block 조건이 거부에서 padding으로 바뀌었다.** 계층이
+> **Triton block → block group → execution tile**로 명시되었다. block group은
+> Triton block 정수 개를 하드웨어 실행 단위(output block 높이 `batch`, 폭
+> `4096/batch`, reduction step `256/batch`)의 정수 배에 채운 것이고, 딱 맞지 않으면
+> 남는 자리를 stage가 0으로 채운다 — 그 몫의 lane과 reduction step이 노는 것이
+> 비용이고, `--convert-pim-to-aimx`가 remark로 비율을 알린다. 아래 표의 조건은 이제
+> **물리 크기**(`#aimx.tile_group`의 `execution`)에 대한 것이며, 물리 크기는 구성상
+> 언제나 만족한다: m은 `lcm(BLOCK_M, batch)`(padding 항상 0, `m_t = group-m * lcm`),
+> n·k는 Triton block 묶음을 하드웨어 단위로 올림한 것이다. k tile의 눈금은 block
+> group과 vecA 적재 단위 256의 lcm이다. host 좌표(loop 전진 폭, stage/unstage의
+> origin·sizes)는 **유효 크기**로 세고, PIM DRAM·chain은 물리 크기만 본다 —
+> `aimx.stage`/`aimx.unstage`의 `group_rows`/`group_cols`(`[useful, phys]`)가 그
+> 주기 배치다. batch 자동 선택(§2.5)도 "나눠떨어지는 최대"에서 "padding 0인 값 중
+> 최대, 없으면 노는 비율 최소"로 바뀌었다.
+
+> **2026-08-14 — 3계층의 손잡이가 공통 IR로 옮겨졌다.** 공통 계층이 데이터 3계층
+> (block ⊂ block group ⊂ execution tile)을 직접 갖게 되어(`--pim-form-block-groups`,
+> `--pim-form-execution-tiles`/`#pim.execution_tile`), `--convert-pim-to-aimx`의
+> `group-m`/`tile-k`/`tile-n` 옵션이 사라졌다. 남는 옵션은 `batch`와
+> `bank-capacity-bytes` 뿐이다. 이 pass가 보는 "Triton block"은 이제 공통 block
+> group일 수 있고(구분하지 않는다), execution tile 상한은 `#pim.execution_tile`
+> (원소 단위, 유효 데이터 기준)에서 읽는다: m 상한은 `lcm(block m, batch)` 경계로
+> 올려 `m_t`가 되고(0이면 group 하나), n·k 상한은 담기는 group 수(내림, 최소 1) ×
+> 물리 group 크기로 buffer 상한 `n_max`(0이면 4096)·`k_max`(0이면 32768)가 된다.
+> k 상한의 예산-최대 모드(`tile-k=0` 이분 탐색)는 소비자가 없어 제거했다. §6.1·§12.4
+> 등 본문의 `group-m`/`tile-k`/`tile-n` 서술은 이 정정 이전의 기록이다.
+
+> **2026-08-14 (2차) — 3계층이 단순한 한 규칙으로 통일됐다.** 사용자 방침: 덕지덕지
+> 최적화·특례를 걷어내고 "배수가 안 맞으면 padding, 맞으면 없음" 하나로 간다.
+> 1. **m의 lcm 특례 제거.** m도 n·k와 같은 채움 규칙이다. block group은 세 축 모두
+>    `tiles = max(1, ⌊unit/block⌋)`, `useful = tiles·block`, `phys = ⌈useful/unit⌉·unit`.
+>    m padding이 생길 수 있어 `aimx.unstage`에 `group_rows`가 추가됐고 A stage도
+>    `group_rows`를 싣는다. batch 자동 선택(padding 비율 최소화)도 제거 — batch는
+>    launch 옵션(기본 8)이다.
+> 2. **하드웨어 채움이 공통 IR로 올라갔다.** profile이 `execution_unit = [batch,
+>    4096/batch, 256/batch]`를 싣고, `--pim-form-block-groups`가 이 눈금에 block을
+>    채워 `#pim.block_group<tiles, useful, phys>`를 func에 부착한다.
+>    `--convert-pim-to-aimx`는 이것을 소비만 하며 `batch` 옵션이 사라졌다(남는 옵션은
+>    `bank-capacity-bytes` 하나). padding remark도 공통 pass가 낸다.
+> 3. **상한 0의 정책 숫자 제거.** m: group 하나, n: 한 device 폭, k: **남는 예산
+>    전부**(footprint가 k에 단조증가라 이분 탐색으로 최대 kUnit 배수를 찾는다 —
+>    execution tile은 PIM DRAM에 맞게 적재된다). 고정값 32768은 사라졌다.
+> 4. **profile의 죽은 필드 제거.** `pim_core_shape`, `requires_uniform_instruction_sequence`.
+> 5. **map-devices granularity는 partitions > 1인 축에만** 검사·적용된다.
+
 배수 조건을 어기면 **오류가 아니라 조용한 오답**이 난다. 전부 진단으로 막아야 한다.
 
 | 축 | 배수 조건 | 어기면 | 유래 |

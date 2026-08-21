@@ -37,48 +37,29 @@ static std::pair<int64_t, int64_t> factorize(int64_t n) {
   return {bestRow, bestColumn};
 }
 
-// loop를 device 하나의 몫으로 좁힌다(balanced block). 몫과 나머지로 나누어 나머지
-// partition이 하나씩 더 맡으므로 꼬리에서 device가 놀지 않고, 축마다 연속 구간 하나가
-// 유지된다. 좁힌 뒤 loop는 [0, trips)를 1씩 돌고, 전역 좌표는 몸체 첫머리에서 다시 만든다.
-static void narrowLoop(OpBuilder &b, scf::ForOp loop, Value index,
-                       int64_t partitions, int64_t granularity, Value extent) {
+// 한 scheduling round에서 이 PIM Device가 맡는 execution tile 하나로 loop를 좁힌다.
+//
+//   executionTile = round * partitions + device
+//   first         = executionTile * unitTiles
+//
+// 따라서 6개 execution tile을 3개 device에 배치하면 round 0은 ET0/1/2, round 1은
+// ET3/4/5가 된다. 마지막 round의 빈 device는 trips=0인 no-op이다.
+static void scheduleLoop(OpBuilder &b, scf::ForOp loop, Value round,
+                         Value device, int64_t partitions,
+                         int64_t unitTiles, Value extent) {
   Location loc = loop.getLoc();
   Value lb = loop.getLowerBound(), step = loop.getStep();
   Value c0 = b.create<arith::ConstantIndexOp>(loc, 0);
   Value c1 = b.create<arith::ConstantIndexOp>(loc, 1);
   Value parts = b.create<arith::ConstantIndexOp>(loc, partitions);
-  // 나누는 단위. 기본은 tile 하나지만, target이 눈금을 주면 그 배수로만 자른다. 눈금보다
-  // 잘게 자르면 경계에 걸친 실행 단위가 양쪽 device에서 각각 통째로 실행되어 총 일감이
-  // 늘어난다 — 7개짜리를 둘로 나눌 때 3.5가 올림되어 4+4=8이 되는 식이다. 대신 3+4로
-  // **불균등하게** 나눈다. 눈금이 tile을 나누지 못하면 마지막 group이 부분이므로 아래에서
-  // extent로 자른다.
-  int64_t unitTiles = std::max<int64_t>(granularity, 1);
-  Value unit, units = extent;
-  if (unitTiles != 1) {
-    unit = b.create<arith::ConstantIndexOp>(loc, unitTiles);
-    units = b.create<arith::CeilDivSIOp>(loc, extent, unit);
-  }
-  Value minUnits = b.create<arith::DivSIOp>(loc, units, parts);
-  Value remainder = b.create<arith::RemSIOp>(loc, units, parts);
-  Value firstUnit = b.create<arith::AddIOp>(
-      loc, b.create<arith::MulIOp>(loc, index, minUnits),
-      b.create<arith::MinSIOp>(loc, index, remainder));
-  Value tripUnits = b.create<arith::AddIOp>(
-      loc, minUnits,
-      b.create<arith::SelectOp>(
-          loc,
-          b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, index,
-                                  remainder),
-          c1, c0));
-  Value first = firstUnit, trips = tripUnits;
-  if (unitTiles != 1) {
-    first = b.create<arith::MulIOp>(loc, firstUnit, unit);
-    // 마지막 group이 부분일 수 있고, extent 뒤에서 시작하는 device는 아무것도 맡지 않는다.
-    Value left = b.create<arith::MaxSIOp>(
-        loc, b.create<arith::SubIOp>(loc, extent, first), c0);
-    trips = b.create<arith::MinSIOp>(
-        loc, b.create<arith::MulIOp>(loc, tripUnits, unit), left);
-  }
+  Value unit = b.create<arith::ConstantIndexOp>(loc, unitTiles);
+  Value executionTile = b.create<arith::AddIOp>(
+      loc, b.create<arith::MulIOp>(loc, round, parts), device);
+  Value first =
+      b.create<arith::MulIOp>(loc, executionTile, unit).getResult();
+  Value left = b.create<arith::MaxSIOp>(
+      loc, b.create<arith::SubIOp>(loc, extent, first), c0);
+  Value trips = b.create<arith::MinSIOp>(loc, unit, left);
   Value start =
       b.create<arith::AddIOp>(loc, lb, b.create<arith::MulIOp>(loc, first, step));
 
@@ -93,7 +74,9 @@ static void narrowLoop(OpBuilder &b, scf::ForOp loop, Value index,
   auto scaled = bb.create<arith::MulIOp>(loc, local, step);
   auto global = bb.create<arith::AddIOp>(loc, start, scaled);
   global->setAttr("pim.device_origin", bb.getUnitAttr());
-  local.replaceAllUsesExcept(global, scaled);
+  local.replaceUsesWithIf(global, [&](OpOperand &use) {
+    return use.getOwner() != scaled && use.getOwner() != global;
+  });
 }
 
 struct PIMMapDevicesPass
@@ -128,6 +111,13 @@ struct PIMMapDevicesPass
     });
     if (loops.empty())
       return success();
+
+    auto execution =
+        func->getAttrOfType<pim::ExecutionTileAttr>("pim.execution_tile");
+    if (!execution)
+      return func->emitError(
+          "pim-map-devices: the function has no #pim.execution_tile; run "
+          "--pim-form-execution-tiles before --pim-map-devices");
 
     // 자동 인수분해에서 explicit K 분할은 device 축이 아니다 — A·B의 K 영역이 연속으로
     // 남아 일반 cyclic placement 없이 배치된다. 명시 분할(device-axis-partitions)로는
@@ -195,6 +185,20 @@ struct PIMMapDevicesPass
     // 하나가 몇 원소인지는 커널의 BLOCK 이 정하므로 target 이 알 수 없다. 여기서 tile 수로
     // 바꾼다.
     SmallVector<int64_t> granularity(loops.size(), 1);
+    for (auto [i, name] : llvm::enumerate(names)) {
+      StringRef axis = cast<StringAttr>(name).getValue();
+      int64_t cap = axis == "output_row_tile"      ? execution.getM()
+                    : axis == "output_column_tile" ? execution.getN()
+                                                    : 0;
+      if (cap <= 0)
+        continue;
+      int64_t perTile = pim::tileElementsAlong(loops[i], loops);
+      if (perTile <= 0 || cap % perTile != 0)
+        return func->emitError("pim-map-devices: execution tile cap ")
+               << cap << " is not a multiple of the " << axis
+               << " block-group tile size " << perTile;
+      granularity[i] = cap / perTile;
+    }
     if (!deviceAxisGranularity.empty()) {
       SmallVector<StringRef> entries;
       StringRef(deviceAxisGranularity).split(entries, ',', -1, /*KeepEmpty=*/false);
@@ -211,6 +215,8 @@ struct PIMMapDevicesPass
             axis = i;
         if (axis < 0)
           continue; // 이 커널에 없는 축이다
+        if (partitions[axis] < 2)
+          continue; // 눈금은 실제로 나눌 때만 의미가 있다 — 나누지 않는 축은 검사도 없다
         int64_t perTile = pim::tileElementsAlong(loops[axis], loops);
         if (perTile <= 0)
           return func->emitError("pim-map-devices: cannot tell how many "
@@ -223,7 +229,11 @@ struct PIMMapDevicesPass
                  << " elements, which does not divide the requested split unit "
                  << elems
                  << " — pick a BLOCK size that divides the hardware unit";
-        granularity[axis] = elems / perTile;
+        int64_t requested = elems / perTile;
+        if (granularity[axis] != 1 && granularity[axis] != requested)
+          return func->emitError("pim-map-devices: device-axis-granularity for ")
+                 << name.trim() << " conflicts with the execution tile";
+        granularity[axis] = requested;
       }
     }
 
@@ -231,7 +241,7 @@ struct PIMMapDevicesPass
     Location loc = loops.front().getLoc();
     OpBuilder b(loops.front());
 
-    // 나누기 전의 축별 tile 개수. 배치 pass가 여기서 배정량을 다시 계산한다.
+    // 나누기 전의 축별 block-group 개수다.
     SmallVector<Value> extents;
     for (scf::ForOp l : loops)
       extents.push_back(b.create<arith::CeilDivSIOp>(
@@ -239,11 +249,66 @@ struct PIMMapDevicesPass
           b.create<arith::SubIOp>(loc, l.getUpperBound(), l.getLowerBound()),
           l.getStep()));
 
-    auto device = b.create<pim::DeviceOp>(
+    SmallVector<Attribute> schedulingOrder;
+    StringRef preferred[] = {"output_column_tile", "explicit_k_partition",
+                             "output_row_tile"};
+    for (StringRef wanted : preferred)
+      for (Attribute name : names)
+        if (cast<StringAttr>(name).getValue() == wanted)
+          schedulingOrder.push_back(name);
+    for (Attribute name : names)
+      if (!llvm::is_contained(schedulingOrder, name))
+        schedulingOrder.push_back(name);
+
+    // execution-tile grid를 먼저 만들고 그 바깥에 scheduling round를 둔다. 각 축의
+    // round 수는 ceil(execution_tiles / active_devices)다. 이 loop들은 host 쪽에 남고,
+    // 그 안의 pim.device 한 개가 해당 round의 모든 PIM Device를 병렬 실행한다.
+    SmallVector<Value> roundIVs(loops.size());
+    OpBuilder scheduled(loops.front());
+    Value c0 = b.create<arith::ConstantIndexOp>(loc, 0);
+    Value c1 = b.create<arith::ConstantIndexOp>(loc, 1);
+    for (Attribute orderedName : schedulingOrder) {
+      unsigned axis = 0;
+      while (names[axis] != orderedName)
+        ++axis;
+      Value unit = scheduled.create<arith::ConstantIndexOp>(loc,
+                                                             granularity[axis]);
+      Value executionTiles = scheduled.create<arith::CeilDivSIOp>(
+          loc, extents[axis], unit);
+      Value active = scheduled.create<arith::ConstantIndexOp>(
+          loc, partitions[axis]);
+      Value rounds = scheduled.create<arith::CeilDivSIOp>(
+          loc, executionTiles, active);
+      auto round = scheduled.create<scf::ForOp>(loc, c0, rounds, c1);
+      round->setAttr("pim.scheduling_axis", orderedName);
+      roundIVs[axis] = round.getInductionVar();
+      scheduled.setInsertionPointToStart(round.getBody());
+    }
+
+    auto device = scheduled.create<pim::DeviceOp>(
         loc,
         pim::DeviceMappingAttr::get(ctx, ArrayAttr::get(ctx, names),
                                     b.getDenseI64ArrayAttr(partitions)),
         extents);
+    auto plan = pim::DevicePlanAttr::get(
+        ctx, devices, ArrayAttr::get(ctx, names),
+        b.getDenseI64ArrayAttr(partitions),
+        b.getDenseI64ArrayAttr(
+            {execution.getM(), execution.getN(), execution.getK()}),
+        ArrayAttr::get(ctx, schedulingOrder));
+    device->setAttr("pim.execution_tile", execution);
+    device->setAttr("pim.device_plan", plan);
+    bool hasSpatialK = llvm::any_of(names, [](Attribute name) {
+      return cast<StringAttr>(name).getValue() == "explicit_k_partition";
+    });
+    device->setAttr(
+        "pim.reduction_plan",
+        pim::ReductionPlanAttr::get(
+            ctx,
+            StringAttr::get(ctx, hasSpatialK ? "separate_output_planes"
+                                             : "none"),
+            StringAttr::get(ctx, execution.getK() > 0 ? "host" : "none"),
+            StringAttr::get(ctx, hasSpatialK ? "external" : "none")));
     SmallVector<Type> argTys(loops.size(), b.getIndexType());
     SmallVector<Location> argLocs(loops.size(), loc);
     Block *body = b.createBlock(&device.getBody(), {}, argTys, argLocs);
@@ -251,8 +316,8 @@ struct PIMMapDevicesPass
 
     b.setInsertionPoint(loops.front());
     for (auto [i, l] : llvm::enumerate(loops))
-      narrowLoop(b, l, body->getArgument(i), partitions[i], granularity[i],
-                 extents[i]);
+      scheduleLoop(b, l, roundIVs[i], body->getArgument(i), partitions[i],
+                   granularity[i], extents[i]);
     return success();
   }
 };

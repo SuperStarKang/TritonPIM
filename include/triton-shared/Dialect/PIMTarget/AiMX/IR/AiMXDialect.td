@@ -141,31 +141,37 @@ def AiMX_TilingAttr : AttrDef<AiMX_Dialect, "Tiling"> {
 
 def AiMX_TileGroupAttr : AttrDef<AiMX_Dialect, "TileGroup"> {
   let mnemonic = "tile_group";
-  let summary = "How many Triton blocks make up one hardware execution unit";
+  let summary = "How Triton blocks fill one block group of the hardware grid";
   let description = [{
     `#aimx.tiling` 은 **잡은 buffer 의 모양**이고, 이 attribute 는 **source 의 Triton
     block 과 하드웨어 실행 눈금의 관계**다. 둘을 나누는 이유는 소비자가 다르기
     때문이다 — buffer 모양은 runtime stub 이 쓰고, 이 관계는 legality 와 device 분할이
     쓴다.
 
+    계층은 **Triton block → block group → execution tile** 이다. block group 은
+    Triton block 정수 개를 하드웨어 실행 단위(output block 높이 `batch`, output block
+    폭 `4096/batch`, reduction step `256/batch`)의 정수 배에 채운 것이다. 딱 맞지
+    않으면 남는 자리가 padding 이다 — stage 가 0 을 채우고 unstage 가 읽지 않으므로
+    정확성에는 무해하고, 그 몫의 lane 과 reduction step 이 노는 것이 비용이다.
+
     `block` 은 `linalg.matmul` 의 operand 모양에서 읽은 `[BLOCK_M, BLOCK_N, BLOCK_K]` 다.
 
-    `execution` 은 **하드웨어 상수** `[m_t, 4096/batch, 256/batch]` 다.
-    - `m_t`      : `pim_exec` 한 번의 chain 이 차례로 처리하는 출력 행 수
-    - `4096/batch`: 출력 block 하나의 열 폭. lane 4096 개를 `batch` 행으로 나눈 것
-    - `256/batch` : reduction step 하나가 덮는 k 행 수
+    `group` 은 block group 하나가 담는 Triton block 수 `[m, n, k]` 다.
 
-    `n_t` 는 문제 크기가 정하는 런타임 값이라 여기 들어갈 수 없다. 대신 언제나 상수인
-    출력 block 폭을 싣는다.
+    `execution` 은 block group 의 **물리 크기**다. 세 축 모두 같은 규칙이고 값은
+    공통 `#pim.block_group` 의 phys 그대로다:
+    `execution[i] = roundUp(group[i] * block[i], unit[i])`, 단위는
+    `[batch, 4096/batch, 256/batch]`. padding 은
+    `execution[i] - block[i] * group[i]` 로 유도된다 — 따로 싣지 않는다.
 
-    `group` 은 `execution` 을 `block` 으로 나눈 것이다 — execution 눈금 하나가 Triton
-    block 을 몇 개 묶는가. M 은 `m_t` 를 올림해서 언제나 정수로 만들고, N 과 K 는
-    하드웨어 상수라 올릴 수 없으므로 나누어떨어지지 않으면 진단을 낸다.
+    execution tile은 이 block group의 정수 배이고 `#aimx.tiling`의 m_t/n_t/k_t에
+    compile time 고정된다. tail round의 실제 유효 크기는 stage/unstage operand가
+    표현하며 descriptor chain 모양은 바뀌지 않는다.
   }];
   // DenseI64ArrayAttr 이어야 `[a, b, c]` 로 출력되고 다시 읽힌다. ArrayRefParameter 는
   // struct(params) 안에서 대괄호 없이 나가 round-trip 이 깨진다 — 도구 사이를 MLIR
   // 텍스트로 잇고 있으므로 그러면 파이프라인이 통째로 멈춘다. #pim.target_profile 의
-  // pim_core_shape 도 같은 이유로 이 타입이다.
+  // execution_unit 도 같은 이유로 이 타입이다.
   let parameters = (ins "::mlir::DenseI64ArrayAttr":$block,
                         "::mlir::DenseI64ArrayAttr":$group,
                         "::mlir::DenseI64ArrayAttr":$execution);
@@ -216,7 +222,8 @@ def AiMX_AllocOp : AiMX_Op<"alloc"> {
   let hasVerifier = 1;
 }
 
-// 원본 버퍼의 strided 영역을 PIM DRAM 의 2차원 배열로 모은다.
+// 원본 버퍼의 strided 영역 마지막 두 축을 PIM DRAM의 2차원 배열로 모은다. 앞축은
+// split-K output plane처럼 독립된 2-D slice를 선택하며 PIM layout에는 들어가지 않는다.
 // upmem.stage 와 세 가지가 다르다.
 //   1. pitch 를 받는다. descriptor 의 stride 필드가 행 간격을 읽으므로 PIM DRAM 안의
 //      layout 이 pitch 로 규정된 2차원 배열이다 (UPMEM 은 tile-major 연속 배열).
@@ -225,23 +232,34 @@ def AiMX_AllocOp : AiMX_Op<"alloc"> {
 //   3. transpose 를 받는다. C = A*B 를 C^T = B^T*A^T 로 도는 선택이 여기서 이루어진다.
 // pad_to 는 결과의 행/열 수다. sizes 보다 크면 남는 자리를 0 으로 채운다 — 그 0 이
 // 누산에 그대로 더해지므로 padding 은 성능 최적화가 아니라 정확성 요구사항이다.
+//
+// group_rows / group_cols 는 block group 의 주기 배치다 (`[useful, phys]`,
+// useful < phys). 논리 index i 가 물리 칸 `(i/useful)*phys + i%useful` 로 가고,
+// 각 phys 구간의 나머지 `phys - useful` 칸은 0 이다 — Triton block 이 하드웨어
+// 단위를 딱 채우지 못할 때 그 어긋남이 이 0 이 된다 (#aimx.tile_group). padding 이
+// 없는 축은 attr 를 아예 싣지 않는다. sizes 와 origin 은 논리(유효) 단위이고
+// pad_to 와 pitch 는 물리 단위다.
 def AiMX_StageOp : AiMX_Op<"stage", [AttrSizedOperandSegments]> {
   let summary = "Gather a strided host region into a pitched PIM DRAM array";
   let arguments = (ins AnyRankedOrUnrankedMemRef:$src,
                        Variadic<Index>:$origin, Variadic<Index>:$sizes,
                        Variadic<Index>:$strides, Variadic<Index>:$pad_to,
                        Index:$pitch, AiMX_BufferType:$dst,
-                       TypeAttr:$element_type, UnitAttr:$transpose);
+                       TypeAttr:$element_type, UnitAttr:$transpose,
+                       OptionalAttr<DenseI64ArrayAttr>:$group_rows,
+                       OptionalAttr<DenseI64ArrayAttr>:$group_cols);
   let assemblyFormat = [{
     $src `origin` `[` $origin `]` `sizes` `[` $sizes `]`
     `strides` `[` $strides `]` `pad_to` `[` $pad_to `]` `pitch` $pitch
+    (`group_rows` $group_rows^)? (`group_cols` $group_cols^)?
     (`transpose` $transpose^)? `into` $dst
     attr-dict `:` type($src) `->` type($dst)
   }];
   let hasVerifier = 1;
 }
 
-// aimx.stage 의 반대. PIM DRAM 의 2차원 배열을 원본 버퍼의 strided 영역으로 되돌린다.
+// aimx.stage의 반대. PIM DRAM의 2차원 배열을 원본 버퍼 마지막 두 축으로 되돌린다.
+// 앞축이 있으면 origin/stride가 선택한 독립 slice에 쓴다.
 // 읽는 범위는 sizes 이므로 padding 자리는 읽지 않는다.
 //
 // accumulate 는 런타임 값이고 0 이 아니면 대입 대신 덧셈이다. k 를 여러 execution tile 로
@@ -255,6 +273,10 @@ def AiMX_StageOp : AiMX_Op<"stage", [AttrSizedOperandSegments]> {
 // 이 경로는 k 가 buffer 상한을 넘을 때만 쓰인다. 넘지 않으면 k 전체가 한 chain 에 들어가고
 // reduction 은 vACC 안에서 끝난다 — vACC 는 출력 block 하나 깊이라 invoke 를 건너 살아남지
 // 못하므로, k 를 나누는 순간 부분합은 반드시 PIM 밖으로 나온다.
+//
+// group_rows / group_cols 는 aimx.stage 와 같은 block group 주기 배치다. C 의
+// padding 자리는 계산 결과 자체가 0 이고(0 인 A 행·0 인 B 열의 곱) 여기서 읽지
+// 않는다 — 행은 m group, 열은 n group 의 어긋남이다.
 def AiMX_UnstageOp : AiMX_Op<"unstage", [AttrSizedOperandSegments]> {
   let summary = "Scatter a pitched PIM DRAM array back into a strided host region";
   let arguments = (ins AiMX_BufferType:$src,
@@ -262,11 +284,15 @@ def AiMX_UnstageOp : AiMX_Op<"unstage", [AttrSizedOperandSegments]> {
                        Variadic<Index>:$origin, Variadic<Index>:$sizes,
                        Variadic<Index>:$strides, Index:$pitch,
                        Index:$accumulate,
-                       TypeAttr:$element_type, UnitAttr:$transpose);
+                       TypeAttr:$element_type, UnitAttr:$transpose,
+                       OptionalAttr<DenseI64ArrayAttr>:$group_rows,
+                       OptionalAttr<DenseI64ArrayAttr>:$group_cols);
   let assemblyFormat = [{
     $src `into` $dst `origin` `[` $origin `]` `sizes` `[` $sizes `]`
     `strides` `[` $strides `]` `pitch` $pitch `accumulate` $accumulate
-    (`transpose` $transpose^)? attr-dict `:` type($src) `,` type($dst)
+    (`group_rows` $group_rows^)? (`group_cols` $group_cols^)?
+    (`transpose` $transpose^)?
+    attr-dict `:` type($src) `,` type($dst)
   }];
   let hasVerifier = 1;
 }

@@ -1,33 +1,41 @@
-// Placed PIM IR이 AiMX level 1 IR로 바뀌고, 그 tile 모양에서 descriptor program이
-// 펼쳐지는지 확인한다. buffer 상한은 compile time 상수(tile-k 기본 32768, tile-n 4096)
-// 이고, 실제 tile 모양(k_t, n_t)은 런타임 값이라 IR에 상수로 나타나지 않는다.
+// Placed PIM IR이 AiMX level 1 IR로 바뀌고, 고정 execution-tile 모양에서 descriptor
+// program이 한 번 펼쳐지는지 확인한다. tail의 유효 크기는 stage/unstage만 바꾼다.
 // RUN: triton-shared-opt --convert-pim-to-aimx %s | FileCheck %s
 // RUN: triton-shared-opt --convert-pim-to-aimx --aimx-lower-matmul %s | FileCheck %s --check-prefix=PROGRAM
+// RUN: triton-shared-opt --convert-pim-to-aimx --aimx-lower-matmul %s | FileCheck %s --check-prefix=PIM-CLEAN
+// RUN: triton-shared-opt --convert-pim-to-aimx --aimx-lower-matmul %s | triton-shared-translate --aimx-to-runtime-stub > /dev/null
+// RUN: triton-shared-opt --convert-pim-to-aimx --aimx-lower-matmul %s | triton-shared-translate --aimx-to-descriptors > /dev/null
 
-// 이 attribute는 **할당된 buffer의 모양**이다. --aimx-lower-matmul이 여기서 읽는 것은
-// batch 하나뿐이고, 나머지는 descriptor program의 인자로 런타임에 들어간다.
-// batch는 기본값 0(자동)이라 pass가 고른다. BLOCK_N=32는 4096/8=512를, BLOCK_K=32는
-// 256/8=32를 나누므로 legal한 최대값 8이 뽑힌다.
-// m_t는 크기를 요청해서 나온 값이 아니라 **Triton block 묶음**이다:
-// m_t = BLOCK_M(32) * group-m(기본값 1) = 32. group의 첫 칸이 언제나 group-m과 같다.
+// PIM-CLEAN-LABEL: module
+// PIM-CLEAN-NOT: #pim.target_profile
+// PIM-CLEAN-NOT: #pim.group_execution
+// PIM-CLEAN-NOT: #pim.block_group
+// PIM-CLEAN-NOT: #pim.execution_tile
+
+// 이 attribute는 할당된 buffer와 재사용 descriptor chain의 고정 모양이다.
+// 계층은 Triton block → block group → execution tile이고 전부 공통 IR이 정했다 —
+// block group은 func의 #pim.block_group에서, batch는 profile의 execution_unit에서
+// 온다. BLOCK 32는 실행 단위 [8, 512, 32]의 배수라 padding이 없다.
+// 공통 pass가 자동 선택한 execution tile은 m group 하나(32), n 한 device 폭(4096),
+// k 남는 예산 전부다: 1 GiB에서 k_max = 103936 (kUnit 256의 배수), padded_k = 106496.
 // CHECK-LABEL: func.func @matmul
 // CHECK-SAME:    aimx.tile_group = #aimx.tile_group<block = [32, 32, 32], group = [1, 16, 1], execution = [32, 512, 32]>
-// CHECK-SAME:    aimx.tiling = #aimx.tiling<batch = 8, m_t = 32, k_t = 32768, n_t = 4096, padded_k = 32768, padded_n = 4096, transposed = false>
+// CHECK-SAME:    aimx.tiling = #aimx.tiling<batch = 8, m_t = 32, k_t = 103936, n_t = 4096, padded_k = 106496, padded_n = 4096, transposed = false>
 
 // FPGA 하나를 확보하고 그 안에서 buffer를 잡는다.
 // CHECK: aimx.acquire 1 : !aimx.device_set
 // CHECK: aimx.foreach_device %{{.*}} : !aimx.device_set axes ["output_row_tile", "output_column_tile"] counts [1, 1]
 
 // PMM이 가장 먼저다 — pim_private_malloc이 pim_malloc이 이미 내준 주소를 돌려줄 수 있다.
-// 그다음이 A(32*32768*2), Arel(32*32768*32), B(32768*4096*2), C(32*4096*2),
-// descriptor chain(66592 group * 512). 합쳐서 323 MiB로 1 GiB 예산 안이다. chain만
-// batch에 비례해 커진다 — group 수가 batch배이고 그것이 batch를 8보다 키우지 못하는 이유다.
+// 그다음이 A(32*106496*2), Arel(32*103936*32), B(103936*4096*2), C(32*4096*2),
+// descriptor chain(211152 group * 512). 합쳐서 1,073,258,496 byte로 1 GiB 예산에 찬다 —
+// k 상한이 없으면 execution tile이 PIM DRAM에 맞게 적재되기 때문이다.
 // CHECK:   aimx.alloc %{{.*}} bytes 196608 align 262144 kind pmm
-// CHECK:   aimx.alloc %{{.*}} bytes 2097152 align 512 kind data
-// CHECK:   aimx.alloc %{{.*}} bytes 33554432 align 512 kind data
-// CHECK:   aimx.alloc %{{.*}} bytes 268435456 align 512 kind data
+// CHECK:   aimx.alloc %{{.*}} bytes 6815744 align 512 kind data
+// CHECK:   aimx.alloc %{{.*}} bytes 106430464 align 512 kind data
+// CHECK:   aimx.alloc %{{.*}} bytes 851443712 align 512 kind data
 // CHECK:   aimx.alloc %{{.*}} bytes 262144 align 512 kind data
-// CHECK:   aimx.alloc %{{.*}} bytes 34095104 align 512 kind descriptor
+// CHECK:   aimx.alloc %{{.*}} bytes 108109824 align 512 kind descriptor
 
 // chain은 tile loop 밖에서 한 번만 만든다. 재배치가 먼저, 계산이 다음이다.
 // CHECK:   aimx.build_descriptors @matmul_relayout(
@@ -35,18 +43,20 @@
 // CHECK-NOT: aimx.build_descriptors
 
 // loop 순서는 n → k → m 이다. 가장 큰 buffer인 B가 (k, n)에만 의존하므로 그 둘이
-// 바깥이고, 훨씬 작은 A는 안쪽에서 m마다 올라간다. k가 상한(32768) 안이면 k loop은 한
+// 바깥이고, 훨씬 작은 A는 안쪽에서 m마다 올라간다. k가 상한(k_max) 안이면 k loop은 한
 // 번만 돈다 — K가 런타임 값이라 tile 수도 런타임에 정해지고, 그래서 loop 자체는 언제나
 // 나온다.
+// padding이 없으므로 stage/unstage에 block group attr(group_rows/group_cols)가 없어야
+// 한다 — pitch 값 바로 다음이 into/타입이다.
 // CHECK:   scf.for
 // CHECK:     scf.for
-// CHECK:       aimx.stage {{.*}} pad_to[{{.*}}] pitch {{.*}} into
+// CHECK:       aimx.stage {{.*}} pad_to[{{.*}}] pitch %{{[0-9]+}} into
 // CHECK:       scf.for
-// CHECK:         aimx.stage {{.*}} pad_to[{{.*}}] pitch {{.*}} into
+// CHECK:         aimx.stage {{.*}} pad_to[{{.*}}] pitch %{{[0-9]+}} into
 // CHECK:         aimx.invoke
 // k tile은 전부 **같은 C 영역**에 쓴다 — n이나 m을 나눌 때와 다른 점이다. 그래서 두 번째
 // tile부터는 덮는 것이 아니라 이전 부분합에 더한다.
-// CHECK:         aimx.unstage {{.*}} accumulate
+// CHECK:         aimx.unstage {{.*}} accumulate %{{[0-9]+}} :
 
 // 계산은 descriptor chain이 한다. PIM 쪽도 profile도 남지 않는다.
 // CHECK-NOT: linalg.matmul
@@ -54,6 +64,7 @@
 // CHECK-NOT: pim.place
 // CHECK-NOT: pim.access
 // CHECK-NOT: pim.target_profile
+// CHECK-NOT: pim.block_group
 
 // ── descriptor program ──────────────────────────────────────────────────────
 // 재배치: A를 256개씩 읽어(행 간격 padded_k) BC|TP로 다시 쓴다. 두 descriptor가 한 쌍이다.
@@ -71,16 +82,24 @@
 // PROGRAM:         aimx.desc src(%{{.*}}, %{{.*}}) pitch %{{.*}} dst(%{{.*}}, %{{.*}}) pitch %{{.*}} len 1024 opcode c_mask|matmul|stride
 
 module attributes {pim.target_profile = #pim.target_profile<
-    target = "aimx", number_of_pim_devices = 1, pim_core_shape = [1],
+    target = "aimx", number_of_pim_devices = 1,
     number_of_parallel_lanes_per_pim_core = 4096,
     parallel_execution_kind = "simd",
-    requires_uniform_instruction_sequence = true,
+    execution_unit = array<i64: 8, 512, 32>,
     usable_bank_capacity_bytes = 1073741824, usable_local_capacity_bytes = 0>} {
 
+// pim.block_group 은 --pim-form-block-groups 가 실행 단위에 block 을 채운 결과다 —
+// BLOCK 32가 단위 [8, 512, 32]의 배수라 useful == phys, padding 0.
 func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
                   %K: i32, %N: i32, %ex: index, %ey: index)
     attributes {pim.group_execution = #pim.group_execution<
-        lanes = 4096, lane_axis_role = "whole_tile">} {
+        lanes = 4096, lane_axis_role = "whole_tile">,
+        pim.block_group = #pim.block_group<
+            tiles = array<i64: 1, 16, 1>,
+            useful = array<i64: 32, 512, 32>,
+            phys = array<i64: 32, 512, 32>>,
+        pim.execution_tile = #pim.execution_tile<
+            m = 32, n = 4096, k = 103936>} {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c32 = arith.constant 32 : index
@@ -91,7 +110,18 @@ func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
 
   pim.device #pim.device_mapping<axes = ["output_row_tile", "output_column_tile"],
                                  partitions = [1, 1]>
-      extents [%ex, %ey] {
+      extents [%ex, %ey]
+      attributes {
+        pim.execution_tile = #pim.execution_tile<m = 32, n = 4096, k = 103936>,
+        pim.device_plan = #pim.device_plan<
+            available_devices = 1,
+            axes = ["output_row_tile", "output_column_tile"],
+            active_grid = array<i64: 1, 1>,
+            execution_tile = array<i64: 32, 4096, 103936>,
+            scheduling_order = ["output_column_tile", "output_row_tile"]>,
+        pim.reduction_plan = #pim.reduction_plan<
+            spatial_partials = "none", temporal_accumulation = "host",
+            final_accumulation = "none">} {
   ^bb0(%px: index, %py: index):
     // PIM Device 가 하나라 device 몫이 곧 전체다. 실제 pass 가 내는 모양 그대로 손으로 썼다.
     %capx = arith.ceildivsi %ex, %c1 : index

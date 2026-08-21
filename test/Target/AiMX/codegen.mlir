@@ -52,16 +52,20 @@
 // STUB-NOT: matmul_tiled
 
 module attributes {pim.target_profile = #pim.target_profile<
-    target = "aimx", number_of_pim_devices = 1, pim_core_shape = [1],
+    target = "aimx", number_of_pim_devices = 1,
     number_of_parallel_lanes_per_pim_core = 4096,
     parallel_execution_kind = "simd",
-    requires_uniform_instruction_sequence = true,
+    execution_unit = array<i64: 8, 512, 32>,
     usable_bank_capacity_bytes = 1073741824, usable_local_capacity_bytes = 0>} {
 
 func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
                   %K: i32, %N: i32, %ex: index, %ey: index)
     attributes {pim.group_execution = #pim.group_execution<
-        lanes = 4096, lane_axis_role = "whole_tile">} {
+        lanes = 4096, lane_axis_role = "whole_tile">,
+        pim.block_group = #pim.block_group<
+            tiles = array<i64: 1, 16, 1>,
+            useful = array<i64: 32, 512, 32>,
+            phys = array<i64: 32, 512, 32>>} {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c32 = arith.constant 32 : index

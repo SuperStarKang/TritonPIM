@@ -2,6 +2,7 @@
 #include "triton-shared/Dialect/PIM/IR/PIMDialect.h"
 #include "triton-shared/Dialect/PIM/IR/PIMUtils.h"
 #include "triton-shared/Dialect/PIMTarget/AiMX/IR/AiMXDialect.h"
+#include "triton-shared/Dialect/PIMTarget/AiMX/IR/AiMXFootprint.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -16,6 +17,7 @@
 #include "llvm/ADT/Twine.h"
 
 #include <algorithm>
+#include <numeric>
 
 using namespace mlir;
 
@@ -28,39 +30,35 @@ namespace triton {
 
 namespace {
 
-int64_t ceilDiv(int64_t a, int64_t b) { return (a + b - 1) / b; }
-int64_t roundUp(int64_t a, int64_t b) { return ceilDiv(a, b) * b; }
-
 bool isBatch(int64_t b) { return b == 1 || b == 2 || b == 4 || b == 8; }
 
-// execution tile 하나가 PIM DRAM 에 요구하는 바이트. §6.2 의 표 그대로다.
-struct Footprint {
-  int64_t paddedK, paddedN;
-  int64_t a, arel, b, c, chain;
-  int64_t groups; // descriptor group 수
-
-  int64_t total() const {
-    return a + arel + b + c + chain + aimx::kPMMSize;
-  }
+// block group 한 축 — 공통 #pim.block_group 에서 읽는다. Triton block 정수 개(tiles)를
+// 하드웨어 실행 단위의 정수 배에 채운 것이고, 딱 맞지 않으면 남는 자리가 padding 이다 —
+// stage 가 0 을 채우고 unstage 가 읽지 않으므로 정확성에는 무해하고, 그 몫의 lane 과
+// reduction step 이 노는 것이 비용이다.
+struct BlockGroup {
+  int64_t tiles;  // Triton block 수
+  int64_t useful; // tiles * BLOCK — 실제 데이터
+  int64_t phys;   // 하드웨어가 도는 크기
+  int64_t pad() const { return phys - useful; }
 };
 
-Footprint footprintOf(int64_t batch, int64_t mT, int64_t kT, int64_t nT) {
-  using namespace aimx;
-  Footprint f;
-  f.paddedK = kChunk * ceilDiv(kT, kChunk);
-  f.paddedN = kChunk * ceilDiv(nT, kChunk);
-  f.a = mT * f.paddedK * kTypeSize;
-  // Arel 은 A 를 16 배로 복제한다 — vecA 가 reduction 방향으로 늘어선 A 를 원한다.
-  f.arel = mT * kT * kTypeSize * kNumChannels;
-  f.b = kT * f.paddedN * kTypeSize;
-  f.c = mT * f.paddedN * kTypeSize;
-  int64_t rows = mT / batch;                              // output block 행
-  int64_t cols = f.paddedN * batch / kLanes;              // output block 열
-  int64_t steps = kT * batch / kRegSize;                  // reduction step
-  f.groups = 2 * (kT / kRegSize) * rows + rows * cols * (2 * steps + 1);
-  f.chain = f.groups * kGroupBytes;
-  return f;
-}
+// 한 AiMX Device에서 scheduling round 전체가 공유하는 PIM DRAM 주소들이다.
+// descriptor chain은 이 주소와 execution-tile 최대 모양만 참조하므로 한 번 만든다.
+struct PlacementBuffers {
+  Value device;
+  Value pmm;
+  Value a;
+  Value arel;
+  Value b;
+  Value c;
+  Value chain;
+};
+
+// execution tile 하나가 PIM DRAM 에 요구하는 바이트 — 공통 --pim-form-execution-tiles
+// 의 k 상한 탐색과 같은 식을 써야 하므로 AiMXFootprint.h 로 옮겼다.
+using aimx::Footprint;
+using aimx::footprintOf;
 
 // linalg.matmul 의 operand 를 pim.access 의 id 로 되짚은 결과.
 struct Roles {
@@ -90,11 +88,15 @@ struct ConvertPIMToAiMXPass
       if (failed(convert(d)))
         return signalPassFailure();
 
-    // profile 은 여기서 소비된다. 남겨 두면 target IR 이 여전히 PIM 을 가리키게 되고,
-    // 뒤 단계가 기계 값을 다시 읽을 수 있다는 오해를 만든다.
+    // 공통 PIM planning 속성은 여기서 모두 소비된다. 남겨 두면 target
+    // IR이 여전히 PIM dialect에 의존하고, AiMX translator가 완전히 lowered된
+    // IR만 받는다는 경계가 깨진다.
     getOperation()->removeAttr("pim.target_profile");
-    getOperation().walk(
-        [](func::FuncOp f) { f->removeAttr("pim.group_execution"); });
+    getOperation().walk([](func::FuncOp f) {
+      f->removeAttr("pim.group_execution");
+      f->removeAttr("pim.block_group");
+      f->removeAttr("pim.execution_tile");
+    });
   }
 
   pim::TargetProfileAttr profile;
@@ -108,49 +110,25 @@ struct ConvertPIMToAiMXPass
       return m->emitError(
           "convert-pim-to-aimx: AiMX lanes are address-decoded SIMD slots, so "
           "parallel_execution_kind must be \"simd\"");
-    ArrayRef<int64_t> shape = profile.getPimCoreShape().asArrayRef();
-    if (shape.size() != 1 || shape[0] != 1)
-      return m->emitError(
-          "convert-pim-to-aimx: AiMX has one PIM Core per PIM Device, so "
-          "pim_core_shape must be [1]");
     if (profile.getNumberOfParallelLanesPerPimCore() != aimx::kLanes)
       return m->emitError("convert-pim-to-aimx: AiMX has ")
              << aimx::kLanes << " lanes per PIM Core, not "
              << profile.getNumberOfParallelLanesPerPimCore();
-    if (batch != 0 && !isBatch(batch))
+    // 실행 단위가 batch 를 정한다: 출력 block 은 batch 행 x 4096/batch 열이고
+    // reduction step 은 256/batch 다. 셋이 이 관계가 아니면 AiMX 가 아니다.
+    auto unit = profile.getExecutionUnit();
+    if (!unit || unit.asArrayRef().size() != 3)
       return m->emitError(
-          "convert-pim-to-aimx: batch must be 1, 2, 4, or 8 — or 0 to let the "
-          "pass pick the largest value the Triton block allows");
+          "convert-pim-to-aimx: the profile carries no execution_unit "
+          "[m, n, k], so the block group grid is unknown");
+    ArrayRef<int64_t> u = unit.asArrayRef();
+    if (!isBatch(u[0]) || u[1] != aimx::kLanes / u[0] ||
+        u[2] != aimx::kRegSize / u[0])
+      return m->emitError("convert-pim-to-aimx: the execution unit must be "
+                          "[batch, 4096/batch, 256/batch] with batch 1, 2, 4, "
+                          "or 8 — got [")
+             << u[0] << ", " << u[1] << ", " << u[2] << "]";
     return success();
-  }
-
-  //===--------------------------------------------------------------------===//
-  // batch
-  //===--------------------------------------------------------------------===//
-
-  // batch 는 arithmetic intensity 그 자체다. B tile 은 출력 행 그룹마다 다시 읽히고
-  // 그 횟수가 m_t/batch 이므로 invoke 당 전송량은 1/batch 로 줄고, 대신 descriptor
-  // group 수는 batch 배로 는다. 실측 계수(group 하나 0.44 us, 대역폭 56 GB/s)로 두 항을
-  // 같게 놓으면 batch = sqrt(2 * 4096 * 128 / (a*B)) = 6.5 이고, legal 한 값 중 가장
-  // 가까운 것이 8 이다. batch=1 대비 3.4 배로 실측된다.
-  //
-  // 그런데 8 을 그냥 기본값으로 박을 수는 없다. 세 조건이 전부 Triton block 에 달려 있다.
-  //
-  //   m_t % batch == 0              출력 block 은 batch 행이다
-  //   BLOCK_N | (4096/batch)        출력 block 폭이 Triton block 의 정수 배여야 한다
-  //   BLOCK_K | (256/batch)         reduction step 이 Triton block 의 정수 배여야 한다
-  //
-  // batch 를 키울수록 뒤의 둘이 빡빡해진다 — BLOCK_K=64 는 batch 8 에서 32 를 나누지
-  // 못한다. 그래서 기본값은 값이 아니라 **규칙**이다: 세 조건을 만족하는 최대값.
-  int64_t pickBatch(const Roles &roles, int64_t mT) {
-    if (batch != 0)
-      return batch;
-    int64_t best = 1;
-    for (int64_t b : {2, 4, 8})
-      if (mT % b == 0 && (aimx::kLanes / b) % roles.blockN == 0 &&
-          (aimx::kRegSize / b) % roles.blockK == 0)
-        best = b;
-    return best;
   }
 
   //===--------------------------------------------------------------------===//
@@ -174,47 +152,20 @@ struct ConvertPIMToAiMXPass
         "cannot be chosen");
   }
 
-  // §6.1. 예산은 **buffer 상한** (k_max, n_max) 만 정한다. 실제 tile 모양 (k_t, n_t) 은
-  // 런타임 값이고 descriptor program 이 인자로 받는다. m_t 는 이미 Triton block 묶음으로
-  // 정해져서 들어온다 — 예산에 맞추어 줄일 대상이 아니다.
-  LogicalResult pickTile(Operation *at, int64_t batchV, int64_t mT,
-                         int64_t &kMax, int64_t &nMax, Footprint &fp) {
+  // §6.1. (m_t, k_max, n_max)는 buffer와 재사용 descriptor chain의 고정 모양이다.
+  // tail execution tile은 stage에서 이 모양까지 0 padding하고 unstage는 유효 영역만
+  // 회수한다. 할당해 보고 물러서는 길이가 없으므로 예산을 넘으면 여기서 멈춘다.
+  LogicalResult checkBudget(Operation *at, int64_t batchV, int64_t mT,
+                            int64_t kMax, int64_t nMax, Footprint &fp) {
     int64_t budget;
     if (failed(budgetBytes(at, budget)))
       return failure();
-
-    nMax = roundUp(std::max<int64_t>(tileN, aimx::kChunk), aimx::kChunk);
-
-    if (tileK > 0) {
-      kMax = roundUp(tileK, aimx::kRegSize);
-      fp = footprintOf(batchV, mT, kMax, nMax);
-      if (fp.total() > budget)
-        return at->emitError("convert-pim-to-aimx: the requested buffer bound "
-                             "(m_t=")
-               << mT << ", tile-k=" << kMax << ", tile-n=" << nMax
-               << ") needs " << fp.total()
-               << " byte of PIM DRAM but the budget is " << budget
-               << " byte — lower group-m, tile-k, or tile-n";
-      return success();
-    }
-
-    // footprint 는 k 에 대해 단조 증가하므로 이분 탐색이면 된다. 단위는 256 이다.
-    int64_t lo = 1, hi = (1 << 20) / aimx::kRegSize;
-    if (footprintOf(batchV, mT, lo * aimx::kRegSize, nMax).total() > budget)
-      return at->emitError("convert-pim-to-aimx: even k_max=")
-             << aimx::kRegSize << " with m_t=" << mT << ", n_max=" << nMax
-             << " needs "
-             << footprintOf(batchV, mT, aimx::kRegSize, nMax).total()
-             << " byte of PIM DRAM but the budget is " << budget << " byte";
-    while (lo < hi) {
-      int64_t mid = lo + (hi - lo + 1) / 2;
-      if (footprintOf(batchV, mT, mid * aimx::kRegSize, nMax).total() <= budget)
-        lo = mid;
-      else
-        hi = mid - 1;
-    }
-    kMax = lo * aimx::kRegSize;
     fp = footprintOf(batchV, mT, kMax, nMax);
+    if (fp.total() > budget)
+      return at->emitError("convert-pim-to-aimx: the buffer bound (m_t=")
+             << mT << ", k_max=" << kMax << ", n_max=" << nMax << ") needs "
+             << fp.total() << " byte of PIM DRAM but the budget is " << budget
+             << " byte — lower tile_m, tile_k, or tile_n";
     return success();
   }
 
@@ -227,6 +178,19 @@ struct ConvertPIMToAiMXPass
     MLIRContext *ctx = &getContext();
     Location loc = device.getLoc();
     Block *deviceBody = &device.getBody().front();
+
+    if (!device->getAttrOfType<pim::DevicePlanAttr>("pim.device_plan"))
+      return device->emitError(
+          "convert-pim-to-aimx: the device has no #pim.device_plan");
+    auto reduction =
+        device->getAttrOfType<pim::ReductionPlanAttr>("pim.reduction_plan");
+    if (!reduction)
+      return device->emitError(
+          "convert-pim-to-aimx: the device has no #pim.reduction_plan");
+    if (reduction.getTemporalAccumulation().getValue() != "none" &&
+        reduction.getTemporalAccumulation().getValue() != "host")
+      return device->emitError(
+          "convert-pim-to-aimx: only host temporal accumulation is supported");
 
     auto cores =
         func->getAttrOfType<pim::GroupExecutionAttr>("pim.group_execution");
@@ -259,66 +223,73 @@ struct ConvertPIMToAiMXPass
     if (cPlace.getDirection() != "out")
       return cPlace->emitError(
           "convert-pim-to-aimx: the matmul result must be an \"out\" place");
-    // 출력에 축이 하나 더 있으면 그 축은 reduction 이 아니라 **분리**다 — slice 마다
-    // 독립된 GEMM 이고 host 가 나중에 더한다(전형적인 split-K). AiMX 로 못 내릴 이유는
-    // 없지만 host loop 한 겹과 k_t 기준 변경이 필요하고, 아직 설계에 없다.
-    if (cPlace.getStart().size() != 2)
-      return cPlace->emitError("convert-pim-to-aimx: the output has rank ")
-             << cPlace.getStart().size()
-             << " — an extra output axis is host split-K (one independent "
-                "matmul per slice), which this pass does not lower yet";
+    // 마지막 두 축이 PIM의 2-D C tile이다. 앞축이 있으면 split-K 같은 독립 partial
+    // output 축이며 host buffer의 origin/stride로 보존한다.
+    if (cPlace.getStart().size() < 2)
+      return cPlace->emitError(
+          "convert-pim-to-aimx: the output needs at least row and column axes");
     if (aPlace.getStart().size() != 2 || bPlace.getStart().size() != 2)
       return device->emitError(
           "convert-pim-to-aimx: A and B must be two-dimensional");
 
-    // ── execution tile 은 Triton block 묶음이다 ────────────────────────────────
-    // m 방향만 우리가 고른다: m_t = BLOCK_M * group-m. 반대 방향(요청한 m_t 를 BLOCK_M
-    // 경계로 올리기)은 m_t 가 언제나 BLOCK_M 의 배수로 튀어 BLOCK_M=8 에서 40, 48, 96 을
-    // 만들 수 없었다.
-    //
-    // n·k 방향은 묶음 수가 입력이 될 수 없다. 그쪽 눈금(4096/batch, 256/batch)은 우리가
-    // 고르는 값이 아니라 하드웨어 상수다. 대신 그 상수를 BLOCK_N·BLOCK_K 의 정수 배로
-    // **만드는** 것이 batch 선택이고, 그 결과가 아래 group[1], group[2] 다.
-    //
-    // groupM 은 Pass::Option 이라 값으로 받아 둔다 — 진단 stream 과 산술이 옵션 타입을
-    // 거치지 않게 한다.
-    int64_t gm = std::max<int64_t>(groupM, 1);
-    int64_t mT = roles.blockM * gm;
-    int64_t batchV = pickBatch(roles, mT);
-    if (mT % batchV != 0)
-      return device->emitError("convert-pim-to-aimx: m_t = BLOCK_M(")
-             << roles.blockM << ") * group-m(" << gm << ") = " << mT
-             << " is not a multiple of batch(" << batchV
-             << ") — the output block is batch rows tall, so an execution tile "
-                "has to hold a whole number of them. Pick a group-m that makes "
-                "the product a multiple of "
-             << batchV << ", or leave batch at 0 to let the pass pick";
-    int64_t hwN = aimx::kLanes / batchV, hwK = aimx::kRegSize / batchV;
-    if (hwN % roles.blockN != 0)
-      return device->emitError("convert-pim-to-aimx: BLOCK_N=")
-             << roles.blockN << " does not divide the output block width "
-             << hwN << " (= 4096/batch, batch=" << batchV
-             << "), so the n axis cannot be tiled by whole Triton blocks — pick "
-                "a divisor of "
-             << hwN << ", or leave batch at 0 to let the pass pick";
-    if (hwK % roles.blockK != 0)
-      return device->emitError("convert-pim-to-aimx: BLOCK_K=")
-             << roles.blockK << " does not divide the reduction step " << hwK
-             << " (= 256/batch, batch=" << batchV << ") — pick a divisor of "
-             << hwK << ", or leave batch at 0 to let the pass pick";
+    // ── block → block group → execution tile ─────────────────────────────────
+    // 세 계층은 전부 공통 IR 이 정했다. block 은 matmul operand 의 크기(readRoles)로
+    // 보이고, block group 은 --pim-form-block-groups 가 실행 단위에 block 을 채워
+    // #pim.block_group 으로 적어 두었으며, execution tile 상한은 #pim.execution_tile
+    // 이다. 이 pass 가 하는 일은 번역뿐이다 — group 을 상한까지 모아 buffer 를 잡고,
+    // padding(useful < phys)을 stage/unstage 의 group 배치로 옮긴다.
+    auto bg = func->getAttrOfType<pim::BlockGroupAttr>("pim.block_group");
+    if (!bg)
+      return func->emitError(
+          "convert-pim-to-aimx: the function has no #pim.block_group — run "
+          "--pim-form-block-groups after --pim-set-target-profile");
+    auto groupAt = [&](int i) {
+      BlockGroup g;
+      g.tiles = bg.getTiles().asArrayRef()[i];
+      g.useful = bg.getUseful().asArrayRef()[i];
+      g.phys = bg.getPhys().asArrayRef()[i];
+      return g;
+    };
+    BlockGroup mGroup = groupAt(0), nGroup = groupAt(1), kGroup = groupAt(2);
+    // batch 는 실행 단위의 m 이다 (gate 가 [batch, 4096/batch, 256/batch] 를 검증했다).
+    int64_t batchV = profile.getExecutionUnit().asArrayRef()[0];
+    // k tile 은 block group 과 vecA 적재 단위(256, §2.4 의 k_t % 256)를 동시에 채워야
+    // 한다. 물리 k 의 눈금은 그래서 둘의 lcm 이고, padding 이 없으면 256 그대로다.
+    int64_t kUnit = std::lcm(kGroup.phys, aimx::kRegSize);
+    int64_t kUnitUseful = kUnit / kGroup.phys * kGroup.useful;
 
-    int64_t kMax, nMax;
+    // 상한(유효 원소)이 담는 group 수는 내림이다(최소 1) — 상한은 넘지 않는 약속이다.
+    // host loop 은 유효 크기로 걷고 buffer 는 물리 크기로 잡는다. 세 축의 구체 수치는
+    // 공통 --pim-form-execution-tiles 가 확정했다(사용자 값 또는 예산 탐색 — footprint
+    // 식은 AiMXFootprint.h 로 공유). 이 pass 는 읽기만 하고, 예산 재검증(checkBudget)
+    // 만 방어적으로 유지한다.
+    auto cap =
+        device->getAttrOfType<pim::ExecutionTileAttr>("pim.execution_tile");
+    if (!cap || cap.getM() <= 0 || cap.getN() <= 0 || cap.getK() <= 0)
+      return device->emitError(
+          "convert-pim-to-aimx: #pim.execution_tile with concrete m, n, k "
+          "caps is required — run --pim-form-execution-tiles (it computes "
+          "missing caps from the profile budget)");
+
+    int64_t mCount = std::max<int64_t>(cap.getM() / mGroup.useful, 1);
+    int64_t mUse = mCount * mGroup.useful;
+    int64_t mPhys = mCount * mGroup.phys;
+    int64_t nMax =
+        std::max<int64_t>(cap.getN() / nGroup.useful, 1) * nGroup.phys;
+    int64_t kMax = std::max<int64_t>(cap.getK() / kUnitUseful, 1) * kUnit;
+
     Footprint fp;
-    if (failed(pickTile(device, batchV, mT, kMax, nMax, fp)))
+    if (failed(checkBudget(device, batchV, mPhys, kMax, nMax, fp)))
       return failure();
 
-    // 이 attribute 는 **할당된 buffer 의 모양**이다. 실제 tile 은 런타임 값이고
-    // --aimx-lower-matmul 이 compile time 상수로 읽는 것은 batch 하나뿐이다.
+    // 이 attribute는 할당된 buffer와 descriptor chain의 고정 모양이다.
     func->setAttr("aimx.tiling",
-                  aimx::TilingAttr::get(ctx, batchV, mT, kMax, nMax, fp.paddedK,
-                                        fp.paddedN, /*transposed=*/false));
-    // 위 attribute 가 buffer 모양이라면 이쪽은 source 와 하드웨어의 관계다. execution 은
-    // 전부 compile time 상수이고, n_t 는 런타임 값이라 여기 들어가지 않는다.
+                  aimx::TilingAttr::get(ctx, batchV, mPhys, kMax, nMax,
+                                        fp.paddedK, fp.paddedN,
+                                        /*transposed=*/false));
+    // 위 attribute 가 buffer 모양이라면 이쪽은 source 와 하드웨어의 관계다. group 이
+    // block group 당 Triton block 수, execution 이 block group 의 물리 크기다. 전부
+    // compile time 상수이고, execution tile 안의 실제 tail 크기는 place가 들고 있다.
     auto i64s = [&](std::initializer_list<int64_t> v) {
       return DenseI64ArrayAttr::get(ctx, v);
     };
@@ -326,18 +297,28 @@ struct ConvertPIMToAiMXPass
         "aimx.tile_group",
         aimx::TileGroupAttr::get(
             ctx, i64s({roles.blockM, roles.blockN, roles.blockK}),
-            i64s({mT / roles.blockM, hwN / roles.blockN, hwK / roles.blockK}),
-            i64s({mT, hwN, hwK})));
+            i64s({mGroup.tiles, nGroup.tiles, kGroup.tiles}),
+            i64s({mGroup.phys, nGroup.phys, kGroup.phys})));
 
     int64_t numDevices = 1;
     for (int64_t c : device.getMapping().getPartitions().asArrayRef())
       numDevices *= c;
 
-    // ── host: pim.device 자리에 acquire + foreach_device 를 놓는다 ────────────
-    OpBuilder hb(device);
+    // ── host: 공통 scheduling round 바깥에 foreach_device 를 놓는다 ─────────
+    // PIM Device set은 공통 scheduling round 전체에서 동일하다. acquire와
+    // foreach_device를 가장 바깥 scheduling loop 앞으로 옮긴다. 그 결과 각 device
+    // thread 안에서 allocation/descriptor build를 한 번 하고 모든 round를 돈다.
+    Operation *scheduleRoot = device;
+    while (auto round = dyn_cast_or_null<scf::ForOp>(scheduleRoot->getParentOp())) {
+      if (!round->hasAttr("pim.scheduling_axis"))
+        break;
+      scheduleRoot = round;
+    }
+    OpBuilder setup(scheduleRoot);
     auto setTy = aimx::DeviceSetType::get(ctx);
-    Value set = hb.create<aimx::AcquireOp>(loc, setTy,
-                                           hb.getI64IntegerAttr(numDevices));
+    Value set = setup.create<aimx::AcquireOp>(
+        loc, setTy, setup.getI64IntegerAttr(numDevices));
+    OpBuilder hb(scheduleRoot);
     ArrayAttr axes = device.getMapping().getAxes();
     auto counts = hb.getDenseI64ArrayAttr(
         device.getMapping().getPartitions().asArrayRef());
@@ -350,23 +331,31 @@ struct ConvertPIMToAiMXPass
       argLocs.push_back(loc);
     }
     Block *fdBody = hb.createBlock(&foreach.getBody(), {}, argTys, argLocs);
-    // 좌표 계산을 통째로 옮기고 block argument 를 새 것으로 잇는다.
-    fdBody->getOperations().splice(fdBody->end(), deviceBody->getOperations(),
-                                   deviceBody->begin(), deviceBody->end());
+
+    // round 계산과 pim.device를 함께 foreach_device 안으로 옮긴다. 원래 round IV와
+    // device 좌표를 그대로 보존하므로 place의 전역 origin 식을 다시 만들 필요가 없다.
+    scheduleRoot->moveBefore(fdBody, fdBody->end());
+
+    Block *roundBody = device->getBlock();
+    auto deviceIt = device->getIterator();
+    roundBody->getOperations().splice(deviceIt, deviceBody->getOperations(),
+                                      deviceBody->begin(), deviceBody->end());
     for (unsigned i = 0, e = axes.size(); i < e; i++)
       deviceBody->getArgument(i).replaceAllUsesWith(fdBody->getArgument(i + 1));
 
     // 논리 tile loop nest 는 통째로 사라진다. AiMX 에는 device program 이 없고
     // 계산 자체가 descriptor chain 이다.
     SmallVector<scf::ForOp> nests;
-    for (Operation &op : *fdBody)
+    for (Operation &op : *roundBody)
       if (auto f = dyn_cast<scf::ForOp>(&op))
         nests.push_back(f);
     for (scf::ForOp f : nests)
       f.erase();
 
-    buildPlacement(fdBody, func.getName(), aPlace, bPlace, cPlace, mT, kMax,
-                   nMax, hwN, fp);
+    PlacementBuffers buffers = buildSetup(
+        fdBody, func.getName(), mPhys, kMax, nMax, fp);
+    buildPlacement(device.getOperation(), aPlace, bPlace, cPlace, mUse, mPhys,
+                   kMax, nMax, mGroup, nGroup, kGroup, kUnit, fp, buffers);
 
     for (pim::PlaceOp p : all)
       p.erase();
@@ -463,7 +452,7 @@ struct ConvertPIMToAiMXPass
     if (bTy.getDimSize(0) != roles.blockK)
       return device->emitError("convert-pim-to-aimx: the matmul operands "
                                "disagree on BLOCK_K");
-    // 0 이면 아래에서 lcm 과 나눗셈이 0 으로 나눈다.
+    // 0 이면 아래의 나눗셈들이 0 으로 나눈다.
     if (roles.blockM <= 0 || roles.blockN <= 0 || roles.blockK <= 0)
       return device->emitError("convert-pim-to-aimx: the Triton block has a "
                                "non-positive dimension");
@@ -492,58 +481,15 @@ struct ConvertPIMToAiMXPass
   // level 1 배치
   //===--------------------------------------------------------------------===//
 
-  void buildPlacement(Block *body, StringRef base, pim::PlaceOp aPlace,
-                      pim::PlaceOp bPlace, pim::PlaceOp cPlace, int64_t mT,
-                      int64_t kMax, int64_t nMax, int64_t hwN,
-                      const Footprint &fp) {
-    OpBuilder b(body, body->end());
+  PlacementBuffers buildSetup(Block *body, StringRef base, int64_t mPhys,
+                              int64_t kMax, int64_t nMax,
+                              const Footprint &fp) {
+    OpBuilder b(body, body->begin());
     Location loc = body->getParentOp()->getLoc();
     MLIRContext *ctx = b.getContext();
     Value dev = body->getArgument(0);
     auto bufTy = aimx::BufferType::get(ctx);
-    auto elem = TypeAttr::get(b.getBF16Type());
-    // 이 pass 는 아직 전치를 고르지 않는다. IR 은 표현할 수 있고 규칙이 런타임 값을
-    // 필요로 할 뿐이다.
-    UnitAttr noTranspose;
 
-    // 상수는 loop 를 만들기 전에 전부 만들어 둔다. loop 뒤에 만들면 loop 안의 사용을
-    // 지배하지 못한다.
-    auto idx = [&](int64_t v) {
-      return b.create<arith::ConstantIndexOp>(loc, v).getResult();
-    };
-    auto roundUpVal = [&](Value v, int64_t m) {
-      Value mv = idx(m);
-      Value q = b.create<arith::CeilDivSIOp>(loc, v, mv).getResult();
-      return b.create<arith::MulIOp>(loc, q, mv).getResult();
-    };
-    Value c0 = idx(0), c1 = idx(1);
-    Value mTv = idx(mT);
-
-    // ── 런타임 tile 모양 ────────────────────────────────────────────────────
-    // buffer 는 (k_max, n_max) 로 잡혔고 descriptor program 은 여기서 만든 값을 인자로
-    // 받는다. 세 축 모두 상한에서 clamp 하고 넘치는 만큼 바깥 loop 이 돈다.
-    //
-    // k 를 자르는 것은 **손해**이고 마지막 수단이다. k tile 하나가 통째로 한 chain 에
-    // 들어가면 reduction 이 vACC 안에서 끝나고 bf16 반올림이 출력당 한 번뿐인데, 자르면
-    // 부분합이 tile 마다 PIM 밖으로 나와 C 전송이 k tile 수만큼 곱해진다. vACC 는 출력
-    // block 하나 깊이(주소가 pmm+VACC_OFFSET 하나)라 invoke 를 건너 들고 있을 수 없으므로
-    // 이것은 피할 수 있는 비용이 아니다. 그래서 k_max 는 예산이 허락하는 한 크게 두고
-    // (1 GiB, batch 8, m_t 16, n_max 4096 이면 115712), 자르는 일은 그것을 넘을 때만
-    // 일어난다 — 현실적인 k 는 전부 한 번에 들어간다.
-    Value kRt = b.create<arith::MinSIOp>(
-                     loc, roundUpVal(aPlace.getSize()[1], aimx::kRegSize),
-                     idx(kMax))
-                    .getResult();
-    Value padK = roundUpVal(kRt, aimx::kChunk);
-    // n 의 올림 단위는 **출력 block 폭 4096/batch** 다. 4096 으로 올리면 batch > 1 에서
-    // 남는 열이 그대로 노는 lane 이 된다 — N = 2560, batch = 8 이면 n_t 가 4096(1536 열
-    // 낭비)이 아니라 2560(낭비 0)이다. N >= n_max 면 어느 쪽이든 n_max 로 잘린다.
-    Value nRt = b.create<arith::MinSIOp>(
-                     loc, roundUpVal(cPlace.getSize()[1], hwN), idx(nMax))
-                    .getResult();
-
-    // PIM DRAM buffer 는 언제나 PIM_WIDTH 경계에 둔다. descriptor 가 그 단위로 주소를
-    // 흩뿌리므로 그보다 거친 눈금에서 시작해야 한다.
     auto alloc = [&](int64_t bytes, aimx::AllocKind kind) {
       int64_t align =
           kind == aimx::AllocKind::PMM ? aimx::kPMMAlign : aimx::kPIMWidth;
@@ -554,36 +500,134 @@ struct ConvertPIMToAiMXPass
           .getResult();
     };
 
-    // PMM 이 가장 먼저다. pim_private_malloc 이 pim_malloc 이 이미 내준 물리 주소를
-    // 그대로 돌려주는 경우가 있어, 데이터 buffer 가 그 뒤에 와야 겹침을 검사할 수 있다.
-    Value pmm = alloc(aimx::kPMMSize, aimx::AllocKind::PMM);
-    Value aBuf = alloc(fp.a, aimx::AllocKind::Data);
-    Value arel = alloc(fp.arel, aimx::AllocKind::Data);
-    Value bBuf = alloc(fp.b, aimx::AllocKind::Data);
-    Value cBuf = alloc(fp.c, aimx::AllocKind::Data);
-    Value chain = alloc(fp.chain, aimx::AllocKind::Descriptor);
+    PlacementBuffers buffers;
+    buffers.device = dev;
+    // PMM이 먼저여야 pim_private_malloc과 일반 pim_malloc 영역의 겹침을 검사할 수 있다.
+    buffers.pmm = alloc(aimx::kPMMSize, aimx::AllocKind::PMM);
+    buffers.a = alloc(fp.a, aimx::AllocKind::Data);
+    buffers.arel = alloc(fp.arel, aimx::AllocKind::Data);
+    buffers.b = alloc(fp.b, aimx::AllocKind::Data);
+    buffers.c = alloc(fp.c, aimx::AllocKind::Data);
+    buffers.chain = alloc(fp.chain, aimx::AllocKind::Descriptor);
 
-    // chain 은 tile loop 밖에서 한 번만 만든다. tile 모양과 base 주소가 모두 같으므로
-    // 모든 tile 에서 byte 단위로 동일하다. 재배치가 먼저, 계산이 다음이고 그 순서가
-    // 곧 chain 안의 순서다.
-    //
-    // 인자는 런타임 값(k_t, n_t)이다. group 수는 k 와 padded_n 에 대해 단조 증가하고
-    // k_t <= k_max, n_t <= n_max 이므로 chain buffer 를 넘지 않는다.
+    // descriptor는 execution-tile 최대 모양과 고정 PIM-side base address만 사용한다.
+    // tail round도 같은 chain을 실행하며, 부족한 데이터는 stage가 0으로 채우고
+    // unstage가 실제 유효 영역만 회수한다.
+    Value m = b.create<arith::ConstantIndexOp>(loc, mPhys);
+    Value k = b.create<arith::ConstantIndexOp>(loc, kMax);
+    Value paddedK = b.create<arith::ConstantIndexOp>(loc, fp.paddedK);
+    Value n = b.create<arith::ConstantIndexOp>(loc, nMax);
     b.create<aimx::BuildDescriptorsOp>(
         loc, FlatSymbolRefAttr::get(ctx, (base + "_relayout").str()),
-        ValueRange{mTv, kRt, padK, aBuf, arel}, chain);
+        ValueRange{m, k, paddedK, buffers.a, buffers.arel}, buffers.chain);
     b.create<aimx::BuildDescriptorsOp>(
         loc, FlatSymbolRefAttr::get(ctx, (base + "_compute").str()),
-        ValueRange{mTv, kRt, nRt, arel, bBuf, cBuf, pmm}, chain);
+        ValueRange{m, k, n, buffers.arel, buffers.b, buffers.c, buffers.pmm},
+        buffers.chain);
+    return buffers;
+  }
 
+  void buildPlacement(Operation *at, pim::PlaceOp aPlace,
+                      pim::PlaceOp bPlace, pim::PlaceOp cPlace, int64_t mUse,
+                      int64_t mPhys, int64_t kMax, int64_t nMax,
+                      const BlockGroup &mGroup, const BlockGroup &nGroup,
+                      const BlockGroup &kGroup, int64_t kUnit,
+                      const Footprint &fp,
+                      const PlacementBuffers &buffers) {
+    OpBuilder b(at);
+    Location loc = at->getLoc();
+    MLIRContext *ctx = b.getContext();
+    Value dev = buffers.device;
+    auto elem = TypeAttr::get(b.getBF16Type());
+    // 이 pass 는 아직 전치를 고르지 않는다. IR 은 표현할 수 있고 규칙이 런타임 값을
+    // 필요로 할 뿐이다.
+    UnitAttr noTranspose;
+
+    // 상수는 loop 를 만들기 전에 전부 만들어 둔다. loop 뒤에 만들면 loop 안의 사용을
+    // 지배하지 못한다.
+    auto idx = [&](int64_t v) {
+      return b.create<arith::ConstantIndexOp>(loc, v).getResult();
+    };
+    Value c0 = idx(0), c1 = idx(1);
+    // m 도 n·k 와 같다: host loop 은 유효 크기로 걷고, buffer 와 descriptor program 은
+    // 물리 크기를 본다. padding 이 없으면 둘이 같다.
+    Value mUseV = idx(mUse), mPhysV = idx(mPhys);
+    Value fixedK = idx(kMax), fixedN = idx(nMax);
+    Value fixedPaddedK = idx(fp.paddedK);
+
+    // ── execution tile 안의 실제 유효 범위 ─────────────────────────────────
+    // buffer와 descriptor는 고정 최대 모양이고, 여기서는 현재 round의 유효 크기를
+    // 상한에서 clamp한다. tail은 stage가 최대 모양까지 0으로 채운다.
+    //
+    // block group 이 끼면 **유효(useful)** 크기와 **물리(phys)** 크기가 갈린다. host
+    // 가 소비하는 것(loop 전진 폭, stage/unstage 의 origin·sizes)은 유효 크기이고,
+    // PIM DRAM·chain·descriptor program 이 보는 것(pad_to, pitch, program 인자)은
+    // 물리 크기다. padding 이 없으면 둘이 같아 예전과 같은 값이 나온다.
+    //
+    // k 를 자르는 것은 **손해**이고 마지막 수단이다. k tile 하나가 통째로 한 chain 에
+    // 들어가면 reduction 이 vACC 안에서 끝나고 bf16 반올림이 출력당 한 번뿐인데, 자르면
+    // 부분합이 tile 마다 PIM 밖으로 나와 C 전송이 k tile 수만큼 곱해진다. vACC 는 출력
+    // block 하나 깊이(주소가 pmm+VACC_OFFSET 하나)라 invoke 를 건너 들고 있을 수 없으므로
+    // 이것은 피할 수 있는 비용이 아니다. 그래서 k_max 는 예산이 허락하는 한 크게 두고
+    // (1 GiB, batch 8, m_t 16, n_max 4096 이면 115712), 자르는 일은 그것을 넘을 때만
+    // 일어난다 — 현실적인 k 는 전부 한 번에 들어간다.
+    int64_t kUnitUseful = (kUnit / kGroup.phys) * kGroup.useful;
+    // 단위 수는 최소 1 이다. device 분배가 이 device 에 일을 주지 않으면(범위 0)
+    // 단위 수가 0 이 되고 그 곱 k_t/n_t 가 tile 수 나눗셈의 분모로 들어가 SIGFPE 다.
+    // 1 로 받치면 tile 수가 ceildiv(0, 단위) = 0 이라 loop 이 돌지 않는 no-op 이 된다.
+    Value kUnits = b.create<arith::MaxSIOp>(
+        loc,
+        b.create<arith::MinSIOp>(
+             loc,
+             b.create<arith::CeilDivSIOp>(loc, aPlace.getSize()[1],
+                                          idx(kUnitUseful))
+                 .getResult(),
+             idx(kMax / kUnit))
+            .getResult(),
+        c1);
+    Value kRt = b.create<arith::MulIOp>(loc, kUnits, idx(kUnit)).getResult();
+    Value kUse = kGroup.pad()
+                     ? b.create<arith::MulIOp>(loc, kUnits, idx(kUnitUseful))
+                           .getResult()
+                     : kRt;
+    // n 의 눈금은 block group 의 물리 폭이다 (padding 이 없으면 출력 block 폭
+    // 4096/batch 그대로). 4096 으로 올리면 batch > 1 에서 남는 열이 그대로 노는
+    // lane 이 된다 — N = 2560, batch = 8 이면 n_t 가 4096(1536 열 낭비)이 아니라
+    // 2560(낭비 0)이다. N >= n_max 면 어느 쪽이든 n_max 로 잘린다.
+    Value nGroups = b.create<arith::MaxSIOp>(
+        loc,
+        b.create<arith::MinSIOp>(
+             loc, b.create<arith::CeilDivSIOp>(
+                      loc, cPlace.getSize()[cPlace.getSize().size() - 1],
+                                          idx(nGroup.useful))
+                 .getResult(),
+             idx(nMax / nGroup.phys))
+            .getResult(),
+        c1);
+    Value nRt =
+        b.create<arith::MulIOp>(loc, nGroups, idx(nGroup.phys)).getResult();
+    Value nUse = nGroup.pad()
+                     ? b.create<arith::MulIOp>(loc, nGroups, idx(nGroup.useful))
+                           .getResult()
+                     : nRt;
+    // padding 이 있는 축만 stage / unstage 에 block group 배치를 싣는다. 없는 축은
+    // 항등이라 attr 를 아예 내지 않는다 — 그래야 stub 이 예전 코드를 그대로 낸다.
+    auto grpAttr = [&](const BlockGroup &g) {
+      return g.pad() ? b.getDenseI64ArrayAttr({g.useful, g.phys})
+                     : DenseI64ArrayAttr();
+    };
+
+    // tile 수와 loop 전진 폭은 **유효** 크기로 센다 — host 좌표는 padding 을 모른다.
     Value mTiles =
-        b.create<arith::CeilDivSIOp>(loc, cPlace.getSize()[0], mTv).getResult();
-    Value nTiles =
-        b.create<arith::CeilDivSIOp>(loc, cPlace.getSize()[1], nRt).getResult();
+        b.create<arith::CeilDivSIOp>(
+             loc, cPlace.getSize()[cPlace.getSize().size() - 2], mUseV)
+            .getResult();
+    Value nTiles = b.create<arith::CeilDivSIOp>(
+        loc, cPlace.getSize()[cPlace.getSize().size() - 1], nUse);
     // k 가 상한 안이면 이 값이 1 이고 아래 loop 은 한 번만 돈다 — 그때 나오는 코드는
     // k 를 나누기 전과 같다.
     Value kTiles =
-        b.create<arith::CeilDivSIOp>(loc, aPlace.getSize()[1], kRt).getResult();
+        b.create<arith::CeilDivSIOp>(loc, aPlace.getSize()[1], kUse).getResult();
 
     // 이 tile 이 실제로 맡는 크기. 마지막 tile 이 덜 맡으면 stage 가 그만큼만 모으고
     // 나머지 자리는 0 이 된다 — 그 0 이 누산에 그대로 더해지므로 정확성 요구사항이다.
@@ -602,12 +646,12 @@ struct ConvertPIMToAiMXPass
     auto nLoop = b.create<scf::ForOp>(loc, c0, nTiles, c1);
     OpBuilder nb = OpBuilder::atBlockBegin(nLoop.getBody());
     Value nOff =
-        nb.create<arith::MulIOp>(loc, nLoop.getInductionVar(), nRt).getResult();
+        nb.create<arith::MulIOp>(loc, nLoop.getInductionVar(), nUse).getResult();
 
     auto kLoop = nb.create<scf::ForOp>(loc, c0, kTiles, c1);
     OpBuilder kb = OpBuilder::atBlockBegin(kLoop.getBody());
     Value kOff =
-        kb.create<arith::MulIOp>(loc, kLoop.getInductionVar(), kRt).getResult();
+        kb.create<arith::MulIOp>(loc, kLoop.getInductionVar(), kUse).getResult();
 
     Value bRow0 =
         kb.create<arith::AddIOp>(loc, bPlace.getStart()[0], kOff).getResult();
@@ -615,10 +659,12 @@ struct ConvertPIMToAiMXPass
         kb.create<arith::AddIOp>(loc, bPlace.getStart()[1], nOff).getResult();
     kb.create<aimx::StageOp>(
         loc, bPlace.getBuffer(), ValueRange{bRow0, bCol0},
-        ValueRange{remaining(kb, bPlace.getSize()[0], kOff, kRt),
-                   remaining(kb, bPlace.getSize()[1], nOff, nRt)},
-        bPlace.getStrides(), ValueRange{kRt, nRt}, nRt, bBuf, elem,
-        noTranspose);
+        ValueRange{remaining(kb, bPlace.getSize()[0], kOff, kUse),
+                   remaining(kb, bPlace.getSize()[1], nOff, nUse)},
+        bPlace.getStrides(), ValueRange{fixedK, fixedN}, fixedN, buffers.b,
+        elem,
+        noTranspose, /*group_rows=*/grpAttr(kGroup),
+        /*group_cols=*/grpAttr(nGroup));
 
     // 두 번째 k tile 부터는 C 를 덮는 것이 아니라 이전 부분합에 더한다. k tile 이
     // 하나뿐이면 이 값은 언제나 0 이고 unstage 는 예전 그대로 대입만 한다.
@@ -634,7 +680,8 @@ struct ConvertPIMToAiMXPass
     auto mLoop = kb.create<scf::ForOp>(loc, c0, mTiles, c1);
     OpBuilder mb = OpBuilder::atBlockBegin(mLoop.getBody());
     Value mOff =
-        mb.create<arith::MulIOp>(loc, mLoop.getInductionVar(), mTv).getResult();
+        mb.create<arith::MulIOp>(loc, mLoop.getInductionVar(), mUseV)
+            .getResult();
 
     Value aRow0 =
         mb.create<arith::AddIOp>(loc, aPlace.getStart()[0], mOff).getResult();
@@ -642,22 +689,29 @@ struct ConvertPIMToAiMXPass
         mb.create<arith::AddIOp>(loc, aPlace.getStart()[1], kOff).getResult();
     mb.create<aimx::StageOp>(
         loc, aPlace.getBuffer(), ValueRange{aRow0, aCol0},
-        ValueRange{remaining(mb, aPlace.getSize()[0], mOff, mTv),
-                   remaining(mb, aPlace.getSize()[1], kOff, kRt)},
-        aPlace.getStrides(), ValueRange{mTv, kRt}, padK, aBuf, elem,
-        noTranspose);
+        ValueRange{remaining(mb, aPlace.getSize()[0], mOff, mUseV),
+                   remaining(mb, aPlace.getSize()[1], kOff, kUse)},
+        aPlace.getStrides(), ValueRange{mPhysV, fixedK}, fixedPaddedK,
+        buffers.a, elem,
+        noTranspose, /*group_rows=*/grpAttr(mGroup),
+        /*group_cols=*/grpAttr(kGroup));
 
-    mb.create<aimx::InvokeOp>(loc, dev, chain);
+    mb.create<aimx::InvokeOp>(loc, dev, buffers.chain);
 
-    Value cRow0 =
-        mb.create<arith::AddIOp>(loc, cPlace.getStart()[0], mOff).getResult();
-    Value cCol0 =
-        mb.create<arith::AddIOp>(loc, cPlace.getStart()[1], nOff).getResult();
+    unsigned cRank = cPlace.getStart().size();
+    SmallVector<Value> cOrigin(cPlace.getStart());
+    SmallVector<Value> cSizes(cPlace.getSize());
+    cOrigin[cRank - 2] = mb.create<arith::AddIOp>(
+        loc, cOrigin[cRank - 2], mOff);
+    cOrigin[cRank - 1] = mb.create<arith::AddIOp>(
+        loc, cOrigin[cRank - 1], nOff);
+    cSizes[cRank - 2] =
+        remaining(mb, cSizes[cRank - 2], mOff, mUseV);
+    cSizes[cRank - 1] = remaining(mb, cSizes[cRank - 1], nOff, nUse);
     mb.create<aimx::UnstageOp>(
-        loc, cBuf, cPlace.getBuffer(), ValueRange{cRow0, cCol0},
-        ValueRange{remaining(mb, cPlace.getSize()[0], mOff, mTv),
-                   remaining(mb, cPlace.getSize()[1], nOff, nRt)},
-        cPlace.getStrides(), nRt, acc, elem, noTranspose);
+        loc, buffers.c, cPlace.getBuffer(), cOrigin, cSizes,
+        cPlace.getStrides(), fixedN, acc, elem, noTranspose,
+        /*group_rows=*/grpAttr(mGroup), /*group_cols=*/grpAttr(nGroup));
   }
 };
 

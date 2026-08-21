@@ -514,20 +514,36 @@ struct HostEmitter {
   // 타일 단위 버퍼를 원본의 strided 영역으로 되돌린다. 읽는 범위는 실제로 쓴 영역(sizes)
   // 이고, 축별 타일 수는 버퍼 자체의 크기(capacity)에서 나온다. 유닛이 배정량보다 적게
   // 맡으면 둘이 달라지므로 나누어 써야 한다.
+  // accumulate(k 창 번호)가 있으면 첫 창(0)은 대입, 그 뒤는 누산이다 — k 창은
+  // launch 마다 부분합을 내므로 host 가 창을 건너 더해야 완성값이 된다.
   LogicalResult emitUnstage(upmem::UnstageOp un, unsigned depth) {
     unsigned rank = un.getOrigin().size();
     ArrayRef<int64_t> tile = un.getTile();
-    emitTileLoops(rank, tile, un.getSizes(), depth);
-    e.indent(depth + 1 + 2 * rank);
-    os() << e.name(un.getDst()) << "["
-         << strideIndex(rank, tile, un.getOrigin(), un.getStrides())
-         << "] = " << e.name(un.getBuffer()) << "["
-         << tileIndex(rank, tile,
-                      [&](unsigned d) {
-                        return "(" + e.name(un.getCapacity()[d]) + " / " +
-                               std::to_string(tile[d]) + ")";
-                      })
-         << "];\n";
+    auto emitBody = [&](unsigned d, StringRef assignOp) {
+      emitTileLoops(rank, tile, un.getSizes(), d);
+      e.indent(d + 1 + 2 * rank);
+      os() << e.name(un.getDst()) << "["
+           << strideIndex(rank, tile, un.getOrigin(), un.getStrides())
+           << "] " << assignOp << " " << e.name(un.getBuffer()) << "["
+           << tileIndex(rank, tile,
+                        [&](unsigned dd) {
+                          return "(" + e.name(un.getCapacity()[dd]) + " / " +
+                                 std::to_string(tile[dd]) + ")";
+                        })
+           << "];\n";
+    };
+    if (Value acc = un.getAccumulate()) {
+      e.indent(depth);
+      os() << "if (" << e.name(acc) << " == 0) {\n";
+      emitBody(depth + 1, "=");
+      e.indent(depth);
+      os() << "} else {\n";
+      emitBody(depth + 1, "+=");
+      e.indent(depth);
+      os() << "}\n";
+      return success();
+    }
+    emitBody(depth, "=");
     return success();
   }
 };
