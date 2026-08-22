@@ -96,6 +96,13 @@ class ConstraintEngine:
                 and config.replication_policy != "slice"):
             return ("replication legality 위반: resident operand 없이 "
                     f"replication={config.replication_policy}")
+        # Phase 3 legality: 재사용은 단계적으로만 성립한다.
+        if config.descriptor_reuse and not config.device_set_reuse:
+            return "descriptor 재사용은 device set 재사용을 전제로 한다"
+        if config.command_reuse and not config.descriptor_reuse:
+            return "command 재사용은 descriptor 재사용을 전제로 한다"
+        if config.persistent_execution and not config.command_reuse:
+            return "persistent execution은 command 재사용을 전제로 한다"
 
         # Constraint 2 — local memory (§10): S_A+S_B+S_C+S_runtime ≤ C_local.
         s_local = (local_memory_footprint(problem, config)

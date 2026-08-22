@@ -49,6 +49,17 @@ RESIDENCY_POLICIES = ("stream", "resident")
 REPLICATION_POLICIES = ("slice", "full")
 STREAMING_POLICIES = ("per_round", "all_rounds")
 
+# Phase 3 (§53) — PersistenceFragment:
+# (device_set_reuse, descriptor_reuse, command_reuse, persistent_execution).
+# 재사용은 단계적으로만 의미가 있으므로 legal 조합만 나열한다 (§6의 논리).
+PERSISTENCE_STRATEGIES = (
+    (False, False, False, False),   # 매 round device set부터 재확보
+    (True, False, False, False),    # device set 재사용 (기본)
+    (True, True, False, False),     # + descriptor 재사용
+    (True, True, True, False),      # + command 재사용
+    (True, True, True, True),       # + persistent execution (launch 1회)
+)
+
 
 @dataclass(frozen=True)
 class PIMConfigSpace:
@@ -60,6 +71,7 @@ class PIMConfigSpace:
     residency_policies: tuple = RESIDENCY_POLICIES
     replication_policies: tuple = REPLICATION_POLICIES
     streaming_policies: tuple = STREAMING_POLICIES
+    persistence_strategies: tuple = PERSISTENCE_STRATEGIES
 
 
 def build_config_space(problem, hardware):
@@ -74,14 +86,17 @@ def build_config_space(problem, hardware):
 def make_config(problem, hardware, blocks, groups, executions,
                 distribution_policy, ksplit_strategy,
                 a_residency="stream", b_residency="stream",
-                replication_policy="slice", streaming_policy="per_round"):
+                replication_policy="slice", streaming_policy="per_round",
+                persistence_strategy=(True, False, False, False)):
     """knob 값들로부터 완전한 PIMConfig를 만든다.
 
     P_K/reduction은 KSplitFragment에서 (§6), P_M/P_N은 distribution
     policy와 tile grid에서 결정된다 (§6.1). residency/replication/streaming은
-    Phase 2 knob이다 (§53).
+    Phase 2, persistence는 Phase 3 knob이다 (§53).
     """
     p_k, reduction_policy = ksplit_strategy
+    device_set_reuse, descriptor_reuse, command_reuse, persistent_execution = \
+        persistence_strategy
     tile_m = blocks[0] * groups[0] * executions[0]
     tile_n = blocks[1] * groups[1] * executions[1]
     p_m, p_n = resolve_distribution(
@@ -97,6 +112,10 @@ def make_config(problem, hardware, blocks, groups, executions,
         a_residency=a_residency, b_residency=b_residency,
         replication_policy=replication_policy,
         streaming_policy=streaming_policy,
+        device_set_reuse=device_set_reuse,
+        descriptor_reuse=descriptor_reuse,
+        command_reuse=command_reuse,
+        persistent_execution=persistent_execution,
     )
 
 
@@ -228,7 +247,8 @@ def random_valid_configs(problem, hardware, spec, count, rng, engine):
             a_residency=rng.choice(spec.residency_policies),
             b_residency=rng.choice(spec.residency_policies),
             replication_policy=rng.choice(spec.replication_policies),
-            streaming_policy=rng.choice(spec.streaming_policies))
+            streaming_policy=rng.choice(spec.streaming_policies),
+            persistence_strategy=rng.choice(spec.persistence_strategies))
         if engine.valid(config):
             configs.append(config)
     return configs

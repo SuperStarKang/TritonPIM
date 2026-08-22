@@ -4,7 +4,8 @@
 # Planner는 AutoTuner가 아니다: "이 Config가 주어졌을 때 실제로 어떻게
 # 실행해야 하는가?"만 결정한다 (§14).
 
-from .types import PIMPlan, ReductionPlan, TransferPlan, ceil_div
+from .types import (DescriptorPlan, PIMPlan, ReductionPlan, TransferPlan,
+                    ceil_div)
 
 
 def resolve_distribution(problem, hardware, tile_m, tile_n, p_k, policy):
@@ -63,6 +64,10 @@ class PIMPlanner:
         rounds_n = ceil_div(e_n, p_n)
         num_rounds = rounds_m * rounds_n
         assignments = []
+        # Phase 3: descriptor는 (device, round) 작업마다 하나다. 재사용이 켜져
+        # 있으면 같은 active 모양의 round는 descriptor를 다시 만들지 않는다.
+        descriptor_builds = 0
+        built_shapes = set()
         for r_m in range(rounds_m):
             active_m = min(p_m, e_m - r_m * p_m)
             for r_n in range(rounds_n):
@@ -75,6 +80,12 @@ class PIMPlanner:
                             round_items.append(
                                 (device, r_m * p_m + i, r_n * p_n + j, plane))
                 assignments.append(round_items)
+                if config.descriptor_reuse:
+                    if (active_m, active_n) not in built_shapes:
+                        built_shapes.add((active_m, active_n))
+                        descriptor_builds += len(round_items)
+                else:
+                    descriptor_builds += len(round_items)
 
         # §23 — transfer placement: 실제 전송량과 operand replication.
         # 한 (output tile, plane) 작업은 A의 T_M×(plane K 구간), B의
@@ -141,6 +152,19 @@ class PIMPlanner:
         else:
             raise ValueError(f"알 수 없는 reduction_policy: {policy}")
 
+        # Phase 3 — descriptor/command/launch 계획 (§53).
+        descriptor_transfer_bytes = (descriptor_builds
+                                     * self.hardware.descriptor_bytes)
+        descriptor = DescriptorPlan(
+            descriptor_build_count=descriptor_builds,
+            descriptor_transfer_bytes=descriptor_transfer_bytes,
+            descriptor_reuse_factor=items / descriptor_builds,
+            command_build_count=1 if config.command_reuse else num_rounds,
+            kernel_launch_count=1 if config.persistent_execution
+            else num_rounds,
+            device_alloc_count=1 if config.device_set_reuse else num_rounds,
+        )
+
         transfer = TransferPlan(
             a_bytes=a_bytes,
             b_bytes=b_bytes,
@@ -148,7 +172,8 @@ class PIMPlanner:
             b_replication_bytes=b_replication,
             a_resident_bytes=a_resident_bytes,
             b_resident_bytes=b_resident_bytes,
-            h2d_bytes=a_bytes + b_bytes,
+            # §23: B_H2D = Σ(B_A + B_B + B_metadata)
+            h2d_bytes=a_bytes + b_bytes + descriptor_transfer_bytes,
             d2h_bytes=d2h_bytes,
         )
         reduction = ReductionPlan(
@@ -168,4 +193,5 @@ class PIMPlanner:
             device_assignments=assignments,
             transfer_plan=transfer,
             reduction_plan=reduction,
+            descriptor_plan=descriptor,
         )

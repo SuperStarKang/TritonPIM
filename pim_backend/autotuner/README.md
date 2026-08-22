@@ -89,3 +89,19 @@ Config에 `a_residency`/`b_residency`(stream|resident),
 - Seed G(weight-stationary, B resident)는 space가 resident를 허용할 때만
   생성된다. residency를 실행에 반영하지 못하는 runtime(현 split_k 러너)은
   `PIMConfigSpace(residency_policies=("stream",), ...)`로 제한해서 쓴다.
+
+## Phase 3 — Persistent Execution (§53)
+
+PersistenceFragment `(device_set_reuse, descriptor_reuse, command_reuse,
+persistent_execution)` 을 추가했다. 재사용은 단계적으로만 성립하므로
+(descriptor ⇒ device set, command ⇒ descriptor, persistent ⇒ command)
+legal 조합 5개만 나열하고 하나의 categorical knob으로 탐색한다.
+
+- Planner가 descriptor 계획을 산출한다: descriptor는 (device, round) 작업마다
+  하나이고, 재사용이 켜지면 같은 active 모양의 round는 다시 만들지 않는다.
+- Plan feature: `descriptor_build_count`, `descriptor_transfer_bytes`
+  (h2d의 §23 metadata 항으로도 가산), `descriptor_reuse_factor`,
+  `command_build_count`, `kernel_launch_count`, `device_alloc_count`.
+- descriptor 크기는 profile의 `descriptor_bytes`(기본 0 = 무시)로 준다.
+- persistence를 실행에 반영하지 못하는 runtime은 space를 기본 전략
+  `(True, False, False, False)` 하나로 제한해서 쓴다 (현 split_k 러너).

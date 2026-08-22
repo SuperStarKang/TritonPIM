@@ -48,6 +48,7 @@ def extract_plan_features(problem, hardware, config, plan):
 
     transfer = plan.transfer_plan
     reduction = plan.reduction_plan
+    descriptor = plan.descriptor_plan
     return PIMPlanFeatures(
         effective_utilization=effective_utilization,
         load_imbalance=load_imbalance,
@@ -65,6 +66,12 @@ def extract_plan_features(problem, hardware, config, plan):
         execution_tile_count=e_m * e_n * e_k,
         a_resident_bytes=transfer.a_resident_bytes,
         b_resident_bytes=transfer.b_resident_bytes,
+        descriptor_build_count=descriptor.descriptor_build_count,
+        descriptor_transfer_bytes=descriptor.descriptor_transfer_bytes,
+        descriptor_reuse_factor=descriptor.descriptor_reuse_factor,
+        command_build_count=descriptor.command_build_count,
+        kernel_launch_count=descriptor.kernel_launch_count,
+        device_alloc_count=descriptor.device_alloc_count,
     )
 
 
@@ -83,6 +90,9 @@ def feature_names(spec):
     # Phase 2 knob (이진이라 열 하나씩이면 충분하다)
     names += ["a_residency", "b_residency",
               "replication=full", "streaming=all_rounds"]
+    # Phase 3 knob
+    names += ["device_set_reuse", "descriptor_reuse",
+              "command_reuse", "persistent_execution"]
     names += [
         "active_units",
         "effective_utilization",
@@ -100,6 +110,12 @@ def feature_names(spec):
         "device_memory_pressure",
         "a_resident_bytes",
         "b_resident_bytes",
+        "descriptor_build_count",
+        "descriptor_transfer_bytes",
+        "descriptor_reuse_factor",
+        "command_build_count",
+        "kernel_launch_count",
+        "device_alloc_count",
     ]
     return names
 
@@ -126,6 +142,12 @@ def config_plan_vector(config, features, spec):
         1.0 if config.streaming_policy == "all_rounds" else 0.0,
     ]
     vector += [
+        1.0 if config.device_set_reuse else 0.0,
+        1.0 if config.descriptor_reuse else 0.0,
+        1.0 if config.command_reuse else 0.0,
+        1.0 if config.persistent_execution else 0.0,
+    ]
+    vector += [
         float(features.active_units),
         features.effective_utilization,
         float(features.execution_tile_count),
@@ -142,5 +164,11 @@ def config_plan_vector(config, features, spec):
         features.device_memory_pressure,
         float(features.a_resident_bytes),
         float(features.b_resident_bytes),
+        float(features.descriptor_build_count),
+        float(features.descriptor_transfer_bytes),
+        features.descriptor_reuse_factor,
+        float(features.command_build_count),
+        float(features.kernel_launch_count),
+        float(features.device_alloc_count),
     ]
     return vector

@@ -82,6 +82,12 @@ PLAN_FEATURE_INFLUENCE = {
                               "group_m", "group_n", "group_k"),
     "device_memory_pressure": ("execution_m", "execution_n", "execution_k",
                                "residency", "streaming"),
+    "descriptor_build_count": ("persistence",),
+    "descriptor_transfer_bytes": ("persistence",),
+    "descriptor_reuse_factor": ("persistence",),
+    "command_build_count": ("persistence",),
+    "kernel_launch_count": ("persistence", "execution_m", "execution_n"),
+    "device_alloc_count": ("persistence",),
 }
 
 
@@ -110,6 +116,9 @@ def influenced_fragments(feature_name):
         return ("replication",)
     if feature_name.startswith("streaming="):
         return ("streaming",)
+    if feature_name in ("device_set_reuse", "descriptor_reuse",
+                        "command_reuse", "persistent_execution"):
+        return ("persistence",)
     raise ValueError(f"알 수 없는 feature 이름: {feature_name}")
 
 
@@ -139,6 +148,8 @@ def semantic_mutate(config, fragment_kinds, problem, hardware, spec):
     policy = config.distribution_policy
     strategy_index = spec.ksplit_strategies.index(
         (config.p_k, config.reduction_policy))
+    persistence_index = spec.persistence_strategies.index(
+        config.persistence_strategy())
 
     def rebuild(new_blocks=blocks, new_groups=groups,
                 new_executions=executions, new_policy=policy,
@@ -146,13 +157,16 @@ def semantic_mutate(config, fragment_kinds, problem, hardware, spec):
                 a_residency=config.a_residency,
                 b_residency=config.b_residency,
                 replication_policy=config.replication_policy,
-                streaming_policy=config.streaming_policy):
+                streaming_policy=config.streaming_policy,
+                new_persistence_index=persistence_index):
         return make_config(problem, hardware, new_blocks, new_groups,
                            new_executions, new_policy,
                            spec.ksplit_strategies[new_strategy_index],
                            a_residency=a_residency, b_residency=b_residency,
                            replication_policy=replication_policy,
-                           streaming_policy=streaming_policy)
+                           streaming_policy=streaming_policy,
+                           persistence_strategy=spec.persistence_strategies[
+                               new_persistence_index])
 
     neighbors = []
     for kind in fragment_kinds:
@@ -196,6 +210,10 @@ def semantic_mutate(config, fragment_kinds, problem, hardware, spec):
             for other in spec.streaming_policies:
                 if other != config.streaming_policy:
                     neighbors.append(rebuild(streaming_policy=other))
+        elif kind == "persistence":
+            for index in (persistence_index - 1, persistence_index + 1):
+                if 0 <= index < len(spec.persistence_strategies):
+                    neighbors.append(rebuild(new_persistence_index=index))
         else:
             raise ValueError(f"알 수 없는 fragment 종류: {kind}")
     return neighbors
@@ -312,7 +330,8 @@ def tune(problem, hardware, benchmark_fn, *, space=None, cache=None,
                 a_residency=cached.a_residency,
                 b_residency=cached.b_residency,
                 replication_policy=cached.replication_policy,
-                streaming_policy=cached.streaming_policy))
+                streaming_policy=cached.streaming_policy,
+                persistence_strategy=cached.persistence_strategy()))
     population += random_valid_configs(
         problem, hardware, spec, initial_random, rng, engine)
 

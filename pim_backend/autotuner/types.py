@@ -70,6 +70,9 @@ class PIMHardwareProfile:
     # local memory에서 tile 버퍼가 쓸 수 없는 runtime 상주분 (§10의 S_runtime).
     # 예: UPMEM WRAM의 tasklet stack(lane 수 × stack 크기), sw_cache, heap.
     local_memory_reserved_bytes: int = 0
+    # (device, round) 작업 하나의 descriptor 크기 (§23의 metadata 항).
+    # 0이면 descriptor 전송량을 계산하지 않는다.
+    descriptor_bytes: int = 0
     target_constraints: dict = field(default_factory=dict)
 
 
@@ -105,6 +108,13 @@ class PIMConfig:
     b_residency: str = "stream"
     replication_policy: str = "slice"
     streaming_policy: str = "per_round"
+    # Phase 3 (§53) — persistent execution. PersistenceFragment가 legal 조합만
+    # 만든다: descriptor_reuse ⇒ device_set_reuse, command_reuse ⇒
+    # descriptor_reuse, persistent_execution ⇒ command_reuse.
+    device_set_reuse: bool = True
+    descriptor_reuse: bool = False
+    command_reuse: bool = False
+    persistent_execution: bool = False
 
     @property
     def tile_m(self):
@@ -127,7 +137,8 @@ class PIMConfig:
                 self.p_m, self.p_n, self.p_k,
                 self.reduction_policy,
                 self.a_residency, self.b_residency,
-                self.replication_policy, self.streaming_policy)
+                self.replication_policy, self.streaming_policy,
+                self.persistence_strategy())
 
     def knobs(self):
         """diversity 비교용 tuning knob 목록 (§42)."""
@@ -136,7 +147,13 @@ class PIMConfig:
                 self.execution_m, self.execution_n, self.execution_k,
                 self.distribution_policy, self.p_k, self.reduction_policy,
                 self.a_residency, self.b_residency,
-                self.replication_policy, self.streaming_policy)
+                self.replication_policy, self.streaming_policy,
+                self.persistence_strategy())
+
+    def persistence_strategy(self):
+        """PersistenceFragment 표현 (Phase 3, §53)."""
+        return (self.device_set_reuse, self.descriptor_reuse,
+                self.command_reuse, self.persistent_execution)
 
 
 @dataclass
@@ -171,6 +188,21 @@ class ReductionPlan:
 
 
 @dataclass
+class DescriptorPlan:
+    """Phase 3 (§53) — descriptor/command/launch 재사용 계획.
+
+    descriptor는 (device, round) 작업 하나의 전송·실행 metadata다.
+    """
+
+    descriptor_build_count: int      # 새로 구성하는 descriptor 수
+    descriptor_transfer_bytes: int   # descriptor 전송량 (§23의 metadata 항)
+    descriptor_reuse_factor: float   # 전체 작업 수 / build 수
+    command_build_count: int
+    kernel_launch_count: int
+    device_alloc_count: int
+
+
+@dataclass
 class PIMPlan:
     """Config를 실제 hardware에 배치한 결과 (§14, §51)."""
 
@@ -182,6 +214,7 @@ class PIMPlan:
     device_assignments: list         # round별 [(device, e_m, e_n, plane), ...] (§17)
     transfer_plan: TransferPlan
     reduction_plan: ReductionPlan
+    descriptor_plan: DescriptorPlan
 
 
 @dataclass
@@ -206,6 +239,13 @@ class PIMPlanFeatures:
     # Phase 2 (§53) — resident operand의 1회 placement 총량
     a_resident_bytes: int = 0
     b_resident_bytes: int = 0
+    # Phase 3 (§53) — descriptor/launch 재사용
+    descriptor_build_count: int = 0
+    descriptor_transfer_bytes: int = 0
+    descriptor_reuse_factor: float = 1.0
+    command_build_count: int = 0
+    kernel_launch_count: int = 0
+    device_alloc_count: int = 0
 
 
 @dataclass
