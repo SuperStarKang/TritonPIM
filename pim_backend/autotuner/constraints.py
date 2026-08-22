@@ -26,9 +26,45 @@ def local_memory_footprint(problem, config):
 
 
 def device_memory_footprint(problem, config):
-    """execution tile 하나가 PIM device에 상주하는 데 필요한 memory (§11)."""
-    return gemm_footprint_bytes(problem,
-                                config.tile_m, config.tile_n, config.tile_k)
+    """PIM device 하나에 상주해야 하는 memory (§11, Phase 2 확장).
+
+    S_tile + S_resident ≤ C_device 의 좌변. operand별로:
+      resident + slice     자기 몫 전체 (자기 round들의 조각 × K plane)
+      resident + full      operand 전체 사본
+      stream + per_round   temporal window 하나 (T_M×T_K 또는 T_K×T_N)
+      stream + all_rounds  자기 몫 전체를 호출마다 적재 (footprint는 slice와 동일)
+    """
+    t_m, t_n, t_k = config.tile_m, config.tile_n, config.tile_k
+    in_b = problem.input_bytes
+    out_b = problem.output_bytes
+    e_m = ceil_div(problem.M, t_m)
+    e_n = ceil_div(problem.N, t_n)
+    rounds_m = ceil_div(e_m, config.p_m)
+    rounds_n = ceil_div(e_n, config.p_n)
+    k_plane = ceil_div(problem.K, config.p_k)
+    k_plane_padded = ceil_div(k_plane, t_k) * t_k
+
+    def operand_bytes(residency, window_bytes, share_bytes, full_bytes):
+        if residency == "resident":
+            if config.replication_policy == "full":
+                return full_bytes
+            return share_bytes
+        if config.streaming_policy == "all_rounds":
+            return share_bytes
+        return window_bytes
+
+    a_bytes = operand_bytes(
+        config.a_residency,
+        t_m * t_k * in_b,
+        t_m * rounds_m * k_plane_padded * in_b,
+        problem.M * problem.K * in_b)
+    b_bytes = operand_bytes(
+        config.b_residency,
+        t_k * t_n * in_b,
+        t_n * rounds_n * k_plane_padded * in_b,
+        problem.K * problem.N * in_b)
+    c_bytes = t_m * t_n * out_b
+    return a_bytes + b_bytes + c_bytes
 
 
 class ConstraintEngine:
@@ -53,6 +89,13 @@ class ConstraintEngine:
         if (config.p_k == 1) != (config.reduction_policy == "none"):
             return (f"reduction legality 위반: P_K={config.p_k}, "
                     f"reduction={config.reduction_policy}")
+        # Phase 2 legality: replication_policy는 resident operand에만 의미가
+        # 있다 (§6의 무의미 조합 제거와 같은 논리).
+        if (config.a_residency == "stream"
+                and config.b_residency == "stream"
+                and config.replication_policy != "slice"):
+            return ("replication legality 위반: resident operand 없이 "
+                    f"replication={config.replication_policy}")
 
         # Constraint 2 — local memory (§10): S_A+S_B+S_C+S_runtime ≤ C_local.
         s_local = (local_memory_footprint(problem, config)

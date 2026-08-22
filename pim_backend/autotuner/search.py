@@ -65,17 +65,23 @@ PLAN_FEATURE_INFLUENCE = {
     "effective_utilization": ("distribution", "execution_m", "execution_n"),
     "execution_tile_count": ("execution_m", "execution_n", "execution_k"),
     "scheduling_rounds": ("distribution", "execution_m", "execution_n"),
-    "h2d_bytes": ("distribution", "execution_m", "execution_n", "execution_k"),
+    "h2d_bytes": ("distribution", "execution_m", "execution_n", "execution_k",
+                  "residency", "streaming"),
     "d2h_bytes": ("ksplit", "execution_m", "execution_n"),
-    "a_replication_bytes": ("distribution", "execution_m", "execution_n"),
-    "b_replication_bytes": ("distribution", "execution_m", "execution_n"),
+    "a_replication_bytes": ("distribution", "execution_m", "execution_n",
+                            "residency", "replication"),
+    "b_replication_bytes": ("distribution", "execution_m", "execution_n",
+                            "residency", "replication"),
+    "a_resident_bytes": ("residency", "replication"),
+    "b_resident_bytes": ("residency", "replication"),
     "reduction_bytes": ("ksplit", "execution_k"),
     "reduction_rounds": ("ksplit",),
     "padding_ratio": ("execution_m", "execution_n", "execution_k"),
     "load_imbalance": ("distribution", "execution_m", "execution_n"),
     "local_memory_pressure": ("block_m", "block_n", "block_k",
                               "group_m", "group_n", "group_k"),
-    "device_memory_pressure": ("execution_m", "execution_n", "execution_k"),
+    "device_memory_pressure": ("execution_m", "execution_n", "execution_k",
+                               "residency", "streaming"),
 }
 
 
@@ -98,6 +104,12 @@ def influenced_fragments(feature_name):
         return ("distribution",)
     if feature_name.startswith("reduction="):
         return ("ksplit",)
+    if feature_name in ("a_residency", "b_residency"):
+        return ("residency",)
+    if feature_name.startswith("replication="):
+        return ("replication",)
+    if feature_name.startswith("streaming="):
+        return ("streaming",)
     raise ValueError(f"알 수 없는 feature 이름: {feature_name}")
 
 
@@ -130,10 +142,17 @@ def semantic_mutate(config, fragment_kinds, problem, hardware, spec):
 
     def rebuild(new_blocks=blocks, new_groups=groups,
                 new_executions=executions, new_policy=policy,
-                new_strategy_index=strategy_index):
+                new_strategy_index=strategy_index,
+                a_residency=config.a_residency,
+                b_residency=config.b_residency,
+                replication_policy=config.replication_policy,
+                streaming_policy=config.streaming_policy):
         return make_config(problem, hardware, new_blocks, new_groups,
                            new_executions, new_policy,
-                           spec.ksplit_strategies[new_strategy_index])
+                           spec.ksplit_strategies[new_strategy_index],
+                           a_residency=a_residency, b_residency=b_residency,
+                           replication_policy=replication_policy,
+                           streaming_policy=streaming_policy)
 
     neighbors = []
     for kind in fragment_kinds:
@@ -163,6 +182,20 @@ def semantic_mutate(config, fragment_kinds, problem, hardware, spec):
             for index in (strategy_index - 1, strategy_index + 1):
                 if 0 <= index < len(spec.ksplit_strategies):
                     neighbors.append(rebuild(new_strategy_index=index))
+        elif kind == "residency":
+            for other in spec.residency_policies:
+                if other != config.a_residency:
+                    neighbors.append(rebuild(a_residency=other))
+                if other != config.b_residency:
+                    neighbors.append(rebuild(b_residency=other))
+        elif kind == "replication":
+            for other in spec.replication_policies:
+                if other != config.replication_policy:
+                    neighbors.append(rebuild(replication_policy=other))
+        elif kind == "streaming":
+            for other in spec.streaming_policies:
+                if other != config.streaming_policy:
+                    neighbors.append(rebuild(streaming_policy=other))
         else:
             raise ValueError(f"알 수 없는 fragment 종류: {kind}")
     return neighbors
@@ -275,7 +308,11 @@ def tune(problem, hardware, benchmark_fn, *, space=None, cache=None,
                 (cached.group_m, cached.group_n, cached.group_k),
                 (cached.execution_m, cached.execution_n, cached.execution_k),
                 cached.distribution_policy,
-                (cached.p_k, cached.reduction_policy)))
+                (cached.p_k, cached.reduction_policy),
+                a_residency=cached.a_residency,
+                b_residency=cached.b_residency,
+                replication_policy=cached.replication_policy,
+                streaming_policy=cached.streaming_policy))
     population += random_valid_configs(
         problem, hardware, spec, initial_random, rng, engine)
 

@@ -97,6 +97,14 @@ class PIMConfig:
     p_n: int
     p_k: int
     reduction_policy: str
+    # Phase 2 (§53) — residency / replication / streaming.
+    # resident operand는 device memory에 상주해 steady-state H2D에서 빠지고,
+    # replication_policy는 상주 사본의 범위(slice=필요한 조각만, full=전체),
+    # streaming_policy는 stream operand의 적재 단위(per_round / all_rounds)다.
+    a_residency: str = "stream"
+    b_residency: str = "stream"
+    replication_policy: str = "slice"
+    streaming_policy: str = "per_round"
 
     @property
     def tile_m(self):
@@ -117,24 +125,35 @@ class PIMConfig:
                 self.execution_m, self.execution_n, self.execution_k,
                 self.distribution_policy,
                 self.p_m, self.p_n, self.p_k,
-                self.reduction_policy)
+                self.reduction_policy,
+                self.a_residency, self.b_residency,
+                self.replication_policy, self.streaming_policy)
 
     def knobs(self):
         """diversity 비교용 tuning knob 목록 (§42)."""
         return (self.block_m, self.block_n, self.block_k,
                 self.group_m, self.group_n, self.group_k,
                 self.execution_m, self.execution_n, self.execution_k,
-                self.distribution_policy, self.p_k, self.reduction_policy)
+                self.distribution_policy, self.p_k, self.reduction_policy,
+                self.a_residency, self.b_residency,
+                self.replication_policy, self.streaming_policy)
 
 
 @dataclass
 class TransferPlan:
-    """device 전체에 실제로 전달되는 데이터 (§23)."""
+    """device 전체에 실제로 전달되는 데이터 (§23).
+
+    a_bytes/b_bytes는 호출마다 반복되는 steady-state 전송이고,
+    a_resident_bytes/b_resident_bytes는 resident operand의 1회 placement다
+    (Phase 2 — transfer minimization의 대상).
+    """
 
     a_bytes: int
     b_bytes: int
     a_replication_bytes: int
     b_replication_bytes: int
+    a_resident_bytes: int
+    b_resident_bytes: int
     h2d_bytes: int
     d2h_bytes: int
 
@@ -184,6 +203,9 @@ class PIMPlanFeatures:
     # §27 feature vector가 추가로 요구하는 값
     active_units: int
     execution_tile_count: int
+    # Phase 2 (§53) — resident operand의 1회 placement 총량
+    a_resident_bytes: int = 0
+    b_resident_bytes: int = 0
 
 
 @dataclass

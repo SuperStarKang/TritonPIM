@@ -63,6 +63,8 @@ def extract_plan_features(problem, hardware, config, plan):
         device_memory_pressure=device_memory_pressure,
         active_units=active_units,
         execution_tile_count=e_m * e_n * e_k,
+        a_resident_bytes=transfer.a_resident_bytes,
+        b_resident_bytes=transfer.b_resident_bytes,
     )
 
 
@@ -78,6 +80,9 @@ def feature_names(spec):
     # one-hot encoding을 쓴다 (§27).
     names += [f"distribution={p}" for p in spec.distribution_policies]
     names += [f"reduction={p}" for p in REDUCTION_POLICIES]
+    # Phase 2 knob (이진이라 열 하나씩이면 충분하다)
+    names += ["a_residency", "b_residency",
+              "replication=full", "streaming=all_rounds"]
     names += [
         "active_units",
         "effective_utilization",
@@ -93,6 +98,8 @@ def feature_names(spec):
         "load_imbalance",
         "local_memory_pressure",
         "device_memory_pressure",
+        "a_resident_bytes",
+        "b_resident_bytes",
     ]
     return names
 
@@ -113,6 +120,12 @@ def config_plan_vector(config, features, spec):
     vector += [1.0 if config.reduction_policy == p else 0.0
                for p in REDUCTION_POLICIES]
     vector += [
+        1.0 if config.a_residency == "resident" else 0.0,
+        1.0 if config.b_residency == "resident" else 0.0,
+        1.0 if config.replication_policy == "full" else 0.0,
+        1.0 if config.streaming_policy == "all_rounds" else 0.0,
+    ]
+    vector += [
         float(features.active_units),
         features.effective_utilization,
         float(features.execution_tile_count),
@@ -127,5 +140,7 @@ def config_plan_vector(config, features, spec):
         features.load_imbalance,
         features.local_memory_pressure,
         features.device_memory_pressure,
+        float(features.a_resident_bytes),
+        float(features.b_resident_bytes),
     ]
     return vector

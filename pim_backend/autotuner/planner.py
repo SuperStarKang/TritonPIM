@@ -79,14 +79,37 @@ class PIMPlanner:
         # §23 — transfer placement: 실제 전송량과 operand replication.
         # 한 (output tile, plane) 작업은 A의 T_M×(plane K 구간), B의
         # (plane K 구간)×T_N을 받는다. 전송은 padding된 크기로 계산한다 (§25).
+        # Phase 2: resident operand는 steady-state 전송(a_bytes/b_bytes)에서
+        # 빠지고 1회 placement(a_resident_bytes/b_resident_bytes)로 잡힌다.
         in_b = problem.input_bytes
         out_b = problem.output_bytes
         padded_k = k_windows * t_k
         items = e_m * e_n * p_k
-        a_bytes = items * t_m * padded_k * in_b
-        b_bytes = items * padded_k * t_n * in_b
-        a_replication = a_bytes - M * K * in_b
-        b_replication = b_bytes - K * N * in_b
+
+        if config.a_residency == "resident":
+            a_bytes = 0
+            if config.replication_policy == "full":
+                a_resident_bytes = p_m * p_n * p_k * M * K * in_b
+            else:
+                a_resident_bytes = (p_n * p_k * (rounds_m * p_m)
+                                    * t_m * padded_k * in_b)
+        else:
+            a_bytes = items * t_m * padded_k * in_b
+            a_resident_bytes = 0
+
+        if config.b_residency == "resident":
+            b_bytes = 0
+            if config.replication_policy == "full":
+                b_resident_bytes = p_m * p_n * p_k * K * N * in_b
+            else:
+                b_resident_bytes = (p_m * p_k * (rounds_n * p_n)
+                                    * t_n * padded_k * in_b)
+        else:
+            b_bytes = items * padded_k * t_n * in_b
+            b_resident_bytes = 0
+
+        a_replication = (a_bytes + a_resident_bytes) - M * K * in_b
+        b_replication = (b_bytes + b_resident_bytes) - K * N * in_b
 
         # §18 — reduction plan: partial output ownership / location /
         # ordering / rounds / data movement.
@@ -123,6 +146,8 @@ class PIMPlanner:
             b_bytes=b_bytes,
             a_replication_bytes=a_replication,
             b_replication_bytes=b_replication,
+            a_resident_bytes=a_resident_bytes,
+            b_resident_bytes=b_resident_bytes,
             h2d_bytes=a_bytes + b_bytes,
             d2h_bytes=d2h_bytes,
         )

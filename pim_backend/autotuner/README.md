@@ -72,3 +72,20 @@ result.best.result    # PIMBenchmarkResult
     utilization은 seed 유도에만 쓰며 objective는 항상 실측 total_ms다 (§31).
 - **KSplitFragment 범위**: 문서 예시는 PK≤8이지만 UPMEM 실측 최적점
   (split_k.py, SPLIT_K=16)이 탐색 범위 안에 있도록 PK=16까지 연다.
+
+## Phase 2 — Residency / Replication (§53)
+
+Config에 `a_residency`/`b_residency`(stream|resident),
+`replication_policy`(slice|full), `streaming_policy`(per_round|all_rounds)를
+추가했다.
+
+- resident operand는 steady-state H2D(`a_bytes`/`b_bytes`)에서 빠지고 1회
+  placement(`a_resident_bytes`/`b_resident_bytes`)로 계산된다 — transfer
+  minimization이 search space에 반영되는 지점.
+- device memory 검사(§11)가 residency/streaming을 반영한다: resident+slice와
+  stream+all_rounds는 자기 몫 전체(자기 round 조각 × K plane), resident+full은
+  operand 전체 사본, stream+per_round는 temporal window 하나.
+- legality: resident operand가 없으면 replication은 slice여야 한다.
+- Seed G(weight-stationary, B resident)는 space가 resident를 허용할 때만
+  생성된다. residency를 실행에 반영하지 못하는 runtime(현 split_k 러너)은
+  `PIMConfigSpace(residency_policies=("stream",), ...)`로 제한해서 쓴다.

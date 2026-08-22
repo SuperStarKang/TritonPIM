@@ -41,6 +41,14 @@ DISTRIBUTION_POLICIES = ("M-major", "N-major", "MN-balanced")
 # categorical encoding 순서 (§27).
 REDUCTION_POLICIES = ("none", "device", "host", "tree")
 
+# Phase 2 (§53) — residency / replication / streaming.
+# resident: operand를 device memory에 상주시켜 steady-state H2D에서 제거.
+# replication slice: 각 device가 자기 조각만 상주 / full: 전체 사본 상주.
+# streaming per_round: round마다 window 하나 적재 / all_rounds: 자기 몫 전부 적재.
+RESIDENCY_POLICIES = ("stream", "resident")
+REPLICATION_POLICIES = ("slice", "full")
+STREAMING_POLICIES = ("per_round", "all_rounds")
+
 
 @dataclass(frozen=True)
 class PIMConfigSpace:
@@ -49,6 +57,9 @@ class PIMConfigSpace:
     execution_values: tuple = EXECUTION_VALUES
     ksplit_strategies: tuple = KSPLIT_STRATEGIES
     distribution_policies: tuple = DISTRIBUTION_POLICIES
+    residency_policies: tuple = RESIDENCY_POLICIES
+    replication_policies: tuple = REPLICATION_POLICIES
+    streaming_policies: tuple = STREAMING_POLICIES
 
 
 def build_config_space(problem, hardware):
@@ -61,11 +72,14 @@ def build_config_space(problem, hardware):
 
 
 def make_config(problem, hardware, blocks, groups, executions,
-                distribution_policy, ksplit_strategy):
+                distribution_policy, ksplit_strategy,
+                a_residency="stream", b_residency="stream",
+                replication_policy="slice", streaming_policy="per_round"):
     """knob 값들로부터 완전한 PIMConfig를 만든다.
 
     P_K/reduction은 KSplitFragment에서 (§6), P_M/P_N은 distribution
-    policy와 tile grid에서 결정된다 (§6.1).
+    policy와 tile grid에서 결정된다 (§6.1). residency/replication/streaming은
+    Phase 2 knob이다 (§53).
     """
     p_k, reduction_policy = ksplit_strategy
     tile_m = blocks[0] * groups[0] * executions[0]
@@ -80,6 +94,9 @@ def make_config(problem, hardware, blocks, groups, executions,
         distribution_policy=distribution_policy,
         p_m=p_m, p_n=p_n, p_k=p_k,
         reduction_policy=reduction_policy,
+        a_residency=a_residency, b_residency=b_residency,
+        replication_policy=replication_policy,
+        streaming_policy=streaming_policy,
     )
 
 
@@ -166,7 +183,7 @@ def heuristic_seeds(problem, hardware, spec):
         return make_config(problem, hardware, blocks, groups, executions,
                            policy, strategy)
 
-    return [
+    seeds = [
         # Seed A — reduction 최소화: PK=1, N-major
         seed("N-major", (1, "none")),
         # Seed B — parallelism 최대화: PM/PN을 최대한 사용, PK=1
@@ -182,6 +199,16 @@ def heuristic_seeds(problem, hardware, spec):
         # Seed F — small execution tile: parallelism ↑, memory footprint ↓
         seed("MN-balanced", (1, "none"), util_scale=0.5),
     ]
+    # Seed G (Phase 2, §53) — weight-stationary: B를 상주시켜 steady-state
+    # 전송을 최소화한다. runtime이 residency를 지원하지 않아 space를
+    # 제한한 경우에는 만들지 않는다.
+    if "resident" in spec.residency_policies:
+        executions = _derive_executions(
+            problem, hardware, blocks, groups, 1, spec)
+        seeds.append(make_config(
+            problem, hardware, blocks, groups, executions,
+            "N-major", (1, "none"), b_residency="resident"))
+    return seeds
 
 
 def random_valid_configs(problem, hardware, spec, count, rng, engine):
@@ -196,8 +223,12 @@ def random_valid_configs(problem, hardware, spec, count, rng, engine):
         executions = tuple(rng.choice(spec.execution_values) for _ in range(3))
         policy = rng.choice(spec.distribution_policies)
         strategy = rng.choice(spec.ksplit_strategies)
-        config = make_config(problem, hardware, blocks, groups, executions,
-                             policy, strategy)
+        config = make_config(
+            problem, hardware, blocks, groups, executions, policy, strategy,
+            a_residency=rng.choice(spec.residency_policies),
+            b_residency=rng.choice(spec.residency_policies),
+            replication_policy=rng.choice(spec.replication_policies),
+            streaming_policy=rng.choice(spec.streaming_policies))
         if engine.valid(config):
             configs.append(config)
     return configs

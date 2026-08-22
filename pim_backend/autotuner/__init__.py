@@ -20,7 +20,9 @@ from .search import (SearchBudget, TuningRecord, TuningResult,
                      make_quantile_labels, rank_with_diversity_penalty,
                      semantic_mutate, tune)
 from .space import (DISTRIBUTION_POLICIES, KSPLIT_STRATEGIES,
-                    REDUCTION_POLICIES, PIMConfigSpace, build_config_space,
-                    heuristic_seeds, make_config, random_valid_configs)
+                    REDUCTION_POLICIES, REPLICATION_POLICIES,
+                    RESIDENCY_POLICIES, STREAMING_POLICIES, PIMConfigSpace,
+                    build_config_space, heuristic_seeds, make_config,
+                    random_valid_configs)
 from .types import (PIMBenchmarkResult, PIMConfig, PIMHardwareProfile,
                     PIMPlan, PIMPlanFeatures, PIMProblem)
