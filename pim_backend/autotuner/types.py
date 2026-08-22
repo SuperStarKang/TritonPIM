@@ -1,0 +1,214 @@
+# PIM AutoTuner 핵심 객체 (design/AutoTuner_Design.md §2, §51)
+#
+#   PIMProblem          실행해야 하는 GEMM
+#   PIMHardwareProfile  사용 가능한 PIM 자원과 제약
+#   PIMConfig           AutoTuner가 변경하는 선택 변수
+#   PIMPlan             Config를 실제 hardware에 배치한 결과
+#   PIMPlanFeatures     Plan에서 계산한 PIM-specific feature
+#   PIMBenchmarkResult  실제 실행 결과
+#
+# Config와 실제 실행 배치는 동일한 개념이 아니므로(§2) 네 객체를 분리하고,
+# Plan = Planner(Problem, Hardware, Config) 관계를 그대로 따른다.
+
+from dataclasses import dataclass, field
+
+DTYPE_BYTES = {
+    "int8": 1,
+    "uint8": 1,
+    "int16": 2,
+    "float16": 2,
+    "bfloat16": 2,
+    "int32": 4,
+    "float32": 4,
+}
+
+
+def ceil_div(value, divisor):
+    return -(-value // divisor)
+
+
+@dataclass(frozen=True)
+class PIMProblem:
+    """실행해야 하는 GEMM: A[M,K] @ B[K,N] (§3, §51)."""
+
+    M: int
+    N: int
+    K: int
+    input_dtype: str = "int8"
+    output_dtype: str = "int32"
+    a_layout: str = "row_major"
+    b_layout: str = "row_major"
+    # residency는 Phase 2에서 search space에 들어간다 (§53). 여기서는 보존만 한다.
+    a_resident: bool = False
+    b_resident: bool = False
+
+    @property
+    def input_bytes(self):
+        return DTYPE_BYTES[self.input_dtype]
+
+    @property
+    def output_bytes(self):
+        return DTYPE_BYTES[self.output_dtype]
+
+
+@dataclass(frozen=True)
+class PIMHardwareProfile:
+    """사용 가능한 PIM 자원과 제약 (§3, §51)."""
+
+    target: str
+    num_units: int
+    local_memory_bytes: int
+    device_memory_bytes: int
+    alignment_bytes: int
+    execution_units_per_device: int
+    # 한 PIM device의 실행 자원을 가득 채우는 작업 묶음(element 단위).
+    # execution tile seed는 이 단위로 묶인다. device memory 용량은 GEMM이
+    # PIM DRAM보다 클 때만 상한으로 작동한다. target별로 계산해 지정한다.
+    utilization_tile_m: int
+    utilization_tile_n: int
+    utilization_tile_k: int
+    # local memory에서 tile 버퍼가 쓸 수 없는 runtime 상주분 (§10의 S_runtime).
+    # 예: UPMEM WRAM의 tasklet stack(lane 수 × stack 크기), sw_cache, heap.
+    local_memory_reserved_bytes: int = 0
+    target_constraints: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class PIMConfig:
+    """AutoTuner가 변경하는 선택 변수 (§4, §51).
+
+    execution tile은 독립 knob이 아니라 derived configuration이다 (§5):
+        T_M = B_M * G_M * E_M  (tile_m property)
+    p_k와 reduction_policy는 KSplitFragment로 함께 결정되고 (§6),
+    p_m/p_n은 distribution_policy로부터 tile grid를 보고 계산된다 (§6.1).
+    """
+
+    block_m: int
+    block_n: int
+    block_k: int
+    group_m: int
+    group_n: int
+    group_k: int
+    execution_m: int
+    execution_n: int
+    execution_k: int
+    distribution_policy: str
+    p_m: int
+    p_n: int
+    p_k: int
+    reduction_policy: str
+
+    @property
+    def tile_m(self):
+        return self.block_m * self.group_m * self.execution_m
+
+    @property
+    def tile_n(self):
+        return self.block_n * self.group_n * self.execution_n
+
+    @property
+    def tile_k(self):
+        return self.block_k * self.group_k * self.execution_k
+
+    def key(self):
+        """중복 측정 방지용 identity (§43 loop에서 사용)."""
+        return (self.block_m, self.block_n, self.block_k,
+                self.group_m, self.group_n, self.group_k,
+                self.execution_m, self.execution_n, self.execution_k,
+                self.distribution_policy,
+                self.p_m, self.p_n, self.p_k,
+                self.reduction_policy)
+
+    def knobs(self):
+        """diversity 비교용 tuning knob 목록 (§42)."""
+        return (self.block_m, self.block_n, self.block_k,
+                self.group_m, self.group_n, self.group_k,
+                self.execution_m, self.execution_n, self.execution_k,
+                self.distribution_policy, self.p_k, self.reduction_policy)
+
+
+@dataclass
+class TransferPlan:
+    """device 전체에 실제로 전달되는 데이터 (§23)."""
+
+    a_bytes: int
+    b_bytes: int
+    a_replication_bytes: int
+    b_replication_bytes: int
+    h2d_bytes: int
+    d2h_bytes: int
+
+
+@dataclass
+class ReductionPlan:
+    """partial result를 최종 결과로 합치는 방법 (§18, §19)."""
+
+    policy: str
+    owner_plane: int
+    ordering: str
+    partial_outputs: int
+    reduction_bytes: int
+    reduction_rounds: int
+
+
+@dataclass
+class PIMPlan:
+    """Config를 실제 hardware에 배치한 결과 (§14, §51)."""
+
+    execution_tile_shape: tuple      # (T_M, T_N, T_K)                (§15)
+    execution_grid: tuple            # (E_M, E_N, E_K) logical grid   (§15)
+    active_device_grid: tuple        # (P_M, P_N, P_K)                (§16)
+    num_rounds: int                  # device-set 재사용 round 수      (§17)
+    k_windows_per_plane: int         # spatial K plane 안 temporal window 수
+    device_assignments: list         # round별 [(device, e_m, e_n, plane), ...] (§17)
+    transfer_plan: TransferPlan
+    reduction_plan: ReductionPlan
+
+
+@dataclass
+class PIMPlanFeatures:
+    """Plan에서 계산한 PIM-specific feature (§20~§27, §51)."""
+
+    effective_utilization: float
+    load_imbalance: float
+    h2d_bytes: int
+    d2h_bytes: int
+    a_replication_bytes: int
+    b_replication_bytes: int
+    reduction_bytes: int
+    reduction_rounds: int
+    padding_ratio: float
+    scheduling_rounds: int
+    local_memory_pressure: float
+    device_memory_pressure: float
+    # §27 feature vector가 추가로 요구하는 값
+    active_units: int
+    execution_tile_count: int
+
+
+@dataclass
+class PIMBenchmarkResult:
+    """실제 실행 결과 (§30, §32, §51).
+
+    objective는 항상 실제 wall-clock total_ms이다 (§30). 각 breakdown은
+    objective가 아니라 설명과 학습을 위한 auxiliary information이다.
+    """
+
+    total_ms: float
+    stage_ms: float = 0.0
+    h2d_ms: float = 0.0
+    compute_ms: float = 0.0
+    reduction_ms: float = 0.0
+    d2h_ms: float = 0.0
+    launch_ms: float = 0.0
+    compile_status: str = "ok"
+    correctness: bool = True
+    # tune()이 측정 후 채운다.
+    config: PIMConfig = None
+    plan: PIMPlan = None
+    plan_features: PIMPlanFeatures = None
+
+    @property
+    def ok(self):
+        """compile/runtime 실패는 BAD sample로만 쓰인다 (§35)."""
+        return self.compile_status == "ok" and self.correctness
