@@ -127,6 +127,8 @@ def _derive_groups(problem, hardware, blocks, spec):
     이후 search가 fragment mutation으로 조정한다.
     """
     dims = (problem.M, problem.N, problem.K)
+    # Constraint 2(§10)와 같은 예산: runtime 상주분을 뺀 tile 버퍼 예산.
+    budget = hardware.local_memory_bytes - hardware.local_memory_reserved_bytes
     groups = [1, 1, 1]
     axis = 0
     stalled = 0
@@ -136,8 +138,7 @@ def _derive_groups(problem, hardware, blocks, spec):
         size[axis] = blocks[axis] * trial
         if (trial in spec.group_values
                 and size[axis] <= dims[axis]
-                and gemm_footprint_bytes(problem, *size)
-                <= hardware.local_memory_bytes):
+                and gemm_footprint_bytes(problem, *size) <= budget):
             groups[axis] = trial
             stalled = 0
         else:
