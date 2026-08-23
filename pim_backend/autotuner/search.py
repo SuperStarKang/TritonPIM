@@ -17,7 +17,7 @@ from .features import config_plan_vector, extract_plan_features, feature_names
 from .forest import RandomForestClassifier
 from .planner import PIMPlanner
 from .space import (build_config_space, heuristic_seeds, make_config,
-                    random_valid_configs)
+                    random_valid_configs, strategy_for_pk)
 
 
 @dataclass
@@ -318,15 +318,30 @@ def tune(problem, hardware, benchmark_fn, *, space=None, cache=None,
     population = heuristic_seeds(problem, hardware, spec)
     if cache is not None:
         # warm start (§46): 과거 best의 knob을 가져오되, P_M/P_N은 현재
-        # problem의 tile grid에 맞게 다시 계산한다 (§6.1).
+        # problem의 tile grid에 맞게 다시 계산한다 (§6.1). 현재 spec에 없는
+        # knob 값(예: target reduction 정책이 바뀐 이전 cache)은 spec의
+        # 값으로 맞추거나, 맞출 수 없으면 seed로 쓰지 않는다.
         for cached in cache.lookup_similar(problem, hardware):
+            strategy = strategy_for_pk(spec, cached.p_k)
+            if strategy is None:
+                continue
+            if (cached.persistence_strategy()
+                    not in spec.persistence_strategies):
+                continue
+            if (cached.a_residency not in spec.residency_policies
+                    or cached.b_residency not in spec.residency_policies
+                    or cached.replication_policy
+                    not in spec.replication_policies
+                    or cached.streaming_policy
+                    not in spec.streaming_policies):
+                continue
             population.append(make_config(
                 problem, hardware,
                 (cached.block_m, cached.block_n, cached.block_k),
                 (cached.group_m, cached.group_n, cached.group_k),
                 (cached.execution_m, cached.execution_n, cached.execution_k),
                 cached.distribution_policy,
-                (cached.p_k, cached.reduction_policy),
+                strategy,
                 a_residency=cached.a_residency,
                 b_residency=cached.b_residency,
                 replication_policy=cached.replication_policy,

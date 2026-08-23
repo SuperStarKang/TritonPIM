@@ -23,16 +23,21 @@ EXECUTION_VALUES = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024)
 # configuration이 과도하게 생기므로 하나의 categorical knob으로 묶는다.
 # 문서의 예시는 PK≤8이지만, UPMEM 실측 최적점(split_k.py, SPLIT_K=16)이
 # 탐색 범위 안에 있어야 하므로 16까지 연다.
-KSPLIT_STRATEGIES = (
-    (1, "none"),
-    (2, "device"),
-    (4, "device"),
-    (4, "host"),
-    (8, "device"),
-    (8, "tree"),
-    (16, "device"),
-    (16, "tree"),
-)
+KSPLIT_PK_VALUES = (1, 2, 4, 8, 16)
+
+# 고정 template 기간의 target별 reduction 실행 위치. 지금은 커널이 하나라
+# reduction 위치를 config가 바꿀 수 없으므로, plan·feature가 실제 실행과
+# 일치하도록 target이 정한다. codegen이 pim.reduction_plan을 소비해
+# policy대로 코드를 생성하게 되면 이 표는 제거한다.
+TARGET_REDUCTION_POLICY = {
+    "upmem": "host",
+    "aimx": "device",
+}
+
+# 일반형 기본 전략 목록 (PIMConfigSpace를 직접 만들 때의 기본값).
+# build_config_space는 target의 reduction 위치로 이 목록을 재구성한다.
+KSPLIT_STRATEGIES = tuple(
+    (pk, "none" if pk == 1 else "device") for pk in KSPLIT_PK_VALUES)
 
 # §6.1 DistributionFragment. K축 분할은 KSplitFragment가 가지므로
 # 배치 전략은 남은 budget을 M/N 축에 나누는 방법을 고른다.
@@ -74,13 +79,30 @@ class PIMConfigSpace:
     persistence_strategies: tuple = PERSISTENCE_STRATEGIES
 
 
-def build_config_space(problem, hardware):
-    """§52 build_config_space. Phase 1은 고정 knob 목록을 쓴다 (§53).
+def build_config_space(problem, hardware, **overrides):
+    """§52 build_config_space.
 
-    shape/hardware에 따라 불가능한 값은 여기서 자르지 않고 Constraint
-    Engine(§8)이 제거한다.
+    KSplit 전략의 reduction 위치는 고정 template 기간 동안 target이 정한다
+    (TARGET_REDUCTION_POLICY). 나머지 knob 목록은 기본값이고, runtime이
+    지원하지 못하는 knob은 overrides로 제한한다. shape에 따라 불가능한
+    값은 여기서 자르지 않고 Constraint Engine(§8)이 제거한다.
     """
-    return PIMConfigSpace()
+    reduction = TARGET_REDUCTION_POLICY[hardware.target]
+    fields = {
+        "ksplit_strategies": tuple(
+            (pk, "none" if pk == 1 else reduction)
+            for pk in KSPLIT_PK_VALUES),
+    }
+    fields.update(overrides)
+    return PIMConfigSpace(**fields)
+
+
+def strategy_for_pk(spec, p_k):
+    """spec에서 해당 P_K의 KSplit 전략을 찾는다. 없으면 None."""
+    for strategy in spec.ksplit_strategies:
+        if strategy[0] == p_k:
+            return strategy
+    return None
 
 
 def make_config(problem, hardware, blocks, groups, executions,
@@ -203,31 +225,34 @@ def heuristic_seeds(problem, hardware, spec):
         return make_config(problem, hardware, blocks, groups, executions,
                            policy, strategy)
 
-    seeds = [
+    # KSplit 전략은 하드코딩하지 않고 spec에서 고른다 — reduction 위치가
+    # target별로 다르기 때문이다 (TARGET_REDUCTION_POLICY).
+    no_split = strategy_for_pk(spec, 1)
+    seeds = []
+    if no_split is not None:
         # Seed A — reduction 최소화: PK=1, N-major
-        seed("N-major", (1, "none")),
+        seeds.append(seed("N-major", no_split))
         # Seed B — parallelism 최대화: PM/PN을 최대한 사용, PK=1
-        seed("MN-balanced", (1, "none")),
-        # Seed C — mild split-K: PK=2
-        seed("N-major", (2, "device")),
-        # Seed D — aggressive split-K: PK=4 / 8 / 16
-        seed("N-major", (4, "device")),
-        seed("N-major", (8, "tree")),
-        seed("N-major", (16, "tree")),
+        seeds.append(seed("MN-balanced", no_split))
+    # Seed C·D — mild(PK=2)부터 aggressive(PK=16)까지의 split-K 사다리
+    for p_k in (2, 4, 8, 16):
+        strategy = strategy_for_pk(spec, p_k)
+        if strategy is not None:
+            seeds.append(seed("N-major", strategy))
+    if no_split is not None:
         # Seed E — large execution tile: reuse ↑, round 수 ↓
-        seed("MN-balanced", (1, "none"), util_scale=2),
+        seeds.append(seed("MN-balanced", no_split, util_scale=2))
         # Seed F — small execution tile: parallelism ↑, memory footprint ↓
-        seed("MN-balanced", (1, "none"), util_scale=0.5),
-    ]
+        seeds.append(seed("MN-balanced", no_split, util_scale=0.5))
     # Seed G (Phase 2, §53) — weight-stationary: B를 상주시켜 steady-state
     # 전송을 최소화한다. runtime이 residency를 지원하지 않아 space를
     # 제한한 경우에는 만들지 않는다.
-    if "resident" in spec.residency_policies:
+    if no_split is not None and "resident" in spec.residency_policies:
         executions = _derive_executions(
             problem, hardware, blocks, groups, 1, spec)
         seeds.append(make_config(
             problem, hardware, blocks, groups, executions,
-            "N-major", (1, "none"), b_residency="resident"))
+            "N-major", no_split, b_residency="resident"))
     return seeds
 
 

@@ -72,6 +72,14 @@ result.best.result    # PIMBenchmarkResult
     utilization은 seed 유도에만 쓰며 objective는 항상 실측 total_ms다 (§31).
 - **KSplitFragment 범위**: 문서 예시는 PK≤8이지만 UPMEM 실측 최적점
   (split_k.py, SPLIT_K=16)이 탐색 범위 안에 있도록 PK=16까지 연다.
+- **reduction 위치는 고정 template 기간 동안 target이 정한다**:
+  커널이 하나뿐이라 reduction 위치를 config가 바꿀 수 없으므로,
+  `build_config_space`가 `TARGET_REDUCTION_POLICY`(upmem→host, aimx→device)로
+  KSplit 전략을 구성해 plan·feature가 실제 실행과 일치하게 한다.
+  표에 없는 target은 KeyError로 명시적으로 실패한다. codegen이
+  `pim.reduction_plan`을 소비해 policy대로 코드를 생성하게 되면 이 표를
+  제거하고 reduction 위치를 다시 탐색 dimension으로 연다. seed는 전략을
+  하드코딩하지 않고 spec에서 P_K 사다리(1·2·4·8·16)로 고른다.
 
 ## Phase 2 — Residency / Replication (§53)
 
