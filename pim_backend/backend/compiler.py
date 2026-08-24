@@ -439,6 +439,16 @@ class PIMBackend(BaseBackend):
         "local_memory_bytes": ("PIM_LOCAL_MEMORY_BYTES", int),
         "unit_memory_bytes": ("PIM_UNIT_MEMORY_BYTES", int),
         "host_threads": ("PIM_HOST_THREADS", int),
+        # autotuner가 고른 실행 계획을 인덕터 경로로 전달하는 통로.
+        # compile_threads=1이면 lowering이 compile 직전에 설정한 값이
+        # 해당 커널에 순차적으로 적용된다.
+        "group_m": ("PIM_GROUP_M", int),
+        "group_n": ("PIM_GROUP_N", int),
+        "group_k": ("PIM_GROUP_K", int),
+        "tile_m": ("PIM_TILE_M", int),
+        "tile_n": ("PIM_TILE_N", int),
+        "tile_k": ("PIM_TILE_K", int),
+        "device_axis_partitions": ("PIM_DEVICE_AXIS_PARTITIONS", str),
     }
 
     def parse_options(self, opts) -> PIMOptions:

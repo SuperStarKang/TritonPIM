@@ -19,6 +19,7 @@ from .planner import PIMPlanner, resolve_distribution
 from .search import (SearchBudget, TuningRecord, TuningResult,
                      make_quantile_labels, rank_with_diversity_penalty,
                      semantic_mutate, tune)
+from .targets import TARGET_PROFILES, target_profile
 from .space import (DISTRIBUTION_POLICIES, KSPLIT_PK_VALUES,
                     KSPLIT_STRATEGIES, PERSISTENCE_STRATEGIES,
                     REDUCTION_POLICIES, REPLICATION_POLICIES,

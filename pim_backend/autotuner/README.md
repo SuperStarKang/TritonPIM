@@ -16,6 +16,8 @@ space에서 탐색한다.
 | `forest.py` | §36 — Random Forest surrogate (numpy만 사용, decision path 노출) |
 | `search.py` | §33, §37~§44, §52 — LFBO loop: quantile label, search copies, tree-guided neighbor, scoring, diversity, termination |
 | `cache.py` | §45~§46 — config cache, warm start, 측정 이력 저장·재사용 |
+| `targets.py` | target → PIMHardwareProfile 등록표 (사용자가 실측값을 한 번만 적는 곳) |
+| `decorator.py` | `@pim_autotune` — problem만으로 동작하는 사용면 (torch 필요, `__init__`에서 제외) |
 
 ## 사용
 
@@ -128,3 +130,25 @@ legal 조합 5개만 나열하고 하나의 categorical knob으로 탐색한다.
 3. **유사 shape warm start**: context(hardware·dtype·version)가 정확히 같고
    shape만 다른 항목의 best knob을 seed로 주입한다. context가 하나라도
    다르면(예: local_memory 변경) 재사용하지 않는다.
+
+## 데코레이터와 torch 연계
+
+`decorator.py`의 `@pim_autotune`은 problem을 텐서에서 추출하고 hardware를
+`targets.py` 등록표에서 얻는다. 동작:
+
+```text
+cache 정확 일치        → best config/plan 주입해 실행
+miss, PIM_AUTOTUNE≠1  → heuristic seed의 첫 유효 config 하나로 실행
+miss, PIM_AUTOTUNE=1  → 데코레이트된 함수를 benchmark로 tune() → best 저장·실행
+```
+
+wall-clock 측정과 정답 검증(탐색 중에만, 기본은 균등 표본 위치를 작은 참조
+GEMM으로 직접 계산해 비교, `ref_fn`으로 교체 가능)은 데코레이터가 수행하고,
+config→커널 인자 매핑은 함수 본문이 소유한다(공통부는 `pim_launch_options`).
+
+torch.compile 경로(`workspace/torch_integration/pim_template.py`)는 같은
+cache의 **소비자**다: lowering이 shape별로 cache를 조회해(없으면 seed 유도값)
+best config를 PIMTemplate 1개 후보로 내고, outer 경쟁 없이 무조건 PIM으로
+확정한다. launch 옵션(group/tile/partitions)은 backend `_ENV_OPTIONS`에 추가된
+env 통로(PIM_GROUP_* / PIM_TILE_* / PIM_DEVICE_AXIS_PARTITIONS)로 전달되며,
+`compile_threads=1`의 순차 컴파일이 shape별 값의 적용을 보장한다.
