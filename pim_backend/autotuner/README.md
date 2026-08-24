@@ -15,7 +15,7 @@ space에서 탐색한다.
 | `features.py` | §20~§27 — Plan Feature Extractor와 feature vector |
 | `forest.py` | §36 — Random Forest surrogate (numpy만 사용, decision path 노출) |
 | `search.py` | §33, §37~§44, §52 — LFBO loop: quantile label, search copies, tree-guided neighbor, scoring, diversity, termination |
-| `cache.py` | §45~§46 — config cache와 warm start |
+| `cache.py` | §45~§46 — config cache, warm start, 측정 이력 저장·재사용 |
 
 ## 사용
 
@@ -113,3 +113,18 @@ legal 조합 5개만 나열하고 하나의 categorical knob으로 탐색한다.
 - descriptor 크기는 profile의 `descriptor_bytes`(기본 0 = 무시)로 준다.
 - persistence를 실행에 반영하지 못하는 runtime은 space를 기본 전략
   `(True, False, False, False)` 하나로 제한해서 쓴다 (현 split_k 러너).
+
+## Cache 동작 (§45~§46 확장)
+
+같은 tuning key(shape·dtype·layout·hardware·version)에 대해 best와
+**측정 이력 전체**를 저장한다. `tune(cache=...)`의 동작:
+
+1. **정확 일치**: 같은 key의 항목이 있으면 탐색 없이 저장된 best를 반환한다
+   (`TuningResult.from_cache=True`). 재탐색은 `retune=True`.
+2. **재탐색(retune)**: 이미 측정한 configuration은 저장된 결과를 재사용하고
+   (`(cache)` 표기, 실측 예산 미소모), 실측은 새 configuration에만 쓴다 —
+   이전 측정 전체가 학습 데이터로 복원되므로 탐색은 이전 best 주변의
+   neighbor 생성부터 사실상 이어진다.
+3. **유사 shape warm start**: context(hardware·dtype·version)가 정확히 같고
+   shape만 다른 항목의 best knob을 seed로 주입한다. context가 하나라도
+   다르면(예: local_memory 변경) 재사용하지 않는다.

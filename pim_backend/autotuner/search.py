@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .constraints import ConstraintEngine
+from .types import PIMBenchmarkResult
 from .features import config_plan_vector, extract_plan_features, feature_names
 from .forest import RandomForestClassifier
 from .planner import PIMPlanner
@@ -45,6 +46,8 @@ class TuningRecord:
 class TuningResult:
     best: TuningRecord
     records: list
+    # 정확 일치 cache 항목을 탐색 없이 그대로 반환한 경우 True.
+    from_cache: bool = False
 
 
 @dataclass
@@ -261,11 +264,18 @@ def rank_with_diversity_penalty(scored, count, diversity_weight):
 def tune(problem, hardware, benchmark_fn, *, space=None, cache=None,
          budget=None, seed=0, initial_random=10, search_copies=5,
          select_per_generation=8, good_quantile=0.1, diversity_weight=0.2,
-         verbose=False):
+         retune=False, verbose=False):
     """§52 AutoTuner pseudocode의 구현.
 
     benchmark_fn(problem, hardware, config, plan) -> PIMBenchmarkResult 가
     Stage 6~7(candidate lowering, real hardware benchmark)을 수행한다.
+
+    cache가 있으면 (§45~§46):
+      - 정확 일치 항목이 있으면 탐색 없이 그 best를 반환한다
+        (retune=True로 재탐색을 강제할 수 있다),
+      - 재탐색 시 이미 측정한 configuration은 저장된 결과를 재사용하고
+        실측 예산(max_benchmarks)은 새 configuration에만 쓴다 — 탐색은
+        이전 측정 전체를 학습한 상태에서 이어진다.
     """
     spec = space if space is not None else build_config_space(problem, hardware)
     budget = budget if budget is not None else SearchBudget()
@@ -275,11 +285,36 @@ def tune(problem, hardware, benchmark_fn, *, space=None, cache=None,
     names = feature_names(spec)
     start_time = time.monotonic()
 
+    # 정확 일치 항목이 있으면 탐색을 생략한다 (§45의 재사용).
+    if cache is not None and not retune:
+        hit = cache.lookup_result(problem, hardware)
+        if hit is not None:
+            config, result = hit
+            plan = planner.build(config)
+            features = extract_plan_features(problem, hardware, config, plan)
+            result.config = config
+            result.plan = plan
+            result.plan_features = features
+            record = TuningRecord(config, plan, features, result)
+            if verbose:
+                print(f"[autotuner] cache 정확 일치 — 탐색 생략, "
+                      f"best {result.total_ms:.2f} ms "
+                      f"(재탐색은 retune=True)")
+            return TuningResult(best=record, records=[record],
+                                from_cache=True)
+
+    # 같은 tuning key로 저장된 측정 이력 — 실측 없이 재사용한다.
+    measured = (cache.measured_results(problem, hardware)
+                if cache is not None else {})
+    if verbose and measured:
+        print(f"[autotuner] cache: 저장된 측정 {len(measured)}개 재사용")
+
     records = []
     seen = set()
+    benchmarks_run = 0
 
     def out_of_budget():
-        if len(records) >= budget.max_benchmarks:
+        if benchmarks_run >= budget.max_benchmarks:
             return True
         if (budget.max_autotune_seconds is not None
                 and time.monotonic() - start_time
@@ -288,6 +323,7 @@ def tune(problem, hardware, benchmark_fn, *, space=None, cache=None,
         return False
 
     def measure(config, plan, features):
+        nonlocal benchmarks_run
         # config 표기는 측정 전에 출력한다 — compile 단계에서 실패해도
         # 어떤 configuration이었는지 로그에 남는다.
         if verbose:
@@ -298,14 +334,21 @@ def tune(problem, hardware, benchmark_fn, *, space=None, cache=None,
                   f"tile={plan.execution_tile_shape} "
                   f"P={grid} {config.distribution_policy}/"
                   f"{config.reduction_policy}", end="", flush=True)
-        result = benchmark_fn(problem, hardware, config, plan)
+        stored = measured.get(config.key())
+        if stored is not None:
+            result = PIMBenchmarkResult(**stored)
+            source = " (cache)"
+        else:
+            benchmarks_run += 1
+            result = benchmark_fn(problem, hardware, config, plan)
+            source = ""
         result.config = config
         result.plan = plan
         result.plan_features = features
         record = TuningRecord(config, plan, features, result)
         records.append(record)
         if verbose:
-            print(f" -> {result.total_ms:.2f} ms (ok={result.ok})")
+            print(f" -> {result.total_ms:.2f} ms (ok={result.ok}){source}")
         return record
 
     def best_ms():
@@ -356,8 +399,9 @@ def tune(problem, hardware, benchmark_fn, *, space=None, cache=None,
         seen.add(config.key())
         if not engine.valid(config):
             continue
-        if out_of_budget():
-            break
+        # 저장된 측정을 재사용하는 config는 실측 예산을 쓰지 않는다.
+        if config.key() not in measured and out_of_budget():
+            continue
         plan = planner.build(config)
         features = extract_plan_features(problem, hardware, config, plan)
         measure(config, plan, features)
@@ -423,8 +467,9 @@ def tune(problem, hardware, benchmark_fn, *, space=None, cache=None,
 
         previous_best = best_ms()
         for candidate in selected:
-            if out_of_budget():
-                break
+            if (candidate.config.key() not in measured
+                    and out_of_budget()):
+                continue
             seen.add(candidate.config.key())
             measure(candidate.config, candidate.plan, candidate.features)
 
@@ -445,5 +490,5 @@ def tune(problem, hardware, benchmark_fn, *, space=None, cache=None,
     assert ok_records, "성공적으로 측정된 configuration이 없습니다"
     best = min(ok_records, key=lambda r: r.result.total_ms)
     if cache is not None:
-        cache.store(problem, hardware, best)
+        cache.store(problem, hardware, best, records)
     return TuningResult(best=best, records=records)
