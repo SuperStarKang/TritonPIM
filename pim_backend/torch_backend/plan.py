@@ -199,17 +199,23 @@ def resolve_execution_plan(torch_config: PIMTorchConfig,
     """이 GEMM을 어떻게 실행할지 확정한다."""
     hardware = target_profile(torch_config.target)
 
-    if torch_config.autotune_cache_path is not None:
+    if torch_config.config is not None:
+        # 주어진 것을 그대로 쓴다. _fit_k_axis도 P_M 고정도 하지 않는다 —
+        # autotuner가 이 config를 재라고 요구한 것이라, 여기서 바꾸면 잰 것과
+        # 기록한 것이 달라진다. 유효성 판정은 아래에서 그대로 한다.
+        config = torch_config.config
+    elif torch_config.autotune_cache_path is not None:
+        # cache의 config도 실측 결과다. 마찬가지로 보정하지 않는다.
         config = _cached_config(problem, hardware, torch_config)
     else:
         config = _seed_config(problem, hardware, torch_config)
-
-    if torch_config.pin_row_partitions:
-        # P_M=1은 직접 경로(examples/split_k.py)에서 확인된 형태다. N-major는
-        # P_N을 먼저 최대로 잡고 남은 budget을 P_M에 주므로 num_units가 크면
-        # P_M>1이 나오는데, 그 형태는 아직 검증하지 않았다. 출력 access가
-        # rank-3(plane,row,col)로 승격되므로 구조상 문제는 없어 보인다.
-        config = replace(config, p_m=1)
+        if torch_config.pin_row_partitions:
+            # P_M=1은 직접 경로(examples/split_k.py)에서 확인된 형태다.
+            # N-major는 P_N을 먼저 최대로 잡고 남은 budget을 P_M에 주므로
+            # num_units가 크면 P_M>1이 나오는데 아직 검증 전이다. 출력
+            # access가 rank-3(plane,row,col)로 승격되므로 구조상 문제는
+            # 없어 보인다. 탐색을 쓰면 이 고정은 필요 없다.
+            config = replace(config, p_m=1)
 
     reason = ConstraintEngine(problem, hardware).check(config)
     if reason is not None:

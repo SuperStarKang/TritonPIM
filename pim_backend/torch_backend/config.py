@@ -12,6 +12,8 @@
 from dataclasses import dataclass
 from typing import Optional
 
+from ._autotuner import PIMConfig
+
 
 class UnsupportedPIMIntMM(RuntimeError):
     """strict 모드에서 PIM이 못 맡는 _int_mm을 만났을 때. CPU fallback을 하지
@@ -43,16 +45,21 @@ class PIMTorchConfig:
     # lowering(CPU)로 되돌아간다. 경로 검증 중에는 True여야 한다.
     strict: bool = True
 
-    # ── config를 고르는 방법 ──────────────────────────────────────────────
-    # 원하는 K 분할 수. 이 P_K를 갖는 heuristic seed를 고른다. 나머지 knob은
-    # seed 규칙(local memory 예산, device 활용 단위)이 shape에서 유도한다.
-    split_k: int = 4
-    # P_M=1로 고정할까. 직접 경로에서 확인된 형태다 (plan.py 주석 참고).
-    pin_row_partitions: bool = True
-    # 경로를 주면 seed 대신 offline autotune cache의 best를 쓴다 (단계 B).
-    # cache miss는 fail-fast다 — 조용히 seed로 돌아가면 무엇으로 실행됐는지
-    # 알 수 없다.
+    # ── config를 고르는 방법 (우선순위 순) ────────────────────────────────
+    # 1) config를 직접 준다. 그대로 쓴다 — 보정도 P_M 고정도 하지 않는다.
+    #    autotuner가 "이 config를 재라"고 요구할 때 쓰는 통로다. 여기서 값을
+    #    바꾸면 잰 것과 기록한 것이 달라진다.
+    config: Optional[PIMConfig] = None
+    # 2) offline autotune cache의 best (단계 B). cache miss는 fail-fast다 —
+    #    조용히 seed로 돌아가면 무엇으로 실행됐는지 알 수 없다.
     autotune_cache_path: Optional[str] = None
+    # 3) 둘 다 없으면 heuristic seed. 정답 확인용이고 성능 숫자를 내는 용도가
+    #    아니다 — seed는 shape를 다 보지 않는다(plan._fit_k_axis 주석 참고).
+    #    이 P_K를 갖는 seed를 고른다.
+    split_k: int = 4
+    # seed 경로에서만 P_M=1로 고정한다. 직접 경로에서 확인된 형태다.
+    # 주입된 config와 cache의 config는 실측 결과이므로 건드리지 않는다.
+    pin_row_partitions: bool = True
 
     # ── autotuner가 모르는 knob ──────────────────────────────────────────
     # lane 실행 형태. PIMConfig에도 profile에도 없다.

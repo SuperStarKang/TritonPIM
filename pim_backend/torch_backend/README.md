@@ -58,6 +58,7 @@ compiled = torch.compile(
 환경변수는 하나도 쓰지 않는다.
 
 - 검증 스크립트: `examples/torch_int_mm.py` (단일 MM), `examples/torch_attention.py`
+- 튜닝 스크립트: `examples/autotune_torch.py`
 
 ## 파일
 
@@ -115,12 +116,37 @@ block/group/execution tile, 축별 device 분할 수, 하드웨어 자원은 이
 | `backend_options` dict | `autotuner.decorator.pim_launch_options` |
 
 `plan.py`가 하는 일은 둘뿐이다 — 어느 config를 고를까, 고른 것을 template
-metadata로 어떻게 옮길까.
+metadata로 어떻게 옮길까. 고르는 방법은 셋이고 우선순위가 있다.
 
 ```
-PIMTorchConfig(split_k=4)          ← 원하는 P_K의 heuristic seed를 고른다
-PIMTorchConfig(autotune_cache_path=...)  ← offline autotune cache의 best (단계 B)
+PIMTorchConfig(config=PIMConfig(...))    ① 그대로 쓴다. 보정도 P_M 고정도 안 한다
+PIMTorchConfig(autotune_cache_path=...)  ② 실측된 best (단계 B). miss는 fail-fast
+PIMTorchConfig(split_k=4)                ③ heuristic seed. 정답 확인용
 ```
+
+①은 autotuner가 "이 config를 재라"고 요구할 때의 통로다. ②③과 달리 어떤
+보정도 하지 않는다 — 값을 바꾸면 잰 것과 기록한 것이 달라진다. 유효성 판정
+(`ConstraintEngine`)은 셋 다 똑같이 거친다.
+
+③은 성능 숫자를 내는 용도가 아니다. seed는 shape를 다 보지 않는다 — 예를 들어
+`utilization_tile_m`이 어떤 M보다도 커서 `tile_m`이 항상 M까지 자라고, 그러면
+`e_m = 1`이라 M축 device 병렬이 0이 된다. 그 축을 흔드는 것은 탐색의 일이다.
+
+### 실측해서 cache를 채우기
+
+```bash
+python examples/autotune_torch.py --m 8192 --n 8192 --k 128   # attention QK
+python examples/autotune_torch.py --m 8192 --n 128  --k 8192  # attention P.V
+```
+
+`examples/autotune_gemm.py`와 다른 점: 그쪽은 `examples/split_k.py`의 커널을
+직접 launch한 것을 재고, 이쪽은 **torch 경로 자체**를 잰다(측정에 PIM launch와
+CPU partial 합이 모두 들어간다). config마다 `torch.compile`을 새로 만들어 재고
+그 결과를 `autotuner.tune`의 `benchmark_fn`으로 넘긴다 — 튜닝이 lowering 안에서
+일어날 이유가 없다. 밖에는 실제 텐서가 있다.
+
+두 스크립트가 같은 cache 파일을 쓰고 template을 cache key에 넣지 않으므로, 같은
+`(M,N,K)`를 두 경로에서 튜닝하면 나중 것이 이긴다.
 
 실제로 고른 config는 lowering이 로그로 찍는다.
 
@@ -131,15 +157,20 @@ python examples/torch_int_mm.py -v
   distribution=N-major reduction=host
 ```
 
-### torch 쪽에서 손대는 두 곳
+### seed 경로에서만 손대는 두 곳
 
-1. **`pin_row_partitions=True` (기본)** — `resolve_distribution("N-major")`는
-   P_N을 먼저 최대로 잡고 남은 budget을 P_M에 주므로 `num_units`가 크면 P_M>1이
-   나온다. 그 형태는 아직 검증 전이라 1로 고정한다. 출력 access가 rank-3
-   (plane,row,col)로 승격되므로 구조상 문제는 없어 보인다.
-2. **`_fit_k_axis`** — seed의 execution 유도는 device 활용 단위에서 나오므로
+주입된 config와 cache의 config는 실측 결과이므로 건드리지 않는다. 아래 둘은
+seed 경로에만 적용된다.
+
+1. **`_fit_k_axis`** — seed의 execution 유도는 device 활용 단위에서 나오므로
    K가 작은 shape에서는 `tile_k`가 K 몫(spatial K plane)을 넘긴다. 예: K=128,
    P_K=4면 plane이 32인데 seed는 tile_k=256을 낸다. 줄이는 방향으로만 맞춘다.
+   성능이 아니라 **유효성** 보정이다 — 안 하면 `ConstraintEngine`이 거부한다.
+2. **`pin_row_partitions=True` (기본)** — `resolve_distribution("N-major")`는
+   P_N을 먼저 최대로 잡고 남은 budget을 P_M에 주므로 `num_units`가 크면 P_M>1이
+   나온다. 그 형태는 아직 하드웨어에서 확인 전이라 seed 경로에서는 1로 고정한다.
+   출력 access가 rank-3(plane,row,col)로 승격되므로 구조상 문제는 없어 보이고,
+   `autotune_torch.py`가 자연히 P_M>1을 재게 된다.
 
 ## 지원 조건 (strict 모드)## 지원 조건 (strict 모드)
 
