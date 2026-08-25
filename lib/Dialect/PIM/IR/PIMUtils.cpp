@@ -75,7 +75,17 @@ int64_t mlir::pim::tileElementsAlong(scf::ForOp axis,
     for (unsigned d = 0, e = sizes.size(); d < e; d++) {
       llvm::SmallPtrSet<Operation *, 4> drivers;
       collectDrivers(a.getOrigin()[d], loops, drivers);
-      if (drivers.size() != 1 || !drivers.contains(axis))
+      if (!drivers.contains(axis))
+        continue;
+      // 공간 축(pim.axis 태그) 오프셋이 함께 실려 있어도 — split-K 커널의
+      // K 주소 = pid_k·K_PER + k·BLOCK_K 가 그 예다 — 이 loop 한 회전이
+      // 옮기는 원소 수는 access 크기 그대로다. 태그 없는 다른 loop 가 함께
+      // 몰면 크기를 단정할 수 없으므로 그 차원은 건너뛴다.
+      bool foreign = false;
+      for (Operation *op : drivers)
+        if (op != axis && !op->getAttrOfType<StringAttr>("pim.axis"))
+          foreign = true;
+      if (foreign)
         continue;
       if (elems && elems != sizes[d])
         conflict = true;
