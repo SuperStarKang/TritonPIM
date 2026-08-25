@@ -19,6 +19,14 @@
 # [CPU fallback을 두지 않는 이유]
 # strict 모드에서 조건을 어기면 바로 멈춘다. fallback이 있으면 PIM template
 # compile이 실패했는데도 결과가 맞아 테스트가 통과한 것처럼 보인다.
+#
+# [실행 계획은 여기서 정하지 않는다]
+# 이 파일이 보는 것은 "그래프가 이 template에 들어올 모양인가"뿐이다. block/
+# group/execution tile과 축별 device 분할 수는 plan.resolve_execution_plan이
+# autotuner에게서 받아 오고, 그 config가 이 shape에서 성립하는지는 autotuner의
+# ConstraintEngine이 판정한다.
+
+import logging
 
 import sympy
 import torch
@@ -27,20 +35,13 @@ from torch._inductor import ir
 from torch._inductor.kernel.mm_common import mm_args
 from torch._inductor.lowering import _full, _register_lowering, lowerings
 
-from .config import PIMTorchConfig, UnsupportedPIMIntMM, resolve_pim_config
+from ._autotuner import PIMProblem
+from .config import PIMTorchConfig, UnsupportedPIMIntMM
+from .plan import resolve_execution_plan
 from .template import pim_split_k_template
 
 aten = torch.ops.aten
-
-
-class _Problem:
-    """정적으로 확정된 GEMM 모양."""
-
-    def __init__(self, M, N, K):
-        self.M, self.N, self.K = M, N, K
-
-    def __repr__(self):
-        return f"_Problem(M={self.M}, N={self.N}, K={self.K})"
+log = logging.getLogger(__name__)
 
 
 def _static_int(value, what):
@@ -52,8 +53,12 @@ def _static_int(value, what):
     return int(expr)
 
 
-def validate_pim_int_mm(mat1, mat2, m, n, k, config: PIMTorchConfig) -> _Problem:
-    """지원 조건 (설계 §4). 하나라도 어기면 여기서 멈춘다."""
+def validate_pim_int_mm(mat1, mat2, m, n, k) -> PIMProblem:
+    """PIM이 맡을 수 있는 _int_mm인지 본다 (설계 §4).
+
+    여기서 보는 것은 "그래프가 이 template에 들어올 모양인가"뿐이다. 실행
+    계획이 이 shape에서 성립하는지(memory 예산, 축별 분할 수, alignment)는
+    autotuner의 ConstraintEngine이 본다 — plan.resolve_execution_plan."""
     if len(mat1.get_size()) != 2 or len(mat2.get_size()) != 2:
         raise UnsupportedPIMIntMM(
             f"PIM _int_mm supports 2-D inputs only, got "
@@ -68,35 +73,12 @@ def validate_pim_int_mm(mat1, mat2, m, n, k, config: PIMTorchConfig) -> _Problem
                 f"{name} must live on CPU (PIM is a compile/exec backend, "
                 f"not a tensor device), got {device}")
 
-    problem = _Problem(_static_int(m, "M"), _static_int(n, "N"), _static_int(k, "K"))
-
-    divisor = config.split_k * config.block_k
-    if problem.K % divisor:
-        raise UnsupportedPIMIntMM(
-            f"K={problem.K} must be divisible by "
-            f"SPLIT_K*BLOCK_K={config.split_k}*{config.block_k}={divisor}")
-    check_even_tiles(problem, config)
-    return problem
-
-
-def even_tiles(problem, config: PIMTorchConfig) -> bool:
-    """M/N이 tile에 딱 맞는가 = mask 없는 본문을 낼 수 있는가.
-
-    K는 이미 K % (SPLIT_K*BLOCK_K) == 0을 검사했으므로 K_PER % BLOCK_K == 0이 되어
-    K축 mask도 항상 참이다."""
-    return (problem.M % config.block_m == 0) and (problem.N % config.block_n == 0)
-
-
-def check_even_tiles(problem, config: PIMTorchConfig) -> None:
-    if even_tiles(problem, config) or config.allow_masked_tiles:
-        return
-    raise UnsupportedPIMIntMM(
-        f"M={problem.M} must be divisible by BLOCK_M={config.block_m} and "
-        f"N={problem.N} by BLOCK_N={config.block_n}.\n"
-        f"나누어떨어지지 않으면 template이 mask를 만들어야 하는데, Inductor가 "
-        f"shape를 상수로 확정하므로 mask extent가 상수가 되고 PIMPlaceDataPass가 "
-        f"extent를 복원하지 못한다. block_m/block_n을 shape에 맞추거나, 제약이 "
-        f"풀렸는지 확인하려면 PIMTorchConfig(allow_masked_tiles=True)로 둔다.")
+    # dtype과 layout을 problem이 들고 다닌다 — ConstraintEngine의 alignment
+    # 검사가 problem.input_bytes / output_bytes를 쓴다.
+    return PIMProblem(
+        M=_static_int(m, "M"), N=_static_int(n, "N"), K=_static_int(k, "K"),
+        input_dtype="int8", output_dtype="int32",
+        a_layout="row_major", b_layout="row_major")
 
 
 def _zeroed_partial(device, split_k, m, n):
@@ -135,7 +117,8 @@ def is_pim_template_buffer(node) -> bool:
     return getattr(node, "_pim_template", False) is True
 
 
-def generate_pim_split_k_template(mat1, mat2, partial, problem, config):
+def generate_pim_split_k_template(mat1, mat2, partial, execution):
+    problem = execution.problem
     caller = pim_split_k_template.generate(
         input_nodes=(mat1, mat2, partial),
         # 선언상 출력은 쓰이지 않는다. 실제 출력은 mutated input인 partial이다
@@ -146,8 +129,8 @@ def generate_pim_split_k_template(mat1, mat2, partial, problem, config):
             size=[sympy.Integer(1)],
             stride=[sympy.Integer(1)],
         ),
-        num_stages=config.num_stages,
-        num_warps=config.num_warps,
+        num_stages=execution.torch_config.num_stages,
+        num_warps=execution.torch_config.num_warps,
         mutated_inputs=[partial],
         # grid_fn(m, n, meta)가 쓰는 값. 선언상 출력([1])이 아니라 실제 문제
         # 크기를 넘겨야 grid가 맞는다.
@@ -156,9 +139,9 @@ def generate_pim_split_k_template(mat1, mat2, partial, problem, config):
         # triton_heuristics의 patch(_precompile_config)가 이것을 읽는다.
         triton_meta={
             "compile_backend": "pim",
-            "backend_options": config.backend_options(),
+            "backend_options": execution.backend_options(),
         },
-        **config.template_meta(even_tiles(problem, config)),
+        **execution.template_meta(),
     )
     if caller is None:
         raise UnsupportedPIMIntMM(
@@ -180,20 +163,15 @@ def make_pim_int_mm_lowering(config: PIMTorchConfig, fallback):
         try:
             m, n, k, _out_layout, mat1_r, mat2_r = mm_args(
                 mat1, mat2, layout=layout, out_dtype=torch.int32)
-            problem = validate_pim_int_mm(mat1_r, mat2_r, m, n, k, config)
-            resolved = resolve_pim_config(config, problem)
-            # cache에서 온 config는 block_k/split_k가 달라질 수 있으므로 나눔
-            # 조건을 다시 본다.
-            divisor = resolved.split_k * resolved.block_k
-            if problem.K % divisor:
-                raise UnsupportedPIMIntMM(
-                    f"K={problem.K} must be divisible by "
-                    f"SPLIT_K*BLOCK_K={divisor} (config from autotune cache)")
-            check_even_tiles(problem, resolved)
+            problem = validate_pim_int_mm(mat1_r, mat2_r, m, n, k)
+            execution = resolve_execution_plan(config, problem)
         except UnsupportedPIMIntMM:
             if config.strict:
                 raise
             return fallback(mat1, mat2, layout=layout)
+
+        log.info("PIM _int_mm (M,N,K)=(%d,%d,%d): %s",
+                 problem.M, problem.N, problem.K, execution.describe())
 
         # PIM 데이터 배치는 row-major 연속을 전제로 한다. Inductor가 고른 layout이
         # 그렇지 않으면 복사를 하나 끼워 맞춘다 (연산 자체는 여전히 PIM에서 돈다).
@@ -201,12 +179,20 @@ def make_pim_int_mm_lowering(config: PIMTorchConfig, fallback):
         mat2_r = ir.ExternKernel.require_contiguous(mat2_r)
 
         partial = _zeroed_partial(
-            mat1_r.get_device(), resolved.split_k, problem.M, problem.N)
+            mat1_r.get_device(), execution.config.p_k, problem.M, problem.N)
 
-        generate_pim_split_k_template(mat1_r, mat2_r, partial, problem, resolved)
+        generate_pim_split_k_template(mat1_r, mat2_r, partial, execution)
 
         # partial을 읽는 쪽은 mutation 이후의 이름을 보게 된다 (MutationOutput).
         # dtype을 명시하지 않으면 torch.sum 규약대로 int64로 승격된다.
+        #
+        # reduction 위치는 target이 정한다 (autotuner의 TARGET_REDUCTION_POLICY).
+        # "host"가 아니면 device가 이미 합친 결과라 여기서 또 합치면 안 된다.
+        if execution.config.reduction_policy not in ("host", "none"):
+            raise UnsupportedPIMIntMM(
+                f"reduction_policy={execution.config.reduction_policy!r} is not "
+                f"supported yet — this lowering always adds a host reduction. "
+                f"target={config.target}")
         return lowerings[aten.sum](partial, axis=0, dtype=torch.int32)
 
     return pim_int_mm

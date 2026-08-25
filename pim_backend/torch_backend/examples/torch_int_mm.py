@@ -2,10 +2,10 @@
 #
 # 실행:
 #   conda activate pim_triton
-#   python torch_int_mm.py --column-partitions <p_n>
+#   python torch_int_mm.py [--split-k P_K]
 #
 # 생성된 코드를 보려면:
-#   TORCH_LOGS=output_code python torch_int_mm.py --column-partitions <p_n>
+#   TORCH_LOGS=output_code python torch_int_mm.py [--split-k P_K]
 #     - PIM 커널은 @triton_heuristics.template(...)로 정의되고, 그 triton_meta에
 #       "compile_backend": "pim"과 "backend_options"가 들어 있어야 한다.
 #     - 커널 본문이 split-K 커널(pid_k, K_PER, tl.dot 누산)이어야 한다.
@@ -16,9 +16,10 @@
 #     - aten._int_mm.default 노드가 있어야 한다 (decompose되지 않았다).
 #
 # 환경변수는 하나도 필요 없다. 필요하면 아래를 확인용으로 넣고 돌려도 된다:
-#   env -u PIM_TARGET -u TRITON_PIM_ACTIVE python torch_int_mm.py --column-partitions <p_n>
+#   env -u PIM_TARGET -u TRITON_PIM_ACTIVE python torch_int_mm.py [--split-k P_K]
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
@@ -30,27 +31,17 @@ import torch  # noqa: E402
 from torch_backend import PIMInductorBackend, PIMTorchConfig  # noqa: E402
 
 
-def build_config(column_partitions):
-    # 값의 근거는 설계 문서(단계 A: 고정 config)를 따른다. 하드웨어에 맞춰
-    # 바꿀 때는 tile_* 가 block_* × group_* 의 배수라는 조건을 지켜야 한다.
-    #
-    # device 분할은 자동 인수분해를 쓸 수 없다. 자유 knob은 p_n(column_partitions)
-    # 하나이고, p_m=1 / p_k=split_k 는 저장 주소 구조가 강제한다 (config.py의
-    # device_axis_partitions 주석 참고). 제약:
-    #   p_n <= ceil(N / BLOCK_N)          그보다 크면 device가 논다
-    #   1 * p_n * split_k <= num_units
-    return PIMTorchConfig(
-        target="upmem",
-        strict=True,
-        block_m=32, block_n=32, block_k=16,
-        split_k=4,
-        num_units=256,
-        local_lanes=8,
-        host_threads=8,
-        group_m=1, group_n=1, group_k=1,
-        tile_m=32, tile_n=32, tile_k=256,
-        column_partitions=column_partitions,
-    )
+def build_config(split_k):
+    """실행 계획은 여기서 정하지 않는다.
+
+    block/group/execution tile과 축별 device 분할 수는 autotuner가 shape와
+    hardware profile(autotuner/targets.py)에서 유도하고, ConstraintEngine이
+    검증한다. 여기서 고르는 것은 "어느 P_K의 seed를 쓸까"뿐이다.
+    실제로 고른 config는 실행 시 로그로 찍힌다:
+
+        python torch_int_mm.py -v
+    """
+    return PIMTorchConfig(target="upmem", strict=True, split_k=split_k)
 
 
 def pim_mm(a, b):
@@ -62,16 +53,18 @@ def main():
     parser.add_argument("--m", type=int, default=128)
     parser.add_argument("--k", type=int, default=1024)
     parser.add_argument("--n", type=int, default=256)
-    parser.add_argument("--column-partitions", type=int, required=True,
-                        help="output_column_tile device 분할 수 (p_n). "
-                             "p_n <= ceil(N/BLOCK_N), p_n*split_k <= num_units")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="고른 실행 계획(block/group/tile/device 분할)을 찍는다")
+    parser.add_argument("--split-k", type=int, default=4,
+                        help="원하는 K 분할 수 P_K. 이 P_K를 갖는 heuristic "
+                             "seed를 고른다 (1,2,4,8,16)")
     args = parser.parse_args()
 
-    config = build_config(args.column_partitions)
-    divisor = config.split_k * config.block_k
-    if args.k % divisor:
-        raise SystemExit(
-            f"K={args.k} must be divisible by SPLIT_K*BLOCK_K={divisor}")
+    if args.verbose:
+        logging.basicConfig(level=logging.INFO)
+        logging.getLogger("torch_backend").setLevel(logging.INFO)
+
+    config = build_config(args.split_k)
 
     torch.manual_seed(0)
     a = torch.randint(-8, 8, (args.m, args.k), dtype=torch.int8)

@@ -3,7 +3,7 @@
 #
 # 실행:
 #   conda activate pim_triton
-#   python torch_attention.py --seq 256 --kv 256 --head-dim 128 --column-partitions <p_n>
+#   python torch_attention.py --seq 256 --kv 256 --head-dim 128 [--split-k P_K]
 #
 # 예상 배치:
 #   transpose        CPU Cpp
@@ -18,6 +18,7 @@
 # KV group loop는 아직 torch.compile 밖에 둔다.
 
 import argparse
+import logging
 import math
 import sys
 from pathlib import Path
@@ -57,17 +58,18 @@ def main():
     parser.add_argument("--seq", type=int, default=256)       # M
     parser.add_argument("--kv", type=int, default=256)        # N (= PV의 K)
     parser.add_argument("--head-dim", type=int, default=128)  # QK의 K
-    parser.add_argument("--column-partitions", type=int, required=True,
-                        help="output_column_tile device 분할 수 (p_n). "
-                             "QK와 PV의 N이 다르므로 둘 다 만족하는 값을 준다")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="고른 실행 계획(block/group/tile/device 분할)을 찍는다")
+    parser.add_argument("--split-k", type=int, default=4,
+                        help="원하는 K 분할 수 P_K. QK와 PV 둘 다 "
+                             "K %% (P_K*BLOCK_K) == 0 이어야 한다")
     args = parser.parse_args()
 
-    config = build_config(args.column_partitions)
-    divisor = config.split_k * config.block_k
-    for name, k in (("head_dim (QK의 K)", args.head_dim), ("kv (PV의 K)", args.kv)):
-        if k % divisor:
-            raise SystemExit(
-                f"{name}={k} must be divisible by SPLIT_K*BLOCK_K={divisor}")
+    if args.verbose:
+        logging.basicConfig(level=logging.INFO)
+        logging.getLogger("torch_backend").setLevel(logging.INFO)
+
+    config = build_config(args.split_k)
 
     torch.manual_seed(0)
     q = torch.randint(-8, 8, (args.seq, args.head_dim), dtype=torch.int8)
