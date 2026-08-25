@@ -4,10 +4,13 @@
 # 나머지를 담당한다:
 #   - problem은 텐서 shape·dtype에서 자동 구성
 #   - hardware는 target 등록표(targets.py)에서
-#   - cache 정확 일치       → best config/plan 주입해 실행 (측정·검증 없음)
-#   - miss, PIM_AUTOTUNE≠1 → heuristic seed의 첫 유효 config 하나로 실행
-#   - miss, PIM_AUTOTUNE=1 → 데코레이트된 함수를 benchmark로 tune()을 돌려
-#                             best를 cache에 저장하고 best로 실행
+#   - cache 정확 일치     → best config/plan 주입해 실행 (측정·검증 없음)
+#   - cache miss          → 데코레이트된 함수를 benchmark로 tune()을 돌려
+#                           best를 cache에 저장하고 best로 실행
+#                           (search=False / PIM_AUTOTUNE=0 이면 탐색 대신
+#                            seed 유도 config 하나로 실행)
+#   - retune=True         → cache에 있어도 재탐색. 이미 잰 config는 저장값을
+#     (PIM_RETUNE=1)        재사용하고 실측 예산은 새 후보에만 쓴다
 #
 # wall-clock 측정(§30)과 정답 검증(탐색 중에만)은 데코레이터가 수행하고,
 # config→커널 인자 매핑은 함수 본문이 소유한다. backend 공통 launch 옵션은
@@ -87,12 +90,32 @@ def _sample_indices(size, limit=32):
     return torch.arange(0, size, step)
 
 
+def _env_flag(name, default):
+    """env가 정책을 덮어쓴다. 값이 없으면 데코레이터 인자를 그대로 쓴다."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value == "1"
+
+
 def pim_autotune(target=None, hardware=None, cache_path=DEFAULT_CACHE_PATH,
                  budget=None, space_overrides=None, ref_fn=None, reps=1,
-                 seed=0, verbose=True):
+                 seed=0, search=True, retune=False, verbose=True):
     """PIM GEMM launch 함수를 autotune한다.
 
     데코레이트된 함수의 계약: fn(a, b, *, config, plan) -> 출력 텐서 (M, N).
+
+    정책은 두 값이 정한다. 데코레이터 인자가 기본이고, env가 그 위를
+    덮어쓴다 — 코드를 고치지 않고 같은 스크립트를 다른 모드로 돌리기 위한
+    통로다.
+
+        search  (PIM_AUTOTUNE=0|1)  cache miss일 때 탐색할까
+                                    True(기본): 탐색해서 best를 저장
+                                    False: seed 유도 config 하나로 실행
+        retune  (PIM_RETUNE=0|1)    cache에 있어도 다시 탐색할까
+                                    False(기본): 저장된 best를 그대로 사용
+                                    True: 재탐색 — 이미 잰 config는 저장값을
+                                          재사용하고 새 후보만 실측한다
 
     - target: targets.py 등록표의 이름 (hardware를 직접 주면 무시)
     - space_overrides: runtime이 지원 못 하는 knob 제한
@@ -112,14 +135,17 @@ def pim_autotune(target=None, hardware=None, cache_path=DEFAULT_CACHE_PATH,
         def wrapper(a, b):
             problem = problem_from_tensors(a, b)
             planner = PIMPlanner(problem, profile)
+            do_search = _env_flag("PIM_AUTOTUNE", search)
+            do_retune = _env_flag("PIM_RETUNE", retune)
 
-            hit = cache.lookup_result(problem, profile)
-            if hit is not None:
-                config = hit[0]
-                return fn(a, b, config=config, plan=planner.build(config))
+            if not do_retune:
+                hit = cache.lookup_result(problem, profile)
+                if hit is not None:
+                    config = hit[0]
+                    return fn(a, b, config=config, plan=planner.build(config))
 
             spec = build_config_space(problem, profile, **overrides)
-            if os.environ.get("PIM_AUTOTUNE") != "1":
+            if not (do_search or do_retune):
                 config = default_config(problem, profile, spec)
                 return fn(a, b, config=config, plan=planner.build(config))
 
@@ -154,7 +180,7 @@ def pim_autotune(target=None, hardware=None, cache_path=DEFAULT_CACHE_PATH,
 
             result = tune(problem, profile, benchmark_fn, space=spec,
                           cache=cache, budget=budget, seed=seed,
-                          verbose=verbose)
+                          retune=do_retune, verbose=verbose)
             best = result.best
             return fn(a, b, config=best.config, plan=best.plan)
 

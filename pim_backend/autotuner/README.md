@@ -137,10 +137,20 @@ legal 조합 5개만 나열하고 하나의 categorical knob으로 탐색한다.
 `targets.py` 등록표에서 얻는다. 동작:
 
 ```text
-cache 정확 일치        → best config/plan 주입해 실행
-miss, PIM_AUTOTUNE≠1  → heuristic seed의 첫 유효 config 하나로 실행
-miss, PIM_AUTOTUNE=1  → 데코레이트된 함수를 benchmark로 tune() → best 저장·실행
+cache 정확 일치   → best config/plan 주입해 실행 (측정·검증 없음)
+cache miss        → tune() 실행 → best를 cache에 저장하고 실행
+retune            → cache에 있어도 재탐색. 이미 잰 config는 저장값 재사용,
+                    실측 예산은 새 후보에만
+search=False      → 탐색하지 않는다. miss면 seed 유도 config 하나로 실행
 ```
+
+정책 두 개(`search`, `retune`)는 데코레이터 인자가 기본값이고 env가 그 위를
+덮어쓴다 — 코드를 고치지 않고 같은 스크립트를 다른 모드로 돌리기 위한 통로다.
+
+| 인자 | env | 기본 | 뜻 |
+|---|---|---|---|
+| `search` | `PIM_AUTOTUNE=0\|1` | True | cache miss일 때 탐색할까 |
+| `retune` | `PIM_RETUNE=0\|1` | False | cache에 있어도 다시 탐색할까 |
 
 wall-clock 측정과 정답 검증(탐색 중에만, 기본은 균등 표본 위치를 작은 참조
 GEMM으로 직접 계산해 비교, `ref_fn`으로 교체 가능)은 데코레이터가 수행하고,
