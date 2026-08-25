@@ -425,38 +425,20 @@ class PIMBackend(BaseBackend):
     def __init__(self, target: GPUTarget) -> None:
         super().__init__(target)
 
-    # 인덕터 경로에는 launch kwarg를 끼워 넣을 자리가 없다. triton.compile에 넘어가는 옵션은
-    # _create_compile_options(_inductor/runtime/triton_heuristics.py:804-812)가 만드는
-    # 화이트리스트(num_warps/num_stages/debug/sanitize_overflow)뿐이라, PIM 고유 옵션은
-    # 통로가 없다. 그래서 env를 통로로 하나 더 연다.
+    # 옵션은 전달받은 것만 쓴다. env 통로는 두지 않는다.
     #
-    # fallback이 아니다 — env가 없으면 pim_target은 여전히 None이고 __post_init__이 그대로
-    # 터진다. 손으로 띄우는 경로(launch kwarg)가 있으면 그쪽이 이긴다(아래 update 순서).
-    _ENV_OPTIONS = {
-        "pim_target": ("PIM_TARGET", str),
-        "num_units": ("PIM_NUM_UNITS", int),
-        "local_lanes": ("PIM_LOCAL_LANES", int),
-        "local_memory_bytes": ("PIM_LOCAL_MEMORY_BYTES", int),
-        "unit_memory_bytes": ("PIM_UNIT_MEMORY_BYTES", int),
-        "host_threads": ("PIM_HOST_THREADS", int),
-        # autotuner가 고른 실행 계획을 인덕터 경로로 전달하는 통로.
-        # compile_threads=1이면 lowering이 compile 직전에 설정한 값이
-        # 해당 커널에 순차적으로 적용된다.
-        "group_m": ("PIM_GROUP_M", int),
-        "group_n": ("PIM_GROUP_N", int),
-        "group_k": ("PIM_GROUP_K", int),
-        "tile_m": ("PIM_TILE_M", int),
-        "tile_n": ("PIM_TILE_N", int),
-        "tile_k": ("PIM_TILE_K", int),
-        "device_axis_partitions": ("PIM_DEVICE_AXIS_PARTITIONS", str),
-    }
-
+    # env를 없앤 이유:
+    #   - env는 프로세스 단위라 커널마다 다른 실행 계획을 줄 수 없다. 한 그래프에
+    #     _int_mm이 둘 이상 있으면(예: attention의 QK / PV) 둘의 shape가 달라
+    #     서로 다른 tile 이 필요한데, env로는 같은 값 하나밖에 못 준다.
+    #   - 설정이 어디서 왔는지 추적이 끊긴다. 실패한 실행을 재현하려면 그때의
+    #     환경 전체를 알아야 한다.
+    #
+    # 인덕터 경로의 통로는 이제 template metadata다. torch_backend의
+    # runtime_compat이 triton_meta["backend_options"]를 읽어 triton.compile
+    # 옵션에 합쳐 준다. 손으로 띄우는 경로는 종전대로 launch kwarg를 쓴다.
     def parse_options(self, opts) -> PIMOptions:
         args = {'arch': self.target.arch}
-        for field, (env, cast) in self._ENV_OPTIONS.items():
-            value = os.environ.get(env)
-            if value is not None:
-                args[field] = cast(value)
         args.update({k: opts[k] for k in PIMOptions.__dataclass_fields__.keys() if k in opts})
         return PIMOptions(**args)
 

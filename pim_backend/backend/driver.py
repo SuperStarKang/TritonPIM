@@ -329,16 +329,18 @@ class PIMDriver(DriverBase):
         self.launcher_cls = PIMLauncher
         self.binary_ext = "pimobj"
 
-    # 기본은 자동 선택되지 않는다 — triton.runtime.driver.set_active(PIMDriver())로 명시 활성화.
+    # PIM은 자동 탐지 대상이 아니다. 항상 명시 선택한다.
     #
-    # 다만 인덕터 경로에서는 그 자리에 끼어들 수 없다. 생성된 커널의 device type이 "cpu"가
-    # 아니면 torch가 set_driver_to_gpu()를 부르는데(_inductor/runtime/triton_heuristics.py:855),
-    # 그 함수는 backends를 훑어 is_active()가 True인 것을 스스로 고르고 못 찾으면
-    # RuntimeError를 낸다(triton_helpers.py:53-68). 그래서 env로 자동 선택 대상이 되게 연다.
-    # env가 없으면 종전과 완전히 같다(False).
+    #   손으로 띄울 때: triton.runtime.driver.set_active(PIMDriver())
+    #   인덕터 경로:    torch_backend.runtime_compat.set_driver_to_backend("pim")
+    #                   — compile_backend == "pim"인 template에서만 불린다.
+    #
+    # True를 돌려주면 안 되는 이유: set_driver_to_gpu()는 backends를 훑어
+    # is_active()가 True인 것을 스스로 고른다. 그러면 PIM을 쓰지 않는 다른
+    # torch.compile이나 다른 Triton 커널까지 PIM driver로 끌려간다.
     @staticmethod
     def is_active():
-        return os.environ.get("TRITON_PIM_ACTIVE", "0") == "1"
+        return False
 
     def get_benchmarker(self):
         return _pim_do_bench
