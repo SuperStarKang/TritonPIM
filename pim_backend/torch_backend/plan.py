@@ -18,6 +18,7 @@
 # 절반이 놀았고, 그것을 생성 코드를 읽고서야 알았다. ConstraintEngine의
 # Constraint 4가 바로 그 조건이다.
 
+import logging
 from dataclasses import dataclass, replace
 
 from ._autotuner import (
@@ -41,6 +42,8 @@ from .config import PIMTorchConfig, UnsupportedPIMIntMM, validate_pim_options
 # examples/autotune_gemm.py의 SPACE_OVERRIDES와 같은 이유다 — 커널이 residency나
 # persistent execution을 구현하지 않으므로 그 축을 열어 두면 무의미한 config가
 # 나온다.
+log = logging.getLogger(__name__)
+
 SPACE_OVERRIDES = dict(
     residency_policies=("stream",),
     replication_policies=("slice",),
@@ -190,7 +193,15 @@ def _cached_config(problem, hardware, torch_config) -> PIMConfig:
             f"{problem.K}) at {torch_config.autotune_cache_path}. "
             f"Tune this shape offline first (examples/autotune_gemm.py), "
             f"or set autotune_cache_path=None to use a seed config.")
-    config, _result = found
+    config, result = found
+    # 이 항목이 몇 개의 측정 위에 서 있는지 남긴다. tune()은 끝까지 돌아야
+    # cache.store를 부르므로(search.py), 중단된 탐색은 아무것도 남기지 않는다.
+    # 반대로 --max-benchmarks 1 같은 smoke test는 record 1개짜리 항목을 남기는데,
+    # 그것을 "튜닝된 config"로 오해하기 쉽다.
+    measured = len(cache.measured_results(problem, hardware))
+    log.info("PIM autotune cache hit (M,N,K)=(%d,%d,%d): %.2f ms, "
+             "measured configs=%d", problem.M, problem.N, problem.K,
+             result.total_ms, measured)
     return config
 
 

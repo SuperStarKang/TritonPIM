@@ -32,7 +32,9 @@ import torch  # noqa: E402
 import triton.backends.pim.driver as pim_driver  # noqa: E402
 
 from torch_backend import PIMInductorBackend, PIMTorchConfig  # noqa: E402
-from torch_backend._autotuner import PIMProblem  # noqa: E402
+from torch_backend._autotuner import (  # noqa: E402
+    PIMConfigCache, PIMProblem, target_profile)
+from torch_backend.config import UnsupportedPIMIntMM  # noqa: E402
 from torch_backend.plan import resolve_execution_plan  # noqa: E402
 
 # name: (q_heads, kv_heads, head_dim) — run_attention_kernel.py의 표와 같다
@@ -128,7 +130,18 @@ def main():
     for label, m, k, n in cases:
         print(f"\n=== {label}  (m,k,n)=({m},{k},{n}) ===")
         problem = PIMProblem(M=m, N=n, K=k)
-        execution = resolve_execution_plan(config, problem)
+        try:
+            execution = resolve_execution_plan(config, problem)
+        except UnsupportedPIMIntMM as exc:
+            print(f"  건너뜀: {exc}")
+            continue
+        if args.cache:
+            # record가 1~2개면 튜닝이 아니라 smoke test 결과다. tune()은 끝까지
+            # 돌아야 저장하므로 중단된 탐색은 아무것도 남기지 않는다.
+            measured = len(PIMConfigCache(args.cache).measured_results(
+                problem, target_profile(config.target)))
+            note = "  ← 측정이 너무 적다. 튜닝이 끝까지 돌지 않았다" if measured <= 2 else ""
+            print(f"  cache: 측정된 config {measured}개{note}")
         p_m, p_n, p_k = execution.plan.active_device_grid
         print(f"  plan: {execution.describe()}")
         partial_gib = p_k * m * n * 4 / 2**30

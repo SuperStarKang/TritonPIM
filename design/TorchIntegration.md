@@ -435,6 +435,12 @@ triton-shared-opt <dump> <실패 로그의 pass 목록> --mlir-print-ir-before=p
 **CPU partial 합이 launch 밖에 있다.** 별도 cpp 커널이라 `pim_driver.timing`에
 잡히지 않는다. 총 시간을 볼 때는 반드시 포함해야 한다.
 
+**중단된 탐색은 아무것도 남기지 않는다.** `search.py:493`의 `cache.store`는
+`tune()` 맨 끝에서 한 번만 불린다. 반대로 `--max-benchmarks 1` 같은 smoke test는
+record 1개짜리 항목을 남기는데, 그것을 "튜닝된 config"로 오해하기 쉽다.
+`_cached_config`가 측정 수를 로그로 남기고 `attention_compare.py`가 그것을
+출력하는 이유다.
+
 **`pim_driver.timing`은 마지막 launch만 담는다.** attention처럼 한 그래프에 PIM
 커널이 둘이면 뒤엣것만 남는다. 단계별 breakdown은 GEMM 하나짜리 그래프에서 봐야
 한다.
