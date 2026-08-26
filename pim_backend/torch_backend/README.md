@@ -59,6 +59,8 @@ compiled = torch.compile(
 
 - 검증 스크립트: `examples/torch_int_mm.py` (단일 MM), `examples/torch_attention.py`
 - 튜닝 스크립트: `examples/autotune_torch.py`
+- PIM-LLM 비교: `examples/attention_compare.py`
+- 설계 문서: `design/TorchIntegration.md`
 
 ## 파일
 
