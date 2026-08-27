@@ -4,7 +4,7 @@
 include "mlir/Pass/PassBase.td"
 
 def ConvertPIMToUPMEM : Pass<"convert-pim-to-upmem", "mlir::ModuleOp"> {
-  let summary = "Convert placed PIM IR into the UPMEM execution model";
+  let summary = "Convert PIM Common IR into the UPMEM execution model";
   let description = [{
     `pim.device` + `pim.place` 를 UPMEM 의 host/device 구조로 옮긴다. PIM IR 이 정하지
     않은 것을 여기서 정한다: 메모리 계층, 전송 단위, 재배치.
@@ -38,9 +38,12 @@ def ConvertPIMToUPMEM : Pass<"convert-pim-to-upmem", "mlir::ModuleOp"> {
     - tile 은 WRAM 버퍼가 되고 계산은 그 위에서 memref 형태 linalg 로 돈다.
     - `pim.load`/`pim.store` 는 타일 하나를 옮기는 DMA 가 된다. 타일이 2048 byte 를 넘으면
       행 묶음으로 쪼갠다.
-    - tasklet 이 여럿이면 device 가 맡은 타일을 tasklet 에 나눈다. 병렬 축 loop 들을 하나로
-      합친 뒤 tasklet 번호부터 tasklet 수만큼 건너뛰며 돈다. 타일마다 쓰는 자리가 겹치지
-      않으므로 barrier 가 없다. tile 버퍼는 tasklet 마다 따로 잡는다.
+    - tasklet 이 여럿이면 `#pim.intra_device_plan`의 `lane_axis = "m"`에 따라 block
+      group의 행을 연속 구간으로 나눠 협력 실행한다. WRAM buffer는 공유하고 DMA를
+      분담하므로 적재와 계산 사이를 barrier로 구분한다.
+    - matmul/fill 외에 identity indexing map과 all-parallel iterator를 가진
+      `linalg.generic` pointwise 연산을 지원한다. 모든 operand를 같은 m 행으로 자르고,
+      scalar `arith` body를 하나의 C loop로 내므로 add/mul 같은 fusion이 보존된다.
 
     시간(창) 분할은 공통 IR 의 `#pim.execution_tile` 에서 온다. 축 상한 하나가
     창 하나이고, 창의 tile 수 = 상한 / 그 축의 group tile 원소수다. host loop 은
@@ -49,7 +52,7 @@ def ConvertPIMToUPMEM : Pass<"convert-pim-to-upmem", "mlir::ModuleOp"> {
     k level, A(m·k)는 m level 에서 재전송되고, 어느 창에도 매이지 않은 입력은
     처음 한 번만 전송된다. 배정이 상한 안이면 창 수가 런타임에 1 로 퇴화한다.
     k(reduction) 창은 launch 마다 K 의 한 구간만 누적한 부분합을 내므로 host 가
-    창을 건너 누산한다(`upmem.unstage` 의 accumulate). 단 explicit_k_partition
+    창을 건너 누산한다(`upmem.unstage` 의 accumulate). 단 k
     축이 있으면 k 상한은 공간 분할(SPLIT_K)의 눈금이라 창을 만들지 않는다.
     device 바이너리는 loop 상한이 host 변수로 오므로 창이 있어도 변하지 않는다.
   }];

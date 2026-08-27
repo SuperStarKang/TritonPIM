@@ -100,6 +100,19 @@ static Value rebuildIn(Operation *scope, OpBuilder &top, Value v,
   return r;
 }
 
+// UPMEM의 첫 elementwise 지원 범위. 모든 operand가 같은 logical index를 쓰고 모든
+// iterator가 parallel이면 첫 차원(m)을 tasklet별 연속 행으로 안전하게 자를 수 있다.
+static bool isIdentityPointwise(linalg::GenericOp gen) {
+  if (gen.getOutputs().size() != 1)
+    return false;
+  for (AffineMap map : gen.getIndexingMapsArray())
+    if (!map.isIdentity())
+      return false;
+  return llvm::all_of(gen.getIteratorTypesArray(), [](utils::IteratorType t) {
+    return t == utils::IteratorType::parallel;
+  });
+}
+
 // 축 하나에 대응하는 loop와, 그 loop가 device 몫으로 좁혀지며 생긴 값들.
 struct Axis {
   StringAttr name;
@@ -156,9 +169,13 @@ struct ConvertPIMToUPMEMPass
     // IR만 받는다는 경계가 깨진다.
     getOperation()->removeAttr("pim.target_profile");
     getOperation().walk([](func::FuncOp f) {
-      f->removeAttr("pim.group_execution");
+      f->removeAttr("pim.intra_device_plan");
       f->removeAttr("pim.block_group");
       f->removeAttr("pim.execution_tile");
+    });
+    getOperation().walk([](Operation *op) {
+      op->removeAttr("pim.axis");
+      op->removeAttr("pim.device_origin");
     });
   }
 
@@ -174,6 +191,11 @@ struct ConvertPIMToUPMEMPass
       return getOperation()->emitError(
           "convert-pim-to-upmem: UPMEM tasklets are independent threads, so "
           "parallel_execution_kind must be \"multithread\"");
+    if (profile.getNumberOfBanksPerPimDevice() != 1 ||
+        profile.getNumberOfPimCoresPerBank() != 1)
+      return getOperation()->emitError(
+          "convert-pim-to-upmem: UPMEM topology must be one MRAM bank and "
+          "one DPU core per PIM Device");
     if (!profile.getUsableBankCapacityBytes())
       return getOperation()->emitError(
           "convert-pim-to-upmem: usable_bank_capacity_bytes is not recorded, so "
@@ -188,9 +210,10 @@ struct ConvertPIMToUPMEMPass
     Location loc = device.getLoc();
     Block *deviceBody = &device.getBody().front();
 
-    if (!device->getAttrOfType<pim::DevicePlanAttr>("pim.device_plan")) {
+    if (!device->getAttrOfType<pim::InterDevicePlanAttr>(
+            "pim.inter_device_plan")) {
       device->emitError(
-          "convert-pim-to-upmem: the device has no #pim.device_plan");
+          "convert-pim-to-upmem: the device has no #pim.inter_device_plan");
       return signalPassFailure();
     }
     auto reduction =
@@ -207,18 +230,41 @@ struct ConvertPIMToUPMEMPass
       return signalPassFailure();
     }
 
-    auto cores =
-        func->getAttrOfType<pim::GroupExecutionAttr>("pim.group_execution");
-    if (!cores) {
+    auto intra = func->getAttrOfType<pim::IntraDevicePlanAttr>(
+        "pim.intra_device_plan");
+    if (!intra) {
       func->emitError("convert-pim-to-upmem: the function has no "
-                      "#pim.group_execution");
+                      "#pim.intra_device_plan");
       return signalPassFailure();
     }
-    int64_t lanes = cores.getLanes();
+    int64_t lanes = intra.getLanes();
+    ArrayRef<int64_t> bp = intra.getBankPartitions().asArrayRef();
+    ArrayRef<int64_t> cp = intra.getCorePartitions().asArrayRef();
+    if (!llvm::all_of(bp, [](int64_t p) { return p == 1; }) ||
+        !llvm::all_of(cp, [](int64_t p) { return p == 1; })) {
+      func->emitError(
+          "convert-pim-to-upmem: UPMEM intra-device bank/core partitions "
+          "must both be [1, 1, 1]");
+      return signalPassFailure();
+    }
+    if (lanes > 1 && intra.getLaneAxis().getValue() != "m") {
+      func->emitError(
+          "convert-pim-to-upmem: cooperative tasklets can split only the m "
+          "axis");
+      return signalPassFailure();
+    }
+    if (auto group =
+            func->getAttrOfType<pim::BlockGroupAttr>("pim.block_group")) {
+      int64_t rows = group.getUseful().asArrayRef()[0];
+      if (rows % lanes != 0) {
+        func->emitError("convert-pim-to-upmem: block-group m extent ")
+            << rows << " is not divisible by " << lanes << " tasklets";
+        return signalPassFailure();
+      }
+    }
     // 협력 lane 모드: lane들이 tile 하나를 출력 행으로 나눠 함께 계산한다. 버퍼는 한 벌,
     // 적재는 분담, 경계는 barrier다. lane이 하나면 나눌 것이 없어 기존 경로와 같다.
-    bool rowSplit =
-        lanes > 1 && cores.getLaneAxisRole().getValue() == "output_row";
+    bool rowSplit = lanes > 1 && intra.getLaneAxis().getValue() == "m";
 
     // ── 입력 모으기 ────────────────────────────────────────────────────────
     SmallVector<pim::PlaceOp> inputs, outputs;
@@ -259,7 +305,7 @@ struct ConvertPIMToUPMEMPass
     // 상한 안이면 창 수가 런타임에 1 로 퇴화해 반복이 없던 것과 같다.
     // host loop 순서는 n → k → m 이고, 각 place 는 자기가 매인 창 중 가장 안쪽
     // level 에서 창을 재전송한다 — B(k·n)는 k level, A(m·k)는 m level. k 상한이
-    // explicit_k_partition이 있어도 각 spatial plane 안의 reduction 범위가 tile-k보다
+    // k이 있어도 각 spatial plane 안의 reduction 범위가 tile-k보다
     // 크면 temporal K window를 추가한다. temporal partial은 같은 output plane에 host
     // 누산되고, 서로 다른 spatial plane의 최종 합산은 그 출력의 소비자가 수행한다.
     auto tiles =
@@ -275,7 +321,7 @@ struct ConvertPIMToUPMEMPass
           llvm::SmallPtrSet<Operation *, 4> ds;
           pim::collectDrivers(o, allLoops, ds);
           for (Operation *op : ds)
-            if (!op->getAttrOfType<StringAttr>("pim.axis"))
+            if (!op->getAttrOfType<pim::AxisAttr>("pim.axis"))
               reds.insert(op);
         }
       });
@@ -293,7 +339,7 @@ struct ConvertPIMToUPMEMPass
         if (!kLoop) {
           device->emitError(
               "convert-pim-to-upmem: the execution tile has a k cap but the "
-              "kernel has neither an explicit_k_partition axis nor a single "
+              "kernel has neither a k axis nor a single "
               "reduction loop to window");
           return signalPassFailure();
         }
@@ -778,8 +824,9 @@ struct ConvertPIMToUPMEMPass
       auto name = cast<StringAttr>(a);
       scf::ForOp loop;
       device.getBody().walk([&](scf::ForOp l) {
-        if (l->getAttrOfType<StringAttr>("pim.axis") == name)
-          loop = l;
+        if (auto axis = l->getAttrOfType<pim::AxisAttr>("pim.axis"))
+          if (axis.getName() == name)
+            loop = l;
       });
       if (!loop)
         return device->emitError("no loop for axis ") << name;
@@ -958,7 +1005,8 @@ struct ConvertPIMToUPMEMPass
       if (rowSplit) {
         // 전원이 같은 tile을 계산하므로 각자 자기 출력 행만 맡는다. 어느 피연산자를
         // 가르는지는 op마다 정해져 있다 — matmul은 A와 누산기의 행이 출력 행과 같은
-        // 축이고 B는 전 행이 필요하다. 그 밖의 계산은 가르는 규칙이 없으므로 진단이다.
+        // 축이고 B는 전 행이 필요하다. identity pointwise generic은 모든 shaped
+        // operand의 첫 축이 출력 m과 같으므로 전부 같은 행 slice로 가른다.
         if (isa<linalg::FillOp>(op)) {
           if (!(operands[1] = rowSliceOf(operands[1], op)))
             return WalkResult::interrupt();
@@ -969,11 +1017,26 @@ struct ConvertPIMToUPMEMPass
             return WalkResult::interrupt();
           // 공유 피연산자(B)의 적재가 전부 끝난 뒤에만 계산을 시작한다.
           b.create<upmem::BarrierOp>(op->getLoc());
+        } else if (auto gen = dyn_cast<linalg::GenericOp>(op)) {
+          if (!isIdentityPointwise(gen)) {
+            op->emitError(
+                "convert-pim-to-upmem: cooperating tasklets require an "
+                "identity-map, all-parallel linalg.generic");
+            return WalkResult::interrupt();
+          }
+          for (Value &operand : operands) {
+            auto type = dyn_cast<MemRefType>(operand.getType());
+            if (!type || type.getRank() == 0 ||
+                !(operand = rowSliceOf(operand, op)))
+              return WalkResult::interrupt();
+          }
+          // DMA chunk는 tasklet 사이에 분담되므로 계산 전에 모든 입력 적재가 끝나야 한다.
+          b.create<upmem::BarrierOp>(op->getLoc());
         } else {
           op->emitError(
               "convert-pim-to-upmem: cooperating tasklets "
-              "(lane_axis_role = output_row) can split only matmul and fill "
-              "by output rows");
+              "(lane_axis = m) can split only matmul, fill, and identity "
+              "pointwise generic operations by output rows");
           return WalkResult::interrupt();
         }
       }

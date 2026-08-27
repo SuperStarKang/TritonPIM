@@ -12,6 +12,7 @@ namespace {
 // buffer 모양의 곱을 그대로 더한 것이고, DMA 정렬을 위해 buffer 마다 8 byte 로 올린다.
 struct UPMEMTargetSpec : public pim::TargetSpec {
   int64_t deviceFootprintBytes(pim::TargetProfileAttr /*profile*/,
+                               pim::IntraDevicePlanAttr /*plan*/,
                                ArrayRef<pim::BufferShape> buffers,
                                int64_t mT, int64_t nT,
                                int64_t kT) const override {

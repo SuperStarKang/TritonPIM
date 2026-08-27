@@ -41,14 +41,15 @@ def PIMBuildLogicalGrid : Pass<"pim-build-logical-grid", "mlir::ModuleOp"> {
     사용자가 launch 편의로 고른 것이라 데이터가 어떻게 쪼개지는지를 말하지 않는다.
     - 2차원 이상 grid: 축이 그대로 logical 축이다.
     - `pid / d` 와 `pid % d` 쌍: 한 축이 두 logical 축으로 갈라진다.
-    - GROUP_M 순서: 그룹 좌표 사슬을 (output_row_tile, output_column_tile) 로 되돌린다.
+    - GROUP_M 순서: 그룹 좌표 사슬을 (m, n) 로 되돌린다.
       순서 자체는 배치에 영향이 없으므로 사슬은 통째로 죽는다.
-    앞의 두 logical 축이 output_row_tile 과 output_column_tile 이고, 남는 source 축은
-    explicit_k_partition 이다. 각 loop 에 `pim.axis` 로 이름을 단다.
+    앞의 두 logical 축이 m 과 n 이고, 남는 source 축은
+    k 이다. 각 loop 에 `pim.axis` 로 이름을 단다.
     복원할 수 없는 형태는 진단을 낸다.
   }];
   let constructor = "mlir::triton::createPIMBuildLogicalGridPass()";
-  let dependentDialects = ["mlir::scf::SCFDialect", "mlir::arith::ArithDialect"];
+  let dependentDialects = ["mlir::pim::PIMDialect", "mlir::scf::SCFDialect",
+                           "mlir::arith::ArithDialect"];
 }
 
 def PIMRecoverAccessOrigin : Pass<"pim-recover-access-origin", "mlir::ModuleOp"> {
@@ -92,21 +93,16 @@ def PIMSetTargetProfile : Pass<"pim-set-target-profile", "mlir::ModuleOp"> {
     Option<"target", "target", "std::string", "\"upmem\"", "target 이름.">,
     Option<"numberOfPIMDevices", "number-of-pim-devices", "int64_t", "2048",
            "PIM Device 개수.">,
+    Option<"banksPerDevice", "number-of-banks-per-pim-device", "int64_t", "1",
+           "PIM Device 하나의 bank 수.">,
+    Option<"coresPerBank", "number-of-pim-cores-per-bank", "int64_t", "1",
+           "bank 하나의 PIM Core 수.">,
     Option<"lanesPerCore", "number-of-parallel-lanes-per-pim-core", "int64_t", "16",
            "PIM Core 하나의 병렬 실행 lane 능력값.">,
     Option<"parallelExecutionKind", "parallel-execution-kind", "std::string",
            "\"multithread\"", "lane 의 성격. multithread 또는 simd.">,
-    Option<"laneMode", "lane-mode", "std::string", "\"\"",
-           "multithread 기계의 lane 실행 형태. whole_tile 은 lane 이 서로 다른 "
-           "tile 을 통째로 맡고 버퍼가 lane 수만큼 복제된다. output_row 는 lane "
-           "들이 한 tile 을 출력 행으로 나눠 협력하고 버퍼는 한 벌이다 — block "
-           "group 자동 산출(pim-form-block-groups)은 이 모드에서만 켜진다. "
-           "비우면 필드가 없다(simd 기계).">,
-    ListOption<"executionUnit", "execution-unit", "int64_t",
-               "축별 실행 단위 [m, n, k] (원소). 한 번의 하드웨어 실행이 소비하는 "
-               "크기다. 비우면 눈금이 없다 — block group 이 항등이다.">,
     Option<"usableBankCapacityBytes", "usable-bank-capacity-bytes", "int64_t",
-           "33554432", "PIM Core 하나의 attached bank 중 커널 몫. 음수면 미측정.">,
+           "33554432", "bank 하나에서 커널이 사용할 수 있는 용량. 음수면 미측정.">,
     Option<"usableLocalCapacityBytes", "usable-local-capacity-bytes", "int64_t",
            "49152", "PIM Core 하나의 local storage 중 커널 몫. 음수면 미측정.">,
   ];
@@ -131,33 +127,24 @@ def PIMFormBlockGroups : Pass<"pim-form-block-groups", "mlir::ModuleOp"> {
     valid(mask)는 건드리지 않는다 — 소비자는 pim-place-data 의 원본 크기 복원뿐이고
     그 판정은 식의 구조만 본다.
 
-    몇 개를 묶을지의 출처는 축마다 셋 중 하나다:
+    몇 개를 묶을지의 출처는 축마다 둘 중 하나다:
     1) 사용자 값(group-m/n/k > 0) — 그대로 쓴다. 1 은 명시적 항등이다.
-    2) 자동(옵션 0) — 눈금 없는 기계(execution_unit 없음)가 협력 모드
-       (simd 또는 lane_mode = output_row)일 때, local 예산
-       (usable_local_capacity_bytes)에 들어갈 때까지 m → n → k 순서로 번갈아
+    2) 자동(옵션 0) — local 예산(usable_local_capacity_bytes)에 들어갈 때까지
+       m → n → k 순서로 번갈아
        1씩 키운다. 한 벌 기준 상주 바이트는
          bytes(gm, gn, gk) = Σ_tile elemBytes · Π_dim (tile 크기 × 그 차원을
          모는 축의 배수)
-       다. 조건이 아니면(눈금 있는 기계, 예산 미측정, whole_tile) 항등이다.
-    3) 눈금 있는 기계는 아래 fillUnits 가 하드웨어 실행 단위에 채운다.
+       다. 예산이 없거나 0이면 항등이다.
 
-    묶은 뒤에는 하드웨어 실행 단위(profile 의 execution_unit [m, n, k])에 block 을
-    채워 `#pim.block_group` 을 func 에 부착한다. 규칙은 세 축 모두 같다:
-
-      tiles  = max(1, ⌊unit / block⌋)     block 정수 개를 단위에 채운다
-      useful = tiles · block               실제 데이터
-      phys   = ⌈useful / unit⌉ · unit      하드웨어가 도는 크기
-
-    배수가 안 맞으면 남는 자리(phys − useful)가 padding 이고(remark 로 알린다),
-    맞으면 padding 이 없다. execution_unit 이 없는 기계는 이 걸음이 항등이다.
-    target lowering 이 이 attr 를 소비해 buffer 와 stage 배치를 만든다.
+    결과는 target-neutral `#pim.block_group<tiles, useful>`로 func에 붙는다.
+    tiles는 묶은 Triton block 수이고 useful은 실제 원소 shape다. 하드웨어 실행
+    눈금에 대한 padding은 TargetSpec과 target lowering이 target IR에 materialize한다.
   }];
   let options = [
     Option<"groupM", "group-m", "int64_t", "0",
-           "output_row_tile 방향으로 묶는 tile 수. 0 = 자동, 1 = 항등">,
+           "m 방향으로 묶는 tile 수. 0 = 자동, 1 = 항등">,
     Option<"groupN", "group-n", "int64_t", "0",
-           "output_column_tile 방향으로 묶는 tile 수. 0 = 자동, 1 = 항등">,
+           "n 방향으로 묶는 tile 수. 0 = 자동, 1 = 항등">,
     Option<"groupK", "group-k", "int64_t", "0",
            "reduction 방향으로 묶는 tile 수. 0 = 자동, 1 = 항등. 출력 축이 아니라 "
            "reduction loop 를 넓힌다 — 누산기는 그대로고 A·B strip 의 K 변만 "
@@ -169,23 +156,25 @@ def PIMFormBlockGroups : Pass<"pim-form-block-groups", "mlir::ModuleOp"> {
                            "mlir::scf::SCFDialect"];
 }
 
-def PIMPlanGroupExecution : Pass<"pim-plan-group-execution", "mlir::ModuleOp"> {
-  let summary = "Decide how the lanes of a PIM Core execute one block group";
+def PIMPlanIntraDevice : Pass<"pim-plan-intra-device", "mlir::ModuleOp"> {
+  let summary = "Plan one block group's bank, core, and lane decomposition";
   let description = [{
-    `#pim.group_execution` 을 func 에 붙인다 — lane 수와, lane 이 block group 의
-    무엇을 나눠 갖는가다. lane 실행 형태는 profile 의 lane_mode 필드에서 읽는다 —
-    pim-form-block-groups(자동 group 의 예산 셈법)와 같은 값을 봐야 하기 때문이다.
-    profile 의 lane 수는 능력값이고 실제 값은 모드가 정한다:
-    - whole_tile(복제): lanes = max(1, min(능력값, local 예산 / lane당 group 바이트))
-    - output_row(협력): 버퍼가 한 벌이라 예산과 무관하다. 대신 lane 들이 출력 행을
-      나눠 가지므로, group 의 출력 행 수를 나누어떨어지게 하는 능력값 이하의 최대
-      약수를 lanes 로 고른다.
-    parallel_execution_kind 가 simd 면 버퍼가 lane 마다 복제되지 않으므로 능력값을
-    그대로 쓰고 역할은 언제나 output_row 다.
-    다중 core 로의 group 분배는 아직 없으므로 PIM Core 가 여럿인 topology 는 진단을
-    낸다 — 그런 target 이 오면 group 계층의 확장으로 만든다.
+    `#pim.intra_device_plan` 을 func 에 붙인다. bank_partitions는 하나의 block
+    group을 [m,n,k] bank grid로 나누고, core_partitions는 각 bank subtile을 다시
+    [m,n,k] core grid로 나눈다. lanes는 각 core subtile을 lane_axis에서 나눈다.
+    세 분할 모두 연속 sequential 분할이며 별도의 assignment 필드는 없다.
   }];
-  let constructor = "mlir::triton::createPIMPlanGroupExecutionPass()";
+  let options = [
+    ListOption<"bankPartitions", "bank-partitions", "int64_t",
+               "하나의 block group을 나누는 bank grid [m,n,k]. 기본 [1,1,1].">,
+    ListOption<"corePartitions", "core-partitions", "int64_t",
+               "각 bank subtile을 나누는 core grid [m,n,k]. 기본 [1,1,1].">,
+    Option<"lanes", "lanes", "int64_t", "0",
+           "core당 사용할 lane 수. 0이면 profile 능력값에서 선택.">,
+    Option<"laneAxis", "lane-axis", "std::string", "\"m\"",
+           "lane이 core subtile을 나눌 축: m, n, 또는 k.">,
+  ];
+  let constructor = "mlir::triton::createPIMPlanIntraDevicePass()";
   let dependentDialects = ["mlir::pim::PIMDialect"];
 }
 
@@ -196,7 +185,7 @@ def PIMMapDevices : Pass<"pim-map-devices", "mlir::ModuleOp"> {
     동시 사용할 PIM Device 수를 정하고 loop nest 를 `pim.device` region 으로
     감싼다. execution tile 경계를 지키며 나눈 device 배정량이 상한보다
     크면 target lowering 이 같은 device set 을 scheduling round 별로 재사용한다.
-    explicit_k_partition 은 자동 인수분해에서는 나누지 않지만, device-axis-partitions 로
+    k 은 자동 인수분해에서는 나누지 않지만, device-axis-partitions 로
     명시하면 나눌 수 있다 — 그때 K 영역이 연속인지는 pim-place-data 가 판정한다.
     자동 인수분해는 device 수를 정사각에 가깝게 가른다 — tile 개수가 런타임이라
     컴파일 시점에는 그것 말고 고를 근거가 없다.
@@ -214,8 +203,8 @@ def PIMMapDevices : Pass<"pim-map-devices", "mlir::ModuleOp"> {
     Option<"deviceAxisPriority", "device-axis-priority", "std::string", "\"\"",
            "먼저 쪼갤 logical 축 이름을 쉼표로 나열한다. 앞에 적힌 축이 인수분해의 "
            "큰 인수를 받는다. 축마다 복제되는 피연산자가 다르므로 어느 축이 싼지는 "
-           "target 이 안다 — matmul 은 output_row_tile 을 쪼개면 B 가, "
-           "output_column_tile 을 쪼개면 A 가 device 수만큼 복제된다. "
+           "target 이 안다 — matmul 은 m 을 쪼개면 B 가, "
+           "n 을 쪼개면 A 가 device 수만큼 복제된다. "
            "비우면 logical 축 순서 그대로 정사각에 가깝게 나눈다.">,
     Option<"deviceAxisGranularity", "device-axis-granularity", "std::string",
            "\"\"", "축을 자를 때 지킬 최소 단위를 <축이름>:<원소수> 로, 쉼표로 "
@@ -225,7 +214,7 @@ def PIMMapDevices : Pass<"pim-map-devices", "mlir::ModuleOp"> {
            "원소인지는 pim.access 의 sizes 에서 읽는다.">,
     Option<"deviceAxisPartitions", "device-axis-partitions", "std::string",
            "\"\"", "축별 device partition 수를 <축이름>:<개수> 로, 쉼표로 나열한다. "
-           "주면 자동 인수분해를 통째로 대체한다. explicit_k_partition 도 나눌 수 "
+           "주면 자동 인수분해를 통째로 대체한다. k 도 나눌 수 "
            "있다 — 단 kernel 이 K 를 연속 구간으로 갈라야 하며(blocked 분할), 그 "
            "판정은 pim-place-data 가 한다. 나열되지 않은 축은 1 이고, 곱이 PIM "
            "Device 수를 넘으면 진단이다. tile 수는 런타임이라 어느 축을 얼마나 "
@@ -248,23 +237,25 @@ def PIMFormExecutionTiles : Pass<"pim-form-execution-tiles", "mlir::ModuleOp"> {
     축마다 출처는 둘 중 하나다:
     1) 사용자 값(tile-m/n/k > 0) — 그대로 쓴다. 그 축의 group tile 원소수의
        배수여야 하고(창 경계는 tile 위), 상한이 붙는 축이 커널에 없으면 진단이다.
-    2) 자동(옵션 0) — matmul 모양 커널(m·n 축 + reduction loop 하나,
-       explicit_k_partition 없음)이고 target 의 footprint spec 이 등록돼 있고
-       bank 예산이 알려져 있으면:
+    2) 자동(옵션 0):
+       - matmul 모양 커널(m·n 축 + reduction loop 하나, k 없음)이고 target 의
+         footprint spec 이 등록돼 있고 bank 예산이 알려져 있으면:
          m = block group 1개, n = target 기본 단위(spec 의 preferredNGroups —
          AiMX 는 한 device 폭), k = 남는 예산 전부 (footprint 가 k 에
          단조증가라 이분 탐색으로 "예산에 드는 최대"를 찾는다).
-       explicit_k_partition 커널은 spatial/temporal reduction 정책이 필요하므로 자동
+       - reduction 없는 elementwise/map 커널이면 존재하는 m/n 축마다 block group
+         1개를 보수적 seed로 쓴다. 더 큰 execution tile은 autotuner가 탐색한다.
+       k 커널은 spatial/temporal reduction 정책이 필요하므로 자동
        선택하지 않는다. 세 tile 값을 모두 명시하지 않으면 진단한다.
   }];
   let options = [
     Option<"tileM", "tile-m", "int64_t", "0",
-           "output_row_tile 방향 상한 (원소). 0 = 자동">,
+           "m 방향 상한 (원소). 0 = 자동">,
     Option<"tileN", "tile-n", "int64_t", "0",
-           "output_column_tile 방향 상한 (원소). 0 = 자동">,
+           "n 방향 상한 (원소). 0 = 자동">,
     Option<"tileK", "tile-k", "int64_t", "0",
            "각 spatial K plane 내부 reduction 방향 상주 상한(원소). 0 = 자동. "
-           "explicit_k_partition은 독립된 spatial output 축이고 tile-k는 그 plane "
+           "k은 독립된 spatial output 축이고 tile-k는 그 plane "
            "내부의 temporal window다. 여러 window의 partial은 target lowering이 "
            "같은 output plane에 host 누산한다.">,
   ];
@@ -295,7 +286,7 @@ def PIMVerify : Pass<"pim-verify", "mlir::ModuleOp"> {
     - origin 이 비어 있지 않고 rank 가 sizes 와 같다.
     - pad 가 0 이 아니면 진단(단계 1 은 pad = 0 만 지원).
     - device partition 의 곱이 PIM Device 개수를 넘지 않는다.
-    - `#pim.device_plan`, `#pim.execution_tile`, `#pim.reduction_plan`이 모두
+    - `#pim.inter_device_plan`, `#pim.execution_tile`, `#pim.reduction_plan`이 모두
       존재하고 spatial K 축·temporal tile-k와 서로 일치한다.
     - lane 당 group 바이트 × lane 수가 usable_local_capacity_bytes 안이다(simd 와
       협력 모드는 × 없이 한 벌, 0 이면 생략, 미측정이면 진단).

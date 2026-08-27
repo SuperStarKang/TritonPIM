@@ -3,8 +3,8 @@
 // RUN: triton-shared-translate --upmem-to-host   %s | FileCheck %s --check-prefix=HOST
 // RUN: triton-shared-translate --upmem-to-device %s | FileCheck %s --check-prefix=DEVICE
 
-upmem.mram @A_mram : memref<4096xi8, #upmem.space<mram>>
-upmem.mram @C_mram : memref<1024xi32, #upmem.space<mram>>
+upmem.mram @A_mram : memref<4096xi8, #upmem<space mram>>
+upmem.mram @C_mram : memref<1024xi32, #upmem<space mram>>
 upmem.host_var @tiles_x : index
 upmem.host_var @pitch_a : index
 
@@ -14,10 +14,10 @@ upmem.host_var @pitch_a : index
 // HOST: extern "C" void kernel(int8_t* a0, int32_t* a1, int64_t a2, int64_t a3)
 // 확보와 적재는 런타임이 한 번만 한다.
 // HOST: _set = upmem_acquire(4, DPU_BINARY);
-// 유닛 좌표는 선형 번호에서 자리값으로 푼다.
-// HOST: for (int64_t _u = 0; _u < 4; ++_u)
 // staging: dedup 축을 뺀 조합마다 한 번씩만 만들고, 남는 자리는 0이다.
 // HOST: calloc(2, sizeof(int8_t*))
+// 유닛 좌표는 선형 번호에서 자리값으로 푼다.
+// HOST: for (int64_t _u = 0; _u < 4; ++_u)
 // HOST: calloc(
 // 부분 타일도 돌되 원본 범위를 넘는 원소는 건너뛴다.
 // HOST: for (int64_t _t0 = 0; _t0 < (({{.*}} + 7) / 8); ++_t0)
@@ -42,7 +42,7 @@ func.func @kernel(%A: memref<*xi8>, %C: memref<*xi32>, %lda: index, %ldc: index)
     %r = arith.muli %pm, %c16 : index
     %c = arith.muli %pn, %c16 : index
     %sa = upmem.stage %A origin[%r, %c] sizes[%c16, %c16] strides[%lda, %c1]
-          pad_to[%c16, %c16] tile array<i64: 8, 16> {dedup_over = ["y"]}
+          pad_to[%c16, %c16] tile [8, 16] {dedup_over = ["y"]}
           : memref<*xi8> -> memref<?x?xi8>
     upmem.to_mram %dpu, %sa, @A_mram : memref<?x?xi8>
     upmem.to_host_var %dpu, %c8, @tiles_x : index
@@ -54,7 +54,7 @@ func.func @kernel(%A: memref<*xi8>, %C: memref<*xi32>, %lda: index, %ldc: index)
   ^bb0(%part: memref<?x?xi32>, %pm: index, %pn: index):
     %cr = arith.muli %pm, %c16 : index
     upmem.unstage %part into %C origin[%cr, %c0] sizes[%c16, %c16] strides[%ldc, %c1]
-        capacity[%c16, %c16] tile array<i64: 8, 16>
+        capacity[%c16, %c16] tile [8, 16]
         : memref<?x?xi32>, memref<*xi32>
   }
   return
@@ -76,25 +76,25 @@ upmem.device_func @kernel_device {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c8 = arith.constant 8 : index
-  %aw = memref.alloc() : memref<8x16xi8, #upmem.space<wram>>
-  %acc = memref.alloc() : memref<8x32xi32, #upmem.space<wram>>
+  %aw = memref.alloc() : memref<8x16xi8, #upmem<space wram>>
+  %acc = memref.alloc() : memref<8x32xi32, #upmem<space wram>>
   %n = upmem.get_host_var @tiles_x : index
   %p = upmem.get_host_var @pitch_a : index
   scf.for %tx = %c0 to %n step %c1 {
     %off = arith.muli %tx, %p : index
     scf.for %r = %c0 to %c8 step %c1 {
       %row = memref.subview %aw[%r, 0] [1, 16] [1, 1]
-             : memref<8x16xi8, #upmem.space<wram>>
-            to memref<16xi8, strided<[1], offset: ?>, #upmem.space<wram>>
+             : memref<8x16xi8, #upmem<space wram>>
+            to memref<16xi8, strided<[1], offset: ?>, #upmem<space wram>>
       upmem.mram_read @A_mram[%off], %row
-             : memref<16xi8, strided<[1], offset: ?>, #upmem.space<wram>>
+             : memref<16xi8, strided<[1], offset: ?>, #upmem<space wram>>
     }
     scf.for %r2 = %c0 to %c8 step %c1 {
       %crow = memref.subview %acc[%r2, 0] [1, 16] [1, 1]
-             : memref<8x32xi32, #upmem.space<wram>>
-            to memref<16xi32, strided<[1], offset: ?>, #upmem.space<wram>>
+             : memref<8x32xi32, #upmem<space wram>>
+            to memref<16xi32, strided<[1], offset: ?>, #upmem<space wram>>
       upmem.mram_write %crow, @C_mram[%off]
-             : memref<16xi32, strided<[1], offset: ?>, #upmem.space<wram>>
+             : memref<16xi32, strided<[1], offset: ?>, #upmem<space wram>>
     }
   }
 }

@@ -5,8 +5,8 @@
 // CHECK-LABEL: func.func @plain
 // CHECK:         scf.for
 // CHECK:           scf.for
-// CHECK:           } {pim.axis = "output_column_tile"}
-// CHECK:         } {pim.axis = "output_row_tile"}
+// CHECK:           } {pim.axis = #pim.axis<"n">}
+// CHECK:         } {pim.axis = #pim.axis<"m">}
 func.func @plain(%A: memref<*xf32>, %npx: i32, %npy: i32, %npz: i32,
                  %pidx: i32, %pidy: i32, %pidz: i32) {
   %c0 = arith.constant 0 : index
@@ -28,9 +28,9 @@ func.func @plain(%A: memref<*xf32>, %npx: i32, %npy: i32, %npz: i32,
 // CHECK:         %[[D:.*]] = arith.divsi
 // CHECK:         %[[R:.*]] = arith.ceildivsi %arg1, %[[D]]
 // CHECK:         scf.for %{{.*}} = %{{.*}} to %{{.*}}
-// CHECK:           } {pim.axis = "explicit_k_partition"}
-// CHECK:         } {pim.axis = "output_column_tile"}
-// CHECK:         } {pim.axis = "output_row_tile"}
+// CHECK:           } {pim.axis = #pim.axis<"k">}
+// CHECK:         } {pim.axis = #pim.axis<"n">}
+// CHECK:         } {pim.axis = #pim.axis<"m">}
 func.func @div_rem(%A: memref<*xf32>, %npx: i32, %npy: i32, %npz: i32,
                    %pidx: i32, %pidy: i32, %pidz: i32) {
   %c0 = arith.constant 0 : index
@@ -57,8 +57,8 @@ func.func @div_rem(%A: memref<*xf32>, %npx: i32, %npy: i32, %npz: i32,
 // GROUP_M 순회 순서. 그룹 좌표 사슬은 통째로 죽고 2차원 nest만 남는다.
 // CHECK-LABEL: func.func @group_order
 // CHECK-NOT:     arith.remsi
-// CHECK:         } {pim.axis = "output_column_tile"}
-// CHECK:         } {pim.axis = "output_row_tile"}
+// CHECK:         } {pim.axis = #pim.axis<"n">}
+// CHECK:         } {pim.axis = #pim.axis<"m">}
 func.func @group_order(%A: memref<*xf32>, %M: i32, %N: i32,
                        %npx: i32, %npy: i32, %npz: i32,
                        %pidx: i32, %pidy: i32, %pidz: i32) {

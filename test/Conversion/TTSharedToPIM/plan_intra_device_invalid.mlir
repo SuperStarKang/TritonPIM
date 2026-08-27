@@ -1,13 +1,15 @@
-// 모르는 lane-mode 는 기본값으로 때우지 않고 진단이다.
-// RUN: triton-shared-opt --pim-plan-group-execution=lane-mode=diagonal -verify-diagnostics %s
+// Invalid intra-device axis names are rejected before target lowering.
+// RUN: triton-shared-opt --pim-plan-intra-device=lane-axis=diagonal -verify-diagnostics %s
 
 module attributes {pim.target_profile = #pim.target_profile<
     target = "upmem", number_of_pim_devices = 8,
+    number_of_banks_per_pim_device = 1,
+    number_of_pim_cores_per_bank = 1,
     number_of_parallel_lanes_per_pim_core = 16,
     parallel_execution_kind = "multithread",
     usable_bank_capacity_bytes = 3072, usable_local_capacity_bytes = 4096>} {
 
-// expected-error @+1 {{unknown lane-mode "diagonal"}}
+// expected-error @+1 {{lane-axis must be m, n, or k}}
 func.func @matmul(%A: memref<*xi8>, %lda: index) {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index

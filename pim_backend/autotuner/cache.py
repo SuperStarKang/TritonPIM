@@ -37,6 +37,8 @@ class PIMConfigCache:
             problem.a_layout, problem.b_layout,
             problem.a_resident, problem.b_resident,
             hardware.target, hardware.num_units,
+            hardware.banks_per_device, hardware.cores_per_bank,
+            hardware.lanes_per_core, hardware.usable_bank_capacity_bytes,
             hardware.local_memory_bytes, hardware.device_memory_bytes,
             hardware.alignment_bytes,
             self.template_version, self.compiler_version,

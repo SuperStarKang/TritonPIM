@@ -1,4 +1,5 @@
 #include "triton-shared/Conversion/TTSharedToPIM/TTSharedToPIM.h"
+#include "triton-shared/Dialect/PIM/IR/PIMDialect.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -24,7 +25,7 @@ static constexpr unsigned kGridRank = 3;
 
 // logical 축 이름. 앞의 둘이 출력 tile 좌표이고 그다음이 명시적 K 분할이다.
 static constexpr StringRef kAxisNames[] = {
-    "output_row_tile", "output_column_tile", "explicit_k_partition"};
+    "m", "n", "k"};
 
 // 복원된 logical 축 하나. 축의 tile 개수는 extent 이거나, divideBy 가 있으면
 // ceildiv(extent, divideBy) 다. 둘 다 func 인자와 상수만으로 계산된다.
@@ -72,7 +73,7 @@ static Value otherOperand(Operation *op, Value one) {
   return op->getOperand(0) == one ? op->getOperand(1) : op->getOperand(0);
 }
 
-// GROUP_M 순회 순서를 (output_row_tile, output_column_tile)로 되돌린다.
+// GROUP_M 순회 순서를 (m, n)로 되돌린다.
 //   tiles_per_group  = column_tiles * G
 //   group            = pid / tiles_per_group
 //   first_row        = group * G
@@ -209,7 +210,9 @@ struct PIMBuildLogicalGridPass
     SmallVector<scf::ForOp> loops;
     for (auto [i, ub] : llvm::enumerate(upperBounds)) {
       auto forOp = b.create<scf::ForOp>(loc, c0, ub, c1);
-      forOp->setAttr("pim.axis", b.getStringAttr(kAxisNames[i]));
+      forOp->setAttr(
+          "pim.axis",
+          pim::AxisAttr::get(func.getContext(), b.getStringAttr(kAxisNames[i])));
       loops.push_back(forOp);
       b.setInsertionPointToStart(forOp.getBody());
     }

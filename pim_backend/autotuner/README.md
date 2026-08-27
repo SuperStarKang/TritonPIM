@@ -26,9 +26,10 @@ from autotuner import PIMProblem, PIMHardwareProfile, PIMBenchmarkResult, tune
 
 problem = PIMProblem(M=1024, N=8192, K=28672)
 hardware = PIMHardwareProfile(
-    target="upmem", num_units=2048,
-    local_memory_bytes=48 * 1024, device_memory_bytes=64 * 1024 * 1024,
-    alignment_bytes=8, execution_units_per_device=16,
+    target="upmem", num_devices=2048,
+    banks_per_device=1, cores_per_bank=1, lanes_per_core=16,
+    usable_bank_capacity_bytes=60 * 1024 * 1024,
+    usable_local_capacity_bytes=48 * 1024, alignment_bytes=8,
     # 한 device의 실행 자원을 가득 채우는 작업 묶음 — target 실측으로 지정
     utilization_tile_m=..., utilization_tile_n=..., utilization_tile_k=...,
     target_constraints={"k_split_block_multiple": True},

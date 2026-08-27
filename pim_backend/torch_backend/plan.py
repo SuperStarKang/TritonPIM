@@ -80,12 +80,9 @@ class PIMExecutionPlan:
 
         본체는 autotuner의 pim_launch_options다 — 손으로 띄우는 경로와 인덕터
         경로가 같은 plan에서 같은 문자열을 만들어야 두 경로가 갈라지지 않는다.
-        그 helper가 다루지 않는 두 knob만 여기서 얹는다."""
+        그 helper가 다루지 않는 host knob만 여기서 얹는다."""
         options = dict(pim_launch_options(self.config, self.plan, self.hardware))
-        options.update(
-            lane_mode=self.torch_config.lane_mode,
-            host_threads=self.torch_config.host_threads,
-        )
+        options.update(host_threads=self.torch_config.host_threads)
         return validate_pim_options(options)
 
     def describe(self) -> str:

@@ -123,6 +123,17 @@ def make_config(problem, hardware, blocks, groups, executions,
     tile_n = blocks[1] * groups[1] * executions[1]
     p_m, p_n = resolve_distribution(
         problem, hardware, tile_m, tile_n, p_k, distribution_policy)
+    if hardware.target == "aimx":
+        batch = hardware.target_constraints.get("default_batch", 8)
+        intra = dict(
+            bank_p_m=batch, bank_p_n=hardware.banks_per_device // batch,
+            bank_p_k=1, core_p_m=1, core_p_n=1, core_p_k=1,
+            intra_device_lanes=hardware.lanes_per_core, lane_axis="n")
+    else:
+        intra = dict(
+            bank_p_m=1, bank_p_n=1, bank_p_k=1,
+            core_p_m=1, core_p_n=1, core_p_k=1,
+            intra_device_lanes=hardware.lanes_per_core, lane_axis="m")
     return PIMConfig(
         block_m=blocks[0], block_n=blocks[1], block_k=blocks[2],
         group_m=groups[0], group_n=groups[1], group_k=groups[2],
@@ -131,6 +142,7 @@ def make_config(problem, hardware, blocks, groups, executions,
         distribution_policy=distribution_policy,
         p_m=p_m, p_n=p_n, p_k=p_k,
         reduction_policy=reduction_policy,
+        **intra,
         a_residency=a_residency, b_residency=b_residency,
         replication_policy=replication_policy,
         streaming_policy=streaming_policy,

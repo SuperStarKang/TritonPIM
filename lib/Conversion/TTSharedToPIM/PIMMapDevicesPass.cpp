@@ -104,9 +104,9 @@ struct PIMMapDevicesPass
     SmallVector<scf::ForOp> loops;
     SmallVector<Attribute> names;
     func.walk<WalkOrder::PreOrder>([&](scf::ForOp l) {
-      if (auto a = l->getAttrOfType<StringAttr>("pim.axis")) {
+      if (auto a = l->getAttrOfType<pim::AxisAttr>("pim.axis")) {
         loops.push_back(l);
-        names.push_back(a);
+        names.push_back(a.getName());
       }
     });
     if (loops.empty())
@@ -124,12 +124,12 @@ struct PIMMapDevicesPass
     // 나눌 수 있고, 그때의 연속성은 pim-place-data가 판정한다.
     SmallVector<unsigned> tileAxes;
     for (auto [i, n] : llvm::enumerate(names))
-      if (cast<StringAttr>(n) != "explicit_k_partition")
+      if (cast<StringAttr>(n) != "k")
         tileAxes.push_back(i);
 
     // 어느 축을 먼저 쪼갤지는 target 이 안다 — 축마다 복제되는 피연산자가 다르기
-    // 때문이다. matmul 에서 output_row_tile 을 쪼개면 B 가 device 수만큼 복제되고,
-    // output_column_tile 을 쪼개면 A 가 복제된다. 목록에 적힌 축이 앞으로 오고 아래에서
+    // 때문이다. matmul 에서 m 을 쪼개면 B 가 device 수만큼 복제되고,
+    // n 을 쪼개면 A 가 복제된다. 목록에 적힌 축이 앞으로 오고 아래에서
     // factorize 의 **큰** 인수를 받는다. 목록이 비어 있으면 지금까지의 순서 그대로다.
     if (!deviceAxisPriority.empty()) {
       SmallVector<StringRef> wanted;
@@ -187,8 +187,8 @@ struct PIMMapDevicesPass
     SmallVector<int64_t> granularity(loops.size(), 1);
     for (auto [i, name] : llvm::enumerate(names)) {
       StringRef axis = cast<StringAttr>(name).getValue();
-      int64_t cap = axis == "output_row_tile"      ? execution.getM()
-                    : axis == "output_column_tile" ? execution.getN()
+      int64_t cap = axis == "m"      ? execution.getM()
+                    : axis == "n" ? execution.getN()
                                                     : 0;
       if (cap <= 0)
         continue;
@@ -250,8 +250,8 @@ struct PIMMapDevicesPass
           l.getStep()));
 
     SmallVector<Attribute> schedulingOrder;
-    StringRef preferred[] = {"output_column_tile", "explicit_k_partition",
-                             "output_row_tile"};
+    StringRef preferred[] = {"n", "k",
+                             "m"};
     for (StringRef wanted : preferred)
       for (Attribute name : names)
         if (cast<StringAttr>(name).getValue() == wanted)
@@ -290,16 +290,16 @@ struct PIMMapDevicesPass
         pim::DeviceMappingAttr::get(ctx, ArrayAttr::get(ctx, names),
                                     b.getDenseI64ArrayAttr(partitions)),
         extents);
-    auto plan = pim::DevicePlanAttr::get(
+    auto plan = pim::InterDevicePlanAttr::get(
         ctx, devices, ArrayAttr::get(ctx, names),
         b.getDenseI64ArrayAttr(partitions),
         b.getDenseI64ArrayAttr(
             {execution.getM(), execution.getN(), execution.getK()}),
         ArrayAttr::get(ctx, schedulingOrder));
     device->setAttr("pim.execution_tile", execution);
-    device->setAttr("pim.device_plan", plan);
+    device->setAttr("pim.inter_device_plan", plan);
     bool hasSpatialK = llvm::any_of(names, [](Attribute name) {
-      return cast<StringAttr>(name).getValue() == "explicit_k_partition";
+      return cast<StringAttr>(name).getValue() == "k";
     });
     device->setAttr(
         "pim.reduction_plan",

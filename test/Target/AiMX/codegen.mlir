@@ -1,5 +1,5 @@
 // AiMX IR이 runtime stub(C++)과 descriptor program(C 헤더)으로 나가는지 확인한다.
-// 입력은 Placed PIM IR이고 두 pass를 거쳐 온다 — 손으로 쓴 AiMX IR과 실제 pass 출력이
+// 입력은 PIM Common IR이고 두 pass를 거쳐 온다 — 손으로 쓴 AiMX IR과 실제 pass 출력이
 // 어긋나지 않도록.
 // RUN: triton-shared-opt --convert-pim-to-aimx --aimx-lower-matmul %s | triton-shared-translate --aimx-to-descriptors | FileCheck %s --check-prefix=DESC
 // RUN: triton-shared-opt --convert-pim-to-aimx --aimx-lower-matmul %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=STUB
@@ -10,14 +10,13 @@
 // DESC: static uint32_t aimx_prog_matmul_relayout(pim_isa_32_t *code, uint32_t cap, uint32_t idx, uint64_t *next, int fpga_id
 // 쓰기 전에 경계를 확인한다. tile 모양이 런타임 값이라 group 수도 런타임에 정해진다.
 // DESC: aimx_require(idx + NUM_CHANNELS <= cap
-// DESC-SAME: uint64_t
 // pitch는 물리 주소(33 bit) 바로 위에 얹는다. 쓰지 않는 쪽은 0x0이다.
-// DESC: PIM_RD_INSTR_MC(&idx, next, ({{.*}} + (uint64_t){{.*}}) | ((uint64_t){{.*}} << 33), 0x0, 512u, 0x41000u
-// DESC: PIM_RD_INSTR_MC(&idx, next, 0x0, ({{.*}} + (uint64_t){{.*}}), 65536u, 0x2400u
+// DESC-NEXT: PIM_RD_INSTR_MC(&idx, next, ({{.*}} + (uint64_t){{.*}}) | ((uint64_t){{.*}} << 33), 0x0, 512u, 0x59000u
+// DESC: PIM_RD_INSTR_MC(&idx, next, 0x0, ({{.*}} + (uint64_t){{.*}}), 65536u, 0x1a400u
 // DESC: static uint32_t aimx_prog_matmul_compute
-// DESC: PIM_RD_INSTR_MC(&idx, next, ({{.*}} + (uint64_t){{.*}}), 0x0, 8192u, 0x1012u
-// DESC: PIM_RD_INSTR_MC(&idx, next, ({{.*}} + (uint64_t){{.*}}) | ((uint64_t){{.*}} << 33), 0x0, 1024u, 0x41014u
-// DESC: PIM_RD_INSTR_MC(&idx, next, ({{.*}} + (uint64_t){{.*}}) | ((uint64_t){{.*}} << 33), ({{.*}} + (uint64_t){{.*}}) | ((uint64_t){{.*}} << 33), 1024u, 0x40018u
+// DESC: PIM_RD_INSTR_MC(&idx, next, ({{.*}} + (uint64_t){{.*}}), 0x0, 8192u, 0x19012u
+// DESC: PIM_RD_INSTR_MC(&idx, next, ({{.*}} + (uint64_t){{.*}}) | ((uint64_t){{.*}} << 33), 0x0, 1024u, 0x59014u
+// DESC: PIM_RD_INSTR_MC(&idx, next, ({{.*}} + (uint64_t){{.*}}) | ((uint64_t){{.*}} << 33), ({{.*}} + (uint64_t){{.*}}) | ((uint64_t){{.*}} << 33), 1024u, 0x58018u
 
 // ── runtime stub ────────────────────────────────────────────────────────────
 // 진입 함수 이름을 compiler.py가 이 정규식으로 읽어 metadata["name"]에 채운다.
@@ -53,19 +52,18 @@
 
 module attributes {pim.target_profile = #pim.target_profile<
     target = "aimx", number_of_pim_devices = 1,
-    number_of_parallel_lanes_per_pim_core = 4096,
+    number_of_banks_per_pim_device = 256,
+    number_of_pim_cores_per_bank = 1,
+    number_of_parallel_lanes_per_pim_core = 16,
     parallel_execution_kind = "simd",
-    execution_unit = array<i64: 8, 512, 32>,
-    usable_bank_capacity_bytes = 1073741824, usable_local_capacity_bytes = 0>} {
+    usable_bank_capacity_bytes = 268435456, usable_local_capacity_bytes = 0>} {
 
 func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
                   %K: i32, %N: i32, %ex: index, %ey: index)
-    attributes {pim.group_execution = #pim.group_execution<
-        lanes = 4096, lane_axis_role = "whole_tile">,
+    attributes {pim.intra_device_plan = #pim.intra_device_plan<bank_partitions = [8, 32, 1], core_partitions = [1, 1, 1], lanes = 16, lane_axis = "n">,
         pim.block_group = #pim.block_group<
-            tiles = array<i64: 1, 16, 1>,
-            useful = array<i64: 32, 512, 32>,
-            phys = array<i64: 32, 512, 32>>} {
+            tiles = [1, 16, 1],
+            useful = [32, 512, 32]>} {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c32 = arith.constant 32 : index
@@ -74,9 +72,20 @@ func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
   %ldb = arith.index_cast %N : i32 to index
   %kk = arith.index_cast %K : i32 to index
 
-  pim.device #pim.device_mapping<axes = ["output_row_tile", "output_column_tile"],
+  pim.device #pim.device_mapping<axes = ["m", "n"],
                                  partitions = [1, 1]>
-      extents [%ex, %ey] {
+      extents [%ex, %ey]
+      attributes {
+        pim.execution_tile = #pim.execution_tile<m = 32, n = 4096, k = 103936>,
+        pim.inter_device_plan = #pim.inter_device_plan<
+            available_devices = 1,
+            axes = ["m", "n"],
+            active_grid = [1, 1],
+            execution_tile = [32, 4096, 103936],
+            scheduling_order = ["n", "m"]>,
+        pim.reduction_plan = #pim.reduction_plan<
+            spatial_partials = "none", temporal_accumulation = "host",
+            final_accumulation = "none">} {
   ^bb0(%px: index, %py: index):
     // PIM Device 가 하나라 device 몫이 곧 전체다. 실제 pass 가 내는 모양 그대로 손으로 썼다.
     %capx = arith.ceildivsi %ex, %c1 : index
@@ -94,8 +103,8 @@ func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
     pim.place %A start[%ar, %c0] size[%arn, %akn] capacity[%arc, %akn]
         strides[%lda, %c1]
         {direction = "in", access = 0 : i64,
-         mapping = #pim.place_mapping<axis_sources = ["output_row_tile", ""]>,
-         replicated_over = ["output_column_tile"]} : memref<*xf32>
+         mapping = #pim.place_mapping<axis_sources = ["m", ""]>,
+         replicated_over = ["n"]} : memref<*xf32>
 
     %bc = arith.muli %starty, %c32 : index
     %bcn = arith.muli %tripsy, %c32 : index
@@ -103,14 +112,14 @@ func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
     pim.place %B start[%c0, %bc] size[%akn, %bcn] capacity[%akn, %bcc]
         strides[%ldb, %c1]
         {direction = "in", access = 1 : i64,
-         mapping = #pim.place_mapping<axis_sources = ["", "output_column_tile"]>,
-         replicated_over = ["output_row_tile"]} : memref<*xf32>
+         mapping = #pim.place_mapping<axis_sources = ["", "n"]>,
+         replicated_over = ["m"]} : memref<*xf32>
 
     pim.place %C start[%ar, %bc] size[%arn, %bcn] capacity[%arc, %bcc]
         strides[%ldb, %c1]
         {direction = "out", access = 2 : i64,
-         mapping = #pim.place_mapping<axis_sources = ["output_row_tile",
-                                                      "output_column_tile"]>} : memref<*xf32>
+         mapping = #pim.place_mapping<axis_sources = ["m",
+                                                      "n"]>} : memref<*xf32>
 
     scf.for %tx = %c0 to %tripsx step %c1 {
       %gx = arith.addi %startx, %tx {pim.device_origin} : index
@@ -136,8 +145,8 @@ func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
         %dc = pim.access %C offset %n sizes [32, 32] strides[%ldb, %c1] origin[%m, %n]
               {id = 2 : i64} : memref<*xf32> -> !pim.access
         pim.store %r, %dc : tensor<32x32xf32>, !pim.access
-      } {pim.axis = "output_column_tile"}
-    } {pim.axis = "output_row_tile"}
+      } {pim.axis = #pim.axis<"n">}
+    } {pim.axis = #pim.axis<"m">}
   }
   return
 }

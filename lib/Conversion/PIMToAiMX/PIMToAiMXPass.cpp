@@ -17,6 +17,7 @@
 #include "llvm/ADT/Twine.h"
 
 #include <algorithm>
+#include <limits>
 #include <numeric>
 
 using namespace mlir;
@@ -93,7 +94,7 @@ struct ConvertPIMToAiMXPass
     // IR만 받는다는 경계가 깨진다.
     getOperation()->removeAttr("pim.target_profile");
     getOperation().walk([](func::FuncOp f) {
-      f->removeAttr("pim.group_execution");
+      f->removeAttr("pim.intra_device_plan");
       f->removeAttr("pim.block_group");
       f->removeAttr("pim.execution_tile");
     });
@@ -110,24 +111,20 @@ struct ConvertPIMToAiMXPass
       return m->emitError(
           "convert-pim-to-aimx: AiMX lanes are address-decoded SIMD slots, so "
           "parallel_execution_kind must be \"simd\"");
-    if (profile.getNumberOfParallelLanesPerPimCore() != aimx::kLanes)
-      return m->emitError("convert-pim-to-aimx: AiMX has ")
-             << aimx::kLanes << " lanes per PIM Core, not "
-             << profile.getNumberOfParallelLanesPerPimCore();
-    // 실행 단위가 batch 를 정한다: 출력 block 은 batch 행 x 4096/batch 열이고
-    // reduction step 은 256/batch 다. 셋이 이 관계가 아니면 AiMX 가 아니다.
-    auto unit = profile.getExecutionUnit();
-    if (!unit || unit.asArrayRef().size() != 3)
+    if (profile.getNumberOfBanksPerPimDevice() !=
+            aimx::kNumBanks * aimx::kNumChannels ||
+        profile.getNumberOfPimCoresPerBank() != 1 ||
+        profile.getNumberOfParallelLanesPerPimCore() != aimx::kALUSize)
       return m->emitError(
-          "convert-pim-to-aimx: the profile carries no execution_unit "
-          "[m, n, k], so the block group grid is unknown");
-    ArrayRef<int64_t> u = unit.asArrayRef();
-    if (!isBatch(u[0]) || u[1] != aimx::kLanes / u[0] ||
-        u[2] != aimx::kRegSize / u[0])
-      return m->emitError("convert-pim-to-aimx: the execution unit must be "
-                          "[batch, 4096/batch, 256/batch] with batch 1, 2, 4, "
-                          "or 8 — got [")
-             << u[0] << ", " << u[1] << ", " << u[2] << "]";
+                 "convert-pim-to-aimx: AiMX topology must be 256 banks per "
+                 "device, one core per bank, and 16 lanes per core; got ")
+             << profile.getNumberOfBanksPerPimDevice() << " banks, "
+             << profile.getNumberOfPimCoresPerBank() << " cores, and "
+             << profile.getNumberOfParallelLanesPerPimCore();
+    if (!isBatch(batch))
+      return m->emitError(
+                 "convert-pim-to-aimx: batch must be one of 1, 2, 4, 8; got ")
+             << batch;
     return success();
   }
 
@@ -139,16 +136,21 @@ struct ConvertPIMToAiMXPass
   // 없다 — 할당해 보고 물러서는 길이 없으므로(§1.8 (h)) 여기서 멈추는 것이 맞다.
   LogicalResult budgetBytes(Operation *at, int64_t &budget) {
     if (bankCapacityBytes >= 0) {
-      budget = bankCapacityBytes;
+      if (bankCapacityBytes != 0 &&
+          profile.getNumberOfBanksPerPimDevice() >
+          std::numeric_limits<int64_t>::max() / bankCapacityBytes)
+        return at->emitError("convert-pim-to-aimx: bank capacity overflows the device budget");
+      budget = bankCapacityBytes * profile.getNumberOfBanksPerPimDevice();
       return success();
     }
-    if (auto bank = profile.getUsableBankCapacityBytes()) {
-      budget = bank.getInt();
+    if (std::optional<int64_t> capacity =
+            pim::usableDeviceCapacityBytes(profile)) {
+      budget = *capacity;
       return success();
     }
     return at->emitError(
         "convert-pim-to-aimx: neither usable_bank_capacity_bytes nor "
-        "bank-capacity-bytes gives the PIM DRAM budget, so the execution tile "
+        "bank-capacity-bytes gives the per-bank PIM DRAM budget, so the execution tile "
         "cannot be chosen");
   }
 
@@ -161,6 +163,16 @@ struct ConvertPIMToAiMXPass
     if (failed(budgetBytes(at, budget)))
       return failure();
     fp = footprintOf(batchV, mT, kMax, nMax);
+    int64_t banks = profile.getNumberOfBanksPerPimDevice();
+    int64_t bankBudget = bankCapacityBytes >= 0
+                             ? bankCapacityBytes
+                             : profile.getUsableBankCapacityBytes().getInt();
+    int64_t perBank = fp.maxBankBytes();
+    if (perBank > bankBudget)
+      return at->emitError("convert-pim-to-aimx: the allocation-wise interleaved "
+                           "footprint needs ")
+             << perBank << " byte in each of " << banks
+             << " banks but usable_bank_capacity_bytes is " << bankBudget;
     if (fp.total() > budget)
       return at->emitError("convert-pim-to-aimx: the buffer bound (m_t=")
              << mT << ", k_max=" << kMax << ", n_max=" << nMax << ") needs "
@@ -179,9 +191,10 @@ struct ConvertPIMToAiMXPass
     Location loc = device.getLoc();
     Block *deviceBody = &device.getBody().front();
 
-    if (!device->getAttrOfType<pim::DevicePlanAttr>("pim.device_plan"))
+    if (!device->getAttrOfType<pim::InterDevicePlanAttr>(
+            "pim.inter_device_plan"))
       return device->emitError(
-          "convert-pim-to-aimx: the device has no #pim.device_plan");
+          "convert-pim-to-aimx: the device has no #pim.inter_device_plan");
     auto reduction =
         device->getAttrOfType<pim::ReductionPlanAttr>("pim.reduction_plan");
     if (!reduction)
@@ -192,16 +205,23 @@ struct ConvertPIMToAiMXPass
       return device->emitError(
           "convert-pim-to-aimx: only host temporal accumulation is supported");
 
-    auto cores =
-        func->getAttrOfType<pim::GroupExecutionAttr>("pim.group_execution");
-    if (!cores)
+    auto intra = func->getAttrOfType<pim::IntraDevicePlanAttr>(
+        "pim.intra_device_plan");
+    if (!intra)
       return func->emitError(
-          "convert-pim-to-aimx: the function has no #pim.group_execution");
-    if (cores.getLanes() != aimx::kLanes)
+          "convert-pim-to-aimx: the function has no #pim.intra_device_plan");
+    ArrayRef<int64_t> bp = intra.getBankPartitions().asArrayRef();
+    ArrayRef<int64_t> cp = intra.getCorePartitions().asArrayRef();
+    bool validBanks = bp.size() == 3 && bp[0] == batch &&
+                      bp[1] == aimx::kNumBanks * aimx::kNumChannels / batch &&
+                      bp[2] == 1;
+    bool validCores = cp.size() == 3 && cp[0] == 1 && cp[1] == 1 && cp[2] == 1;
+    if (!validBanks || !validCores || intra.getLanes() != aimx::kALUSize ||
+        intra.getLaneAxis().getValue() != "n")
       return func->emitError(
-                 "convert-pim-to-aimx: --pim-plan-group-execution chose ")
-             << cores.getLanes() << " lanes, but AiMX always drives "
-             << aimx::kLanes;
+          "convert-pim-to-aimx: intra-device plan must use "
+          "bank_partitions=[batch, 256/batch, 1], "
+          "core_partitions=[1, 1, 1], lanes=16, lane_axis=n");
 
     Roles roles;
     if (failed(readRoles(device, roles)))
@@ -243,16 +263,17 @@ struct ConvertPIMToAiMXPass
       return func->emitError(
           "convert-pim-to-aimx: the function has no #pim.block_group — run "
           "--pim-form-block-groups after --pim-set-target-profile");
+    int64_t units[] = {batch, aimx::kLanes / batch,
+                       aimx::kRegSize / batch};
     auto groupAt = [&](int i) {
       BlockGroup g;
       g.tiles = bg.getTiles().asArrayRef()[i];
       g.useful = bg.getUseful().asArrayRef()[i];
-      g.phys = bg.getPhys().asArrayRef()[i];
+      g.phys = (g.useful + units[i] - 1) / units[i] * units[i];
       return g;
     };
     BlockGroup mGroup = groupAt(0), nGroup = groupAt(1), kGroup = groupAt(2);
-    // batch 는 실행 단위의 m 이다 (gate 가 [batch, 4096/batch, 256/batch] 를 검증했다).
-    int64_t batchV = profile.getExecutionUnit().asArrayRef()[0];
+    int64_t batchV = batch;
     // k tile 은 block group 과 vecA 적재 단위(256, §2.4 의 k_t % 256)를 동시에 채워야
     // 한다. 물리 k 의 눈금은 그래서 둘의 lcm 이고, padding 이 없으면 256 그대로다.
     int64_t kUnit = std::lcm(kGroup.phys, aimx::kRegSize);

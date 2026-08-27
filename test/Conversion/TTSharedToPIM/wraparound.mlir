@@ -6,6 +6,7 @@
 func.func @wrap_load(%A: memref<*xf32>, %o0: index, %o1: index, %s: index,
                      %v0: index, %v1: index) -> tensor<32x16xf32> {
   %pad = arith.constant 0.0 : f32
+  // expected-error @+1 {{this memory access pattern is not supported on PIM}}
   %rc0 = memref.reinterpret_cast %A to offset: [%o0], sizes: [%v0, 16], strides: [%s, 1]
       : memref<*xf32> to memref<?x16xf32, strided<[?, 1], offset: ?>>
   %rc1 = memref.reinterpret_cast %A to offset: [%o1], sizes: [%v1, 16], strides: [%s, 1]

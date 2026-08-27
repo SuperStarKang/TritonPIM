@@ -52,11 +52,11 @@ def _active_device_grid(M, N, K, execution_m, execution_n,
     return best_grid
 
 
-def device_plan(M, N, K, *,
-                BLOCK_M, BLOCK_N, BLOCK_K,
-                group_m=1, group_n=1, group_k=1,
-                tile_m=None, tile_n=None, tile_k=None,
-                split_k=None, num_units=2048):
+def inter_device_plan(M, N, K, *,
+                      BLOCK_M, BLOCK_N, BLOCK_K,
+                      group_m=1, group_n=1, group_k=1,
+                      tile_m=None, tile_n=None, tile_k=None,
+                      split_k=None, num_units=2048):
     """Build launch options for an execution-tile PIM Device schedule.
 
     Each scheduling round assigns at most one M/N execution tile to an abstract
@@ -65,7 +65,7 @@ def device_plan(M, N, K, *,
     controls the resident temporal window accumulated inside each plane.
     """
     assert tile_m is not None and tile_n is not None, (
-        "device_plan은 구체적인 tile_m과 tile_n을 필요로 합니다")
+        "inter_device_plan은 구체적인 tile_m과 tile_n을 필요로 합니다")
     assert num_units > 0, "num_units는 양수여야 합니다"
     assert min(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K,
                group_m, group_n, group_k, tile_m, tile_n) > 0, (
@@ -121,11 +121,11 @@ def device_plan(M, N, K, *,
     devices_m, devices_n, devices_k = _active_device_grid(
         M, N, K, tile_m, tile_n, spatial_planes, num_units)
     parts = {
-        "output_row_tile": devices_m,
-        "output_column_tile": devices_n,
+        "m": devices_m,
+        "n": devices_n,
     }
     if tile_k is not None:
-        parts["explicit_k_partition"] = devices_k
+        parts["k"] = devices_k
 
     options["device_axis_partitions"] = ",".join(
         f"{axis}:{count}" for axis, count in parts.items())
@@ -137,6 +137,11 @@ def device_plan(M, N, K, *,
     return options
 
 
+def device_plan(*args, **kwargs):
+    """Compatibility name for :func:`inter_device_plan`."""
+    return inter_device_plan(*args, **kwargs)
+
+
 def execution_tile(*args, **kwargs):
-    """Compatibility name for :func:`device_plan`."""
-    return device_plan(*args, **kwargs)
+    """Compatibility name for :func:`inter_device_plan`."""
+    return inter_device_plan(*args, **kwargs)

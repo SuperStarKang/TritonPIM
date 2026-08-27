@@ -55,14 +55,14 @@ struct PIMFormExecutionTilesPass
       for (scf::ForOp l : loops) {
         // reduction loop 는 pim.axis 가 없다 — null StringAttr 를 StringRef 와
         // 비교하면 getValue() 가 터지므로 걸러서 지난다.
-        auto a = l->getAttrOfType<StringAttr>("pim.axis");
-        if (a && a.getValue() == name)
+        auto a = l->getAttrOfType<pim::AxisAttr>("pim.axis");
+        if (a && a.getName().getValue() == name)
           return l;
       }
       return scf::ForOp();
     };
     // tile-k는 spatial split 여부와 무관하게 각 output plane 내부 reduction loop의
-    // temporal 상주 window다. explicit_k_partition은 별도의 spatial output 축이다.
+    // temporal 상주 window다. k은 별도의 spatial output 축이다.
     // reduction loop는 pim.axis 없이 access origin을 모는 loop 하나로 찾는다.
     auto reductionLoop = [&]() -> scf::ForOp {
       llvm::SmallPtrSet<Operation *, 4> reds;
@@ -71,25 +71,34 @@ struct PIMFormExecutionTilesPass
           llvm::SmallPtrSet<Operation *, 4> ds;
           pim::collectDrivers(o, loops, ds);
           for (Operation *op : ds)
-            if (!op->getAttrOfType<StringAttr>("pim.axis"))
+            if (!op->getAttrOfType<pim::AxisAttr>("pim.axis"))
               reds.insert(op);
         }
       });
       return reds.size() == 1 ? cast<scf::ForOp>(*reds.begin()) : scf::ForOp();
     };
-    scf::ForOp mLoop = axisLoop("output_row_tile");
-    scf::ForOp nLoop = axisLoop("output_column_tile");
-    scf::ForOp explicitK = axisLoop("explicit_k_partition");
+    scf::ForOp mLoop = axisLoop("m");
+    scf::ForOp nLoop = axisLoop("n");
+    scf::ForOp explicitK = axisLoop("k");
     scf::ForOp redLoop = reductionLoop();
+    const pim::TargetSpec *spec =
+        profile ? pim::lookupTargetSpec(profile.getTarget().getValue())
+                : nullptr;
+    auto intra = func->getAttrOfType<pim::IntraDevicePlanAttr>(
+        "pim.intra_device_plan");
+    if (spec && !intra)
+      return func->emitError(
+          "pim-form-execution-tiles: target footprint planning requires "
+          "#pim.intra_device_plan; run --pim-plan-intra-device first");
 
-    // execution tile 은 block group 정수 개다. group 이 없으면(눈금 없는 기계) block
-    // 정수 개이고(useful = phys), explicit_k_partition 은 공간 분할의 눈금이라 언제나
-    // block 기준이다.
+    // execution tile 은 block group 정수 개다. 공통 block group은 유효 원소수만
+    // 기록하고, target의 물리 실행 눈금은 TargetSpec이 profile과 intra-device plan에서
+    // 산출한다. group이 없으면 block 정수 개다.
     auto group = func->getAttrOfType<pim::BlockGroupAttr>("pim.block_group");
     auto unitFor = [&](int idx, scf::ForOp loop) -> std::pair<int64_t, int64_t> {
       if (group && idx >= 0)
         return {group.getUseful().asArrayRef()[idx],
-                group.getPhys().asArrayRef()[idx]};
+                group.getUseful().asArrayRef()[idx]};
       int64_t e = loop ? pim::tileElementsAlong(loop, loops) : 0;
       return {e, e};
     };
@@ -100,8 +109,8 @@ struct PIMFormExecutionTilesPass
       StringRef axis;
       StringRef option;
     };
-    Cap caps[] = {{tileM, "output_row_tile", "tile-m"},
-                  {tileN, "output_column_tile", "tile-n"},
+    Cap caps[] = {{tileM, "m", "tile-m"},
+                  {tileN, "n", "tile-n"},
                   {tileK, "reduction", "tile-k"}};
     for (const Cap &c : caps) {
       if (c.cap == 0)
@@ -112,7 +121,7 @@ struct PIMFormExecutionTilesPass
         return func->emitError("pim-form-execution-tiles: ")
                << c.option << " is given but the kernel has no " << c.axis
                << (isK ? " loop" : " axis");
-      int idx = isK ? 2 : (c.axis == "output_row_tile" ? 0 : 1);
+      int idx = isK ? 2 : (c.axis == "m" ? 0 : 1);
       int64_t elems = unitFor(idx, loop).first;
       StringRef grain = (group && idx >= 0) ? "block group" : "tile";
       if (elems <= 0)
@@ -129,17 +138,14 @@ struct PIMFormExecutionTilesPass
     int64_t capM = tileM, capN = tileN, capK = tileK;
 
     // ── 자동 산출 — device 배치 전에 execution tile shape 을 먼저 고른다 ──
-    // 조건: matmul 모양(m·n 축 + reduction loop 하나, explicit_k_partition 없음),
+    // 조건: matmul 모양(m·n 축 + reduction loop 하나, k 없음),
     // target 의 footprint spec 등록됨, bank 예산 알려짐. 조건 밖이면 0 을 그대로
     // 둔다 — 전부 0 이면 attr 없이 두는 기존 동작이다.
     bool matmulShaped = mLoop && nLoop && redLoop && !explicitK;
-    const pim::TargetSpec *spec =
-        profile ? pim::lookupTargetSpec(profile.getTarget().getValue())
-                : nullptr;
-    IntegerAttr bank =
-        profile ? profile.getUsableBankCapacityBytes() : IntegerAttr();
+    std::optional<int64_t> deviceCapacity =
+        pim::usableDeviceCapacityBytes(profile);
     if ((capM == 0 || capN == 0 || capK == 0) && matmulShaped && spec &&
-        bank && bank.getInt() > 0) {
+        deviceCapacity && *deviceCapacity > 0) {
       auto [mU, mP] = unitFor(0, mLoop);
       auto [nU, nP] = unitFor(1, nLoop);
       auto [kU, kP] = unitFor(2, redLoop);
@@ -147,12 +153,16 @@ struct PIMFormExecutionTilesPass
         return func->emitError(
             "pim-form-execution-tiles: cannot tell the per-axis tile grain, "
             "so the execution tile cannot be computed automatically");
-      auto [kGrainU, kGrainP] = spec->kGrain(profile, kU, kP);
+      mP = spec->physicalGroupExtent(profile, intra, 0, mU);
+      nP = spec->physicalGroupExtent(profile, intra, 1, nU);
+      kP = spec->physicalGroupExtent(profile, intra, 2, kU);
+      auto [kGrainU, kGrainP] =
+          spec->kGrain(profile, intra, kU, kP);
 
       if (capM == 0)
         capM = mU; // group 1개 — 두 target 공통 기본
       if (capN == 0) {
-        int64_t nGroups = spec->preferredNGroups(profile, nU, nP);
+        int64_t nGroups = spec->preferredNGroups(profile, intra, nU, nP);
         capN = std::max<int64_t>(1, nGroups) * nU;
       }
       // footprint 는 물리 원소 위에서 계산한다 (검증을 통과했으므로 나눗셈은 정확).
@@ -162,10 +172,10 @@ struct PIMFormExecutionTilesPass
       if (capK == 0) {
         SmallVector<pim::BufferShape> buffers;
         collectBufferShapes(func, mLoop, nLoop, redLoop, buffers);
-        int64_t budget = bank.getInt();
+        int64_t budget = *deviceCapacity;
         auto fits = [&](int64_t u) {
-          return spec->deviceFootprintBytes(profile, buffers, mPhys, nPhys,
-                                            u * kGrainP) <= budget;
+          return spec->deviceFootprintBytes(profile, intra, buffers, mPhys,
+                                            nPhys, u * kGrainP) <= budget;
         };
         if (!fits(1))
           return func->emitError(
@@ -185,9 +195,21 @@ struct PIMFormExecutionTilesPass
       }
     }
 
+    // reduction이 없는 elementwise/map 커널은 각 공간축 block group 하나를 가장
+    // 보수적인 seed execution tile로 쓴다. 이 선택에는 target 실행 눈금이나 연산별
+    // footprint 식이 필요 없다. 더 큰 execution tile은 autotuner가 같은 tile-m/n
+    // 옵션으로 탐색하고, target lowering이 실제 buffer 용량을 다시 검증한다.
+    if (!redLoop && !explicitK) {
+      if (mLoop && capM == 0)
+        capM = unitFor(0, mLoop).first;
+      if (nLoop && capN == 0)
+        capN = unitFor(1, nLoop).first;
+      capK = 0;
+    }
+
     if (explicitK && (capM == 0 || capN == 0 || capK == 0))
       return func->emitError(
-          "pim-form-execution-tiles: a kernel with explicit_k_partition "
+          "pim-form-execution-tiles: a kernel with k "
           "requires concrete tile-m, tile-n, and tile-k; automatic spatial "
           "plus temporal K planning is not implemented yet");
 

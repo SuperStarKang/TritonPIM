@@ -4,16 +4,15 @@
 include "mlir/Pass/PassBase.td"
 
 def ConvertPIMToAiMX : Pass<"convert-pim-to-aimx", "mlir::ModuleOp"> {
-  let summary = "Convert placed PIM IR into the AiMX host placement model";
+  let summary = "Convert PIM Common IR into the AiMX host placement model";
   let description = [{
     `pim.device` + `pim.place` 를 AiMX level 1 IR(acquire / alloc / stage /
     build_descriptors / invoke / unstage)로 옮긴다. PIM IR 이 정하지 않은 것을 여기서
-    정한다: execution tile, padding, PIM DRAM 안의 pitch layout, 전치 여부.
+    정한다: target 물리 padding, PIM DRAM 안의 pitch layout, 전치 여부.
 
     진입 즉시 legality gate 를 지난다 — target 이 aimx 이고, lane 이 SIMD 이며,
-    PIM Core topology 가 `[1]` 이고 lane 이 4096 이어야 한다. AiMX 의 PIM Device 는
-    FPGA 하나이고 그 안의 4096 lane 은 주소 decoding 이 정하는 고정된 갈래라
-    compiler 가 배정할 대상이 아니다.
+    Device 하나가 256 bank, bank 하나가 core 하나, core 하나가 16 lane 이어야 한다.
+    한 block group은 `#pim.intra_device_plan`에 따라 이 계층 전체에 분해된다.
 
     **buffer 크기만 compile time 상수여야 하고, tile 모양은 아니다.** `pim_malloc` 은
     실패해도 NULL 을 돌려주지 않고 프로세스를 죽이므로 할당량은 compile time 에
@@ -21,22 +20,21 @@ def ConvertPIMToAiMX : Pass<"convert-pim-to-aimx", "mlir::ModuleOp"> {
     `m_t`·`k_t`·`padded_k`·`padded_n` 을 **함수 인자로 받는다** — compile time 상수로
     쓰는 것은 `batch` 하나뿐이다. 그래서 둘을 나눈다.
 
-      k_max, n_max : buffer 를 잡는 크기. compile time. 예산이 정한다
+      k_max, n_max : buffer 를 잡는 크기. compile time. 공통 execution tile이 정한다
       k_t,   n_t   : descriptor program 이 실제로 도는 길이. 런타임. pim.place 에서 온다
 
     선택 (§6.1): 세 계층은 전부 공통 IR 이 정한다. block group 은 `#pim.block_group`
-    (pim-form-block-groups 가 profile 의 execution_unit 에 block 을 채운 것), execution
+    (Triton block 정수 개를 묶은 target-neutral 단위), execution
     tile 은 `#pim.execution_tile` 이다 (원소 단위, 유효 데이터 기준 — 공통
     pim-form-execution-tiles 가 사용자 값 또는 예산 탐색으로 세 축 모두 구체값을
-    확정한다. footprint 식은 AiMXFootprint.h 로 공유된다). batch 는 실행 단위의 m
-    이다 — profile 이 [batch, 4096/batch, 256/batch] 를 싣는다. 이 pass 가 하는
-    일은 번역뿐이다: 상한이 담는 group 수(내림, 최소 1)를 세고 그 group 들의
-    물리 크기로 buffer 를 잡는다. 세 축 모두 같은 규칙이다.
+    확정한다. footprint 식은 AiMXFootprint.h 로 공유된다). batch 는 이 target
+    lowering의 option이며 profile에는 들어가지 않는다. 이 pass는 block-group useful
+    shape을 [batch, 4096/batch, 256/batch] 눈금으로 padding하고 buffer를 잡는다.
 
       m_t   = group 수 × 물리 group 높이 — 전송량 식에서 m_t 는 A 의
               ceil(M/m_t)*m_t 항에만 나타나므로 작을수록 좋다
       n_max = group 수 × 물리 group 폭
-      k_max = kUnit 수 × kUnit. 예산 재검증(checkBudget)을 넘으면 진단
+      k_max = kUnit 수 × kUnit. allocation별 per-bank 예산 재검증을 넘으면 진단
       k_t   = min(256 * ceil(k / 256), k_max)                  (런타임)
       n_t   = min((4096/batch) * ceil(N / (4096/batch)), n_max)  (런타임)
 
@@ -73,8 +71,10 @@ def ConvertPIMToAiMX : Pass<"convert-pim-to-aimx", "mlir::ModuleOp"> {
   }];
   let constructor = "mlir::triton::createConvertPIMToAiMXPass()";
   let options = [
+    Option<"batch", "batch", "int64_t", "8",
+           "AiMX matmul batch. 1, 2, 4, 8 중 하나이며 intra-device plan과 일치해야 한다.">,
     Option<"bankCapacityBytes", "bank-capacity-bytes", "int64_t", "-1",
-           "device 당 PIM DRAM 예산. 음수면 profile 의 "
+           "bank 당 usable PIM DRAM 예산. 음수면 profile 의 "
            "usable_bank_capacity_bytes 를 쓴다.">,
   ];
   let dependentDialects = ["mlir::aimx::AiMXDialect", "mlir::pim::PIMDialect",

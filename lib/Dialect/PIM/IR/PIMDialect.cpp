@@ -44,6 +44,28 @@ void PIMDialect::initialize() {
 // Verifiers
 //===----------------------------------------------------------------------===//
 
+LogicalResult TargetProfileAttr::verify(
+    function_ref<InFlightDiagnostic()> emitError, StringAttr target,
+    int64_t numberOfPimDevices, int64_t numberOfBanksPerPimDevice,
+    int64_t numberOfPimCoresPerBank,
+    int64_t numberOfParallelLanesPerPimCore,
+    StringAttr parallelExecutionKind, IntegerAttr usableBankCapacityBytes,
+    IntegerAttr usableLocalCapacityBytes) {
+  if (target.getValue().empty())
+    return emitError() << "target must not be empty";
+  if (numberOfPimDevices < 1 || numberOfBanksPerPimDevice < 1 ||
+      numberOfPimCoresPerBank < 1 || numberOfParallelLanesPerPimCore < 1)
+    return emitError() << "device, bank, core, and lane topology values must be positive";
+  StringRef kind = parallelExecutionKind.getValue();
+  if (kind != "multithread" && kind != "simd")
+    return emitError() << "parallel_execution_kind must be multithread or simd";
+  if (usableBankCapacityBytes && usableBankCapacityBytes.getInt() < 0)
+    return emitError() << "usable_bank_capacity_bytes must not be negative";
+  if (usableLocalCapacityBytes && usableLocalCapacityBytes.getInt() < 0)
+    return emitError() << "usable_local_capacity_bytes must not be negative";
+  return success();
+}
+
 LogicalResult AccessOp::verify() {
   int64_t rank = getSizes().size();
   if (static_cast<int64_t>(getStrides().size()) != rank)
@@ -68,7 +90,8 @@ LogicalResult DeviceOp::verify() {
     return emitOpError("axis_extents must have one entry per axis");
   if (getBody().front().getNumArguments() != n)
     return emitOpError("body must take one partition coordinate per axis");
-  auto plan = (*this)->getAttrOfType<DevicePlanAttr>("pim.device_plan");
+  auto plan =
+      (*this)->getAttrOfType<InterDevicePlanAttr>("pim.inter_device_plan");
   if (!plan)
     return success();
   if (plan.getAxes() != mapping.getAxes())
@@ -96,6 +119,34 @@ LogicalResult DeviceOp::verify() {
   }
   if (active > plan.getAvailableDevices())
     return emitOpError("device plan uses more devices than are available");
+  return success();
+}
+
+LogicalResult AxisAttr::verify(function_ref<InFlightDiagnostic()> emitError,
+                               StringAttr name) {
+  StringRef value = name.getValue();
+  if (value != "m" && value != "n" && value != "k")
+    return emitError() << "axis must be m, n, or k";
+  return success();
+}
+
+LogicalResult IntraDevicePlanAttr::verify(
+    function_ref<InFlightDiagnostic()> emitError,
+    DenseI64ArrayAttr bankPartitions, DenseI64ArrayAttr corePartitions,
+    int64_t lanes, StringAttr laneAxis) {
+  if (bankPartitions.size() != 3 || corePartitions.size() != 3)
+    return emitError() << "bank_partitions and core_partitions must be [m, n, k]";
+  for (int64_t p : bankPartitions.asArrayRef())
+    if (p < 1)
+      return emitError() << "bank_partitions entries must be positive";
+  for (int64_t p : corePartitions.asArrayRef())
+    if (p < 1)
+      return emitError() << "core_partitions entries must be positive";
+  if (lanes < 1)
+    return emitError() << "lanes must be positive";
+  StringRef axis = laneAxis.getValue();
+  if (axis != "m" && axis != "n" && axis != "k")
+    return emitError() << "lane_axis must be m, n, or k";
   return success();
 }
 

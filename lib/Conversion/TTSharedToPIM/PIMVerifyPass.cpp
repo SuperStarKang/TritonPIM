@@ -51,14 +51,58 @@ struct PIMVerifyPass
 
   LogicalResult verifyCores(pim::TargetProfileAttr profile) {
     IntegerAttr local = profile.getUsableLocalCapacityBytes();
-    bool simd = profile.getParallelExecutionKind() == "simd";
     WalkResult res = getOperation().walk([&](func::FuncOp func) {
-      auto cores =
-          func->getAttrOfType<pim::GroupExecutionAttr>("pim.group_execution");
-      if (!cores)
+      bool hasAccess = false;
+      func.walk([&](pim::AccessOp) { hasAccess = true; });
+      if (!hasAccess)
         return WalkResult::advance();
-      // lane 예산. simd 와 협력 모드(lane_axis_role = output_row)는 버퍼가 lane 마다
-      // 복제되지 않으므로 lane 수를 곱하지 않는다.
+      auto plan = func->getAttrOfType<pim::IntraDevicePlanAttr>(
+          "pim.intra_device_plan");
+      if (!plan) {
+        func->emitError(
+            "pim-verify: every PIM function needs #pim.intra_device_plan");
+        return WalkResult::interrupt();
+      }
+      auto product = [](ArrayRef<int64_t> values) {
+        int64_t value = 1;
+        for (int64_t v : values)
+          value *= v;
+        return value;
+      };
+      int64_t banks = product(plan.getBankPartitions().asArrayRef());
+      int64_t cores = product(plan.getCorePartitions().asArrayRef());
+      if (banks > profile.getNumberOfBanksPerPimDevice()) {
+        func->emitError("pim-verify: intra-device plan needs ")
+            << banks << " banks but a PIM Device has "
+            << profile.getNumberOfBanksPerPimDevice();
+        return WalkResult::interrupt();
+      }
+      if (cores > profile.getNumberOfPimCoresPerBank()) {
+        func->emitError("pim-verify: intra-device plan needs ")
+            << cores << " cores per bank but a bank has "
+            << profile.getNumberOfPimCoresPerBank();
+        return WalkResult::interrupt();
+      }
+      if (plan.getLanes() > profile.getNumberOfParallelLanesPerPimCore()) {
+        func->emitError("pim-verify: intra-device plan needs ")
+            << plan.getLanes() << " lanes per core but a core has "
+            << profile.getNumberOfParallelLanesPerPimCore();
+        return WalkResult::interrupt();
+      }
+      ArrayRef<int64_t> bp = plan.getBankPartitions().asArrayRef();
+      ArrayRef<int64_t> cp = plan.getCorePartitions().asArrayRef();
+      bool laneReducesK =
+          plan.getLaneAxis().getValue() == "k" && plan.getLanes() > 1;
+      if (bp[2] > 1 || cp[2] > 1 || laneReducesK) {
+        func->emitError(
+            "pim-verify: intra-device k partitioning needs an explicit "
+            "bank/core/lane reduction contract; it is not materialized yet");
+        return WalkResult::interrupt();
+      }
+      // 축별 divisibility와 padding은 target의 물리 실행 눈금에 의존한다. 공통
+      // verifier는 topology 사용량만 검사하고, target lowering이 실제 subtile을
+      // materialize하면서 나눗셈과 padding legality를 검사한다.
+      // 하나의 group을 협력 실행하므로 local buffer는 lane마다 복제되지 않는다.
       if (!local) {
         func->emitError("pim-verify: usable_local_capacity_bytes is not "
                         "recorded, so the lane budget cannot be checked");
@@ -66,10 +110,8 @@ struct PIMVerifyPass
       }
       if (local.getInt() == 0)
         return WalkResult::advance();
-      bool sharedBuffers =
-          simd || cores.getLaneAxisRole().getValue() == "output_row";
       int64_t bytes = pim::localTileBytes(func);
-      int64_t need = sharedBuffers ? bytes : bytes * cores.getLanes();
+      int64_t need = bytes;
       if (need > local.getInt()) {
         func->emitError("pim-verify: tile buffers need ")
             << need << " byte of local storage but a PIM Core has "
@@ -84,10 +126,11 @@ struct PIMVerifyPass
   LogicalResult verifyDevice(pim::DeviceOp device,
                              pim::TargetProfileAttr profile) {
     auto plan =
-        device->getAttrOfType<pim::DevicePlanAttr>("pim.device_plan");
+        device->getAttrOfType<pim::InterDevicePlanAttr>(
+            "pim.inter_device_plan");
     if (!plan)
       return device->emitError(
-          "pim-verify: every pim.device needs #pim.device_plan");
+          "pim-verify: every pim.device needs #pim.inter_device_plan");
     auto execution =
         device->getAttrOfType<pim::ExecutionTileAttr>("pim.execution_tile");
     if (!execution)
@@ -106,14 +149,14 @@ struct PIMVerifyPass
 
     bool hasSpatialK = llvm::any_of(
         device.getMapping().getAxes(), [](Attribute axis) {
-          return cast<StringAttr>(axis).getValue() == "explicit_k_partition";
+          return cast<StringAttr>(axis).getValue() == "k";
         });
     if (hasSpatialK !=
         (reduction.getSpatialPartials().getValue() ==
          "separate_output_planes"))
       return device->emitError(
           "pim-verify: reduction plan spatial_partials disagrees with the "
-          "explicit_k_partition axis");
+          "k axis");
     if (execution.getK() > 0 &&
         reduction.getTemporalAccumulation().getValue() != "host")
       return device->emitError(

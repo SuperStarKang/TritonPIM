@@ -56,11 +56,13 @@ class PIMHardwareProfile:
     """사용 가능한 PIM 자원과 제약 (§3, §51)."""
 
     target: str
-    num_units: int
-    local_memory_bytes: int
-    device_memory_bytes: int
+    num_devices: int
+    banks_per_device: int
+    cores_per_bank: int
+    lanes_per_core: int
+    usable_bank_capacity_bytes: int
+    usable_local_capacity_bytes: int
     alignment_bytes: int
-    execution_units_per_device: int
     # 한 PIM device의 실행 자원을 가득 채우는 작업 묶음(element 단위).
     # execution tile seed는 이 단위로 묶인다. device memory 용량은 GEMM이
     # PIM DRAM보다 클 때만 상한으로 작동한다. target별로 계산해 지정한다.
@@ -74,6 +76,19 @@ class PIMHardwareProfile:
     # 0이면 descriptor 전송량을 계산하지 않는다.
     descriptor_bytes: int = 0
     target_constraints: dict = field(default_factory=dict)
+
+    @property
+    def num_units(self):
+        """Legacy launch spelling; one unit is one PIM Device."""
+        return self.num_devices
+
+    @property
+    def device_memory_bytes(self):
+        return self.banks_per_device * self.usable_bank_capacity_bytes
+
+    @property
+    def local_memory_bytes(self):
+        return self.usable_local_capacity_bytes
 
 
 @dataclass(frozen=True)
@@ -100,6 +115,16 @@ class PIMConfig:
     p_n: int
     p_k: int
     reduction_policy: str
+    # 하나의 block group 내부 분할. 0/빈 값은 target seed를 사용한다. 현재 search
+    # fragment는 이 값을 흔들지 않지만 cache/config 경로는 처음부터 전달 가능하다.
+    bank_p_m: int = 0
+    bank_p_n: int = 0
+    bank_p_k: int = 0
+    core_p_m: int = 0
+    core_p_n: int = 0
+    core_p_k: int = 0
+    intra_device_lanes: int = 0
+    lane_axis: str = ""
     # Phase 2 (§53) — residency / replication / streaming.
     # resident operand는 device memory에 상주해 steady-state H2D에서 빠지고,
     # replication_policy는 상주 사본의 범위(slice=필요한 조각만, full=전체),
@@ -136,6 +161,9 @@ class PIMConfig:
                 self.distribution_policy,
                 self.p_m, self.p_n, self.p_k,
                 self.reduction_policy,
+                self.bank_p_m, self.bank_p_n, self.bank_p_k,
+                self.core_p_m, self.core_p_n, self.core_p_k,
+                self.intra_device_lanes, self.lane_axis,
                 self.a_residency, self.b_residency,
                 self.replication_policy, self.streaming_policy,
                 self.persistence_strategy())
@@ -146,6 +174,9 @@ class PIMConfig:
                 self.group_m, self.group_n, self.group_k,
                 self.execution_m, self.execution_n, self.execution_k,
                 self.distribution_policy, self.p_k, self.reduction_policy,
+                self.bank_p_m, self.bank_p_n, self.bank_p_k,
+                self.core_p_m, self.core_p_n, self.core_p_k,
+                self.intra_device_lanes, self.lane_axis,
                 self.a_residency, self.b_residency,
                 self.replication_policy, self.streaming_policy,
                 self.persistence_strategy())

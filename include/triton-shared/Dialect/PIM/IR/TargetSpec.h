@@ -33,15 +33,18 @@ class TargetSpec {
 public:
   virtual ~TargetSpec() = default;
 
-  // execution tile 이 device 의 큰 메모리에서 차지하는 바이트. mT/nT/kT 는 물리 원소
-  // (block group 의 phys 배수)다.
+  // execution tile이 device의 큰 메모리 예산에서 차지하는 바이트. mT/nT/kT는
+  // physicalGroupExtent가 target 실행 눈금에 맞춘 물리 원소수다. per-bank tail이나
+  // replication이 있으면 target은 이를 device 전체에 환산한 보수적 값을 반환한다.
   virtual int64_t deviceFootprintBytes(TargetProfileAttr profile,
+                                       IntraDevicePlanAttr plan,
                                        llvm::ArrayRef<BufferShape> buffers,
                                        int64_t mT, int64_t nT,
                                        int64_t kT) const = 0;
 
   // n 상한의 기본 block group 개수. 0 이면 공통 기본(group 1개)이다.
   virtual int64_t preferredNGroups(TargetProfileAttr profile,
+                                   IntraDevicePlanAttr plan,
                                    int64_t nGroupUseful,
                                    int64_t nGroupPhys) const {
     return 0;
@@ -49,9 +52,18 @@ public:
 
   // k 탐색 눈금 {useful, phys}. 기본은 k block group 그대로다.
   virtual std::pair<int64_t, int64_t> kGrain(TargetProfileAttr profile,
+                                             IntraDevicePlanAttr plan,
                                              int64_t kGroupUseful,
                                              int64_t kGroupPhys) const {
     return {kGroupUseful, kGroupPhys};
+  }
+
+  // Common block-group useful extent를 target이 실제로 실행하는 물리 extent로
+  // 바꾼다. axis는 0=m, 1=n, 2=k다. 기본 target은 padding이 없다.
+  virtual int64_t physicalGroupExtent(TargetProfileAttr profile,
+                                      IntraDevicePlanAttr plan, unsigned axis,
+                                      int64_t useful) const {
+    return useful;
   }
 };
 

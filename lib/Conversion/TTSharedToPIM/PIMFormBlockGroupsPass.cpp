@@ -47,10 +47,9 @@ struct PIMFormBlockGroupsPass
 
   pim::TargetProfileAttr profile;
 
-  // 계층 2 는 두 걸음이다. group 값(사용자 지정 또는 자동 산출)대로 IR 을 그 단위로
-  // 재구성하고, 그 결과 block 을 하드웨어 실행 단위(profile 의 execution_unit)에 채워
-  // #pim.block_group 으로 적는다. 눈금 없는 기계(execution_unit 없음)는 둘째 걸음이
-  // 항등이다.
+  // 계층 2는 group 값(사용자 지정 또는 local-memory 기반 자동 산출)대로 IR을
+  // 재구성하고, target-neutral block 묶음을 #pim.block_group으로 기록한다.
+  // 하드웨어 실행 눈금과 padding은 target lowering의 책임이다.
   LogicalResult formGroups(func::FuncOp func) {
     int64_t g[3] = {groupM, groupN, groupK}; // 0 = 자동
     if (g[0] == 0 || g[1] == 0 || g[2] == 0)
@@ -59,14 +58,13 @@ struct PIMFormBlockGroupsPass
     if (g[0] != 1 || g[1] != 1 || g[2] != 1)
       if (failed(regroup(func, g[0], g[1], g[2])))
         return failure();
-    return fillUnits(func);
+    return recordGroup(func, g);
   }
 
   // 자동 group 산출 — "빠른 메모리에 들어갈 때까지 m → n → k 순서로 번갈아 1씩
-  // 키운다". 조건은 셋이다: 눈금 없는 기계(execution_unit 없음 — 눈금 있는 기계는
-  // fillUnits 가 담당), local 예산이 알려짐, 협력 모드(simd 또는 lane_mode =
-  // output_row — 버퍼가 한 벌이라 예산 셈법이 성립). 조건 밖이거나 셈에 필요한
-  // 정보가 없으면 자동 축을 1(항등)로 둔다 — 예산 위반 진단은 pim-verify 의 몫이다.
+  // 키운다". local 예산을 알 수 없거나 셈에 필요한 정보가 없으면 자동 축을
+  // 1(항등)로 둔다. 하나의 block group은 intra-device 계층이 협력 실행하므로 local
+  // buffer 한 벌을 기준으로 계산한다.
   LogicalResult autoGroups(func::FuncOp func, int64_t g[3]) {
     auto identity = [&] {
       for (int i = 0; i < 3; i++)
@@ -74,30 +72,23 @@ struct PIMFormBlockGroupsPass
           g[i] = 1;
       return success();
     };
-    if (!profile || profile.getExecutionUnit())
+    if (!profile)
       return identity();
     IntegerAttr local = profile.getUsableLocalCapacityBytes();
     if (!local || local.getInt() <= 0)
       return identity();
-    bool cooperative =
-        profile.getParallelExecutionKind() == "simd" ||
-        (profile.getLaneMode() &&
-         profile.getLaneMode().getValue() == "output_row");
-    if (!cooperative)
-      return identity();
-
     // 축 loop: m/n 은 pim.axis 이름으로, k 는 reduction loop(pim.axis 없이 origin
     // 을 모는 loop, 하나일 때만)로 찾는다 — regroup/fillUnits 와 같은 판정이다.
     SmallVector<scf::ForOp> loops;
     func.walk<WalkOrder::PreOrder>([&](scf::ForOp l) { loops.push_back(l); });
     scf::ForOp axis[3] = {};
     for (scf::ForOp l : loops) {
-      auto a = l->getAttrOfType<StringAttr>("pim.axis");
+      auto a = l->getAttrOfType<pim::AxisAttr>("pim.axis");
       if (!a)
         continue;
-      if (a.getValue() == "output_row_tile")
+      if (a.getName().getValue() == "m")
         axis[0] = l;
-      else if (a.getValue() == "output_column_tile")
+      else if (a.getName().getValue() == "n")
         axis[1] = l;
     }
     llvm::SmallPtrSet<Operation *, 4> reds;
@@ -106,7 +97,7 @@ struct PIMFormBlockGroupsPass
         llvm::SmallPtrSet<Operation *, 4> ds;
         pim::collectDrivers(o, loops, ds);
         for (Operation *op : ds)
-          if (!op->getAttrOfType<StringAttr>("pim.axis"))
+          if (!op->getAttrOfType<pim::AxisAttr>("pim.axis"))
             reds.insert(op);
       }
     });
@@ -207,25 +198,25 @@ struct PIMFormBlockGroupsPass
     // 묶을 축 loop 를 이름으로 찾는다.
     scf::ForOp rowLoop, colLoop;
     func.walk<WalkOrder::PreOrder>([&](scf::ForOp l) {
-      auto a = l->getAttrOfType<StringAttr>("pim.axis");
+      auto a = l->getAttrOfType<pim::AxisAttr>("pim.axis");
       if (!a)
         return;
-      if (a == "output_row_tile")
+      if (a.getName().getValue() == "m")
         rowLoop = l;
-      else if (a == "output_column_tile")
+      else if (a.getName().getValue() == "n")
         colLoop = l;
     });
     SmallVector<std::pair<scf::ForOp, int64_t>, 2> grouped;
     if (gM != 1) {
       if (!rowLoop)
         return func->emitError("pim-form-block-groups: group-m is ")
-               << gM << " but the kernel has no output_row_tile axis";
+               << gM << " but the kernel has no m axis";
       grouped.push_back({rowLoop, gM});
     }
     if (gN != 1) {
       if (!colLoop)
         return func->emitError("pim-form-block-groups: group-n is ")
-               << gN << " but the kernel has no output_column_tile axis";
+               << gN << " but the kernel has no n axis";
       grouped.push_back({colLoop, gN});
     }
     if (gK != 1) {
@@ -239,7 +230,7 @@ struct PIMFormBlockGroupsPass
           llvm::SmallPtrSet<Operation *, 4> ds;
           pim::collectDrivers(o, all, ds);
           for (Operation *op : ds)
-            if (!op->getAttrOfType<StringAttr>("pim.axis"))
+            if (!op->getAttrOfType<pim::AxisAttr>("pim.axis"))
               reductions.insert(op);
         }
       });
@@ -256,7 +247,7 @@ struct PIMFormBlockGroupsPass
     // 깨진다 — build-logical-grid 가 상한을 전부 entry 에 만드는 것과 같은 이유다.
     scf::ForOp outermost;
     func.walk<WalkOrder::PreOrder>([&](scf::ForOp l) {
-      if (!l->getAttrOfType<StringAttr>("pim.axis"))
+      if (!l->getAttrOfType<pim::AxisAttr>("pim.axis"))
         return WalkResult::advance();
       outermost = l;
       return WalkResult::interrupt();
@@ -277,7 +268,7 @@ struct PIMFormBlockGroupsPass
       // 밖에서 읽는다), reduction 의 상한은 그 loop 앞 — 원래 상한이 nest 안에서
       // 정의되기 때문이다(pim-place-data 의 rebuild 가 필요하면 밖으로 복제한다).
       Type ivType = loop.getInductionVar().getType();
-      bool isAxis = loop->getAttrOfType<StringAttr>("pim.axis") != nullptr;
+      bool isAxis = loop->getAttrOfType<pim::AxisAttr>("pim.axis") != nullptr;
       OpBuilder b(isAxis ? outermost.getOperation() : loop.getOperation());
       Value gOut =
           b.create<arith::ConstantOp>(loc, b.getIntegerAttr(ivType, g));
@@ -352,27 +343,20 @@ struct PIMFormBlockGroupsPass
     return success();
   }
 
-  // 하드웨어 실행 단위에 block 을 채운다. 규칙은 세 축 모두 같다:
-  //   tiles = max(1, ⌊unit/block⌋), useful = tiles·block, phys = ⌈useful/unit⌉·unit
-  // 남는 자리(phys − useful)는 target 의 stage 가 0 으로 채우는 padding 이다.
-  LogicalResult fillUnits(func::FuncOp func) {
-    if (!profile || !profile.getExecutionUnit())
-      return success(); // 눈금 없는 기계 — block group 은 항등이다
-    ArrayRef<int64_t> unit = profile.getExecutionUnit().asArrayRef();
-    if (unit.size() != 3 || unit[0] < 1 || unit[1] < 1 || unit[2] < 1)
-      return func->emitError("pim-form-block-groups: execution_unit must be "
-                             "three positive values (m, n, k)");
-
+  // 현재 IR에서 group의 useful shape을 읽어 target-neutral block group을 기록한다.
+  // k가 없는 elementwise 연산은 k 축을 1로 둔다. target padding은 공통 attribute를
+  // 변경하지 않고 TargetSpec과 target lowering이 target IR에 materialize한다.
+  LogicalResult recordGroup(func::FuncOp func, const int64_t g[3]) {
     SmallVector<scf::ForOp> loops;
     func.walk<WalkOrder::PreOrder>([&](scf::ForOp l) { loops.push_back(l); });
     scf::ForOp axis[3]; // m, n, k
     for (scf::ForOp l : loops) {
-      auto a = l->getAttrOfType<StringAttr>("pim.axis");
+      auto a = l->getAttrOfType<pim::AxisAttr>("pim.axis");
       if (!a)
         continue;
-      if (a.getValue() == "output_row_tile")
+      if (a.getName().getValue() == "m")
         axis[0] = l;
-      else if (a.getValue() == "output_column_tile")
+      else if (a.getName().getValue() == "n")
         axis[1] = l;
     }
     llvm::SmallPtrSet<Operation *, 4> reds;
@@ -381,46 +365,30 @@ struct PIMFormBlockGroupsPass
         llvm::SmallPtrSet<Operation *, 4> ds;
         pim::collectDrivers(o, loops, ds);
         for (Operation *op : ds)
-          if (!op->getAttrOfType<StringAttr>("pim.axis"))
+          if (!op->getAttrOfType<pim::AxisAttr>("pim.axis"))
             reds.insert(op);
       }
     });
     if (reds.size() == 1)
       axis[2] = cast<scf::ForOp>(*reds.begin());
-    // 세 축이 다 있어야 [m, n, k] 가 성립한다. 아니면 이 커널은 이 계층을 쓰지 않는
-    // 모양이다 — attr 없이 두고, 그것을 요구하는 target lowering 이 진단한다.
-    if (!axis[0] || !axis[1] || !axis[2])
-      return success();
-
     static const char *name[3] = {"m", "n", "k"};
-    int64_t tiles[3], useful[3], phys[3];
+    int64_t tiles[3] = {g[0], g[1], g[2]};
+    int64_t useful[3] = {1, 1, 1};
     for (int i = 0; i < 3; i++) {
+      if (!axis[i])
+        continue;
       int64_t block = pim::tileElementsAlong(axis[i], loops);
       if (block <= 0)
         return func->emitError("pim-form-block-groups: cannot tell how many "
                                "elements one block moves on the ")
-               << name[i] << " axis, so it cannot be filled into the "
-               << unit[i] << "-element execution unit";
-      tiles[i] = std::max<int64_t>(1, unit[i] / block);
-      useful[i] = tiles[i] * block;
-      phys[i] = (useful[i] + unit[i] - 1) / unit[i] * unit[i];
+               << name[i] << " axis";
+      useful[i] = block;
     }
     OpBuilder b(func.getContext());
     func->setAttr("pim.block_group",
                   pim::BlockGroupAttr::get(func.getContext(),
                                            b.getDenseI64ArrayAttr(tiles),
-                                           b.getDenseI64ArrayAttr(useful),
-                                           b.getDenseI64ArrayAttr(phys)));
-    // op 가 아니라 location 에 붙인다 — op 에 붙이면 진단 엔진이 "see current
-    // operation" 으로 함수 전체를 덤프해 정보 한 줄이 화면 한 페이지가 된다.
-    if (useful[0] != phys[0] || useful[1] != phys[1] || useful[2] != phys[2])
-      emitRemark(func.getLoc(),
-                 "pim-form-block-groups: the block does not fill the "
-                 "execution unit — pad m ")
-          << phys[0] - useful[0] << "/" << phys[0] << ", n "
-          << phys[1] - useful[1] << "/" << phys[1] << ", k "
-          << phys[2] - useful[2] << "/" << phys[2]
-          << "; the padded cells do no useful work";
+                                           b.getDenseI64ArrayAttr(useful)));
     return success();
   }
 };

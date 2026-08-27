@@ -70,18 +70,31 @@ def pim_launch_options(config, plan, hardware):
     직접 쓴다.
     """
     p_m, p_n, p_k = plan.active_device_grid
-    return {
+    options = {
         "pim_target": hardware.target,
         "num_units": hardware.num_units,
-        "local_lanes": hardware.execution_units_per_device,
+        "local_lanes": hardware.lanes_per_core,
         "device_axis_partitions": (
-            f"output_row_tile:{p_m},output_column_tile:{p_n},"
-            f"explicit_k_partition:{p_k}"),
+            f"m:{p_m},n:{p_n},"
+            f"k:{p_k}"),
         "group_m": config.group_m, "group_n": config.group_n,
         "group_k": config.group_k,
         "tile_m": config.tile_m, "tile_n": config.tile_n,
         "tile_k": config.tile_k,
     }
+    if config.bank_p_m and config.bank_p_n and config.bank_p_k:
+        options["bank_partitions"] = (
+            f"{config.bank_p_m},{config.bank_p_n},{config.bank_p_k}")
+    if config.core_p_m and config.core_p_n and config.core_p_k:
+        options["core_partitions"] = (
+            f"{config.core_p_m},{config.core_p_n},{config.core_p_k}")
+    if config.intra_device_lanes:
+        options["intra_device_lanes"] = config.intra_device_lanes
+    if config.lane_axis:
+        options["lane_axis"] = config.lane_axis
+    if hardware.target == "aimx" and config.bank_p_m:
+        options["batch"] = config.bank_p_m
+    return options
 
 
 def _sample_indices(size, limit=32):

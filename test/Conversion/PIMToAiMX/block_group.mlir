@@ -1,36 +1,39 @@
 // Triton block이 하드웨어 눈금을 나누지 못하는 경우다. 예전에는 진단으로 거부했고,
 // 지금은 block group이 어긋남을 padding으로 흡수한다 — Triton block 정수 개(group)를
 // 하드웨어 단위의 정수 배(execution)에 채우고 남는 자리를 stage가 0으로 채운다.
-// RUN: triton-shared-opt --convert-pim-to-aimx %s | FileCheck %s
-// RUN: triton-shared-opt --convert-pim-to-aimx --aimx-lower-matmul %s | FileCheck %s --check-prefix=PROGRAM
+// RUN: triton-shared-opt --convert-pim-to-aimx=batch=2 %s | FileCheck %s
+// RUN: triton-shared-opt --convert-pim-to-aimx=batch=2 --aimx-lower-matmul %s | FileCheck %s --check-prefix=PROGRAM
+// RUN: not triton-shared-opt --convert-pim-to-aimx=batch=8 %s 2>&1 | FileCheck %s --check-prefix=BATCH-ERR
 
-// batch는 profile의 execution_unit에서 온다 — 여기서는 [2, 2048, 128] (batch 2).
-// 그 눈금에 공통 pass가 block을 채운 결과가 func의 #pim.block_group이다:
+// BATCH-ERR: intra-device plan must use bank_partitions=[batch, 256/batch, 1]
+
+// batch=2는 AiMX target option에서 온다. 공통 #pim.block_group의 useful shape을
+// target lowering이 [2, 2048, 128] 눈금으로 padding한다:
 //   n: Triton block 21개 = 2016 유효 + 32 padding = 물리 2048 (출력 block 1개)
 //   k: Triton block 5개  =  120 유효 +  8 padding = 물리 128  (reduction step 1개)
 //   m: BLOCK_M=32는 단위 2의 배수 — block 1개 = 32 유효 = 물리 32, padding 0
-// 상한이 없으므로 m은 group 하나, n은 한 device 폭, k는 남는 예산 전부다:
-// 1 GiB에서 k_max = 111616 (kUnit 256의 배수), padded_k = 114688.
+// 입력 PIM IR의 유효 k 상한 111616은 block-group useful 눈금 240으로 내림한 뒤,
+// 물리 눈금 256으로 바뀐다: k_max = 119040, padded_k = 122880.
 // CHECK-LABEL: func.func @matmul
 // CHECK-SAME:    aimx.tile_group = #aimx.tile_group<block = [32, 96, 24], group = [1, 21, 5], execution = [32, 2048, 128]>
-// CHECK-SAME:    aimx.tiling = #aimx.tiling<batch = 2, m_t = 32, k_t = 111616, n_t = 4096, padded_k = 114688, padded_n = 4096, transposed = false>
+// CHECK-SAME:    aimx.tiling = #aimx.tiling<batch = 2, m_t = 32, k_t = 119040, n_t = 4096, padded_k = 122880, padded_n = 4096, transposed = false>
 
-// buffer 크기는 물리 크기에서 나온다. A(32*114688*2), Arel(32*111616*32),
-// B(111616*4096*2), C(32*4096*2), chain(69792 group * 512).
+// buffer 크기는 물리 크기에서 나온다. A(32*122880*2), Arel(32*119040*32),
+// B(119040*4096*2), C(32*4096*2), descriptor chain도 같은 상한을 쓴다.
 // CHECK: aimx.alloc %{{.*}} bytes 196608 align 262144 kind pmm
-// CHECK: aimx.alloc %{{.*}} bytes 7340032 align 512 kind data
-// CHECK: aimx.alloc %{{.*}} bytes 114294784 align 512 kind data
-// CHECK: aimx.alloc %{{.*}} bytes 914358272 align 512 kind data
+// CHECK: aimx.alloc %{{.*}} bytes 7864320 align 512 kind data
+// CHECK: aimx.alloc %{{.*}} bytes 121896960 align 512 kind data
+// CHECK: aimx.alloc %{{.*}} bytes 975175680 align 512 kind data
 // CHECK: aimx.alloc %{{.*}} bytes 262144 align 512 kind data
-// CHECK: aimx.alloc %{{.*}} bytes 35733504 align 512 kind descriptor
+// CHECK: aimx.alloc %{{.*}} bytes 38109184 align 512 kind descriptor
 
 // padding이 있는 축만 stage/unstage가 block group 배치([useful, phys])를 싣는다.
 // B는 행(k)·열(n) 둘 다, A는 열(k)만, C는 열(n)만이다. host loop의 전진 폭은 유효
 // 크기이고 pad_to·pitch는 물리 크기다.
-// CHECK:   aimx.stage {{.*}} group_rows array<i64: 120, 128> group_cols array<i64: 2016, 2048> into
-// CHECK:   aimx.stage {{.*}} group_cols array<i64: 120, 128> into
+// CHECK:   aimx.stage {{.*}} group_rows [120, 128] group_cols [2016, 2048] into
+// CHECK:   aimx.stage {{.*}} group_cols [120, 128] into
 // CHECK:   aimx.invoke
-// CHECK:   aimx.unstage {{.*}} group_cols array<i64: 2016, 2048> :
+// CHECK:   aimx.unstage {{.*}} group_cols [2016, 2048]
 
 // chain은 물리 눈금만 본다 — padding은 stage가 채운 0이 데이터로 흐를 뿐 descriptor
 // program은 달라지지 않는다. batch=2라 B operand와 C drain이 8192/2 = 4096이다.
@@ -44,19 +47,18 @@
 
 module attributes {pim.target_profile = #pim.target_profile<
     target = "aimx", number_of_pim_devices = 1,
-    number_of_parallel_lanes_per_pim_core = 4096,
+    number_of_banks_per_pim_device = 256,
+    number_of_pim_cores_per_bank = 1,
+    number_of_parallel_lanes_per_pim_core = 16,
     parallel_execution_kind = "simd",
-    execution_unit = array<i64: 2, 2048, 128>,
-    usable_bank_capacity_bytes = 1073741824, usable_local_capacity_bytes = 0>} {
+    usable_bank_capacity_bytes = 268435456, usable_local_capacity_bytes = 0>} {
 
 func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
                   %K: i32, %N: i32, %ex: index, %ey: index)
-    attributes {pim.group_execution = #pim.group_execution<
-        lanes = 4096, lane_axis_role = "whole_tile">,
+    attributes {pim.intra_device_plan = #pim.intra_device_plan<bank_partitions = [2, 128, 1], core_partitions = [1, 1, 1], lanes = 16, lane_axis = "n">,
         pim.block_group = #pim.block_group<
-            tiles = array<i64: 1, 21, 5>,
-            useful = array<i64: 32, 2016, 120>,
-            phys = array<i64: 32, 2048, 128>>} {
+            tiles = [1, 21, 5],
+            useful = [32, 2016, 120]>} {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c24 = arith.constant 24 : index
@@ -67,17 +69,17 @@ func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
   %ldb = arith.index_cast %N : i32 to index
   %kk = arith.index_cast %K : i32 to index
 
-  pim.device #pim.device_mapping<axes = ["output_row_tile", "output_column_tile"],
+  pim.device #pim.device_mapping<axes = ["m", "n"],
                                  partitions = [1, 1]>
       extents [%ex, %ey]
       attributes {
         pim.execution_tile = #pim.execution_tile<m = 32, n = 4096, k = 111616>,
-        pim.device_plan = #pim.device_plan<
+        pim.inter_device_plan = #pim.inter_device_plan<
             available_devices = 1,
-            axes = ["output_row_tile", "output_column_tile"],
-            active_grid = array<i64: 1, 1>,
-            execution_tile = array<i64: 32, 4096, 111616>,
-            scheduling_order = ["output_column_tile", "output_row_tile"]>,
+            axes = ["m", "n"],
+            active_grid = [1, 1],
+            execution_tile = [32, 4096, 111616],
+            scheduling_order = ["n", "m"]>,
         pim.reduction_plan = #pim.reduction_plan<
             spatial_partials = "none", temporal_accumulation = "host",
             final_accumulation = "none">} {
@@ -97,8 +99,8 @@ func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
     pim.place %A start[%ar, %c0] size[%arn, %akn] capacity[%arc, %akn]
         strides[%lda, %c1]
         {direction = "in", access = 0 : i64,
-         mapping = #pim.place_mapping<axis_sources = ["output_row_tile", ""]>,
-         replicated_over = ["output_column_tile"]} : memref<*xf32>
+         mapping = #pim.place_mapping<axis_sources = ["m", ""]>,
+         replicated_over = ["n"]} : memref<*xf32>
 
     %bc = arith.muli %starty, %c96 : index
     %bcn = arith.muli %tripsy, %c96 : index
@@ -106,14 +108,14 @@ func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
     pim.place %B start[%c0, %bc] size[%akn, %bcn] capacity[%akn, %bcc]
         strides[%ldb, %c1]
         {direction = "in", access = 1 : i64,
-         mapping = #pim.place_mapping<axis_sources = ["", "output_column_tile"]>,
-         replicated_over = ["output_row_tile"]} : memref<*xf32>
+         mapping = #pim.place_mapping<axis_sources = ["", "n"]>,
+         replicated_over = ["m"]} : memref<*xf32>
 
     pim.place %C start[%ar, %bc] size[%arn, %bcn] capacity[%arc, %bcc]
         strides[%ldb, %c1]
         {direction = "out", access = 2 : i64,
-         mapping = #pim.place_mapping<axis_sources = ["output_row_tile",
-                                                      "output_column_tile"]>} : memref<*xf32>
+         mapping = #pim.place_mapping<axis_sources = ["m",
+                                                      "n"]>} : memref<*xf32>
 
     scf.for %tx = %c0 to %tripsx step %c1 {
       %gx = arith.addi %startx, %tx {pim.device_origin} : index
@@ -139,8 +141,8 @@ func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
         %dc = pim.access %C offset %n sizes [32, 96] strides[%ldb, %c1] origin[%m, %n]
               {id = 2 : i64} : memref<*xf32> -> !pim.access
         pim.store %r, %dc : tensor<32x96xf32>, !pim.access
-      } {pim.axis = "output_column_tile"}
-    } {pim.axis = "output_row_tile"}
+      } {pim.axis = #pim.axis<"n">}
+    } {pim.axis = #pim.axis<"m">}
   }
   return
 }

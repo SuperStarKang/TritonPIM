@@ -7,6 +7,8 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "llvm/ADT/STLExtras.h"
 
+#include <limits>
+
 using namespace mlir;
 
 mlir::pim::TargetProfileAttr mlir::pim::targetProfile(Operation *op) {
@@ -15,6 +17,21 @@ mlir::pim::TargetProfileAttr mlir::pim::targetProfile(Operation *op) {
     module = dyn_cast<ModuleOp>(op);
   return module ? module->getAttrOfType<TargetProfileAttr>("pim.target_profile")
                 : TargetProfileAttr();
+}
+
+std::optional<int64_t>
+mlir::pim::usableDeviceCapacityBytes(TargetProfileAttr profile) {
+  if (!profile)
+    return std::nullopt;
+  IntegerAttr bank = profile.getUsableBankCapacityBytes();
+  if (!bank)
+    return std::nullopt;
+  int64_t banks = profile.getNumberOfBanksPerPimDevice();
+  int64_t bytes = bank.getInt();
+  if (banks < 1 || bytes < 0 ||
+      (bytes != 0 && banks > std::numeric_limits<int64_t>::max() / bytes))
+    return std::nullopt;
+  return banks * bytes;
 }
 
 void mlir::pim::collectLocalTiles(Operation *scope,
@@ -83,7 +100,7 @@ int64_t mlir::pim::tileElementsAlong(scf::ForOp axis,
       // 몰면 크기를 단정할 수 없으므로 그 차원은 건너뛴다.
       bool foreign = false;
       for (Operation *op : drivers)
-        if (op != axis && !op->getAttrOfType<StringAttr>("pim.axis"))
+        if (op != axis && !op->getAttrOfType<pim::AxisAttr>("pim.axis"))
           foreign = true;
       if (foreign)
         continue;

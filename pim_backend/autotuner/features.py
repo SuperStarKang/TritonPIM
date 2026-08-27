@@ -42,7 +42,8 @@ def extract_plan_features(problem, hardware, config, plan):
 
     # memory pressure (§27).
     local_memory_pressure = (
-        local_memory_footprint(problem, config) / hardware.local_memory_bytes)
+        local_memory_footprint(problem, config) / hardware.local_memory_bytes
+        if hardware.local_memory_bytes > 0 else 0.0)
     device_memory_pressure = (
         device_memory_footprint(problem, config) / hardware.device_memory_bytes)
 

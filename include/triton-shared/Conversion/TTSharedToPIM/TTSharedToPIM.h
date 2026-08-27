@@ -14,7 +14,7 @@ namespace triton {
 #define GEN_PASS_DECL_PIMFORMCOMPUTE
 #define GEN_PASS_DECL_PIMFORMBLOCKGROUPS
 #define GEN_PASS_DECL_PIMSETTARGETPROFILE
-#define GEN_PASS_DECL_PIMPLANGROUPEXECUTION
+#define GEN_PASS_DECL_PIMPLANINTRADEVICE
 #define GEN_PASS_DECL_PIMMAPDEVICES
 #define GEN_PASS_DECL_PIMFORMEXECUTIONTILES
 #define GEN_PASS_DECL_PIMPLACEDATA
@@ -28,7 +28,7 @@ std::unique_ptr<OperationPass<ModuleOp>> createPIMRecoverAccessOriginPass();
 std::unique_ptr<OperationPass<ModuleOp>> createPIMFormComputePass();
 std::unique_ptr<OperationPass<ModuleOp>> createPIMFormBlockGroupsPass();
 std::unique_ptr<OperationPass<ModuleOp>> createPIMSetTargetProfilePass();
-std::unique_ptr<OperationPass<ModuleOp>> createPIMPlanGroupExecutionPass();
+std::unique_ptr<OperationPass<ModuleOp>> createPIMPlanIntraDevicePass();
 std::unique_ptr<OperationPass<ModuleOp>> createPIMMapDevicesPass();
 std::unique_ptr<OperationPass<ModuleOp>> createPIMFormExecutionTilesPass();
 std::unique_ptr<OperationPass<ModuleOp>> createPIMPlaceDataPass();

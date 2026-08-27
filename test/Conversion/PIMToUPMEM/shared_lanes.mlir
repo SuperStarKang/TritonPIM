@@ -1,4 +1,4 @@
-// 협력 lane 모드(lane_axis_role = output_row): tasklet 들이 tile 하나를 출력 행으로
+// 협력 lane 모드(lane_axis = m): tasklet 들이 tile 하나를 출력 행으로
 // 나눠 함께 계산한다. 버퍼는 한 벌, 적재는 chunk 분담, 경계는 barrier 다.
 // 입력은 convert.mlir 과 같은 GEMM 이고 lanes = 4 만 다르다. 8행 tile 을 4 lane 이
 // 2행씩 맡는다.
@@ -9,9 +9,9 @@
 
 // 자기 행의 시작 = tasklet 번호 × 2. 버퍼는 lane 차원 없이 한 벌씩이다.
 // CHECK:         %[[TID:.*]] = upmem.tasklet_id : index
-// CHECK-DAG:     memref.alloc() : memref<8x32xi8, #upmem.space<wram>>
-// CHECK-DAG:     memref.alloc() : memref<32x32xi8, #upmem.space<wram>>
-// CHECK-DAG:     memref.alloc() : memref<8x32xi32, #upmem.space<wram>>
+// CHECK-DAG:     memref.alloc() : memref<8x32xi8, #upmem<space wram>>
+// CHECK-DAG:     memref.alloc() : memref<32x32xi8, #upmem<space wram>>
+// CHECK-DAG:     memref.alloc() : memref<8x32xi32, #upmem<space wram>>
 
 // 출력 행 slice. A 와 누산기만 갈리고 B 는 전 행이 필요해 그대로다.
 // CHECK-DAG:     memref.subview %{{.*}}[%{{.*}}, 0] [2, 32] [1, 1] : memref<8x32xi8
@@ -27,7 +27,7 @@
 // 공유 B 의 적재가 끝난 뒤에만 계산하고(앞 barrier), 다음 적재가 덮기 전에 전원이
 // 소비를 마친다(뒤 barrier). 계산은 행 slice 위에서 돈다.
 // CHECK:         upmem.barrier
-// CHECK:         linalg.matmul ins(%{{.*}}, %{{.*}} : memref<2x32xi8, {{.*}}>, memref<32x32xi8, #upmem.space<wram>>) outs(%{{.*}} : memref<2x32xi32, {{.*}}>)
+// CHECK:         linalg.matmul ins(%{{.*}}, %{{.*}} : memref<2x32xi8, {{.*}}>, memref<32x32xi8, #upmem<space wram>>) outs(%{{.*}} : memref<2x32xi32, {{.*}}>)
 // CHECK:         upmem.barrier
 
 // 저장은 chunk 분담이라 다른 tasklet 의 행을 읽는다 — 앞뒤로 barrier.
@@ -42,14 +42,15 @@
 
 module attributes {pim.target_profile = #pim.target_profile<
     target = "upmem", number_of_pim_devices = 8,
+    number_of_banks_per_pim_device = 1,
+    number_of_pim_cores_per_bank = 1,
     number_of_parallel_lanes_per_pim_core = 4,
     parallel_execution_kind = "multithread",
     usable_bank_capacity_bytes = 3072, usable_local_capacity_bytes = 49152>} {
 
 func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
                   %K: i32, %N: i32, %ex: index, %ey: index)
-    attributes {pim.group_execution = #pim.group_execution<
-        lanes = 4, lane_axis_role = "output_row">} {
+    attributes {pim.intra_device_plan = #pim.intra_device_plan<bank_partitions = [1, 1, 1], core_partitions = [1, 1, 1], lanes = 4, lane_axis = "m">} {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c2 = arith.constant 2 : index
@@ -61,16 +62,16 @@ func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
   %ldb = arith.index_cast %N : i32 to index
   %kk = arith.index_cast %K : i32 to index
 
-  pim.device #pim.device_mapping<axes = ["output_row_tile", "output_column_tile"],
-                                 partitions = array<i64: 2, 4>>
+  pim.device #pim.device_mapping<axes = ["m", "n"],
+                                 partitions = [2, 4]>
       extents [%ex, %ey]
       attributes {
-        pim.device_plan = #pim.device_plan<
+        pim.inter_device_plan = #pim.inter_device_plan<
             available_devices = 8,
-            axes = ["output_row_tile", "output_column_tile"],
-            active_grid = array<i64: 2, 4>,
-            execution_tile = array<i64: 0, 0, 0>,
-            scheduling_order = ["output_column_tile", "output_row_tile"]>,
+            axes = ["m", "n"],
+            active_grid = [2, 4],
+            execution_tile = [0, 0, 0],
+            scheduling_order = ["n", "m"]>,
         pim.reduction_plan = #pim.reduction_plan<
             spatial_partials = "none", temporal_accumulation = "none",
             final_accumulation = "none">} {
@@ -90,8 +91,8 @@ func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
     pim.place %A start[%ar, %c0] size[%arn, %akn] capacity[%arc, %akn]
         strides[%lda, %c1]
         {direction = "in", access = 0 : i64,
-         mapping = #pim.place_mapping<axis_sources = ["output_row_tile", ""]>,
-         replicated_over = ["output_column_tile"]} : memref<*xi8>
+         mapping = #pim.place_mapping<axis_sources = ["m", ""]>,
+         replicated_over = ["n"]} : memref<*xi8>
 
     %bc = arith.muli %starty, %c32 : index
     %bcn = arith.muli %tripsy, %c32 : index
@@ -99,14 +100,14 @@ func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
     pim.place %B start[%c0, %bc] size[%akn, %bcn] capacity[%akn, %bcc]
         strides[%ldb, %c1]
         {direction = "in", access = 1 : i64,
-         mapping = #pim.place_mapping<axis_sources = ["", "output_column_tile"]>,
-         replicated_over = ["output_row_tile"]} : memref<*xi8>
+         mapping = #pim.place_mapping<axis_sources = ["", "n"]>,
+         replicated_over = ["m"]} : memref<*xi8>
 
     pim.place %C start[%ar, %bc] size[%arn, %bcn] capacity[%arc, %bcc]
         strides[%ldb, %c1]
         {direction = "out", access = 2 : i64,
-         mapping = #pim.place_mapping<axis_sources = ["output_row_tile",
-                                                      "output_column_tile"]>} : memref<*xi32>
+         mapping = #pim.place_mapping<axis_sources = ["m",
+                                                      "n"]>} : memref<*xi32>
 
     scf.for %tx = %c0 to %tripsx step %c1 {
       %gx = arith.addi %startx, %tx {pim.device_origin} : index
@@ -132,8 +133,8 @@ func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
         %dc = pim.access %C offset %n sizes [8, 32] strides[%ldb, %c1] origin[%m, %n]
               {id = 2 : i64} : memref<*xi32> -> !pim.access
         pim.store %r, %dc : tensor<8x32xi32>, !pim.access
-      } {pim.axis = "output_column_tile"}
-    } {pim.axis = "output_row_tile"}
+      } {pim.axis = #pim.axis<"n">}
+    } {pim.axis = #pim.axis<"m">}
   }
   return
 }

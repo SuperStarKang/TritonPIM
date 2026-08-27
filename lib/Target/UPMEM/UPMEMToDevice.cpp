@@ -190,6 +190,8 @@ struct DeviceEmitter {
       return emitFill(fill, depth);
     if (auto mm = dyn_cast<linalg::MatmulOp>(op))
       return emitMatmul(mm, depth);
+    if (auto generic = dyn_cast<linalg::GenericOp>(op))
+      return emitPointwise(generic, depth);
 
     if (isa<arith::ArithDialect>(op->getDialect()))
       return e.emitArith(op, depth, /*hostSide=*/false);
@@ -204,6 +206,67 @@ struct DeviceEmitter {
     os() << "for (int32_t _i = 0; _i < " << elementCount(t) << "; ++_i) "
          << e.name(fill.getOutputs()[0]) << "[_i] = "
          << e.name(fill.getInputs()[0]) << ";\n";
+    return success();
+  }
+
+  // Identity indexing map + parallel iterator만 받는 pointwise generic. block argument를
+  // 각 WRAM buffer의 같은 flat index에 bind한 뒤 region의 scalar arith를 그대로 C로
+  // 낸다. 따라서 add/mul뿐 아니라 CEmitter가 지원하는 scalar arith의 fusion도 같은
+  // loop 하나에 남는다.
+  LogicalResult emitPointwise(linalg::GenericOp generic, unsigned depth) {
+    if (generic.getOutputs().size() != 1)
+      return generic->emitError(
+          "UPMEM pointwise generic must have exactly one output");
+    for (AffineMap map : generic.getIndexingMapsArray())
+      if (!map.isIdentity())
+        return generic->emitError(
+            "UPMEM pointwise generic requires identity indexing maps");
+    for (utils::IteratorType type : generic.getIteratorTypesArray())
+      if (type != utils::IteratorType::parallel)
+        return generic->emitError(
+            "UPMEM pointwise generic requires all-parallel iterators");
+
+    SmallVector<MemRefType> types;
+    for (Value operand : generic->getOperands()) {
+      auto type = dyn_cast<MemRefType>(operand.getType());
+      if (!type || !type.hasStaticShape())
+        return generic->emitError(
+            "UPMEM pointwise generic operands must be static WRAM memrefs");
+      types.push_back(type);
+    }
+    MemRefType output = types.back();
+    for (MemRefType type : types)
+      if (type.getShape() != output.getShape())
+        return generic->emitError(
+            "UPMEM identity pointwise operands must have the same shape");
+
+    Block &body = generic.getRegion().front();
+    if (body.getNumArguments() != generic->getNumOperands())
+      return generic->emitError(
+          "UPMEM pointwise generic region arguments do not match operands");
+    auto yield = dyn_cast<linalg::YieldOp>(body.getTerminator());
+    if (!yield || yield.getValues().size() != 1)
+      return generic->emitError(
+          "UPMEM pointwise generic must yield one scalar");
+
+    e.indent(depth);
+    os() << "for (int32_t _i = 0; _i < " << elementCount(output)
+         << "; ++_i) {\n";
+    for (auto [arg, operand] :
+         llvm::zip(body.getArguments(), generic->getOperands()))
+      e.bind(arg, e.name(operand) + "[_i]");
+    for (Operation &nested : body.without_terminator()) {
+      if (!isa<arith::ArithDialect>(nested.getDialect()))
+        return nested.emitError(
+            "upmem-to-device: pointwise generic body supports scalar arith only");
+      if (failed(e.emitArith(&nested, depth + 1, /*hostSide=*/false)))
+        return failure();
+    }
+    e.indent(depth + 1);
+    os() << e.name(generic.getOutputs()[0]) << "[_i] = "
+         << e.name(yield.getValues()[0]) << ";\n";
+    e.indent(depth);
+    os() << "}\n";
     return success();
   }
 

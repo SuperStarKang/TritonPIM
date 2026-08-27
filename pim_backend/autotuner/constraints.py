@@ -107,7 +107,10 @@ class ConstraintEngine:
         # Constraint 2 — local memory (§10): S_A+S_B+S_C+S_runtime ≤ C_local.
         s_local = (local_memory_footprint(problem, config)
                    + hardware.local_memory_reserved_bytes)
-        if s_local > hardware.local_memory_bytes:
+        # 0은 compiler profile과 같은 의미로 compiler-allocatable local storage가
+        # 없다는 뜻이다(AiMX register state는 target verifier가 검사한다).
+        if (hardware.local_memory_bytes > 0 and
+                s_local > hardware.local_memory_bytes):
             return (f"local memory overflow: {s_local} > "
                     f"{hardware.local_memory_bytes}")
 

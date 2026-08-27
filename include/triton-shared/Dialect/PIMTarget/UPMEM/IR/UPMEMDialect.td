@@ -10,7 +10,7 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 //===----------------------------------------------------------------------===//
 // UPMEM dialect — UPMEM DPU 실행 모델.
 //
-// Placed PIM IR(pim.device + pim.place)을 UPMEM 하드웨어에 맞춘 것이다.
+// PIM Common IR(pim.device + pim.place)을 UPMEM 하드웨어에 맞춘 것이다.
 // PIM IR이 답하지 않는 것을 여기서 정한다:
 //   - 메모리 계층 (host DRAM → MRAM → WRAM 3단)
 //   - 계층 사이 전송 단위 (DMA: 8 byte 정렬, 한 번에 2048 byte 이하, 연속 영역만)
@@ -265,10 +265,9 @@ def UPMEM_NumTaskletsOp : UPMEM_Op<"num_tasklets", [Pure]> {
 }
 
 // barrier_wait. 모든 tasklet이 이 지점에 도달할 때까지 기다린다.
-// 협력 lane 모드(lane_axis_role = "output_row")에서 공유 WRAM 버퍼의 적재와 소비를
+// 협력 lane plan(lane_axis = "m")에서 공유 WRAM 버퍼의 적재와 소비를
 // 가른다 — 적재 뒤의 barrier는 "전부 실렸다"를, 계산 뒤의 barrier는 "전부 읽었다"를
-// 보장한다. tasklet이 하나거나 whole_tile 모드면 --convert-pim-to-upmem이 이 op을
-// 만들지 않는다(타일마다 쓰는 자리가 겹치지 않아 동기화가 필요 없다).
+// 보장한다. tasklet이 하나면 --convert-pim-to-upmem이 이 op을 만들지 않는다.
 def UPMEM_BarrierOp : UPMEM_Op<"barrier"> {
   let summary = "Wait until every tasklet reaches this point";
   let assemblyFormat = "attr-dict";

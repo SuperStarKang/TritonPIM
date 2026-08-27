@@ -1,16 +1,14 @@
-// lane-mode 가 lane 수와 lane_axis_role 을 어떻게 정하는지 확인한다.
-// RUN: triton-shared-opt --pim-plan-group-execution %s | FileCheck %s --check-prefix=WHOLE
-// RUN: triton-shared-opt --pim-plan-group-execution=lane-mode=output_row %s | FileCheck %s --check-prefix=ROW
+// One block group is decomposed through the bank -> core -> lane hierarchy.
+// RUN: triton-shared-opt --pim-plan-intra-device %s | FileCheck %s --check-prefix=AUTO
+// RUN: triton-shared-opt "--pim-plan-intra-device=bank-partitions=1,2,1 core-partitions=1,1,1 lanes=4 lane-axis=n" %s | FileCheck %s --check-prefix=EXPLICIT
 
-// whole_tile(기본): lane 마다 tile 버퍼를 복제하므로 예산이 lane 수를 자른다.
-//   tile 바이트 = A 256 + B 1024 + 누산기 1024 = 2304 → 4096 / 2304 = 1
-// WHOLE: lanes = 1, lane_axis_role = "whole_tile"
-
-// output_row: 버퍼가 한 벌이라 lane 수가 예산과 무관하다. 능력값 16 을 그대로 쓴다.
-// ROW: lanes = 16, lane_axis_role = "output_row"
+// AUTO: #pim.intra_device_plan<bank_partitions = [1, 1, 1], core_partitions = [1, 1, 1], lanes = 16, lane_axis = "m">
+// EXPLICIT: #pim.intra_device_plan<bank_partitions = [1, 2, 1], core_partitions = [1, 1, 1], lanes = 4, lane_axis = "n">
 
 module attributes {pim.target_profile = #pim.target_profile<
     target = "upmem", number_of_pim_devices = 8,
+    number_of_banks_per_pim_device = 1,
+    number_of_pim_cores_per_bank = 1,
     number_of_parallel_lanes_per_pim_core = 16,
     parallel_execution_kind = "multithread",
     usable_bank_capacity_bytes = 3072, usable_local_capacity_bytes = 4096>} {

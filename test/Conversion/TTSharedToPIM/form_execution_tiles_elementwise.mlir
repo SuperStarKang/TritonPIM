@@ -1,0 +1,40 @@
+// Reduction 없는 elementwise/map 커널은 존재하는 공간축마다 block group 하나를
+// 보수적인 자동 execution tile로 선택한다.
+// RUN: triton-shared-opt --pim-form-execution-tiles %s | FileCheck %s
+
+// CHECK-LABEL: func.func @elementwise
+// CHECK-SAME: pim.execution_tile = #pim.execution_tile<m = 8, n = 32, k = 0>
+
+module attributes {pim.target_profile = #pim.target_profile<
+    target = "upmem", number_of_pim_devices = 8,
+    number_of_banks_per_pim_device = 1,
+    number_of_pim_cores_per_bank = 1,
+    number_of_parallel_lanes_per_pim_core = 4,
+    parallel_execution_kind = "multithread",
+    usable_bank_capacity_bytes = 62914560,
+    usable_local_capacity_bytes = 49152>} {
+
+func.func @elementwise(%A: memref<*xf32>, %B: memref<*xf32>,
+                       %tm: index, %tn: index) attributes {
+    pim.block_group = #pim.block_group<tiles = [1, 1, 1],
+                                       useful = [8, 32, 1]>,
+    pim.intra_device_plan = #pim.intra_device_plan<
+        bank_partitions = [1, 1, 1], core_partitions = [1, 1, 1],
+        lanes = 4, lane_axis = "m">} {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c8 = arith.constant 8 : index
+  %c32 = arith.constant 32 : index
+  scf.for %i = %c0 to %tm step %c1 {
+    %m = arith.muli %i, %c8 : index
+    scf.for %j = %c0 to %tn step %c1 {
+      %n = arith.muli %j, %c32 : index
+      %a = pim.access %A offset %n sizes [8, 32] strides[%c32, %c1]
+           origin[%m, %n] {id = 0 : i64} : memref<*xf32> -> !pim.access
+      %b = pim.access %B offset %n sizes [8, 32] strides[%c32, %c1]
+           origin[%m, %n] {id = 1 : i64} : memref<*xf32> -> !pim.access
+    } {pim.axis = #pim.axis<"n">}
+  } {pim.axis = #pim.axis<"m">}
+  return
+}
+}

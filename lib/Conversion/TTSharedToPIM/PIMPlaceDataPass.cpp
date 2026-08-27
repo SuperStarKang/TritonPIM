@@ -261,17 +261,17 @@ struct PIMPlaceDataPass
       r.capacityTiles = r.trips;
       r.axis = StringAttr();
       r.partitions = 1;
-      if (auto name = l->getAttrOfType<StringAttr>("pim.axis")) {
-        r.axis = name;
+      if (auto name = l->getAttrOfType<pim::AxisAttr>("pim.axis")) {
+        r.axis = name.getName();
         r.partitions = partitions[axisIndex];
-        StringRef axis = name.getValue();
-        int64_t cap = axis == "output_row_tile"      ? execution.getM()
-                      : axis == "output_column_tile" ? execution.getN()
-                      : axis == "explicit_k_partition" ? execution.getK()
+        StringRef axis = name.getName().getValue();
+        int64_t cap = axis == "m"      ? execution.getM()
+                      : axis == "n" ? execution.getN()
+                      : axis == "k" ? execution.getK()
                                                          : 0;
         int64_t perTile = pim::tileElementsAlong(l, loops);
         int64_t capacityTiles = 1;
-        if (axis != "explicit_k_partition") {
+        if (axis != "k") {
           if (cap <= 0 || perTile <= 0 || cap % perTile != 0)
             return l->emitError("pim-place-data: execution tile capacity for ")
                    << axis << " is not an integer number of block groups";

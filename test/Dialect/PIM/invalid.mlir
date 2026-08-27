@@ -1,6 +1,20 @@
 // pim.access / pim.device / pim.place verifier가 말이 안 되는 조합을 거부하는지 확인.
 // RUN: triton-shared-opt --split-input-file -verify-diagnostics %s
 
+// expected-error @+1 {{axis must be m, n, or k}}
+module attributes {test.axis = #pim.axis<"x">} {
+}
+
+// -----
+
+// expected-error @+1 {{bank_partitions and core_partitions must be [m, n, k]}}
+module attributes {test.plan = #pim.intra_device_plan<
+    bank_partitions = [1, 1], core_partitions = [1, 1, 1],
+    lanes = 1, lane_axis = "m">} {
+}
+
+// -----
+
 // 축별 stride 개수는 타일 rank와 같아야 한다.
 func.func @bad_strides(%A: memref<*xf32>) {
   %c0 = arith.constant 0 : index
@@ -40,8 +54,8 @@ func.func @pad_without_valid(%A: memref<*xf32>, %f: f32) {
 // block argument는 축마다 하나씩이다.
 func.func @device_arity(%e: index) {
   // expected-error @+1 {{body must take one partition coordinate per axis}}
-  pim.device #pim.device_mapping<axes = ["output_row_tile", "output_column_tile"],
-                                 partitions = array<i64: 2, 4>>
+  pim.device #pim.device_mapping<axes = ["m", "n"],
+                                 partitions = [2, 4]>
       extents [%e, %e] {
   ^bb0(%px: index):
   }
@@ -54,13 +68,13 @@ func.func @device_arity(%e: index) {
 func.func @place_rank(%A: memref<*xi8>, %e: index) {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
-  pim.device #pim.device_mapping<axes = ["output_row_tile"], partitions = array<i64: 1>>
+  pim.device #pim.device_mapping<axes = ["m"], partitions = [1]>
       extents [%e] {
   ^bb0(%px: index):
     // expected-error @+1 {{start, size, capacity, and strides must have the same rank}}
     pim.place %A start[%c0, %c0] size[%c1] capacity[%c1] strides[%c1]
         {direction = "in", access = 0 : i64,
-         mapping = #pim.place_mapping<axis_sources = ["output_row_tile", ""]>} : memref<*xi8>
+         mapping = #pim.place_mapping<axis_sources = ["m", ""]>} : memref<*xi8>
   }
   return
 }

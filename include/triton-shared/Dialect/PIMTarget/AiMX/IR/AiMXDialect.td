@@ -10,7 +10,7 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 //===----------------------------------------------------------------------===//
 // AiMX dialect — silent-PIM FPGA 실행 모델.
 //
-// Placed PIM IR(pim.device + pim.place)을 AiMX 하드웨어에 맞춘 것이다. PIM IR이
+// PIM Common IR(pim.device + pim.place)을 AiMX 하드웨어에 맞춘 것이다. PIM IR이
 // 답하지 않는 것을 여기서 정한다:
 //   - 메모리 계층 (host DRAM → PIM DRAM 2단. core 안의 빠른 메모리가 없다)
 //   - PIM DRAM 안의 layout (행 pitch 로 규정된 2차원 배열. tile-major 가 아니다)
@@ -159,7 +159,7 @@ def AiMX_TileGroupAttr : AttrDef<AiMX_Dialect, "TileGroup"> {
     `group` 은 block group 하나가 담는 Triton block 수 `[m, n, k]` 다.
 
     `execution` 은 block group 의 **물리 크기**다. 세 축 모두 같은 규칙이고 값은
-    공통 `#pim.block_group` 의 phys 그대로다:
+    공통 `#pim.block_group`의 useful 크기를 AiMX 실행 눈금에 맞춰 padding한 값이다:
     `execution[i] = roundUp(group[i] * block[i], unit[i])`, 단위는
     `[batch, 4096/batch, 256/batch]`. padding 은
     `execution[i] - block[i] * group[i]` 로 유도된다 — 따로 싣지 않는다.
@@ -171,7 +171,7 @@ def AiMX_TileGroupAttr : AttrDef<AiMX_Dialect, "TileGroup"> {
   // DenseI64ArrayAttr 이어야 `[a, b, c]` 로 출력되고 다시 읽힌다. ArrayRefParameter 는
   // struct(params) 안에서 대괄호 없이 나가 round-trip 이 깨진다 — 도구 사이를 MLIR
   // 텍스트로 잇고 있으므로 그러면 파이프라인이 통째로 멈춘다. #pim.target_profile 의
-  // execution_unit 도 같은 이유로 이 타입이다.
+  // target lowering에서 계산한 고정 tiling 값도 같은 이유로 이 타입이다.
   let parameters = (ins "::mlir::DenseI64ArrayAttr":$block,
                         "::mlir::DenseI64ArrayAttr":$group,
                         "::mlir::DenseI64ArrayAttr":$execution);

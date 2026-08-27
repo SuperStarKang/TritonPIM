@@ -9,9 +9,9 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 // PIM dialect — target 무관 PIM 공통 IR.
 // 공통 구조는 데이터 3계층이다: block(Triton tile 눈금) ⊂ block group(local 상주·
 // 계산 단위) ⊂ execution tile(PIM Device 하나가 한 번에 맡는 몫). 기계는 각 계층의
-// 소비자로 대응된다 — execution tile 은 PIM Device 가(#pim.device_mapping),
-// block group 은 PIM Core 가(현재 두 target 모두 core 1개), group 내부는 lane 이
-// 소비한다(#pim.group_execution). target 용어(DPU/tasklet/MRAM/channel/bank 등)는
+// 소비자로 대응된다 — execution tile 은 PIM Device 가(#pim.inter_device_plan),
+// block group 하나는 그 Device 안의 bank -> core -> lane 계층이 함께 분해해
+// 소비한다(#pim.intra_device_plan). target 용어(DPU/tasklet/MRAM/channel 등)는
 // 여기 등장하지 않는다.
 //===----------------------------------------------------------------------===//
 
@@ -50,29 +50,34 @@ class PIM_Attr<string name, string _mnemonic>
 //===----------------------------------------------------------------------===//
 
 // 기계 profile. --pim-set-target-profile 이 module 에 붙이고, 그 뒤의 pass 들이 읽는다.
-// 데이터 3계층이 하드웨어에서 필요로 하는 것만 담는다 — device 수(공간 분배),
-// lane 수, 축별 실행 단위(block group 의 눈금), capacity(execution tile 의 예산).
+// 데이터 3계층이 하드웨어에서 필요로 하는 것만 담는다 — device/bank/core/lane
+// topology와 capacity(execution tile 의 예산).
 // usable_*_capacity_bytes 는 세 상태를 구분한다: 값이 있으면 알려진 용량, 0 이면 그
 // 저장소가 존재하지 않아 검사가 성립하지 않음, 필드가 없으면 미측정이라 그 값을
 // 필요로 하는 검사에 도달하는 순간 진단을 낸다.
-// execution_unit 은 [m, n, k] 원소 단위다 — 한 번의 하드웨어 실행이 축마다 소비하는
-// 크기. 없으면 눈금이 없다는 뜻이고(어떤 크기든 그대로 소화) block group 은
-// local 예산(usable_local_capacity_bytes)으로 자동 산출된다.
-// lane_mode 는 multithread 기계의 lane 실행 형태다(whole_tile | output_row).
-// pim-form-block-groups(자동 group 의 예산 셈법)와 pim-plan-group-execution(lane 수)
-// 두 pass 가 같은 값을 읽어야 하므로 profile 에 둔다. simd 기계는 필드가 없다.
 def PIM_TargetProfileAttr : PIM_Attr<"TargetProfile", "target_profile"> {
   let summary = "Common machine profile shared by every PIM target";
   let parameters = (ins
       "::mlir::StringAttr":$target,
       "int64_t":$number_of_pim_devices,
+      "int64_t":$number_of_banks_per_pim_device,
+      "int64_t":$number_of_pim_cores_per_bank,
       "int64_t":$number_of_parallel_lanes_per_pim_core,
       "::mlir::StringAttr":$parallel_execution_kind,
-      OptionalParameter<"::mlir::StringAttr">:$lane_mode,
-      OptionalParameter<"::mlir::DenseI64ArrayAttr">:$execution_unit,
       OptionalParameter<"::mlir::IntegerAttr">:$usable_bank_capacity_bytes,
       OptionalParameter<"::mlir::IntegerAttr">:$usable_local_capacity_bytes);
   let assemblyFormat = "`<` struct(params) `>`";
+  let genVerifyDecl = 1;
+}
+
+// PIM Common IR의 축은 [m, n, k]로 고정한다. m/n은 병렬 출력 축이고 k는
+// reduction 축이다. 축의 이름 자체가 의미를 가지므로 별도의 scope/kind 문자열은
+// 두지 않는다.
+def PIM_AxisAttr : PIM_Attr<"Axis", "axis"> {
+  let summary = "Canonical m, n, or k axis identity";
+  let parameters = (ins "::mlir::StringAttr":$name);
+  let assemblyFormat = "`<` $name `>`";
+  let genVerifyDecl = 1;
 }
 
 // target 확장 attribute 는 두지 않는다. 공통 pass 가 target 이름의 attribute 를 읽으면
@@ -87,29 +92,27 @@ def PIM_DeviceMappingAttr : PIM_Attr<"DeviceMapping", "device_mapping"> {
   let assemblyFormat = "`<` struct(params) `>`";
 }
 
-// block group 하나를 PIM Core 의 lane 들이 어떻게 실행하는가 — lane 수와, lane 이
-// group 의 무엇을 나눠 갖는가(whole_tile: 서로 다른 group 을 통째로 / output_row:
-// 한 group 을 출력 행으로 협력). 다중 core 로의 group 분배는 그런 target 이 실제로
-// 올 때 group 계층의 확장으로 재설계한다 — 그때까지는 core 1개가 전제다.
-def PIM_GroupExecutionAttr : PIM_Attr<"GroupExecution", "group_execution"> {
-  let summary = "How the lanes of a PIM Core execute one block group";
-  let parameters = (ins "int64_t":$lanes,
-                        "::mlir::StringAttr":$lane_axis_role);
+// 하나의 block group 자체를 device 안에서 bank -> core -> lane 순서로 분할한다.
+// partition vector의 고정 축 순서는 [m, n, k]다. 여러 block group을 서로 다른
+// bank/core에 통째로 배정하는 attribute가 아니다.
+def PIM_IntraDevicePlanAttr
+    : PIM_Attr<"IntraDevicePlan", "intra_device_plan"> {
+  let summary = "Bank, core, and lane decomposition of one block group";
+  let parameters = (ins "::mlir::DenseI64ArrayAttr":$bank_partitions,
+                        "::mlir::DenseI64ArrayAttr":$core_partitions,
+                        "int64_t":$lanes,
+                        "::mlir::StringAttr":$lane_axis);
   let assemblyFormat = "`<` struct(params) `>`";
+  let genVerifyDecl = 1;
 }
 
-// block group — 데이터 3계층의 둘째 층. 하드웨어 실행 단위(profile 의 execution_unit)에
-// Triton block 정수 개를 채운 것이다. 축 순서는 [m, n, k], 규칙은 세 축 모두 같다:
-//   tiles  = max(1, ⌊unit / block⌋)     block 정수 개를 단위에 채운다
-//   useful = tiles · block               실제 데이터
-//   phys   = ⌈useful / unit⌉ · unit      하드웨어가 도는 크기
-//   pad    = phys − useful               어긋남 — target 의 stage 가 0 으로 채운다
-// --pim-form-block-groups 가 func 에 부착하고 target lowering 이 소비한다.
+// block group — 데이터 3계층의 둘째 층. Triton block 정수 개를 인접하게 묶은
+// target-neutral 계산 단위다. 축 순서는 [m, n, k]다. target 하드웨어가 요구하는
+// padding은 profile과 intra-device plan을 읽는 TargetSpec/lowering이 계산한다.
 def PIM_BlockGroupAttr : PIM_Attr<"BlockGroup", "block_group"> {
-  let summary = "Blocks filled into one hardware execution unit, per axis";
+  let summary = "An integer grid of adjacent Triton blocks";
   let parameters = (ins "::mlir::DenseI64ArrayAttr":$tiles,
-                        "::mlir::DenseI64ArrayAttr":$useful,
-                        "::mlir::DenseI64ArrayAttr":$phys);
+                        "::mlir::DenseI64ArrayAttr":$useful);
   let assemblyFormat = "`<` struct(params) `>`";
 }
 
@@ -135,7 +138,7 @@ def PIM_ExecutionTileAttr : PIM_Attr<"ExecutionTile", "execution_tile"> {
 //   scheduling_order  = host round loop 밖→안 순서
 // execution grid·round grid 는 M/N/K 가 런타임 값일 수 있어 lowering 이 SSA 로
 // 계산한다. active_grid 곱은 available_devices 를 넘지 않아야 한다.
-def PIM_DevicePlanAttr : PIM_Attr<"DevicePlan", "device_plan"> {
+def PIM_InterDevicePlanAttr : PIM_Attr<"InterDevicePlan", "inter_device_plan"> {
   let summary = "Common execution-tile schedule over abstract PIM Devices";
   let parameters = (ins "int64_t":$available_devices,
                         "::mlir::ArrayAttr":$axes,

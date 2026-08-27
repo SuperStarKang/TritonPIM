@@ -6,7 +6,7 @@
 #
 # 여기 남은 것은 셋뿐이다.
 #   1) 어느 target이고, 어떻게 config를 고를 것인가 (seed / autotune cache)
-#   2) autotuner가 모르는 template·runtime knob (lane_mode, num_warps, ...)
+#   2) autotuner가 모르는 template·runtime knob (num_warps 등)
 #   3) Inductor 쪽 안전장치 (compile_threads, fx_graph_cache)
 
 from dataclasses import dataclass
@@ -27,11 +27,13 @@ PIM_OPTION_KEYS = (
     "pim_target",
     "num_units",
     "local_lanes",
-    "lane_mode",
     "host_threads",
     "group_m", "group_n", "group_k",
     "tile_m", "tile_n", "tile_k",
     "device_axis_partitions",
+    "bank_partitions", "core_partitions",
+    "intra_device_lanes", "lane_axis",
+    "batch",
 )
 
 
@@ -62,8 +64,6 @@ class PIMTorchConfig:
     pin_row_partitions: bool = True
 
     # ── autotuner가 모르는 knob ──────────────────────────────────────────
-    # lane 실행 형태. PIMConfig에도 profile에도 없다.
-    lane_mode: str = "output_row"
     # host가 영역을 모으고 되돌릴 때 쓰는 스레드 수.
     host_threads: int = 8
     # PIM은 warp/stage 개념이 없지만 triton.compile 옵션 스키마에는 있어서
