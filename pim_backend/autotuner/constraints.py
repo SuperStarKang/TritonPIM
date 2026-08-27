@@ -8,6 +8,49 @@
 from .types import ceil_div
 
 
+AIMX_PMM_BYTES = 0x30000
+AIMX_RUNTIME_POOL_BYTES = 2 * 1024 * 1024
+AIMX_MAX_SINGLE_ALLOCATION_BYTES = 1023 * AIMX_RUNTIME_POOL_BYTES
+
+
+def _round_up(value, unit):
+    return ceil_div(value, unit) * unit
+
+
+def aimx_runtime_allocations(hardware, config):
+    """AiMX target lowering이 실제로 만드는 allocation별 byte 수."""
+    batch = (config.bank_p_m
+             or hardware.target_constraints.get("default_batch", 8))
+    useful_m = config.block_m * config.group_m
+    useful_n = config.block_n * config.group_n
+    useful_k = config.block_k * config.group_k
+    physical_m = _round_up(useful_m, batch)
+    physical_n = _round_up(useful_n, 4096 // batch)
+    physical_k = _round_up(useful_k, 256 // batch)
+
+    t_m = config.tile_m * physical_m
+    t_n = config.tile_n * physical_n
+    # tile_k is the exact logical block-group count.  The 256-element vecA
+    # grain contributes only physical padding; it must not add logical groups.
+    t_k = _round_up(config.tile_k * physical_k, 256)
+    padded_k = _round_up(t_k, 4096)
+    padded_n = _round_up(t_n, 4096)
+
+    rows = t_m // batch
+    cols = padded_n * batch // 4096
+    steps = t_k * batch // 256
+    groups = (2 * (t_k // 256) * rows
+              + rows * cols * (2 * steps + 1))
+    return {
+        "PMM": AIMX_PMM_BYTES,
+        "A": t_m * padded_k * 2,
+        "Arel": t_m * t_k * 2 * 16,
+        "B": t_k * padded_n * 2,
+        "C": t_m * padded_n * 2,
+        "descriptor chain": groups * 512,
+    }
+
+
 def gemm_footprint_bytes(problem, size_m, size_n, size_k):
     """(m,n,k) 작업 묶음이 상주하는 데 필요한 바이트: S_A + S_B + S_C."""
     in_b = problem.input_bytes
@@ -34,7 +77,9 @@ def device_memory_footprint(problem, config):
       stream + per_round   temporal window 하나 (T_M×T_K 또는 T_K×T_N)
       stream + all_rounds  자기 몫 전체를 호출마다 적재 (footprint는 slice와 동일)
     """
-    t_m, t_n, t_k = config.tile_m, config.tile_n, config.tile_k
+    t_m = config.capacity_limit_m
+    t_n = config.capacity_limit_n
+    t_k = config.capacity_limit_k
     in_b = problem.input_bytes
     out_b = problem.output_bytes
     e_m = ceil_div(problem.M, t_m)
@@ -78,11 +123,11 @@ class ConstraintEngine:
         hardware = self.hardware
 
         # Constraint 1 — block/group 구조 (§9).
-        # tile = block * group * execution 은 derived configuration(§5)이라
+        # capacity_limit = block * group * tile 은 derived configuration(§5)이라
         # 항상 성립하므로 값의 양수 여부와 reduction legality(§13)를 본다.
         values = (config.block_m, config.block_n, config.block_k,
                   config.group_m, config.group_n, config.group_k,
-                  config.execution_m, config.execution_n, config.execution_k,
+                  config.tile_m, config.tile_n, config.tile_k,
                   config.p_m, config.p_n, config.p_k)
         if min(values) < 1:
             return "모든 크기와 partition 수는 1 이상이어야 한다"
@@ -115,7 +160,22 @@ class ConstraintEngine:
                     f"{hardware.local_memory_bytes}")
 
         # Constraint 3 — PIM device memory (§11).
-        s_tile = device_memory_footprint(problem, config)
+        if hardware.target == "aimx":
+            allocations = aimx_runtime_allocations(hardware, config)
+            for name, size in allocations.items():
+                if size > AIMX_MAX_SINGLE_ALLOCATION_BYTES:
+                    return (f"AiMX {name} allocation overflow: {size} > "
+                            f"{AIMX_MAX_SINGLE_ALLOCATION_BYTES} "
+                            "(runtime signed-int 2 MiB pool limit)")
+            s_tile = sum(allocations.values())
+            per_bank = sum(
+                ceil_div(size, 8192) * 32
+                for size in allocations.values())
+            if per_bank > hardware.usable_bank_capacity_bytes:
+                return (f"AiMX bank footprint overflow: {per_bank} > "
+                        f"{hardware.usable_bank_capacity_bytes}")
+        else:
+            s_tile = device_memory_footprint(problem, config)
         if s_tile > hardware.device_memory_bytes:
             return (f"device memory overflow: {s_tile} > "
                     f"{hardware.device_memory_bytes}")
@@ -125,9 +185,9 @@ class ConstraintEngine:
         if active > hardware.num_units:
             return (f"P_M*P_N*P_K({active})가 num_units"
                     f"({hardware.num_units})를 넘는다")
-        e_m = ceil_div(problem.M, config.tile_m)
-        e_n = ceil_div(problem.N, config.tile_n)
-        e_k = ceil_div(problem.K, config.tile_k)
+        e_m = ceil_div(problem.M, config.capacity_limit_m)
+        e_n = ceil_div(problem.N, config.capacity_limit_n)
+        e_k = ceil_div(problem.K, config.capacity_limit_k)
         if config.p_m > e_m:
             return f"P_M({config.p_m})이 tile grid M({e_m})보다 크다"
         if config.p_n > e_n:
@@ -136,20 +196,20 @@ class ConstraintEngine:
             return f"P_K({config.p_k})가 tile grid K({e_k})보다 크다"
         # temporal window는 spatial K plane 하나 안에 들어가야 한다 (§16).
         k_plane = ceil_div(problem.K, config.p_k)
-        if config.tile_k > k_plane:
-            return (f"tile_k({config.tile_k})가 spatial K plane"
+        if config.capacity_limit_k > k_plane:
+            return (f"capacity_limit_k({config.capacity_limit_k})가 spatial K plane"
                     f"({k_plane})보다 크다")
 
         # Constraint 5 — target-specific (§13).
         in_b = problem.input_bytes
         out_b = problem.output_bytes
         align = hardware.alignment_bytes
-        if (config.tile_k * in_b) % align != 0:
-            return f"tile_k 전송 단위가 alignment({align})에 맞지 않는다"
-        if (config.tile_n * in_b) % align != 0:
-            return f"tile_n 전송 단위가 alignment({align})에 맞지 않는다"
-        if (config.tile_n * out_b) % align != 0:
-            return f"출력 tile_n 전송 단위가 alignment({align})에 맞지 않는다"
+        if (config.capacity_limit_k * in_b) % align != 0:
+            return f"capacity_limit_k 전송 단위가 alignment({align})에 맞지 않는다"
+        if (config.capacity_limit_n * in_b) % align != 0:
+            return f"capacity_limit_n 전송 단위가 alignment({align})에 맞지 않는다"
+        if (config.capacity_limit_n * out_b) % align != 0:
+            return f"출력 capacity_limit_n 전송 단위가 alignment({align})에 맞지 않는다"
         # blocked split-K 커널의 전제: 각 K 몫이 BLOCK_K 격자에 맞아야 한다
         # (pim_backend/examples/split_k.py의 host assert와 같은 조건).
         if hardware.target_constraints.get("k_split_block_multiple"):

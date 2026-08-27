@@ -1,8 +1,9 @@
 # Stage 1 / 1-A / 1-B / 2 — PIM Config Space와 initial candidate 생성
 # (design/AutoTuner_Design.md §4~§7)
 #
-# tuner는 BM/BN/BK, GM/GN/GK, EM/EN/EK만 탐색하고 TM/TN/TK는 자동으로
-# 계산된다 (§5). 강하게 연관된 parameter는 semantic fragment로 묶는다 (§6):
+# tuner는 BM/BN/BK, GM/GN/GK, TM/TN/TK를 탐색한다. TM/TN/TK는
+# execution tile 하나에 묶는 block-group 개수이고, 논리 원소 상한은
+# capacity_limit = BLOCK * GROUP * TILE로 유도된다 (§5).
 #   KSplitFragment       (P_K, reduction_policy) 쌍
 #   DistributionFragment 배치 전략 → Planner가 P_M/P_N 계산 (§6.1)
 
@@ -17,7 +18,7 @@ from .types import PIMConfig, ceil_div
 # Engine(§8)이 제거한다.
 BLOCK_VALUES = (16, 32, 64, 128)
 GROUP_VALUES = (1, 2, 4, 8, 16, 32)
-EXECUTION_VALUES = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024)
+TILE_VALUES = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024)
 
 # §6 KSplitFragment: PK와 reduction strategy를 무관하게 탐색하면 invalid
 # configuration이 과도하게 생기므로 하나의 categorical knob으로 묶는다.
@@ -70,7 +71,7 @@ PERSISTENCE_STRATEGIES = (
 class PIMConfigSpace:
     block_values: tuple = BLOCK_VALUES
     group_values: tuple = GROUP_VALUES
-    execution_values: tuple = EXECUTION_VALUES
+    tile_values: tuple = TILE_VALUES
     ksplit_strategies: tuple = KSPLIT_STRATEGIES
     distribution_policies: tuple = DISTRIBUTION_POLICIES
     residency_policies: tuple = RESIDENCY_POLICIES
@@ -105,7 +106,7 @@ def strategy_for_pk(spec, p_k):
     return None
 
 
-def make_config(problem, hardware, blocks, groups, executions,
+def make_config(problem, hardware, blocks, groups, tiles,
                 distribution_policy, ksplit_strategy,
                 a_residency="stream", b_residency="stream",
                 replication_policy="slice", streaming_policy="per_round",
@@ -119,10 +120,11 @@ def make_config(problem, hardware, blocks, groups, executions,
     p_k, reduction_policy = ksplit_strategy
     device_set_reuse, descriptor_reuse, command_reuse, persistent_execution = \
         persistence_strategy
-    tile_m = blocks[0] * groups[0] * executions[0]
-    tile_n = blocks[1] * groups[1] * executions[1]
+    capacity_limit_m = blocks[0] * groups[0] * tiles[0]
+    capacity_limit_n = blocks[1] * groups[1] * tiles[1]
     p_m, p_n = resolve_distribution(
-        problem, hardware, tile_m, tile_n, p_k, distribution_policy)
+        problem, hardware, capacity_limit_m, capacity_limit_n, p_k,
+        distribution_policy)
     if hardware.target == "aimx":
         batch = hardware.target_constraints.get("default_batch", 8)
         intra = dict(
@@ -137,8 +139,7 @@ def make_config(problem, hardware, blocks, groups, executions,
     return PIMConfig(
         block_m=blocks[0], block_n=blocks[1], block_k=blocks[2],
         group_m=groups[0], group_n=groups[1], group_k=groups[2],
-        execution_m=executions[0], execution_n=executions[1],
-        execution_k=executions[2],
+        tile_m=tiles[0], tile_n=tiles[1], tile_k=tiles[2],
         distribution_policy=distribution_policy,
         p_m=p_m, p_n=p_n, p_k=p_k,
         reduction_policy=reduction_policy,
@@ -181,42 +182,40 @@ def _derive_groups(problem, hardware, blocks, spec):
     return tuple(groups)
 
 
-def _derive_executions(problem, hardware, blocks, groups, p_k, spec,
-                       util_scale=1):
-    """seed 규칙 2 — execution tile을 device의 최대 활용 단위로 묶는다.
+def _derive_tiles(problem, hardware, blocks, groups, p_k, spec,
+                  capacity_scale=1):
+    """seed 규칙 2 — execution tile에 묶을 block-group 개수를 고른다.
 
-    tile은 utilization_tile(한 device의 실행 자원을 가득 채우는 단위)까지만
-    키운다. device memory 용량(§11)은 GEMM이 PIM DRAM보다 클 때만 상한으로
-    작동한다: UPMEM처럼 memory가 작으면 용량 상한이 먼저 걸려 채우기가 되고,
-    AiMX처럼 실행 단위·memory가 크면 활용 단위에서 멈춘다.
+    derived capacity_limit는 profile의 논리 원소 상한까지만 키운다.
+    device memory 용량(§11)은 그 결과에 대한 별도 상한이다.
     """
     base = [blocks[i] * groups[i] for i in range(3)]
-    util = (hardware.utilization_tile_m,
-            hardware.utilization_tile_n,
-            hardware.utilization_tile_k)
+    limits = (hardware.capacity_limit_m,
+              hardware.capacity_limit_n,
+              hardware.capacity_limit_k)
     # K축의 문제 크기는 spatial plane 하나의 구간이다 (§16).
     dims = (problem.M, problem.N, ceil_div(problem.K, p_k))
-    executions = [1, 1, 1]
+    tiles = [1, 1, 1]
     for axis in range(3):
-        target = min(util[axis] * util_scale, dims[axis])
+        target = min(limits[axis] * capacity_scale, dims[axis])
         # 2배 단위 성장이 문제·K plane 크기를 넘지 않게 한다. 넘으면
         # Constraint 4(tile_k ≤ K plane)가 seed를 버리게 된다.
-        while (executions[axis] * 2 in spec.execution_values
-               and base[axis] * executions[axis] < target
-               and base[axis] * executions[axis] * 2 <= dims[axis]):
-            executions[axis] *= 2
+        while (tiles[axis] * 2 in spec.tile_values
+               and base[axis] * tiles[axis] < target
+               and base[axis] * tiles[axis] * 2 <= dims[axis]):
+            tiles[axis] *= 2
     # 용량 상한 (§11): 넘으면 k→n→m 순으로 반감한다.
     axis = 2
     while (gemm_footprint_bytes(
             problem,
-            base[0] * executions[0],
-            base[1] * executions[1],
-            base[2] * executions[2]) > hardware.device_memory_bytes
-           and max(executions) > 1):
-        if executions[axis] > 1:
-            executions[axis] //= 2
+            base[0] * tiles[0],
+            base[1] * tiles[1],
+            base[2] * tiles[2]) > hardware.device_memory_bytes
+           and max(tiles) > 1):
+        if tiles[axis] > 1:
+            tiles[axis] //= 2
         axis = (axis - 1) % 3
-    return tuple(executions)
+    return tuple(tiles)
 
 
 def heuristic_seeds(problem, hardware, spec):
@@ -224,17 +223,18 @@ def heuristic_seeds(problem, hardware, spec):
 
     seed 값은 상수가 아니라 profile 예산에서 유도한다:
       block/group  ← local memory 예산 채우기 (_derive_groups)
-      execution    ← device 최대 활용 단위로 묶기 (_derive_executions)
+      tile         ← execution tile의 block-group 개수 (_derive_tiles)
     seed는 전략 축(PK, distribution, tile 방향)만 서로 다르게 열고,
     어느 전략이 실제로 빠른지는 실측이 결정한다 (§31, §49).
     """
     blocks = (spec.block_values[0],) * 3
     groups = _derive_groups(problem, hardware, blocks, spec)
 
-    def seed(policy, strategy, util_scale=1):
-        executions = _derive_executions(
-            problem, hardware, blocks, groups, strategy[0], spec, util_scale)
-        return make_config(problem, hardware, blocks, groups, executions,
+    def seed(policy, strategy, capacity_scale=1):
+        tiles = _derive_tiles(
+            problem, hardware, blocks, groups, strategy[0], spec,
+            capacity_scale)
+        return make_config(problem, hardware, blocks, groups, tiles,
                            policy, strategy)
 
     # KSplit 전략은 하드코딩하지 않고 spec에서 고른다 — reduction 위치가
@@ -253,17 +253,17 @@ def heuristic_seeds(problem, hardware, spec):
             seeds.append(seed("N-major", strategy))
     if no_split is not None:
         # Seed E — large execution tile: reuse ↑, round 수 ↓
-        seeds.append(seed("MN-balanced", no_split, util_scale=2))
+        seeds.append(seed("MN-balanced", no_split, capacity_scale=2))
         # Seed F — small execution tile: parallelism ↑, memory footprint ↓
-        seeds.append(seed("MN-balanced", no_split, util_scale=0.5))
+        seeds.append(seed("MN-balanced", no_split, capacity_scale=0.5))
     # Seed G (Phase 2, §53) — weight-stationary: B를 상주시켜 steady-state
     # 전송을 최소화한다. runtime이 residency를 지원하지 않아 space를
     # 제한한 경우에는 만들지 않는다.
     if no_split is not None and "resident" in spec.residency_policies:
-        executions = _derive_executions(
+        tiles = _derive_tiles(
             problem, hardware, blocks, groups, 1, spec)
         seeds.append(make_config(
-            problem, hardware, blocks, groups, executions,
+            problem, hardware, blocks, groups, tiles,
             "N-major", no_split, b_residency="resident"))
     return seeds
 
@@ -277,11 +277,11 @@ def random_valid_configs(problem, hardware, spec, count, rng, engine):
         attempts += 1
         blocks = tuple(rng.choice(spec.block_values) for _ in range(3))
         groups = tuple(rng.choice(spec.group_values) for _ in range(3))
-        executions = tuple(rng.choice(spec.execution_values) for _ in range(3))
+        tiles = tuple(rng.choice(spec.tile_values) for _ in range(3))
         policy = rng.choice(spec.distribution_policies)
         strategy = rng.choice(spec.ksplit_strategies)
         config = make_config(
-            problem, hardware, blocks, groups, executions, policy, strategy,
+            problem, hardware, blocks, groups, tiles, policy, strategy,
             a_residency=rng.choice(spec.residency_policies),
             b_residency=rng.choice(spec.residency_policies),
             replication_policy=rng.choice(spec.replication_policies),

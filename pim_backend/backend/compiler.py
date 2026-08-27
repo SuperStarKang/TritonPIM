@@ -110,16 +110,14 @@ def _run_translate(mlir_text: str, which: str) -> str:
         return subprocess.check_output([tr, which, src]).decode("utf-8")
 
 
-# AiMX FPGA 하나가 커널에 내주는 PIM DRAM 예산 (byte).
-#
-# **보수적으로 선언한 값이다.** 진짜 용량은 driver 가 찍는 BAR 길이에서 읽는다:
-#   sudo dmesg | grep -E "PIM_MEM_[0-9]+\] BAR #4"
-# 할당을 키워 가며 재는 방법은 성립하지 않는다 — pim_malloc 은 1 MB 부터 16 GB 까지
-# 전부 '성공' 하고(주소만 떼어 준다) 진짜 실패하면 NULL 대신 프로세스를 죽인다.
-# profile 값은 물리 정격이 아니라 bank 하나에서 커널이 쓸 수 있다고 간주하는 usable
-# capacity다. 공통 pass는 256개 bank의 aggregate를 유도하고, AiMX lowering은 다시
-# bank당 interleaved footprint를 검사한다.
-AIMX_BANK_CAPACITY_BYTES = 256 << 20
+# AiMX runtime의 FPGA별 PIM DRAM heap과 정확히 같은 예산이다.
+# pim_sw/src/mem_src/mdrv_interface.c가 8 GiB에서 runtime 예약분 18 MiB를 뺀
+# 0x1FEE00000 byte를 device 하나의 heap으로 고정한다. Common profile은 용량을
+# bank 단위로 받으므로 이 총량을 256개 bank에 균등하게 나눈다. 32 MiB를 단순히
+# 넣으면 aggregate가 runtime heap보다 18 MiB 커져 경계 config가 다시 OOM 날 수 있다.
+AIMX_BANKS_PER_DEVICE = 256
+AIMX_DEVICE_HEAP_BYTES = 0x1FEE00000
+AIMX_BANK_CAPACITY_BYTES = AIMX_DEVICE_HEAP_BYTES // AIMX_BANKS_PER_DEVICE
 
 
 def _aimx_device_count() -> int:
@@ -178,16 +176,18 @@ def _aimx_profile(o) -> TargetProfile:
     # 전체에 걸쳐 분할되며 별개의 block group을 bank마다 배정하는 뜻이 아니다.
     # [batch, 4096/batch, 256/batch] 물리 눈금은 profile이 아니라 AiMX target
     # lowering에서 검증하고 padding한다.
-    # device 축은 열부터 4096 단위로 쪼갠다 — 행을 쪼개면 가장 큰 buffer 인 B 가
-    # device 수만큼 복제된다(설계 §6.1). bank 예산은 선언 상수(pim_malloc 은 실패해도
-    # NULL 대신 프로세스를 죽여 재 보는 방법이 없다)이고, bank_capacity_bytes 옵션은
-    # 공통 pass 의 k 상한 탐색과 --convert-pim-to-aimx 재검증이 같은 값을 보도록
-    # profile 에 싣는다.
+    # device 분할 순서는 n→m 이다 — 행을 쪼개면 가장 큰 buffer 인 B 가
+    # device 수만큼 복제된다(설계 §6.1). 분할 눈금은 target 의 물리 폭 4096을
+    # profile 문자열로 다시 넣지 않고, TargetSpec을 통해 공통 pass가 확정한
+    # #pim.execution_tile에서 유도한다. bank 예산은 선언 상수(pim_malloc은
+    # 실패해도 NULL 대신 프로세스를 죽여 재 보는 방법이 없다)이고,
+    # bank_capacity_bytes 옵션은 공통 pass의 k 상한 탐색과
+    # --convert-pim-to-aimx 재검증이 같은 값을 보도록 profile에 싣는다.
     batch = o.batch or 8
     return TargetProfile(
         parallel_execution_kind="simd",
         devices=o.num_units or _aimx_device_count(),
-        banks_per_device=256,
+        banks_per_device=AIMX_BANKS_PER_DEVICE,
         cores_per_bank=1,
         lanes=16,
         bank_bytes=o.bank_capacity_bytes or AIMX_BANK_CAPACITY_BYTES,
@@ -196,7 +196,6 @@ def _aimx_profile(o) -> TargetProfile:
         core_partitions="1,1,1",
         lane_axis="n",
         device_axis_priority="n,m",
-        device_axis_granularity="n:4096",
         device_axis_partitions=o.device_axis_partitions,
     )
 
@@ -270,7 +269,10 @@ def _ttsharedir_to_pim_common(ttshared: str, options) -> str:
         f"lanes={plan_lanes} lane-axis={lane_axis}")
     bg = _axis_options("group", options.group_m, options.group_n, options.group_k)
     form_block_groups = "--pim-form-block-groups" + (f"={bg}" if bg else "")
-    et = _axis_options("tile", options.tile_m, options.tile_n, options.tile_k)
+    # Common pass의 tile-m/n/k는 논리 원소 상한이다. 공개 option의
+    # tile_m/n/k(block-group 개수)와 혼합하지 않고 별도 값을 넘긴다.
+    et = _axis_options("tile", options.capacity_limit_m,
+                       options.capacity_limit_n, options.capacity_limit_k)
     form_execution_tiles = "--pim-form-execution-tiles" + (f"={et}" if et else "")
     return _run_opt(ttshared, [p.format(profile=profile,
                                         form_block_groups=form_block_groups,
@@ -390,6 +392,11 @@ class PIMOptions:
     tile_m: int = 0
     tile_n: int = 0
     tile_k: int = 0
+    # #pim.execution_tile에 넣는 유효 논리 원소 상한. tile_m/n/k는
+    # block-group 개수이고 helper가 BLOCK * GROUP * TILE로 이 값을 유도한다.
+    capacity_limit_m: int = 0
+    capacity_limit_n: int = 0
+    capacity_limit_k: int = 0
     local_lanes: int = 16        # PIM Core 내부 병렬 lane 능력값. 실제 값은 공통 pass 가 정한다.
     # 유닛당 빠른 메모리(공통 이름 — upmem 은 WRAM). 물리 64 KB 에서 스택·런타임 몫을 뺀 값.
     local_memory_bytes: int = 48 * 1024
@@ -430,6 +437,17 @@ class PIMOptions:
                 "PIMBackend requires an explicit `pim_target` option. "
                 "Supported values: 'upmem', 'aimx'."
             )
+        for axis in "mnk":
+            tile = getattr(self, f"tile_{axis}")
+            limit = getattr(self, f"capacity_limit_{axis}")
+            if tile and not limit:
+                raise ValueError(
+                    f"tile_{axis} is a block-group count and cannot be "
+                    "converted without BLOCK/GROUP context; use "
+                    "inter_device_plan/pim_launch_options or also provide "
+                    f"capacity_limit_{axis}=BLOCK_{axis.upper()}*"
+                    f"group_{axis}*tile_{axis}"
+                )
 
     def hash(self):
         key = '_'.join([f'{name}-{val}' for name, val in self.__dict__.items()])

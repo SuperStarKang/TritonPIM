@@ -23,7 +23,7 @@
 // k 남는 예산 전부다: 1 GiB에서 k_max = 103936 (kUnit 256의 배수), padded_k = 106496.
 // CHECK-LABEL: func.func @matmul
 // CHECK-SAME:    aimx.tile_group = #aimx.tile_group<block = [32, 32, 32], group = [1, 16, 1], execution = [32, 512, 32]>
-// CHECK-SAME:    aimx.tiling = #aimx.tiling<batch = 8, m_t = 32, k_t = 103936, n_t = 4096, padded_k = 106496, padded_n = 4096, transposed = false>
+// CHECK-SAME:    aimx.tiling = #aimx.tiling<batch = 8, t_m = 32, t_n = 4096, t_k = 103936, padded_k = 106496, padded_n = 4096, transposed = false>
 
 // FPGA 하나를 확보하고 그 안에서 buffer를 잡는다.
 // CHECK: aimx.acquire 1 : !aimx.device_set

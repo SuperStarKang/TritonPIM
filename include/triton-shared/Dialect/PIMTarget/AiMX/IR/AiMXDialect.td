@@ -127,14 +127,14 @@ def AiMX_OpcodeAttr : EnumAttr<AiMX_Dialect, AiMX_Opcode, "opcode">;
 // --convert-pim-to-aimx 가 고른 execution tile. --aimx-lower-matmul 이 이 값만 보고
 // descriptor program 을 펼치므로, tile 선택이라는 결정이 IR 에 한 번만 적힌다.
 //   batch     output block 을 batch x (4096/batch) 로 자르는 값. {1,2,4,8}
-//   m_t/k_t/n_t   execution tile. n_t 는 4096 element 고정이다
+//   t_m/t_n/t_k   padding이 반영된 물리 execution tile 크기
 //   padded_k  A 의 행 pitch (element). CHUNK = 4096 의 배수
 //   padded_n  B 와 C 의 행 pitch (element). 둘이 같아야 한다
 def AiMX_TilingAttr : AttrDef<AiMX_Dialect, "Tiling"> {
   let mnemonic = "tiling";
   let summary = "Execution tile chosen by --convert-pim-to-aimx";
-  let parameters = (ins "int64_t":$batch, "int64_t":$m_t, "int64_t":$k_t,
-                        "int64_t":$n_t, "int64_t":$padded_k,
+  let parameters = (ins "int64_t":$batch, "int64_t":$t_m, "int64_t":$t_n,
+                        "int64_t":$t_k, "int64_t":$padded_k,
                         "int64_t":$padded_n, "bool":$transposed);
   let assemblyFormat = "`<` struct(params) `>`";
 }
@@ -164,7 +164,7 @@ def AiMX_TileGroupAttr : AttrDef<AiMX_Dialect, "TileGroup"> {
     `[batch, 4096/batch, 256/batch]`. padding 은
     `execution[i] - block[i] * group[i]` 로 유도된다 — 따로 싣지 않는다.
 
-    execution tile은 이 block group의 정수 배이고 `#aimx.tiling`의 m_t/n_t/k_t에
+    execution tile은 이 block group의 정수 배이고 `#aimx.tiling`의 t_m/t_n/t_k에
     compile time 고정된다. tail round의 실제 유효 크기는 stage/unstage operand가
     표현하며 descriptor chain 모양은 바뀌지 않는다.
   }];
@@ -181,6 +181,21 @@ def AiMX_TileGroupAttr : AttrDef<AiMX_Dialect, "TileGroup"> {
 //===----------------------------------------------------------------------===//
 // Level 1 — host op
 //===----------------------------------------------------------------------===//
+
+// PIM Common의 target-neutral compute를 L1에서 잃지 않기 위한 compiler-only
+// template이다. body의 block argument는 원래 linalg op의 operand와 같은
+// 순서·type이고, body에는 linalg.matmul/matvec/generic 같은 의미 연산이
+// 하나 든다. L1은 이 template을 보존하고 L2 descriptor lowering이 소비한
+// 뒤 지운다. 따라서 최종 translator가 linalg를 host 연산으로 실행하지
+// 않으면서도, operation kind·operand 순서·scalar body를 attribute로 다시
+// 인코딩하지 않고 L2까지 유지한다.
+def AiMX_ComputeTemplateOp
+    : AiMX_Op<"compute_template", [NoTerminator, Symbol, IsolatedFromAbove]> {
+  let summary = "Target compute semantics retained between AiMX L1 and L2";
+  let arguments = (ins SymbolNameAttr:$sym_name, StrAttr:$kind);
+  let regions = (region SizedRegion<1>:$body);
+  let assemblyFormat = "$sym_name `kind` $kind attr-dict-with-keyword $body";
+}
 
 // FPGA 를 확보한다. UPMEM 과 달리 적재할 device program 이 없으므로 커널 심볼을 받지
 // 않는다. 짝이 되는 반납 op 이 없는 것은 upmem.acquire 와 같은 이유다 — 다음 호출이

@@ -79,8 +79,13 @@ def pim_launch_options(config, plan, hardware):
             f"k:{p_k}"),
         "group_m": config.group_m, "group_n": config.group_n,
         "group_k": config.group_k,
+        # tile_* is the number of block groups.  The Common pass still accepts
+        # logical element caps, so carry the derived values separately.
         "tile_m": config.tile_m, "tile_n": config.tile_n,
         "tile_k": config.tile_k,
+        "capacity_limit_m": config.capacity_limit_m,
+        "capacity_limit_n": config.capacity_limit_n,
+        "capacity_limit_k": config.capacity_limit_k,
     }
     if config.bank_p_m and config.bank_p_n and config.bank_p_k:
         options["bank_partitions"] = (
@@ -113,7 +118,8 @@ def _env_flag(name, default):
 
 def pim_autotune(target=None, hardware=None, cache_path=DEFAULT_CACHE_PATH,
                  budget=None, space_overrides=None, ref_fn=None, reps=1,
-                 seed=0, search=True, retune=False, verbose=True):
+                 seed=0, search=True, retune=False, verbose=True,
+                 rtol=0.0, atol=0.0):
     """PIM GEMM launch 함수를 autotune한다.
 
     데코레이트된 함수의 계약: fn(a, b, *, config, plan) -> 출력 텐서 (M, N).
@@ -135,6 +141,8 @@ def pim_autotune(target=None, hardware=None, cache_path=DEFAULT_CACHE_PATH,
       (예: residency_policies=("stream",))
     - ref_fn: 탐색 중 정답 검증 기준. None이면 표본 검증 —
       출력의 균등 표본 위치만 작은 참조 GEMM으로 직접 계산해 비교한다.
+    - rtol, atol: correctness의 상대/절대 허용 오차. 둘 다 0이면 기존의
+      bit-exact 검사와 같다. BF16 target은 명시적인 허용 오차를 주어야 한다.
     - reps: config당 측정 반복(median, §32). warmup 1회는 항상 수행해
       compile 시간을 측정에서 뺀다.
     """
@@ -142,7 +150,13 @@ def pim_autotune(target=None, hardware=None, cache_path=DEFAULT_CACHE_PATH,
     overrides = space_overrides if space_overrides is not None else {}
 
     def decorate(fn):
-        cache = PIMConfigCache(cache_path)
+        # 허용 오차가 달라지면 과거 correctness 결과를 재사용하면 안 된다.
+        # cache tuning key에 검증 정책을 포함해 자동으로 분리한다.
+        verify_kind = "custom" if ref_fn is not None else "sampled"
+        cache = PIMConfigCache(
+            cache_path,
+            template_version=(f"tile-counts-v1;verify={verify_kind};"
+                              f"rtol={rtol};atol={atol}"))
 
         @functools.wraps(fn)
         def wrapper(a, b):
@@ -168,7 +182,8 @@ def pim_autotune(target=None, hardware=None, cache_path=DEFAULT_CACHE_PATH,
                 reference = ref_fn(a, b)
 
                 def verify(out):
-                    return bool(torch.equal(out, reference))
+                    return bool(torch.allclose(out, reference,
+                                               rtol=rtol, atol=atol))
             else:
                 rows = _sample_indices(problem.M)
                 cols = _sample_indices(problem.N)
@@ -177,7 +192,8 @@ def pim_autotune(target=None, hardware=None, cache_path=DEFAULT_CACHE_PATH,
 
                 def verify(out):
                     got = out.index_select(0, rows).index_select(1, cols)
-                    return bool(torch.equal(got, ref_block))
+                    return bool(torch.allclose(got, ref_block,
+                                               rtol=rtol, atol=atol))
 
             def benchmark_fn(problem, hardware, config, plan):
                 # 첫 호출은 compile을 포함하므로 측정에서 뺀다.

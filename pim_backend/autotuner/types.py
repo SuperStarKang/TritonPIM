@@ -63,12 +63,12 @@ class PIMHardwareProfile:
     usable_bank_capacity_bytes: int
     usable_local_capacity_bytes: int
     alignment_bytes: int
-    # 한 PIM device의 실행 자원을 가득 채우는 작업 묶음(element 단위).
-    # execution tile seed는 이 단위로 묶인다. device memory 용량은 GEMM이
-    # PIM DRAM보다 클 때만 상한으로 작동한다. target별로 계산해 지정한다.
-    utilization_tile_m: int
-    utilization_tile_n: int
-    utilization_tile_k: int
+    # execution tile이 담을 유효 논리 원소 수의 target별 seed 상한.
+    # tile_m/n/k(block-group 개수)와 단위가 다르다. device memory는
+    # 이 상한을 만족하는지 별도로 검사한다.
+    capacity_limit_m: int
+    capacity_limit_n: int
+    capacity_limit_k: int
     # local memory에서 tile 버퍼가 쓸 수 없는 runtime 상주분 (§10의 S_runtime).
     # 예: UPMEM WRAM의 tasklet stack(lane 수 × stack 크기), sw_cache, heap.
     local_memory_reserved_bytes: int = 0
@@ -95,8 +95,8 @@ class PIMHardwareProfile:
 class PIMConfig:
     """AutoTuner가 변경하는 선택 변수 (§4, §51).
 
-    execution tile은 독립 knob이 아니라 derived configuration이다 (§5):
-        T_M = B_M * G_M * E_M  (tile_m property)
+    tile_m/n/k는 execution tile 하나에 묶는 block-group 개수다:
+        capacity_limit_M = B_M * G_M * tile_m
     p_k와 reduction_policy는 KSplitFragment로 함께 결정되고 (§6),
     p_m/p_n은 distribution_policy로부터 tile grid를 보고 계산된다 (§6.1).
     """
@@ -107,9 +107,9 @@ class PIMConfig:
     group_m: int
     group_n: int
     group_k: int
-    execution_m: int
-    execution_n: int
-    execution_k: int
+    tile_m: int
+    tile_n: int
+    tile_k: int
     distribution_policy: str
     p_m: int
     p_n: int
@@ -142,22 +142,22 @@ class PIMConfig:
     persistent_execution: bool = False
 
     @property
-    def tile_m(self):
-        return self.block_m * self.group_m * self.execution_m
+    def capacity_limit_m(self):
+        return self.block_m * self.group_m * self.tile_m
 
     @property
-    def tile_n(self):
-        return self.block_n * self.group_n * self.execution_n
+    def capacity_limit_n(self):
+        return self.block_n * self.group_n * self.tile_n
 
     @property
-    def tile_k(self):
-        return self.block_k * self.group_k * self.execution_k
+    def capacity_limit_k(self):
+        return self.block_k * self.group_k * self.tile_k
 
     def key(self):
         """중복 측정 방지용 identity (§43 loop에서 사용)."""
         return (self.block_m, self.block_n, self.block_k,
                 self.group_m, self.group_n, self.group_k,
-                self.execution_m, self.execution_n, self.execution_k,
+                self.tile_m, self.tile_n, self.tile_k,
                 self.distribution_policy,
                 self.p_m, self.p_n, self.p_k,
                 self.reduction_policy,
@@ -172,7 +172,7 @@ class PIMConfig:
         """diversity 비교용 tuning knob 목록 (§42)."""
         return (self.block_m, self.block_n, self.block_k,
                 self.group_m, self.group_n, self.group_k,
-                self.execution_m, self.execution_n, self.execution_k,
+                self.tile_m, self.tile_n, self.tile_k,
                 self.distribution_policy, self.p_k, self.reduction_policy,
                 self.bank_p_m, self.bank_p_n, self.bank_p_k,
                 self.core_p_m, self.core_p_n, self.core_p_k,

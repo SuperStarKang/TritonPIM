@@ -131,7 +131,7 @@ PIMTorchConfig(split_k=4)                ③ heuristic seed. 정답 확인용
 (`ConstraintEngine`)은 셋 다 똑같이 거친다.
 
 ③은 성능 숫자를 내는 용도가 아니다. seed는 shape를 다 보지 않는다 — 예를 들어
-`utilization_tile_m`이 어떤 M보다도 커서 `tile_m`이 항상 M까지 자라고, 그러면
+`capacity_limit_m`이 어떤 M보다도 커서 논리 execution tile이 항상 M까지 자라고, 그러면
 `e_m = 1`이라 M축 device 병렬이 0이 된다. 그 축을 흔드는 것은 탐색의 일이다.
 
 ### 실측해서 cache를 채우기
@@ -155,7 +155,7 @@ CPU partial 합이 모두 들어간다). config마다 `torch.compile`을 새로 
 ```
 python examples/torch_int_mm.py -v
   PIM _int_mm (M,N,K)=(128,256,1024): block=(16,16,16) group=(4,4,8)
-  execution=(2,1,2) tile=(128,64,256) devices=(1,4,4)=16/2048 rounds=1
+  tile=(2,1,2) capacity_limit=(128,64,256) devices=(1,4,4)=16/2048 rounds=1
   distribution=N-major reduction=host
 ```
 

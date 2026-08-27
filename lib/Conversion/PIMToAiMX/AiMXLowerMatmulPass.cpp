@@ -3,6 +3,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Twine.h"
@@ -83,6 +84,23 @@ struct AiMXLowerMatmulPass
     // 계산이 다음인데, 그 순서가 chain 안의 순서이기도 하다.
     OpBuilder mb(module.getBody(), module.getBody()->begin());
     for (func::FuncOp f : funcs) {
+      std::string templateName = (f.getName() + "_compute_template").str();
+      auto computeTemplate =
+          module.lookupSymbol<aimx::ComputeTemplateOp>(templateName);
+      if (!computeTemplate) {
+        f->emitError("aimx-lower-matmul: missing L1 compute template @")
+            << templateName;
+        return signalPassFailure();
+      }
+      SmallVector<linalg::MatmulOp> semanticMatmuls;
+      computeTemplate.walk(
+          [&](linalg::MatmulOp mm) { semanticMatmuls.push_back(mm); });
+      if (computeTemplate.getKind() != "matmul" ||
+          semanticMatmuls.size() != 1) {
+        computeTemplate.emitError(
+            "aimx-lower-matmul: expected one retained linalg.matmul");
+        return signalPassFailure();
+      }
       auto tiling = f->getAttrOfType<aimx::TilingAttr>("aimx.tiling");
       if (!tiling) {
         f->emitError("aimx-lower-matmul: aimx.tiling is not an #aimx.tiling");
@@ -110,9 +128,17 @@ struct AiMXLowerMatmulPass
       // attribute 가 같은 그림에서 나왔는지만 대조한다.
       auto ru = [](int64_t a, int64_t u) { return (a + u - 1) / u * u; };
       int64_t unit[3] = {batch, aimx::kLanes / batch, aimx::kRegSize / batch};
-      bool ok = tiling.getMT() % exec[0] == 0;
+      // group은 Common IR이 정한 logical block 묶음이고, target은 그 묶음의
+      // useful extent를 AiMX 실행 눈금으로 padding할 뿐이다. 예를 들어
+      // BLOCK_N=16, group_n=1, batch=8이면 logical group은 그대로 16열이고
+      // physical execution은 roundUp(16, 512)=512열이다. 예전 검사는 group_n도
+      // 512/16=32여야 한다고 요구해 Common의 grouping 결정을 target이 다시
+      // 선택하는 셈이었고, #pim.block_group=[1,1,1]인 정상 IR을 거부했다.
+      bool ok = tiling.getTM() % exec[0] == 0 &&
+                tiling.getTN() % exec[1] == 0 &&
+                tiling.getTK() % exec[2] == 0;
       for (int i = 0; i < 3; i++)
-        ok = ok && grp[i] == std::max<int64_t>(1, unit[i] / blk[i]) &&
+        ok = ok && blk[i] > 0 && grp[i] > 0 && exec[i] > 0 &&
              exec[i] == ru(grp[i] * blk[i], unit[i]);
       if (!ok) {
         f->emitError("aimx-lower-matmul: #aimx.tile_group disagrees with "
@@ -121,6 +147,10 @@ struct AiMXLowerMatmulPass
       }
       buildRelayout(mb, f.getName(), tiling);
       buildCompute(mb, f.getName(), tiling);
+      // descriptor program이 의미 연산을 완전히 대체했다. 최종 AIMX
+      // IR에 linalg가 남으면 translator가 그것을 host 연산으로 잘못
+      // 해석할 수 있으므로 L2 생성을 마친 시점에만 지운다.
+      computeTemplate.erase();
     }
   }
 

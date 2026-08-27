@@ -10,6 +10,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/STLExtras.h"
@@ -18,7 +19,6 @@
 
 #include <algorithm>
 #include <limits>
-#include <numeric>
 
 using namespace mlir;
 
@@ -64,8 +64,10 @@ using aimx::footprintOf;
 // linalg.matmul 의 operand 를 pim.access 의 id 로 되짚은 결과.
 struct Roles {
   int64_t a = -1, b = -1, c = -1;
-  // source 의 Triton block. A tile 이 BLOCK_M x BLOCK_K, B tile 이 BLOCK_K x BLOCK_N 이다.
-  // loop nest 를 지우기 전에 읽어야 한다 — 지운 뒤에는 이 값이 IR 어디에도 남지 않는다.
+  linalg::MatmulOp matmul;
+  // 이 시점의 linalg operand shape. --pim-form-block-groups 뒤이므로 원래 Triton
+  // BLOCK에 group tile 수가 곱해진 useful block-group shape다. 원래 BLOCK은
+  // #pim.block_group의 tiles로 나눠 복원한다. loop nest를 지우기 전에 읽어야 한다.
   int64_t blockM = 0, blockN = 0, blockK = 0;
 };
 
@@ -154,7 +156,7 @@ struct ConvertPIMToAiMXPass
         "cannot be chosen");
   }
 
-  // §6.1. (m_t, k_max, n_max)는 buffer와 재사용 descriptor chain의 고정 모양이다.
+  // §6.1. (t_m, t_k, t_n)은 buffer와 재사용 descriptor chain의 고정 모양이다.
   // tail execution tile은 stage에서 이 모양까지 0 padding하고 unstage는 유효 영역만
   // 회수한다. 할당해 보고 물러서는 길이가 없으므로 예산을 넘으면 여기서 멈춘다.
   LogicalResult checkBudget(Operation *at, int64_t batchV, int64_t mT,
@@ -163,6 +165,23 @@ struct ConvertPIMToAiMXPass
     if (failed(budgetBytes(at, budget)))
       return failure();
     fp = footprintOf(batchV, mT, kMax, nMax);
+    auto checkAllocation = [&](StringRef name, int64_t bytes) -> LogicalResult {
+      if (bytes <= aimx::kMaxRuntimeAllocationBytes)
+        return success();
+      return at->emitError("convert-pim-to-aimx: the ")
+             << name << " allocation needs " << bytes
+             << " byte, but the current AiMX runtime uses a signed int for "
+                "2 MiB pool expansion and supports at most "
+             << aimx::kMaxRuntimeAllocationBytes
+             << " byte in one allocation — lower tile_m, tile_n, or tile_k";
+    };
+    if (failed(checkAllocation("PMM", aimx::kPMMSize)) ||
+        failed(checkAllocation("A", fp.a)) ||
+        failed(checkAllocation("Arel", fp.arel)) ||
+        failed(checkAllocation("B", fp.b)) ||
+        failed(checkAllocation("C", fp.c)) ||
+        failed(checkAllocation("descriptor chain", fp.chain)))
+      return failure();
     int64_t banks = profile.getNumberOfBanksPerPimDevice();
     int64_t bankBudget = bankCapacityBytes >= 0
                              ? bankCapacityBytes
@@ -174,8 +193,8 @@ struct ConvertPIMToAiMXPass
              << perBank << " byte in each of " << banks
              << " banks but usable_bank_capacity_bytes is " << bankBudget;
     if (fp.total() > budget)
-      return at->emitError("convert-pim-to-aimx: the buffer bound (m_t=")
-             << mT << ", k_max=" << kMax << ", n_max=" << nMax << ") needs "
+      return at->emitError("convert-pim-to-aimx: the buffer bound (t_m=")
+             << mT << ", t_k=" << kMax << ", t_n=" << nMax << ") needs "
              << fp.total() << " byte of PIM DRAM but the budget is " << budget
              << " byte — lower tile_m, tile_k, or tile_n";
     return success();
@@ -226,6 +245,8 @@ struct ConvertPIMToAiMXPass
     Roles roles;
     if (failed(readRoles(device, roles)))
       return failure();
+    if (failed(preserveComputeTemplate(func, roles)))
+      return failure();
 
     llvm::DenseMap<int64_t, pim::PlaceOp> byAccess;
     SmallVector<pim::PlaceOp> all;
@@ -274,10 +295,9 @@ struct ConvertPIMToAiMXPass
     };
     BlockGroup mGroup = groupAt(0), nGroup = groupAt(1), kGroup = groupAt(2);
     int64_t batchV = batch;
-    // k tile 은 block group 과 vecA 적재 단위(256, §2.4 의 k_t % 256)를 동시에 채워야
-    // 한다. 물리 k 의 눈금은 그래서 둘의 lcm 이고, padding 이 없으면 256 그대로다.
-    int64_t kUnit = std::lcm(kGroup.phys, aimx::kRegSize);
-    int64_t kUnitUseful = kUnit / kGroup.phys * kGroup.useful;
+    // K의 논리 block-group 개수는 Common이 고른 값을 그대로 유지한다.
+    // vecA의 256-element 단위에 부족한 부분은 t_k의 물리 padding이지,
+    // 추가 논리 group이 아니다.
 
     // 상한(유효 원소)이 담는 group 수는 내림이다(최소 1) — 상한은 넘지 않는 약속이다.
     // host loop 은 유효 크기로 걷고 buffer 는 물리 크기로 잡는다. 세 축의 구체 수치는
@@ -297,7 +317,9 @@ struct ConvertPIMToAiMXPass
     int64_t mPhys = mCount * mGroup.phys;
     int64_t nMax =
         std::max<int64_t>(cap.getN() / nGroup.useful, 1) * nGroup.phys;
-    int64_t kMax = std::max<int64_t>(cap.getK() / kUnitUseful, 1) * kUnit;
+    int64_t kCount = std::max<int64_t>(cap.getK() / kGroup.useful, 1);
+    int64_t kMax = (kCount * kGroup.phys + aimx::kRegSize - 1) /
+                   aimx::kRegSize * aimx::kRegSize;
 
     Footprint fp;
     if (failed(checkBudget(device, batchV, mPhys, kMax, nMax, fp)))
@@ -305,7 +327,7 @@ struct ConvertPIMToAiMXPass
 
     // 이 attribute는 할당된 buffer와 descriptor chain의 고정 모양이다.
     func->setAttr("aimx.tiling",
-                  aimx::TilingAttr::get(ctx, batchV, mPhys, kMax, nMax,
+                  aimx::TilingAttr::get(ctx, batchV, mPhys, nMax, kMax,
                                         fp.paddedK, fp.paddedN,
                                         /*transposed=*/false));
     // 위 attribute 가 buffer 모양이라면 이쪽은 source 와 하드웨어의 관계다. group 이
@@ -314,10 +336,22 @@ struct ConvertPIMToAiMXPass
     auto i64s = [&](std::initializer_list<int64_t> v) {
       return DenseI64ArrayAttr::get(ctx, v);
     };
+    // linalg operand는 Common L1에서 이미 block group으로 묶였다. 이 grouped shape를
+    // block에 그대로 쓰고 group 수도 함께 기록하면 G를 두 번 곱하게 된다. target
+    // attribute의 block은 원래 Triton BLOCK, group은 그 BLOCK의 묶음 수로 유지한다.
+    if (roles.blockM % mGroup.tiles != 0 ||
+        roles.blockN % nGroup.tiles != 0 ||
+        roles.blockK % kGroup.tiles != 0)
+      return device->emitError(
+          "convert-pim-to-aimx: grouped linalg shape is not divisible by "
+          "#pim.block_group tile counts");
+    int64_t sourceBlockM = roles.blockM / mGroup.tiles;
+    int64_t sourceBlockN = roles.blockN / nGroup.tiles;
+    int64_t sourceBlockK = roles.blockK / kGroup.tiles;
     func->setAttr(
         "aimx.tile_group",
         aimx::TileGroupAttr::get(
-            ctx, i64s({roles.blockM, roles.blockN, roles.blockK}),
+            ctx, i64s({sourceBlockM, sourceBlockN, sourceBlockK}),
             i64s({mGroup.tiles, nGroup.tiles, kGroup.tiles}),
             i64s({mGroup.phys, nGroup.phys, kGroup.phys})));
 
@@ -376,7 +410,7 @@ struct ConvertPIMToAiMXPass
     PlacementBuffers buffers = buildSetup(
         fdBody, func.getName(), mPhys, kMax, nMax, fp);
     buildPlacement(device.getOperation(), aPlace, bPlace, cPlace, mUse, mPhys,
-                   kMax, nMax, mGroup, nGroup, kGroup, kUnit, fp, buffers);
+                   kMax, nMax, mGroup, nGroup, kGroup, kCount, fp, buffers);
 
     for (pim::PlaceOp p : all)
       p.erase();
@@ -385,6 +419,36 @@ struct ConvertPIMToAiMXPass
     // 남겨 두면 codegen 이 옮길 수 없는 값(누산기 초기값 f32 상수 같은 것)을 만나
     // 실패한다.
     eraseDead(func);
+    return success();
+  }
+
+  // L1이 operation 의미를 잃지 않도록 linalg op을 module-level
+  // aimx.compute_template으로 복제한다. 원래 op의 operand는 template
+  // block argument로 바꿔 IsolatedFromAbove 경계를 지킨다. 원래 logical loop
+  // nest는 L1 host loop로 바꾸면서 지우지만, 이 template은 L2가 descriptor
+  // program을 만들 때까지 남는다.
+  LogicalResult preserveComputeTemplate(func::FuncOp func, const Roles &roles) {
+    ModuleOp module = func->getParentOfType<ModuleOp>();
+    std::string name = (func.getName() + "_compute_template").str();
+    if (module.lookupSymbol(name))
+      return func->emitError("convert-pim-to-aimx: duplicate L1 compute template @")
+             << name;
+
+    OpBuilder mb(module.getBody(), module.getBody()->end());
+    auto tmpl = mb.create<aimx::ComputeTemplateOp>(
+        roles.matmul->getLoc(), mb.getStringAttr(name),
+        mb.getStringAttr("matmul"));
+
+    SmallVector<Type> argTypes(roles.matmul->getOperandTypes().begin(),
+                               roles.matmul->getOperandTypes().end());
+    SmallVector<Location> argLocs(argTypes.size(), roles.matmul->getLoc());
+    OpBuilder::InsertionGuard guard(mb);
+    Block *body = mb.createBlock(&tmpl.getBody(), {}, argTypes, argLocs);
+    IRMapping mapping;
+    for (auto [operand, argument] :
+         llvm::zip(roles.matmul->getOperands(), body->getArguments()))
+      mapping.map(operand, argument);
+    mb.clone(*roles.matmul, mapping);
     return success();
   }
 
@@ -426,6 +490,7 @@ struct ConvertPIMToAiMXPass
       return device->emitError("convert-pim-to-aimx: expected exactly one "
                                "pim.store inside pim.device, found ")
              << stores.size();
+    roles.matmul = matmuls[0];
 
     auto idOf = [&](Value tile, int64_t &id) -> LogicalResult {
       auto load = tile.getDefiningOp<pim::LoadOp>();
@@ -552,7 +617,7 @@ struct ConvertPIMToAiMXPass
                       pim::PlaceOp bPlace, pim::PlaceOp cPlace, int64_t mUse,
                       int64_t mPhys, int64_t kMax, int64_t nMax,
                       const BlockGroup &mGroup, const BlockGroup &nGroup,
-                      const BlockGroup &kGroup, int64_t kUnit,
+                      const BlockGroup &kGroup, int64_t kCount,
                       const Footprint &fp,
                       const PlacementBuffers &buffers) {
     OpBuilder b(at);
@@ -590,30 +655,32 @@ struct ConvertPIMToAiMXPass
     // 부분합이 tile 마다 PIM 밖으로 나와 C 전송이 k tile 수만큼 곱해진다. vACC 는 출력
     // block 하나 깊이(주소가 pmm+VACC_OFFSET 하나)라 invoke 를 건너 들고 있을 수 없으므로
     // 이것은 피할 수 있는 비용이 아니다. 그래서 k_max 는 예산이 허락하는 한 크게 두고
-    // (1 GiB, batch 8, m_t 16, n_max 4096 이면 115712), 자르는 일은 그것을 넘을 때만
+    // (1 GiB, batch 8, t_m 16, t_n 4096 이면 t_k=115712), 자르는 일은 그것을 넘을 때만
     // 일어난다 — 현실적인 k 는 전부 한 번에 들어간다.
-    int64_t kUnitUseful = (kUnit / kGroup.phys) * kGroup.useful;
-    // 단위 수는 최소 1 이다. device 분배가 이 device 에 일을 주지 않으면(범위 0)
-    // 단위 수가 0 이 되고 그 곱 k_t/n_t 가 tile 수 나눗셈의 분모로 들어가 SIGFPE 다.
+    // group 수는 최소 1 이다. device 분배가 이 device 에 일을 주지 않으면(범위 0)
+    // group 수가 0 이 되고 그 곱 t_k/t_n 이 tile 수 나눗셈의 분모로 들어가 SIGFPE 다.
     // 1 로 받치면 tile 수가 ceildiv(0, 단위) = 0 이라 loop 이 돌지 않는 no-op 이 된다.
-    Value kUnits = b.create<arith::MaxSIOp>(
+    Value kGroups = b.create<arith::MaxSIOp>(
         loc,
         b.create<arith::MinSIOp>(
              loc,
              b.create<arith::CeilDivSIOp>(loc, aPlace.getSize()[1],
-                                          idx(kUnitUseful))
+                                          idx(kGroup.useful))
                  .getResult(),
-             idx(kMax / kUnit))
+             idx(kCount))
             .getResult(),
         c1);
-    Value kRt = b.create<arith::MulIOp>(loc, kUnits, idx(kUnit)).getResult();
-    Value kUse = kGroup.pad()
-                     ? b.create<arith::MulIOp>(loc, kUnits, idx(kUnitUseful))
-                           .getResult()
-                     : kRt;
+    Value kPhysical = b.create<arith::MulIOp>(
+        loc, kGroups, idx(kGroup.phys)).getResult();
+    Value kRt = b.create<arith::MulIOp>(
+        loc,
+        b.create<arith::CeilDivSIOp>(loc, kPhysical, idx(aimx::kRegSize)),
+        idx(aimx::kRegSize));
+    Value kUse = b.create<arith::MulIOp>(
+        loc, kGroups, idx(kGroup.useful)).getResult();
     // n 의 눈금은 block group 의 물리 폭이다 (padding 이 없으면 출력 block 폭
     // 4096/batch 그대로). 4096 으로 올리면 batch > 1 에서 남는 열이 그대로 노는
-    // lane 이 된다 — N = 2560, batch = 8 이면 n_t 가 4096(1536 열 낭비)이 아니라
+    // lane 이 된다 — N = 2560, batch = 8 이면 t_n 이 4096(1536 열 낭비)이 아니라
     // 2560(낭비 0)이다. N >= n_max 면 어느 쪽이든 n_max 로 잘린다.
     Value nGroups = b.create<arith::MaxSIOp>(
         loc,
@@ -658,8 +725,8 @@ struct ConvertPIMToAiMXPass
     };
 
     // ── loop 순서: n → k → m ────────────────────────────────────────────────
-    // B 가 가장 큰 buffer(k_t * n_t * 2)이고 (k, n) 에만 의존하므로 두 축을 바깥에 둔다.
-    // A 는 (m, k) 에 의존하지만 m_t * padded_k * 2 로 훨씬 작아 안쪽이 맞다. k 를 가장
+    // B 가 가장 큰 buffer(t_k * t_n * 2)이고 (k, n) 에만 의존하므로 두 축을 바깥에 둔다.
+    // A 는 (m, k) 에 의존하지만 t_m * padded_k * 2 로 훨씬 작아 안쪽이 맞다. k 를 가장
     // 안쪽에 두면 B 가 m tile 마다 다시 올라가 전송량이 m tile 수만큼 곱해진다.
     // n 과 m 의 상대 순서를 바꾸는 것은 §8 I1 로 chain 을 재배치용과 계산용으로 나눈
     // 뒤에만 의미가 있다 — 지금은 chain 하나에 둘 다 붙어 있어 invoke 마다 재배치가

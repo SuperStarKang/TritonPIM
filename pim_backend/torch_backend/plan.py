@@ -90,8 +90,9 @@ class PIMExecutionPlan:
         p_m, p_n, p_k = p.active_device_grid
         return (f"block=({c.block_m},{c.block_n},{c.block_k}) "
                 f"group=({c.group_m},{c.group_n},{c.group_k}) "
-                f"execution=({c.execution_m},{c.execution_n},{c.execution_k}) "
                 f"tile=({c.tile_m},{c.tile_n},{c.tile_k}) "
+                f"capacity_limit=({c.capacity_limit_m},"
+                f"{c.capacity_limit_n},{c.capacity_limit_k}) "
                 f"devices=({p_m},{p_n},{p_k})={p_m * p_n * p_k}/"
                 f"{self.hardware.num_units} "
                 f"rounds={p.num_rounds} "
@@ -165,9 +166,9 @@ def _fit_k_axis(problem: PIMProblem, config: PIMConfig) -> PIMConfig:
     footprint는 작아지기만 하므로 Constraint 2를 새로 어길 수 없다. 그래도
     최종 판정은 ConstraintEngine이 한다."""
     k_plane = ceil_div(problem.K, config.p_k)
-    while config.block_k * config.group_k * config.execution_k > k_plane:
-        if config.execution_k > 1:
-            config = replace(config, execution_k=config.execution_k // 2)
+    while config.capacity_limit_k > k_plane:
+        if config.tile_k > 1:
+            config = replace(config, tile_k=config.tile_k // 2)
         elif config.group_k > 1:
             config = replace(config, group_k=config.group_k // 2)
         else:

@@ -30,6 +30,7 @@ PIM_OPTION_KEYS = (
     "host_threads",
     "group_m", "group_n", "group_k",
     "tile_m", "tile_n", "tile_k",
+    "capacity_limit_m", "capacity_limit_n", "capacity_limit_k",
     "device_axis_partitions",
     "bank_partitions", "core_partitions",
     "intra_device_lanes", "lane_axis",

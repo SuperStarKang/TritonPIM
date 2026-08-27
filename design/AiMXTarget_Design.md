@@ -36,6 +36,16 @@ Placed PIM Common IR을 AiMX FPGA의 CDMA descriptor stream으로 옮기는 계�
 (`matmul.cpp`: `set_info->r_size = padded_r_size`). B와 C의 행 pitch가 이 값이기
 때문이다 (§1.8). 아래 어디에서도 p/q/r을 쓰지 않는다.
 
+Compiler option과 target IR의 단위는 다음과 같이 구분한다.
+
+- `tile_m/n/k`: execution tile 하나에 묶는 **block-group 개수**
+- `capacity_limit_m/n/k`: `BLOCK * GROUP * TILE`로 유도한 **유효 논리 원소 상한**
+- `t_m/t_n/t_k`: AiMX padding을 반영한 `#aimx.tiling`의 **물리 tile 크기**
+
+`#pim.execution_tile` contract은 논리 원소 상한을 그대로 유지한다. Python
+driver가 `capacity_limit_*`를 Common pass의 내부 `tile-m/n/k` option으로 번역한다.
+AiMX target은 그 결정을 바꾸지 않고 물리 padding만 `t_*`에 반영한다.
+
 | 용어 | 뜻 | 크기 |
 | --- | --- | --- |
 | **lane** | multiply-accumulate 유닛 하나. `ALU_SIZE`의 단위 | 출력 원소 1개 |
@@ -51,7 +61,7 @@ Placed PIM Common IR을 AiMX FPGA의 CDMA descriptor stream으로 옮기는 계�
 | **channel tile** | channel 하나가 맡는 출력 | `1 × 256` |
 | **output block** | PIM Device의 lane 4096개가 한 번에 맡는 출력 | `batch × (4096/batch)` |
 | **reduction step** | vecA 한 번 적재가 지탱하는 reduction 구간 | `256/batch` |
-| **execution tile** | `pim_exec` 한 번이 덮는 범위. PIM Device 하나 안의 **시간적 상주 단위**다 (§3.4) | `(m_t, k_t, n_t)` |
+| **execution tile** | `pim_exec` 한 번이 덮는 범위. PIM Device 하나 안의 **시간적 상주 단위**다 (§3.4) | `(t_m, t_n, t_k)` |
 | **logical output tile** | Triton program instance 하나가 덮는 **출력** 직사각형 | `BLOCK_M × BLOCK_N` |
 | **internal reduction step** | 그 program instance 안의 `k` loop 한 걸음 | `BLOCK_K` |
 | **batch** | output block의 행 수. `{1, 2, 4, 8}` | `N_BATCH_SIZE_TYPES = 4`가 정한 상한 |

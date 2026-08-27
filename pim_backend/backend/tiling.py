@@ -2,23 +2,24 @@
 #
 #   BLOCK_M/N/K   Triton block grain
 #   group_m/n/k   block group (local-memory or hardware execution unit)
-#   tile_m/n/k    execution tile resident in one abstract PIM Device
+#   tile_m/n/k    number of block groups in one execution tile
+#   capacity_limit_m/n/k = BLOCK * group * tile (logical useful elements)
 #
 # Execution tiles may outnumber ``num_units`` on every spatial axis. The common
 # lowering reuses the same PIM Device set over multiple scheduling rounds.
 # ``split_k`` is the number of independent spatial partial-output planes;
-# ``tile_k`` is the resident temporal K window inside each plane.
+# ``capacity_limit_k`` is the resident temporal K window inside each plane.
 
 
 def _ceil_div(value, divisor):
     return (value + divisor - 1) // divisor
 
 
-def _active_device_grid(M, N, K, execution_m, execution_n,
+def _active_device_grid(M, N, K, capacity_limit_m, capacity_limit_n,
                         spatial_planes, num_units):
     """Choose the active M/N/K PIM Device grid of one scheduling round."""
-    execution_tiles_m = _ceil_div(M, execution_m)
-    execution_tiles_n = _ceil_div(N, execution_n)
+    execution_tiles_m = _ceil_div(M, capacity_limit_m)
+    execution_tiles_n = _ceil_div(N, capacity_limit_n)
 
     best_grid = None
     best_score = None
@@ -61,8 +62,9 @@ def inter_device_plan(M, N, K, *,
 
     Each scheduling round assigns at most one M/N execution tile to an abstract
     PIM Device. More M/N tiles create more rounds over the same Device set. A
-    ``split_k`` controls independent spatial output planes, while ``tile_k``
-    controls the resident temporal window accumulated inside each plane.
+    ``split_k`` controls independent spatial output planes. ``tile_m/n/k`` are
+    block-group counts; the helper derives the logical element caps consumed by
+    PIM Common IR.
     """
     assert tile_m is not None and tile_n is not None, (
         "inter_device_plan은 구체적인 tile_m과 tile_n을 필요로 합니다")
@@ -78,12 +80,8 @@ def inter_device_plan(M, N, K, *,
     group_size_m = group_m * BLOCK_M
     group_size_n = group_n * BLOCK_N
     group_size_k = group_k * BLOCK_K
-    assert tile_m % group_size_m == 0, (
-        f"tile_m({tile_m})은 M block group 크기({group_size_m})의 배수여야 "
-        "합니다")
-    assert tile_n % group_size_n == 0, (
-        f"tile_n({tile_n})은 N block group 크기({group_size_n})의 배수여야 "
-        "합니다")
+    capacity_limit_m = group_size_m * tile_m
+    capacity_limit_n = group_size_n * tile_n
 
     options = {
         "group_m": group_m,
@@ -93,15 +91,14 @@ def inter_device_plan(M, N, K, *,
 
     spatial_planes = 1
     if tile_k is not None:
-        assert tile_k % group_size_k == 0, (
-            f"tile_k({tile_k})는 K block group 크기({group_size_k})의 배수여야 "
-            "합니다")
+        capacity_limit_k = group_size_k * tile_k
         # split_k를 생략한 기존 사용법은 tile_k 하나를 spatial plane 하나로 본다.
         # 더 큰 plane 안에서 temporal window를 사용하려면 split_k를 명시한다.
         if split_k is None:
-            assert K % tile_k == 0, (
-                f"split_k를 생략하면 K({K})는 tile_k({tile_k})의 배수여야 합니다")
-            spatial_planes = K // tile_k
+            assert K % capacity_limit_k == 0, (
+                f"split_k를 생략하면 K({K})는 capacity_limit_k"
+                f"({capacity_limit_k})의 배수여야 합니다")
+            spatial_planes = K // capacity_limit_k
         else:
             spatial_planes = split_k
         assert K % spatial_planes == 0, (
@@ -110,8 +107,9 @@ def inter_device_plan(M, N, K, *,
         assert local_k % BLOCK_K == 0, (
             f"각 K plane({local_k})이 BLOCK_K({BLOCK_K}) 격자에 "
             "맞아야 합니다")
-        assert tile_k <= local_k, (
-            f"tile_k({tile_k})는 각 spatial K plane({local_k})보다 클 수 없습니다")
+        assert capacity_limit_k <= local_k, (
+            f"capacity_limit_k({capacity_limit_k})는 각 spatial K plane"
+            f"({local_k})보다 클 수 없습니다")
         options["SPLIT_K"] = spatial_planes
     else:
         assert split_k is None, (
@@ -119,7 +117,8 @@ def inter_device_plan(M, N, K, *,
             "tile_k도 지정해야 합니다")
 
     devices_m, devices_n, devices_k = _active_device_grid(
-        M, N, K, tile_m, tile_n, spatial_planes, num_units)
+        M, N, K, capacity_limit_m, capacity_limit_n, spatial_planes,
+        num_units)
     parts = {
         "m": devices_m,
         "n": devices_n,
@@ -132,8 +131,11 @@ def inter_device_plan(M, N, K, *,
     options["num_units"] = num_units
     options["tile_m"] = tile_m
     options["tile_n"] = tile_n
+    options["capacity_limit_m"] = capacity_limit_m
+    options["capacity_limit_n"] = capacity_limit_n
     if tile_k is not None:
         options["tile_k"] = tile_k
+        options["capacity_limit_k"] = capacity_limit_k
     return options
 
 

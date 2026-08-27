@@ -30,8 +30,8 @@ hardware = PIMHardwareProfile(
     banks_per_device=1, cores_per_bank=1, lanes_per_core=16,
     usable_bank_capacity_bytes=60 * 1024 * 1024,
     usable_local_capacity_bytes=48 * 1024, alignment_bytes=8,
-    # 한 device의 실행 자원을 가득 채우는 작업 묶음 — target 실측으로 지정
-    utilization_tile_m=..., utilization_tile_n=..., utilization_tile_k=...,
+    # execution tile의 논리 원소 seed 상한 — target 실측으로 지정
+    capacity_limit_m=..., capacity_limit_n=..., capacity_limit_k=...,
     target_constraints={"k_split_block_multiple": True},
 )
 
@@ -67,10 +67,9 @@ result.best.result    # PIMBenchmarkResult
 - **seed는 상수가 아니라 profile 예산에서 유도한다** (target-중립):
   - block/group — local memory 예산을 채울 때까지 m→n→k 번갈아 2배
     (MLIR 공통 pass의 block group 자동 산출과 같은 철학).
-  - execution tile — profile의 `utilization_tile_*`(한 device의 실행 자원을
-    가득 채우는 단위)로 묶는다. device memory 용량(§11)은 GEMM이 PIM DRAM보다
-    클 때만 상한으로 작동한다. UPMEM처럼 memory가 작으면 용량 상한이 먼저
-    걸려 채우기가 되고, AiMX처럼 실행 단위·memory가 크면 활용 단위에서 멈춘다.
+  - execution tile — `tile_m/n/k`는 block-group 개수다. 논리 원소 상한은
+    `capacity_limit = BLOCK * GROUP * TILE`로 유도하고 profile의
+    `capacity_limit_*` seed 상한을 넘지 않도록 묶는다. device memory는 별도로 검사한다.
   - seed는 전략 축(PK / distribution / tile 방향)만 서로 다르게 열고,
     utilization은 seed 유도에만 쓰며 objective는 항상 실측 total_ms다 (§31).
 - **KSplitFragment 범위**: 문서 예시는 PK≤8이지만 UPMEM 실측 최적점

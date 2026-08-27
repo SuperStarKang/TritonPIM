@@ -64,32 +64,32 @@ class ScoredCandidate:
 # tree가 중요하게 본 결과 feature는 직접 tuning parameter가 아니므로,
 # 그 feature에 영향을 주는 semantic fragment로 되돌린다.
 PLAN_FEATURE_INFLUENCE = {
-    "active_units": ("distribution", "execution_m", "execution_n"),
-    "effective_utilization": ("distribution", "execution_m", "execution_n"),
-    "execution_tile_count": ("execution_m", "execution_n", "execution_k"),
-    "scheduling_rounds": ("distribution", "execution_m", "execution_n"),
-    "h2d_bytes": ("distribution", "execution_m", "execution_n", "execution_k",
+    "active_units": ("distribution", "tile_m", "tile_n"),
+    "effective_utilization": ("distribution", "tile_m", "tile_n"),
+    "execution_tile_count": ("tile_m", "tile_n", "tile_k"),
+    "scheduling_rounds": ("distribution", "tile_m", "tile_n"),
+    "h2d_bytes": ("distribution", "tile_m", "tile_n", "tile_k",
                   "residency", "streaming"),
-    "d2h_bytes": ("ksplit", "execution_m", "execution_n"),
-    "a_replication_bytes": ("distribution", "execution_m", "execution_n",
+    "d2h_bytes": ("ksplit", "tile_m", "tile_n"),
+    "a_replication_bytes": ("distribution", "tile_m", "tile_n",
                             "residency", "replication"),
-    "b_replication_bytes": ("distribution", "execution_m", "execution_n",
+    "b_replication_bytes": ("distribution", "tile_m", "tile_n",
                             "residency", "replication"),
     "a_resident_bytes": ("residency", "replication"),
     "b_resident_bytes": ("residency", "replication"),
-    "reduction_bytes": ("ksplit", "execution_k"),
+    "reduction_bytes": ("ksplit", "tile_k"),
     "reduction_rounds": ("ksplit",),
-    "padding_ratio": ("execution_m", "execution_n", "execution_k"),
-    "load_imbalance": ("distribution", "execution_m", "execution_n"),
+    "padding_ratio": ("tile_m", "tile_n", "tile_k"),
+    "load_imbalance": ("distribution", "tile_m", "tile_n"),
     "local_memory_pressure": ("block_m", "block_n", "block_k",
                               "group_m", "group_n", "group_k"),
-    "device_memory_pressure": ("execution_m", "execution_n", "execution_k",
+    "device_memory_pressure": ("tile_m", "tile_n", "tile_k",
                                "residency", "streaming"),
     "descriptor_build_count": ("persistence",),
     "descriptor_transfer_bytes": ("persistence",),
     "descriptor_reuse_factor": ("persistence",),
     "command_build_count": ("persistence",),
-    "kernel_launch_count": ("persistence", "execution_m", "execution_n"),
+    "kernel_launch_count": ("persistence", "tile_m", "tile_n"),
     "device_alloc_count": ("persistence",),
 }
 
@@ -103,8 +103,7 @@ def influenced_fragments(feature_name):
     if feature_name.startswith("log2_group_"):
         return ("group_" + feature_name[-1],)
     if feature_name.startswith("log2_tile_"):
-        # tile 크기는 derived이므로 execution multiplier로 조절한다 (§5).
-        return ("execution_" + feature_name[-1],)
+        return ("tile_" + feature_name[-1],)
     if feature_name in ("p_m", "p_n"):
         return ("distribution",)
     if feature_name == "p_k":
@@ -147,7 +146,7 @@ def semantic_mutate(config, fragment_kinds, problem, hardware, spec):
     """
     blocks = (config.block_m, config.block_n, config.block_k)
     groups = (config.group_m, config.group_n, config.group_k)
-    executions = (config.execution_m, config.execution_n, config.execution_k)
+    tiles = (config.tile_m, config.tile_n, config.tile_k)
     policy = config.distribution_policy
     strategy_index = spec.ksplit_strategies.index(
         (config.p_k, config.reduction_policy))
@@ -155,7 +154,7 @@ def semantic_mutate(config, fragment_kinds, problem, hardware, spec):
         config.persistence_strategy())
 
     def rebuild(new_blocks=blocks, new_groups=groups,
-                new_executions=executions, new_policy=policy,
+                new_tiles=tiles, new_policy=policy,
                 new_strategy_index=strategy_index,
                 a_residency=config.a_residency,
                 b_residency=config.b_residency,
@@ -163,7 +162,7 @@ def semantic_mutate(config, fragment_kinds, problem, hardware, spec):
                 streaming_policy=config.streaming_policy,
                 new_persistence_index=persistence_index):
         return make_config(problem, hardware, new_blocks, new_groups,
-                           new_executions, new_policy,
+                           new_tiles, new_policy,
                            spec.ksplit_strategies[new_strategy_index],
                            a_residency=a_residency, b_residency=b_residency,
                            replication_policy=replication_policy,
@@ -185,12 +184,12 @@ def semantic_mutate(config, fragment_kinds, problem, hardware, spec):
                 new = list(groups)
                 new[axis] = value
                 neighbors.append(rebuild(new_groups=tuple(new)))
-        elif kind.startswith("execution_"):
+        elif kind.startswith("tile_"):
             axis = _AXIS_INDEX[kind[-1]]
-            for value in _step_values(spec.execution_values, executions[axis]):
-                new = list(executions)
+            for value in _step_values(spec.tile_values, tiles[axis]):
+                new = list(tiles)
                 new[axis] = value
-                neighbors.append(rebuild(new_executions=tuple(new)))
+                neighbors.append(rebuild(new_tiles=tuple(new)))
         elif kind == "distribution":
             for other in spec.distribution_policies:
                 if other != policy:
@@ -331,7 +330,8 @@ def tune(problem, hardware, benchmark_fn, *, space=None, cache=None,
             print(f"[autotuner] "
                   f"B=({config.block_m},{config.block_n},{config.block_k}) "
                   f"G=({config.group_m},{config.group_n},{config.group_k}) "
-                  f"tile={plan.execution_tile_shape} "
+                  f"tile=({config.tile_m},{config.tile_n},{config.tile_k}) "
+                  f"capacity_limit={plan.execution_tile_shape} "
                   f"P={grid} {config.distribution_policy}/"
                   f"{config.reduction_policy}", end="", flush=True)
         stored = measured.get(config.key())
@@ -382,7 +382,7 @@ def tune(problem, hardware, benchmark_fn, *, space=None, cache=None,
                 problem, hardware,
                 (cached.block_m, cached.block_n, cached.block_k),
                 (cached.group_m, cached.group_n, cached.group_k),
-                (cached.execution_m, cached.execution_n, cached.execution_k),
+                (cached.tile_m, cached.tile_n, cached.tile_k),
                 cached.distribution_policy,
                 strategy,
                 a_residency=cached.a_residency,

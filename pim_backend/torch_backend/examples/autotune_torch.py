@@ -141,8 +141,10 @@ def main():
     print(f"\nbest {best.result.total_ms:.3f} ms")
     print(f"  block=({c.block_m},{c.block_n},{c.block_k}) "
           f"group=({c.group_m},{c.group_n},{c.group_k}) "
-          f"execution=({c.execution_m},{c.execution_n},{c.execution_k})")
-    print(f"  tile=({c.tile_m},{c.tile_n},{c.tile_k}) "
+          f"tile=({c.tile_m},{c.tile_n},{c.tile_k}) "
+          f"capacity_limit=({c.capacity_limit_m},{c.capacity_limit_n},"
+          f"{c.capacity_limit_k})")
+    print(f"  execution_shape={p.execution_tile_shape} "
           f"devices={p.active_device_grid} rounds={p.num_rounds}")
     print(f"  distribution={c.distribution_policy} "
           f"reduction={c.reduction_policy}")

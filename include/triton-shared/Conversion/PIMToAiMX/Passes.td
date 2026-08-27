@@ -17,11 +17,11 @@ def ConvertPIMToAiMX : Pass<"convert-pim-to-aimx", "mlir::ModuleOp"> {
     **buffer 크기만 compile time 상수여야 하고, tile 모양은 아니다.** `pim_malloc` 은
     실패해도 NULL 을 돌려주지 않고 프로세스를 죽이므로 할당량은 compile time 에
     확정해야 한다. 그러나 `--aimx-lower-matmul` 이 만드는 descriptor program 은
-    `m_t`·`k_t`·`padded_k`·`padded_n` 을 **함수 인자로 받는다** — compile time 상수로
+    `t_m`·`t_k`·`padded_k`·`padded_n` 을 **함수 인자로 받는다** — compile time 상수로
     쓰는 것은 `batch` 하나뿐이다. 그래서 둘을 나눈다.
 
       k_max, n_max : buffer 를 잡는 크기. compile time. 공통 execution tile이 정한다
-      k_t,   n_t   : descriptor program 이 실제로 도는 길이. 런타임. pim.place 에서 온다
+      t_k,   t_n   : descriptor program 이 실제로 도는 길이. 런타임. pim.place 에서 온다
 
     선택 (§6.1): 세 계층은 전부 공통 IR 이 정한다. block group 은 `#pim.block_group`
     (Triton block 정수 개를 묶은 target-neutral 단위), execution
@@ -31,12 +31,12 @@ def ConvertPIMToAiMX : Pass<"convert-pim-to-aimx", "mlir::ModuleOp"> {
     lowering의 option이며 profile에는 들어가지 않는다. 이 pass는 block-group useful
     shape을 [batch, 4096/batch, 256/batch] 눈금으로 padding하고 buffer를 잡는다.
 
-      m_t   = group 수 × 물리 group 높이 — 전송량 식에서 m_t 는 A 의
-              ceil(M/m_t)*m_t 항에만 나타나므로 작을수록 좋다
+      t_m   = group 수 × 물리 group 높이 — 전송량 식에서 t_m 는 A 의
+              ceil(M/t_m)*t_m 항에만 나타나므로 작을수록 좋다
       n_max = group 수 × 물리 group 폭
       k_max = kUnit 수 × kUnit. allocation별 per-bank 예산 재검증을 넘으면 진단
-      k_t   = min(256 * ceil(k / 256), k_max)                  (런타임)
-      n_t   = min((4096/batch) * ceil(N / (4096/batch)), n_max)  (런타임)
+      t_k   = min(256 * ceil(k / 256), k_max)                  (런타임)
+      t_n   = min((4096/batch) * ceil(N / (4096/batch)), n_max)  (런타임)
 
     상한은 유효 원소 기준이고 buffer 는 물리 크기다 — block group 에 padding 이 있으면
     (block 이 실행 단위와 어긋날 때) host loop 은 유효 크기로 걷고 하드웨어는 물리
@@ -44,7 +44,7 @@ def ConvertPIMToAiMX : Pass<"convert-pim-to-aimx", "mlir::ModuleOp"> {
 
     n 의 올림 단위는 4096 이 아니라 **출력 block 폭 4096/batch** 다. 그것이 하드웨어가
     한 번에 소비하는 최소 단위이고, 그보다 거칠게 올리면 남는 열이 그대로 노는 lane 이
-    된다 (N = 2560, batch = 8 이면 n_t 가 4096 이 아니라 2560 이다).
+    된다 (N = 2560, batch = 8 이면 t_n 이 4096 이 아니라 2560 이다).
 
     host loop 은 **n → k → m** 이다. 가장 큰 buffer 인 B 가 `(k, n)` 에만 의존하므로 그
     둘을 바깥에 두고, 훨씬 작은 A 를 안쪽에서 m 마다 올린다. n 과 m 의 상대 순서는 §8
@@ -95,7 +95,7 @@ def AiMXLowerMatmul : Pass<"aimx-lower-matmul", "mlir::ModuleOp"> {
 
     주소식은 참조 구현(`_matmul_silent`)의 offset 식 그대로이고 전부 byte 단위다.
     이 pass 가 정하는 것은 descriptor 의 순서와 주소식뿐이며, 그것을 정하는 값
-    (batch, m_t, k_t, n_t, padded_k, padded_n)은 전부 `#aimx.tiling` 에서 온다.
+    (batch, t_m, t_n, t_k, padded_k, padded_n)은 전부 `#aimx.tiling` 에서 온다.
   }];
   let constructor = "mlir::triton::createAiMXLowerMatmulPass()";
   let dependentDialects = ["mlir::aimx::AiMXDialect", "mlir::arith::ArithDialect",

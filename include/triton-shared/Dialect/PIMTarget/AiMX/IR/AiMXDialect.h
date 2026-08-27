@@ -41,6 +41,13 @@ constexpr int64_t kPMMSize = 0x30000;
 constexpr int64_t kVACCOffset = 0x10000;
 constexpr int64_t kPMMAlign = 256 * 1024;
 
+// pim_sw의 multi_mmap_drv는 allocation을 2 MiB pool 단위로 확장하면서 크기를
+// signed int로 받는다. 따라서 2 GiB(0x80000000)부터 음수로 overflow한다.
+// runtime을 바꾸지 않는 동안 한 allocation이 요청할 수 있는 최대 안전 크기는
+// INT32_MAX 이하의 가장 큰 2 MiB 배수다.
+constexpr int64_t kRuntimePoolBytes = 2 * 1024 * 1024;
+constexpr int64_t kMaxRuntimeAllocationBytes = 1023 * kRuntimePoolBytes;
+
 // PIM Device 하나가 한 step 에 내는 출력 byte 수 = lane 수 * TYPE_SIZE.
 constexpr int64_t kDeviceWidth = kNumBanks * kNumChannels * kALUSize * kTypeSize;
 constexpr int64_t kLanes = kDeviceWidth / kTypeSize;  // 4096

@@ -19,6 +19,18 @@ RESULT_FIELDS = ("total_ms", "stage_ms", "h2d_ms", "compute_ms",
                  "compile_status", "correctness")
 
 
+def _decode_config(stored):
+    """Read both the old execution_* spelling and the tile-count spelling."""
+    values = dict(stored)
+    for axis in "mnk":
+        old = f"execution_{axis}"
+        new = f"tile_{axis}"
+        if old in values:
+            values.setdefault(new, values[old])
+            del values[old]
+    return PIMConfig(**values)
+
+
 class PIMConfigCache:
     def __init__(self, path, template_version="", compiler_version=""):
         self.path = path
@@ -53,7 +65,7 @@ class PIMConfigCache:
         entry = self.entries.get(self._key(problem, hardware))
         if entry is None:
             return None
-        return PIMConfig(**entry["config"])
+        return _decode_config(entry["config"])
 
     def lookup_result(self, problem, hardware):
         """정확히 같은 tuning key의 (best config, 저장된 측정 결과).
@@ -63,10 +75,10 @@ class PIMConfigCache:
         entry = self.entries.get(self._key(problem, hardware))
         if entry is None:
             return None
-        config = PIMConfig(**entry["config"])
+        config = _decode_config(entry["config"])
         stored = {"total_ms": entry["total_ms"]}
         for record in entry.get("records", ()):
-            if PIMConfig(**record["config"]).key() == config.key():
+            if _decode_config(record["config"]).key() == config.key():
                 stored = {field: record[field] for field in RESULT_FIELDS}
                 break
         return config, PIMBenchmarkResult(**stored)
@@ -81,7 +93,7 @@ class PIMConfigCache:
             return {}
         results = {}
         for record in entry.get("records", ()):
-            config = PIMConfig(**record["config"])
+            config = _decode_config(record["config"])
             results[config.key()] = {
                 field: record[field] for field in RESULT_FIELDS}
         return results
@@ -99,7 +111,7 @@ class PIMConfigCache:
                         + abs(math.log2(problem.K / k)))
             matches.append((distance, entry))
         matches.sort(key=lambda pair: pair[0])
-        return [PIMConfig(**entry["config"]) for _, entry in matches[:limit]]
+        return [_decode_config(entry["config"]) for _, entry in matches[:limit]]
 
     def store(self, problem, hardware, record, records=()):
         """best config·plan metadata와 측정 이력 전체를 저장한다 (§45).
@@ -112,7 +124,7 @@ class PIMConfigCache:
         previous = self.entries.get(key)
         if previous is not None:
             for old in previous.get("records", ()):
-                merged[PIMConfig(**old["config"]).key()] = old
+                merged[_decode_config(old["config"]).key()] = old
         for measured in records:
             merged[measured.config.key()] = {
                 "config": asdict(measured.config),

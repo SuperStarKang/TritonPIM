@@ -44,7 +44,9 @@ class PIMPlanner:
     def build(self, config):
         problem = self.problem
         M, N, K = problem.M, problem.N, problem.K
-        t_m, t_n, t_k = config.tile_m, config.tile_n, config.tile_k
+        t_m = config.capacity_limit_m
+        t_n = config.capacity_limit_n
+        t_k = config.capacity_limit_k
 
         # §15 — execution tile grid
         e_m = ceil_div(M, t_m)

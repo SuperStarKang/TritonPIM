@@ -467,34 +467,34 @@ reduction 비용 변화
 
 가능하다면 모든 크기를 독립적인 tuning knob로 두지 않는 것이 좋다.
 
-예를 들어 execution tile이 block group의 정수배라는 구조라면:
+예를 들어 `tile_m/n/k`를 execution tile에 묶는 block-group 개수로 두면:
 
 $$
-T_M = B_M G_M E_M
-$$
-
-$$
-T_N = B_N G_N E_N
+C_M = B_M G_M \operatorname{tile}_M
 $$
 
 $$
-T_K = B_K G_K E_K
+C_N = B_N G_N \operatorname{tile}_N
 $$
 
-로 정의할 수 있다.
+$$
+C_K = B_K G_K \operatorname{tile}_K
+$$
+
+로 논리 원소 상한 `capacity_limit_m/n/k`를 유도할 수 있다.
 
 그러면 tuner는
 
 ```text
-BM BN BK
-GM GN GK
-EM EN EK
+block_m/n/k
+group_m/n/k
+tile_m/n/k
 ```
 
 만 탐색하고,
 
 ```text
-TM TN TK
+capacity_limit_m/n/k
 ```
 
 는 자동으로 계산한다.
@@ -2698,9 +2698,14 @@ PIMConfig {
     group_n
     group_k
 
-    execution_m
-    execution_n
-    execution_k
+    tile_m
+    tile_n
+    tile_k
+
+    # derived logical useful-element bounds
+    capacity_limit_m
+    capacity_limit_n
+    capacity_limit_k
 
     distribution_policy
 

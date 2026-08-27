@@ -16,7 +16,7 @@
 // 물리 눈금 256으로 바뀐다: k_max = 119040, padded_k = 122880.
 // CHECK-LABEL: func.func @matmul
 // CHECK-SAME:    aimx.tile_group = #aimx.tile_group<block = [32, 96, 24], group = [1, 21, 5], execution = [32, 2048, 128]>
-// CHECK-SAME:    aimx.tiling = #aimx.tiling<batch = 2, m_t = 32, k_t = 119040, n_t = 4096, padded_k = 122880, padded_n = 4096, transposed = false>
+// CHECK-SAME:    aimx.tiling = #aimx.tiling<batch = 2, t_m = 32, t_n = 4096, t_k = 119040, padded_k = 122880, padded_n = 4096, transposed = false>
 
 // buffer 크기는 물리 크기에서 나온다. A(32*122880*2), Arel(32*119040*32),
 // B(119040*4096*2), C(32*4096*2), descriptor chain도 같은 상한을 쓴다.
