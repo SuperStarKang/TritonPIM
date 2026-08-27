@@ -130,6 +130,8 @@ public:
       binary("(A > B ? A : B)");
     else if (isa<arith::AddFOp>(op))
       binary("A + B");
+    else if (isa<arith::SubFOp>(op))
+      binary("A - B");
     else if (isa<arith::MulFOp>(op))
       binary("A * B");
     else if (isa<arith::IndexCastOp>(op) || isa<arith::ExtSIOp>(op) ||

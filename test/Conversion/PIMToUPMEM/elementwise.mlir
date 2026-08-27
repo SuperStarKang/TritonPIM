@@ -1,4 +1,4 @@
-// Identity-map linalg.generic의 add+mul fusion이 공통 3계층 plan을 유지한 채 UPMEM
+// Identity-map linalg.generic의 add+sub+mul fusion이 공통 3계층 plan을 유지한 채 UPMEM
 // WRAM 계산과 DPU C loop까지 내려가는지 확인한다. lanes=4이므로 block group의 8행을
 // tasklet마다 2행씩 맡는다.
 // RUN: triton-shared-opt --convert-pim-to-upmem %s | FileCheck %s --check-prefix=IR
@@ -15,6 +15,7 @@
 // IR: upmem.barrier
 // IR: linalg.generic
 // IR: arith.addf
+// IR: arith.subf
 // IR: arith.mulf
 // IR-NOT: pim.
 
@@ -22,6 +23,7 @@
 // 2 x 32 원소를 하나의 fused loop에서 계산한다.
 // DEVICE: for (int32_t _i = 0; _i < 64; ++_i) {
 // DEVICE: float {{.*}} = {{.*}}[_i] + {{.*}}[_i];
+// DEVICE: float {{.*}} = {{.*}} - {{.*}}[_i];
 // DEVICE: float {{.*}} = {{.*}} * {{.*}}[_i];
 // DEVICE: {{.*}}[_i] = {{.*}};
 
@@ -90,7 +92,8 @@ func.func @elementwise(%A: memref<*xf32>, %B: memref<*xf32>,
             outs(%empty : tensor<8x32xf32>) {
         ^bb0(%a: f32, %b: f32, %old: f32):
           %sum = arith.addf %a, %b : f32
-          %product = arith.mulf %sum, %b : f32
+          %difference = arith.subf %sum, %b : f32
+          %product = arith.mulf %difference, %b : f32
           linalg.yield %product : f32
         } -> tensor<8x32xf32>
         %dc = pim.access %C offset %n sizes [8, 32] strides[%c32, %c1]
