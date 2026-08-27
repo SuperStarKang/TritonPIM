@@ -1008,7 +1008,8 @@ struct ConvertPIMToUPMEMPass
       if (rowSplit) {
         // 전원이 같은 tile을 계산하므로 각자 자기 출력 행만 맡는다. 어느 피연산자를
         // 가르는지는 op마다 정해져 있다 — matmul은 A와 누산기의 행이 출력 행과 같은
-        // 축이고 B는 전 행이 필요하다. identity pointwise generic은 모든 shaped
+        // 축이고 B는 전 행이 필요하다. matvec도 A와 누산기만 가르고 x는
+        // 전체 K vector를 공유한다. identity pointwise generic은 모든 shaped
         // operand의 첫 축이 출력 m과 같으므로 전부 같은 행 slice로 가른다.
         if (isa<linalg::FillOp>(op)) {
           if (!(operands[1] = rowSliceOf(operands[1], op)))
@@ -1019,6 +1020,13 @@ struct ConvertPIMToUPMEMPass
           if (!(operands[2] = rowSliceOf(operands[2], op)))
             return WalkResult::interrupt();
           // 공유 피연산자(B)의 적재가 전부 끝난 뒤에만 계산을 시작한다.
+          b.create<upmem::BarrierOp>(op->getLoc());
+        } else if (isa<linalg::MatvecOp>(op)) {
+          if (!(operands[0] = rowSliceOf(operands[0], op)))
+            return WalkResult::interrupt();
+          if (!(operands[2] = rowSliceOf(operands[2], op)))
+            return WalkResult::interrupt();
+          // x vector와 A tile의 분담 DMA가 전부 끝난 뒤 계산한다.
           b.create<upmem::BarrierOp>(op->getLoc());
         } else if (auto gen = dyn_cast<linalg::GenericOp>(op)) {
           if (!isIdentityPointwise(gen)) {
@@ -1038,8 +1046,8 @@ struct ConvertPIMToUPMEMPass
         } else {
           op->emitError(
               "convert-pim-to-upmem: cooperating tasklets "
-              "(lane_axis = m) can split only matmul, fill, and identity "
-              "pointwise generic operations by output rows");
+              "(lane_axis = m) can split only matmul, matvec, fill, and "
+              "identity pointwise generic operations by output rows");
           return WalkResult::interrupt();
         }
       }
@@ -1051,7 +1059,7 @@ struct ConvertPIMToUPMEMPass
         r.cloneInto(st.addRegion(), map);
       b.create(st);
       // 다음 반복의 적재가 공유 피연산자를 덮어쓰기 전에 전원의 소비가 끝나야 한다.
-      if (rowSplit && isa<linalg::MatmulOp>(op))
+      if (rowSplit && isa<linalg::MatmulOp, linalg::MatvecOp>(op))
         b.create<upmem::BarrierOp>(op->getLoc());
       oldCompute.push_back(op);
       return WalkResult::advance();

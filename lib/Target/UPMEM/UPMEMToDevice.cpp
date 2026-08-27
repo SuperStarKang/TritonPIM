@@ -190,6 +190,8 @@ struct DeviceEmitter {
       return emitFill(fill, depth);
     if (auto mm = dyn_cast<linalg::MatmulOp>(op))
       return emitMatmul(mm, depth);
+    if (auto mv = dyn_cast<linalg::MatvecOp>(op))
+      return emitMatvec(mv, depth);
     if (auto generic = dyn_cast<linalg::GenericOp>(op))
       return emitPointwise(generic, depth);
 
@@ -308,6 +310,47 @@ struct DeviceEmitter {
     e.indent(depth + 2);
     os() << cn << "[_m * " << N << " + _n] = _s;\n";
     e.indent(depth + 1);
+    os() << "}\n";
+    return success();
+  }
+
+  // y[m] += sum_k A[m,k] * x[k]. PIM Common의 M lane 분할은 A와 y만
+  // tasklet의 행 범위로 잘라 주고 x는 전체 K vector를 공유한다.
+  LogicalResult emitMatvec(linalg::MatvecOp mv, unsigned depth) {
+    auto a = dyn_cast<MemRefType>(mv.getInputs()[0].getType());
+    auto x = dyn_cast<MemRefType>(mv.getInputs()[1].getType());
+    auto y = dyn_cast<MemRefType>(mv.getOutputs()[0].getType());
+    if (!a || !x || !y || !a.hasStaticShape() || !x.hasStaticShape() ||
+        !y.hasStaticShape() || a.getRank() != 2 || x.getRank() != 1 ||
+        y.getRank() != 1)
+      return mv->emitError(
+          "matvec must use static rank-2 matrix and rank-1 WRAM vectors");
+    int64_t M = a.getShape()[0], K = a.getShape()[1];
+    if (x.getShape()[0] != K || y.getShape()[0] != M)
+      return mv->emitError("matvec WRAM buffer shapes are inconsistent");
+    std::string acc = CEmitter::scalarType(y.getElementType(), false);
+    if (acc.empty())
+      return mv->emitError("matvec has an unsupported accumulator type");
+    std::string an = e.name(mv.getInputs()[0]);
+    std::string xn = e.name(mv.getInputs()[1]);
+    std::string yn = e.name(mv.getOutputs()[0]);
+
+    e.indent(depth);
+    os() << "for (int32_t _m = 0; _m < " << M << "; ++_m) {\n";
+    e.indent(depth + 1);
+    os() << acc << " _s = " << yn << "[_m];\n";
+    if (K <= 64) {
+      e.indent(depth + 1);
+      os() << "#pragma unroll\n";
+    }
+    e.indent(depth + 1);
+    os() << "for (int32_t _k = 0; _k < " << K << "; ++_k)\n";
+    e.indent(depth + 2);
+    os() << "_s += (" << acc << ")" << an << "[_m * " << K
+         << " + _k] * (" << acc << ")" << xn << "[_k];\n";
+    e.indent(depth + 1);
+    os() << yn << "[_m] = _s;\n";
+    e.indent(depth);
     os() << "}\n";
     return success();
   }
