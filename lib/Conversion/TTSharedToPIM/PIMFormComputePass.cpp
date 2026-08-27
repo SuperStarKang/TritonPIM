@@ -3,6 +3,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/STLExtras.h"
@@ -19,8 +20,9 @@ namespace triton {
 
 namespace {
 
-// generic이 두 입력을 그대로 더해 내놓기만 하는가. 축이 전부 parallel이고 세 map이
-// 항등이며 body가 두 입력 인자의 덧셈 하나여야 누산기에 접어 넣을 수 있다.
+// generic이 두 입력을 그대로 더해 내놓기만 하는가. 축이 전부 parallel이고 세
+// map이 항등이며 body가 두 입력 인자의 덧셈 하나여야 누산기에 접어 넣을 수
+// 있다.
 static bool isElementwiseAdd(linalg::GenericOp gen) {
   if (gen.getInputs().size() != 2 || gen.getOutputs().size() != 1)
     return false;
@@ -39,8 +41,90 @@ static bool isElementwiseAdd(linalg::GenericOp gen) {
          (add->getOperand(0) == a1 && add->getOperand(1) == a0);
 }
 
-// 0으로 채운 tile인가. 0이라야 "0에 A·B를 더한 것"을 누산기에 더하는 것과 누산기에
-// 바로 더하는 것이 같다.
+// generic이 두 입력의 elementwise 곱이기만 하는가. GEMV frontend 패턴의
+// A * broadcast(x)를 named linalg.matvec로 올리기 전에 의미가 바뀌지 않음을
+// 확인하는 검사다.
+static bool isElementwiseMul(linalg::GenericOp gen) {
+  if (gen.getInputs().size() != 2 || gen.getOutputs().size() != 1)
+    return false;
+  for (AffineMap m : gen.getIndexingMapsArray())
+    if (!m.isIdentity())
+      return false;
+  for (utils::IteratorType t : gen.getIteratorTypesArray())
+    if (t != utils::IteratorType::parallel)
+      return false;
+  auto yield = cast<linalg::YieldOp>(gen.getBody()->getTerminator());
+  Operation *mul = yield->getOperand(0).getDefiningOp();
+  if (!mul || !isa<arith::MulFOp, arith::MulIOp>(mul))
+    return false;
+  Value a0 = gen.getBody()->getArgument(0), a1 = gen.getBody()->getArgument(1);
+  return (mul->getOperand(0) == a0 && mul->getOperand(1) == a1) ||
+         (mul->getOperand(0) == a1 && mul->getOperand(1) == a0);
+}
+
+// reduce body가 input + accumulator 하나인 sum reduction인가.
+static bool isAddReduction(linalg::ReduceOp reduce) {
+  if (reduce.getInputs().size() != 1 || reduce.getInits().size() != 1 ||
+      reduce->getNumResults() != 1)
+    return false;
+  Block *body = reduce.getBody();
+  if (body->getNumArguments() != 2)
+    return false;
+  auto yield = cast<linalg::YieldOp>(body->getTerminator());
+  Operation *add = yield->getOperand(0).getDefiningOp();
+  if (!add || !isa<arith::AddFOp, arith::AddIOp>(add))
+    return false;
+  Value input = body->getArgument(0), acc = body->getArgument(1);
+  return (add->getOperand(0) == input && add->getOperand(1) == acc) ||
+         (add->getOperand(0) == acc && add->getOperand(1) == input);
+}
+
+// tensor<K> -> tensor<1xK> -> tensor<MxK> broadcast 패턴에서 원래 vector를
+// 얻는다. map을 정확히 (m, k) -> (0, k)로 제한해 다른 broadcast가
+// 우연히 GEMV로 바뀌는 것을 막는다.
+static Value matchBroadcastedVector(Value value, RankedTensorType matrixType) {
+  auto broadcast = value.getDefiningOp<linalg::GenericOp>();
+  if (!broadcast || broadcast.getInputs().size() != 1 ||
+      broadcast.getOutputs().size() != 1 || broadcast->getNumResults() != 1)
+    return {};
+  for (utils::IteratorType t : broadcast.getIteratorTypesArray())
+    if (t != utils::IteratorType::parallel)
+      return {};
+  ArrayRef<AffineMap> maps = broadcast.getIndexingMapsArray();
+  if (maps.size() != 2 || !maps[1].isIdentity() || maps[0].getNumDims() != 2 ||
+      maps[0].getNumResults() != 2)
+    return {};
+  auto zero = dyn_cast<AffineConstantExpr>(maps[0].getResult(0));
+  auto kDim = dyn_cast<AffineDimExpr>(maps[0].getResult(1));
+  if (!zero || zero.getValue() != 0 || !kDim || kDim.getPosition() != 1)
+    return {};
+  auto resultType = dyn_cast<RankedTensorType>(value.getType());
+  if (!resultType || resultType != matrixType)
+    return {};
+  auto yield = cast<linalg::YieldOp>(broadcast.getBody()->getTerminator());
+  if (yield.getValues().size() != 1 ||
+      yield.getValues()[0] != broadcast.getBody()->getArgument(0))
+    return {};
+
+  auto expand = broadcast.getInputs()[0].getDefiningOp<tensor::ExpandShapeOp>();
+  if (!expand)
+    return {};
+  auto expandedType = dyn_cast<RankedTensorType>(expand.getResult().getType());
+  auto vectorType = dyn_cast<RankedTensorType>(expand.getSrc().getType());
+  if (!expandedType || !vectorType || expandedType.getRank() != 2 ||
+      vectorType.getRank() != 1 || expandedType.getShape()[0] != 1 ||
+      expandedType.getShape()[1] != matrixType.getShape()[1] ||
+      vectorType.getShape()[0] != matrixType.getShape()[1])
+    return {};
+  return expand.getSrc();
+}
+
+static bool allResultsUnused(Operation *op) {
+  return llvm::all_of(op->getResults(), [](Value v) { return v.use_empty(); });
+}
+
+// 0으로 채운 tile인가. 0이라야 "0에 A·B를 더한 것"을 누산기에 더하는 것과
+// 누산기에 바로 더하는 것이 같다.
 static bool isZeroFill(Value v) {
   auto fill = v.getDefiningOp<linalg::FillOp>();
   if (!fill)
@@ -49,9 +133,9 @@ static bool isZeroFill(Value v) {
   return matchPattern(f, m_Zero()) || matchPattern(f, m_AnyZeroFloat());
 }
 
-// 누산기 초기값을 만드는 op을 그 loop 바로 앞으로 내린다. 값 의미로는 밖에 있어도
-// 맞지만 버퍼로 내리면 초기화가 한 번만 돌아 두 번째 instance부터 앞 결과가 남는다.
-// 쓰는 곳이 그 loop 하나여야 옮긴다.
+// 누산기 초기값을 만드는 op을 그 loop 바로 앞으로 내린다. 값 의미로는 밖에
+// 있어도 맞지만 버퍼로 내리면 초기화가 한 번만 돌아 두 번째 instance부터 앞
+// 결과가 남는다. 쓰는 곳이 그 loop 하나여야 옮긴다.
 static void sinkInit(scf::ForOp loop) {
   SmallVector<Operation *> chain;
   SmallVector<Value> work(loop.getInitArgs());
@@ -79,12 +163,94 @@ struct PIMFormComputePass
     getOperation().walk([&](scf::ForOp l) { loops.push_back(l); });
     for (scf::ForOp l : loops)
       foldIntoAccumulator(l);
+    // Triton GEMV의 broadcast -> mul -> transpose -> reduce를 target에 의존하지
+    // 않는 named op으로 정규화한다. frontend가 linalg.matvec를 바로 내면
+    // 이 단계는 그 op을 그대로 둔다.
+    SmallVector<linalg::ReduceOp> reductions;
+    getOperation().walk(
+        [&](linalg::ReduceOp reduce) { reductions.push_back(reduce); });
+    for (linalg::ReduceOp reduce : reductions)
+      formMatvec(reduce);
     // 접은 뒤라야 초기값이 iter_args에서만 쓰여 내릴 수 있다.
     for (scf::ForOp l : loops)
       sinkInit(l);
   }
 
-  // 누산기 iter_arg마다 matmul(outs=zero) + generic(add) 형태를 matmul(outs=누산기)로 접는다.
+  // TTShared가 GEMV를 내는 두 reduce 배치를 모두 받는다.
+  //   A[M,K] * broadcast(x[K]) -> transpose[K,M] -> reduce(dim=0)
+  //   A[M,K] * broadcast(x[K])                  -> reduce(dim=1)
+  // accumulator가 reduce init에 이미 접힌 뒤에 실행하므로 생성된
+  // linalg.matvec도 같은 K-loop 누산 의미를 가진다.
+  void formMatvec(linalg::ReduceOp reduce) {
+    if (!isAddReduction(reduce) || reduce.getDimensions().size() != 1)
+      return;
+
+    Value product = reduce.getInputs()[0];
+    linalg::TransposeOp transpose;
+    int64_t reductionDim = reduce.getDimensions()[0];
+    if (reductionDim == 0) {
+      transpose = product.getDefiningOp<linalg::TransposeOp>();
+      if (!transpose || transpose.getPermutation().size() != 2 ||
+          transpose.getPermutation()[0] != 1 ||
+          transpose.getPermutation()[1] != 0)
+        return;
+      product = transpose.getInput();
+    } else if (reductionDim != 1) {
+      return;
+    }
+
+    auto productType = dyn_cast<RankedTensorType>(product.getType());
+    auto resultType = dyn_cast<RankedTensorType>(reduce.getResult(0).getType());
+    if (!productType || !resultType || productType.getRank() != 2 ||
+        resultType.getRank() != 1 ||
+        productType.getShape()[0] != resultType.getShape()[0] ||
+        productType.getElementType() != resultType.getElementType())
+      return;
+
+    auto mul = product.getDefiningOp<linalg::GenericOp>();
+    if (!mul || !isElementwiseMul(mul))
+      return;
+    Value matrix, vector;
+    for (unsigned broadcastOperand = 0; broadcastOperand < 2;
+         ++broadcastOperand) {
+      Value candidate = matchBroadcastedVector(
+          mul.getInputs()[broadcastOperand], productType);
+      if (!candidate)
+        continue;
+      Value other = mul.getInputs()[1 - broadcastOperand];
+      if (other.getType() != productType)
+        continue;
+      matrix = other;
+      vector = candidate;
+      break;
+    }
+    if (!matrix || !vector)
+      return;
+
+    OpBuilder b(reduce);
+    auto matvec =
+        b.create<linalg::MatvecOp>(reduce.getLoc(), ValueRange{matrix, vector},
+                                   ValueRange{reduce.getInits()[0]});
+    reduce.getResult(0).replaceAllUsesWith(matvec.getResult(0));
+
+    // 다른 사용자가 있으면 원래 계산을 보존한다. GEMV 전용 연쇄인
+    // 경우에만 소비자에서 생산자 순으로 지워 중간 tile을 없앤다.
+    Operation *transposeOp = transpose ? transpose.getOperation() : nullptr;
+    auto broadcast =
+        (mul.getInputs()[0] == matrix ? mul.getInputs()[1] : mul.getInputs()[0])
+            .getDefiningOp<linalg::GenericOp>();
+    auto expand =
+        broadcast.getInputs()[0].getDefiningOp<tensor::ExpandShapeOp>();
+    SmallVector<Operation *> deadCandidates{
+        reduce, transposeOp, mul.getOperation(), broadcast.getOperation(),
+        expand.getOperation()};
+    for (Operation *op : deadCandidates)
+      if (op && allResultsUnused(op))
+        op->erase();
+  }
+
+  // 누산기 iter_arg마다 matmul(outs=zero) + generic(add) 형태를
+  // matmul(outs=누산기)로 접는다.
   void foldIntoAccumulator(scf::ForOp loop) {
     auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
     for (auto [i, acc] : llvm::enumerate(loop.getRegionIterArgs())) {
