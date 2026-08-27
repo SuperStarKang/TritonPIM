@@ -524,14 +524,17 @@ struct ConvertPIMToUPMEMPass
       mb.create<upmem::HostVarOp>(loc, name,
                                   TypeAttr::get(IndexType::get(ctx)));
     }
-    // 창 축의 반복 횟수 변수. mapping 축 창은 위의 tilesVar 를 그대로 쓰고, k 창은
-    // reduction loop 상한 타입으로 하나 만든다.
+    // 창 축의 반복 횟수 변수. mapping 축 창은 위의 tilesVar 를 그대로 쓰고,
+    // reduction 창은 별도 이름으로 만든다. split-K kernel에는 spatial k축과 그
+    // plane 내부 temporal reduction 창이 동시에 존재하므로 둘 다 `_tiles_k`를 쓰면
+    // module symbol이 충돌한다.
     for (Window &w : windows) {
       if (w.mappingIdx >= 0) {
         w.tilesVar = tilesVar[w.mappingIdx];
         continue;
       }
-      auto name = StringAttr::get(ctx, (base + "_tiles_k").str());
+      auto name =
+          StringAttr::get(ctx, (base + "_tiles_reduction_k").str());
       w.tilesVar = FlatSymbolRefAttr::get(name);
       mb.create<upmem::HostVarOp>(
           loc, name, TypeAttr::get(w.kLoop.getUpperBound().getType()));
