@@ -1,70 +1,25 @@
-# Stage 1 / 1-A / 1-B / 2 — PIM Config Space와 initial candidate 생성
-# (design/AutoTuner_Design.md §4~§7)
-#
-# tuner는 BM/BN/BK, GM/GN/GK, TM/TN/TK를 탐색한다. TM/TN/TK는
-# execution tile 하나에 묶는 block-group 개수이고, 논리 원소 상한은
-# capacity_limit = BLOCK * GROUP * TILE로 유도된다 (§5).
-#   KSplitFragment       (P_K, reduction_policy) 쌍
-#   DistributionFragment 배치 전략 → Planner가 P_M/P_N 계산 (§6.1)
+"""Search space over PIM Common IR hierarchy and mapping values."""
 
 from dataclasses import dataclass
 
-from .constraints import gemm_footprint_bytes
-from .planner import resolve_distribution
+from .constraints import ConstraintEngine, group_extent
 from .types import PIMConfig, ceil_div
 
-# Phase 1 knob 값 목록 (§53). power-of-two라 log2 feature 표현과 맞는다 (§27).
-# 값 목록은 탐색 격자일 뿐이고, shape·memory에 맞지 않는 조합은 Constraint
-# Engine(§8)이 제거한다.
+
 BLOCK_VALUES = (16, 32, 64, 128)
 GROUP_VALUES = (1, 2, 4, 8, 16, 32)
 TILE_VALUES = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024)
 
-# §6 KSplitFragment: PK와 reduction strategy를 무관하게 탐색하면 invalid
-# configuration이 과도하게 생기므로 하나의 categorical knob으로 묶는다.
-# 문서의 예시는 PK≤8이지만, UPMEM 실측 최적점(split_k.py, SPLIT_K=16)이
-# 탐색 범위 안에 있어야 하므로 16까지 연다.
-KSPLIT_PK_VALUES = (1, 2, 4, 8, 16)
 
-# 고정 template 기간의 target별 reduction 실행 위치. 지금은 커널이 하나라
-# reduction 위치를 config가 바꿀 수 없으므로, plan·feature가 실제 실행과
-# 일치하도록 target이 정한다. codegen이 pim.reduction_plan을 소비해
-# policy대로 코드를 생성하게 되면 이 표는 제거한다.
-TARGET_REDUCTION_POLICY = {
-    "upmem": "host",
-    "aimx": "device",
-}
-
-# 일반형 기본 전략 목록 (PIMConfigSpace를 직접 만들 때의 기본값).
-# build_config_space는 target의 reduction 위치로 이 목록을 재구성한다.
-KSPLIT_STRATEGIES = tuple(
-    (pk, "none" if pk == 1 else "device") for pk in KSPLIT_PK_VALUES)
-
-# §6.1 DistributionFragment. K축 분할은 KSplitFragment가 가지므로
-# 배치 전략은 남은 budget을 M/N 축에 나누는 방법을 고른다.
-DISTRIBUTION_POLICIES = ("M-major", "N-major", "MN-balanced")
-
-# categorical encoding 순서 (§27).
-REDUCTION_POLICIES = ("none", "device", "host", "tree")
-
-# Phase 2 (§53) — residency / replication / streaming.
-# resident: operand를 device memory에 상주시켜 steady-state H2D에서 제거.
-# replication slice: 각 device가 자기 조각만 상주 / full: 전체 사본 상주.
-# streaming per_round: round마다 window 하나 적재 / all_rounds: 자기 몫 전부 적재.
-RESIDENCY_POLICIES = ("stream", "resident")
-REPLICATION_POLICIES = ("slice", "full")
-STREAMING_POLICIES = ("per_round", "all_rounds")
-
-# Phase 3 (§53) — PersistenceFragment:
-# (device_set_reuse, descriptor_reuse, command_reuse, persistent_execution).
-# 재사용은 단계적으로만 의미가 있으므로 legal 조합만 나열한다 (§6의 논리).
-PERSISTENCE_STRATEGIES = (
-    (False, False, False, False),   # 매 round device set부터 재확보
-    (True, False, False, False),    # device set 재사용 (기본)
-    (True, True, False, False),     # + descriptor 재사용
-    (True, True, True, False),      # + command 재사용
-    (True, True, True, True),       # + persistent execution (launch 1회)
-)
+def _powers_of_two(limit):
+    values = []
+    value = 1
+    while value <= limit:
+        values.append(value)
+        value *= 2
+    if values[-1] != limit:
+        values.append(limit)
+    return tuple(values)
 
 
 @dataclass(frozen=True)
@@ -72,221 +27,173 @@ class PIMConfigSpace:
     block_values: tuple = BLOCK_VALUES
     group_values: tuple = GROUP_VALUES
     tile_values: tuple = TILE_VALUES
-    ksplit_strategies: tuple = KSPLIT_STRATEGIES
-    distribution_policies: tuple = DISTRIBUTION_POLICIES
-    residency_policies: tuple = RESIDENCY_POLICIES
-    replication_policies: tuple = REPLICATION_POLICIES
-    streaming_policies: tuple = STREAMING_POLICIES
-    persistence_strategies: tuple = PERSISTENCE_STRATEGIES
+    partition_values: tuple = (1,)
 
 
-def build_config_space(problem, hardware, **overrides):
-    """§52 build_config_space.
-
-    KSplit 전략의 reduction 위치는 고정 template 기간 동안 target이 정한다
-    (TARGET_REDUCTION_POLICY). 나머지 knob 목록은 기본값이고, runtime이
-    지원하지 못하는 knob은 overrides로 제한한다. shape에 따라 불가능한
-    값은 여기서 자르지 않고 Constraint Engine(§8)이 제거한다.
-    """
-    reduction = TARGET_REDUCTION_POLICY[hardware.target]
+def build_config_space(problem, target, **overrides):
     fields = {
-        "ksplit_strategies": tuple(
-            (pk, "none" if pk == 1 else reduction)
-            for pk in KSPLIT_PK_VALUES),
+        "partition_values": _powers_of_two(
+            target.common_profile.num_units),
     }
     fields.update(overrides)
     return PIMConfigSpace(**fields)
 
 
-def strategy_for_pk(spec, p_k):
-    """spec에서 해당 P_K의 KSplit 전략을 찾는다. 없으면 None."""
-    for strategy in spec.ksplit_strategies:
-        if strategy[0] == p_k:
-            return strategy
-    return None
-
-
-def make_config(problem, hardware, blocks, groups, tiles,
-                distribution_policy, ksplit_strategy,
-                a_residency="stream", b_residency="stream",
-                replication_policy="slice", streaming_policy="per_round",
-                persistence_strategy=(True, False, False, False)):
-    """knob 값들로부터 완전한 PIMConfig를 만든다.
-
-    P_K/reduction은 KSplitFragment에서 (§6), P_M/P_N은 distribution
-    policy와 tile grid에서 결정된다 (§6.1). residency/replication/streaming은
-    Phase 2, persistence는 Phase 3 knob이다 (§53).
-    """
-    p_k, reduction_policy = ksplit_strategy
-    device_set_reuse, descriptor_reuse, command_reuse, persistent_execution = \
-        persistence_strategy
-    capacity_limit_m = blocks[0] * groups[0] * tiles[0]
-    capacity_limit_n = blocks[1] * groups[1] * tiles[1]
-    p_m, p_n = resolve_distribution(
-        problem, hardware, capacity_limit_m, capacity_limit_n, p_k,
-        distribution_policy)
-    if hardware.target == "aimx":
-        batch = hardware.target_constraints.get("default_batch", 8)
-        intra = dict(
-            bank_p_m=batch, bank_p_n=hardware.banks_per_device // batch,
-            bank_p_k=1, core_p_m=1, core_p_n=1, core_p_k=1,
-            intra_device_lanes=hardware.lanes_per_core, lane_axis="n")
-    else:
-        intra = dict(
-            bank_p_m=1, bank_p_n=1, bank_p_k=1,
-            core_p_m=1, core_p_n=1, core_p_k=1,
-            intra_device_lanes=hardware.lanes_per_core, lane_axis="m")
+def make_config(blocks, groups, tiles, partitions):
     return PIMConfig(
         block_m=blocks[0], block_n=blocks[1], block_k=blocks[2],
         group_m=groups[0], group_n=groups[1], group_k=groups[2],
         tile_m=tiles[0], tile_n=tiles[1], tile_k=tiles[2],
-        distribution_policy=distribution_policy,
-        p_m=p_m, p_n=p_n, p_k=p_k,
-        reduction_policy=reduction_policy,
-        **intra,
-        a_residency=a_residency, b_residency=b_residency,
-        replication_policy=replication_policy,
-        streaming_policy=streaming_policy,
-        device_set_reuse=device_set_reuse,
-        descriptor_reuse=descriptor_reuse,
-        command_reuse=command_reuse,
-        persistent_execution=persistent_execution,
+        p_m=partitions[0], p_n=partitions[1], p_k=partitions[2],
     )
 
 
-def _derive_groups(problem, hardware, blocks, spec):
-    """seed 규칙 1 — local memory 예산을 채울 때까지 group을 m→n→k 번갈아 2배.
+def _partition_seeds(problem, target, blocks, groups, spec):
+    """A bounded set of direct [p_m,p_n,p_k] seeds.
 
-    MLIR 공통 pass의 block group 자동 산출과 같은 철학이다. 예산은 profile의
-    local_memory_bytes에서만 오므로 target-중립이다. 축 배분(block↔group 포함)은
-    이후 search가 fragment mutation으로 조정한다.
+    The first seed uses as many available units as the problem grid permits.
+    Axis-oriented and later random/LFBO candidates remain so measured
+    performance, rather than this ordering, decides the final mapping.
     """
-    dims = (problem.M, problem.N, problem.K)
-    # Constraint 2(§10)와 같은 예산: runtime 상주분을 뺀 tile 버퍼 예산.
-    budget = hardware.local_memory_bytes - hardware.local_memory_reserved_bytes
-    groups = [1, 1, 1]
-    axis = 0
-    stalled = 0
-    while stalled < 3:
-        trial = groups[axis] * 2
-        size = [blocks[i] * groups[i] for i in range(3)]
-        size[axis] = blocks[axis] * trial
-        if (trial in spec.group_values
-                and size[axis] <= dims[axis]
-                and gemm_footprint_bytes(problem, *size) <= budget):
-            groups[axis] = trial
-            stalled = 0
-        else:
-            stalled += 1
-        axis = (axis + 1) % 3
-    return tuple(groups)
+    profile = target.common_profile
+    g_m, g_n, g_k = group_extent(
+        make_config(blocks, groups, (1, 1, 1), (1, 1, 1)))
+    grid = (
+        ceil_div(problem.M, g_m),
+        ceil_div(problem.N, g_n),
+        ceil_div(problem.K, g_k),
+    )
+    candidates = []
+    for p_m in spec.partition_values:
+        if p_m > grid[0]:
+            continue
+        for p_n in spec.partition_values:
+            if p_n > grid[1]:
+                continue
+            for p_k in spec.partition_values:
+                active = p_m * p_n * p_k
+                if active > profile.num_units or p_k > grid[2]:
+                    continue
+                if problem.K % (p_k * blocks[2]):
+                    continue
+                candidates.append((p_m, p_n, p_k))
 
+    if not candidates:
+        raise ValueError(
+            "no [p_m,p_n,p_k] seed satisfies K % (p_k*block_k) == 0")
 
-def _derive_tiles(problem, hardware, blocks, groups, p_k, spec,
-                  capacity_scale=1):
-    """seed 규칙 2 — execution tile에 묶을 block-group 개수를 고른다.
+    # 같은 active-unit 수라면 p_k가 작은 것을 먼저 둔다. 현재 GEMM runner는
+    # p_k마다 MxN partial을 만들기 때문에, 첫 측정부터 불필요하게 큰 host
+    # partial buffer를 만드는 것을 피한다. p_k가 큰 후보도 아래 axis seed와
+    # random/LFBO 후보에 그대로 남는다.
+    full = min(
+        candidates,
+        key=lambda p: (-(p[0] * p[1] * p[2]), p[2]),
+    )
+    # (1,1,1)을 비교용으로 강제하지 않는다. 실제 parallel grid가 하나뿐이면
+    # full 자체가 (1,1,1)이 되고, 그렇지 않은 큰 문제에서 single-unit 실행은
+    # 초기 측정 전체를 막을 수 있다.
+    seeds = [full]
 
-    derived capacity_limit는 profile의 논리 원소 상한까지만 키운다.
-    device memory 용량(§11)은 그 결과에 대한 별도 상한이다.
-    """
-    base = [blocks[i] * groups[i] for i in range(3)]
-    limits = (hardware.capacity_limit_m,
-              hardware.capacity_limit_n,
-              hardware.capacity_limit_k)
-    # K축의 문제 크기는 spatial plane 하나의 구간이다 (§16).
-    dims = (problem.M, problem.N, ceil_div(problem.K, p_k))
-    tiles = [1, 1, 1]
+    # UPMEM은 split-K가 중요하므로 각 p_k 단계를 K-only로 재지 않고,
+    # 그 p_k를 고정한 채 p_m/p_n을 채워 총 active unit을 최대화한다.
+    # 그러면 비슷한 전체 parallelism에서 K 분할 효과를 비교할 수 있다.
+    if profile.target == "upmem":
+        for p_k in spec.partition_values:
+            with_p_k = [p for p in candidates if p[2] == p_k]
+            if with_p_k:
+                seeds.append(max(
+                    with_p_k,
+                    key=lambda p: p[0] * p[1] * p[2],
+                ))
+
     for axis in range(3):
-        target = min(limits[axis] * capacity_scale, dims[axis])
-        # 2배 단위 성장이 문제·K plane 크기를 넘지 않게 한다. 넘으면
-        # Constraint 4(tile_k ≤ K plane)가 seed를 버리게 된다.
-        while (tiles[axis] * 2 in spec.tile_values
-               and base[axis] * tiles[axis] < target
-               and base[axis] * tiles[axis] * 2 <= dims[axis]):
-            tiles[axis] *= 2
-    # 용량 상한 (§11): 넘으면 k→n→m 순으로 반감한다.
-    axis = 2
-    while (gemm_footprint_bytes(
-            problem,
-            base[0] * tiles[0],
-            base[1] * tiles[1],
-            base[2] * tiles[2]) > hardware.device_memory_bytes
-           and max(tiles) > 1):
-        if tiles[axis] > 1:
-            tiles[axis] //= 2
-        axis = (axis - 1) % 3
+        along_axis = [
+            p for p in candidates
+            if all(p[i] == 1 for i in range(3) if i != axis)
+        ]
+        if along_axis:
+            seeds.append(max(along_axis, key=lambda p: p[axis]))
+
+    balanced = [p for p in candidates if p[0] == p[1]]
+    if balanced:
+        seeds.append(min(
+            balanced,
+            key=lambda p: (-(p[0] * p[1] * p[2]), p[2]),
+        ))
+
+    unique = []
+    for seed in seeds:
+        if seed not in unique:
+            unique.append(seed)
+    return unique
+
+
+def _derive_tiles(problem, target, blocks, groups, partitions, spec):
+    """Choose a capacity-safe initial Execution Tile in Block Group counts.
+
+    A small problem stops at the number of groups assigned to one partition.
+    A large problem stops when the target capacity rejects the next group.
+    """
+    base = tuple(blocks[i] * groups[i] for i in range(3))
+    dims = (problem.M, problem.N, ceil_div(problem.K, partitions[2]))
+    groups_per_partition = tuple(
+        ceil_div(ceil_div(dims[i], base[i]), partitions[i])
+        if i < 2 else ceil_div(dims[i], base[i])
+        for i in range(3)
+    )
+    engine = ConstraintEngine(problem, target)
+    exact = make_config(
+        blocks, groups, groups_per_partition, partitions)
+    if engine.check(exact) is None:
+        return groups_per_partition
+
+    tiles = [1, 1, 1]
+    progressed = True
+    while progressed:
+        progressed = False
+        for axis in range(3):
+            current_index = spec.tile_values.index(tiles[axis])
+            if current_index + 1 == len(spec.tile_values):
+                continue
+            next_value = spec.tile_values[current_index + 1]
+            if next_value > groups_per_partition[axis]:
+                continue
+            candidate_tiles = list(tiles)
+            candidate_tiles[axis] = next_value
+            candidate = make_config(
+                blocks, groups, tuple(candidate_tiles), partitions)
+            if engine.check(candidate) is None:
+                tiles[axis] = next_value
+                progressed = True
     return tuple(tiles)
 
 
-def heuristic_seeds(problem, hardware, spec):
-    """PIM 의미를 갖는 initial seed (§7 Seed A~F).
-
-    seed 값은 상수가 아니라 profile 예산에서 유도한다:
-      block/group  ← local memory 예산 채우기 (_derive_groups)
-      tile         ← execution tile의 block-group 개수 (_derive_tiles)
-    seed는 전략 축(PK, distribution, tile 방향)만 서로 다르게 열고,
-    어느 전략이 실제로 빠른지는 실측이 결정한다 (§31, §49).
-    """
+def heuristic_seeds(problem, target, spec):
+    """Initial configs expressed only with Common IR values."""
     blocks = (spec.block_values[0],) * 3
-    groups = _derive_groups(problem, hardware, blocks, spec)
-
-    def seed(policy, strategy, capacity_scale=1):
+    groups = (1, 1, 1)
+    configs = []
+    for partitions in _partition_seeds(
+            problem, target, blocks, groups, spec):
         tiles = _derive_tiles(
-            problem, hardware, blocks, groups, strategy[0], spec,
-            capacity_scale)
-        return make_config(problem, hardware, blocks, groups, tiles,
-                           policy, strategy)
-
-    # KSplit 전략은 하드코딩하지 않고 spec에서 고른다 — reduction 위치가
-    # target별로 다르기 때문이다 (TARGET_REDUCTION_POLICY).
-    no_split = strategy_for_pk(spec, 1)
-    seeds = []
-    if no_split is not None:
-        # Seed A — reduction 최소화: PK=1, N-major
-        seeds.append(seed("N-major", no_split))
-        # Seed B — parallelism 최대화: PM/PN을 최대한 사용, PK=1
-        seeds.append(seed("MN-balanced", no_split))
-    # Seed C·D — mild(PK=2)부터 aggressive(PK=16)까지의 split-K 사다리
-    for p_k in (2, 4, 8, 16):
-        strategy = strategy_for_pk(spec, p_k)
-        if strategy is not None:
-            seeds.append(seed("N-major", strategy))
-    if no_split is not None:
-        # Seed E — large execution tile: reuse ↑, round 수 ↓
-        seeds.append(seed("MN-balanced", no_split, capacity_scale=2))
-        # Seed F — small execution tile: parallelism ↑, memory footprint ↓
-        seeds.append(seed("MN-balanced", no_split, capacity_scale=0.5))
-    # Seed G (Phase 2, §53) — weight-stationary: B를 상주시켜 steady-state
-    # 전송을 최소화한다. runtime이 residency를 지원하지 않아 space를
-    # 제한한 경우에는 만들지 않는다.
-    if no_split is not None and "resident" in spec.residency_policies:
-        tiles = _derive_tiles(
-            problem, hardware, blocks, groups, 1, spec)
-        seeds.append(make_config(
-            problem, hardware, blocks, groups, tiles,
-            "N-major", no_split, b_residency="resident"))
-    return seeds
+            problem, target, blocks, groups, partitions, spec)
+        configs.append(make_config(blocks, groups, tiles, partitions))
+    return configs
 
 
-def random_valid_configs(problem, hardware, spec, count, rng, engine):
-    """나머지 initial population을 채우는 random valid configuration (§7)."""
+def random_valid_configs(problem, target, spec, count, rng, engine):
     configs = []
     attempts = 0
     max_attempts = count * 200
     while len(configs) < count and attempts < max_attempts:
         attempts += 1
-        blocks = tuple(rng.choice(spec.block_values) for _ in range(3))
-        groups = tuple(rng.choice(spec.group_values) for _ in range(3))
-        tiles = tuple(rng.choice(spec.tile_values) for _ in range(3))
-        policy = rng.choice(spec.distribution_policies)
-        strategy = rng.choice(spec.ksplit_strategies)
         config = make_config(
-            problem, hardware, blocks, groups, tiles, policy, strategy,
-            a_residency=rng.choice(spec.residency_policies),
-            b_residency=rng.choice(spec.residency_policies),
-            replication_policy=rng.choice(spec.replication_policies),
-            streaming_policy=rng.choice(spec.streaming_policies),
-            persistence_strategy=rng.choice(spec.persistence_strategies))
+            tuple(rng.choice(spec.block_values) for _ in range(3)),
+            tuple(rng.choice(spec.group_values) for _ in range(3)),
+            tuple(rng.choice(spec.tile_values) for _ in range(3)),
+            tuple(rng.choice(spec.partition_values) for _ in range(3)),
+        )
         if engine.valid(config):
             configs.append(config)
     return configs

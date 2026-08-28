@@ -33,9 +33,8 @@ import triton.backends.pim.driver as pim_driver  # noqa: E402
 
 from torch_backend import PIMInductorBackend, PIMTorchConfig  # noqa: E402
 from torch_backend._autotuner import (  # noqa: E402
-    PIMConfigCache, PIMProblem, target_profile)
-from torch_backend.config import UnsupportedPIMIntMM  # noqa: E402
-from torch_backend.plan import resolve_execution_plan  # noqa: E402
+    PIMConfigCache, PIMProblem, target_spec)
+from torch_backend.execution import resolve_execution  # noqa: E402
 
 # name: (q_heads, kv_heads, head_dim) — run_attention_kernel.py의 표와 같다
 MODELS = {
@@ -103,8 +102,6 @@ def main():
     parser.add_argument("--cache", default=None,
                         help="autotune cache 경로. 없으면 heuristic seed를 쓴다 "
                              "(성능 숫자가 아니다)")
-    parser.add_argument("--split-k", type=int, default=4,
-                        help="cache를 안 쓸 때 고를 seed의 P_K")
     parser.add_argument("--verify", action="store_true",
                         help="전체 참조와 대조한다. seq=8192에서는 느리다")
     parser.add_argument("--dry-run", action="store_true",
@@ -119,7 +116,8 @@ def main():
     cases = [("QK^T", seq, head_dim, seq), ("P.V", seq, seq, head_dim)]
     cases = {"qk": cases[:1], "pv": cases[1:], "both": cases}[args.op]
 
-    config = PIMTorchConfig(target="upmem", split_k=args.split_k,
+    target = target_spec("upmem")
+    config = PIMTorchConfig(spec=target,
                             autotune_cache_path=args.cache)
     print(f"model={args.model} seq={seq} head_dim={head_dim} "
           f"q_heads={q_heads} kv_heads={kv_heads}")
@@ -130,19 +128,17 @@ def main():
     for label, m, k, n in cases:
         print(f"\n=== {label}  (m,k,n)=({m},{k},{n}) ===")
         problem = PIMProblem(M=m, N=n, K=k)
-        try:
-            execution = resolve_execution_plan(config, problem)
-        except UnsupportedPIMIntMM as exc:
-            print(f"  건너뜀: {exc}")
-            continue
+        execution = resolve_execution(config, problem)
         if args.cache:
             # record가 1~2개면 튜닝이 아니라 smoke test 결과다. tune()은 끝까지
             # 돌아야 저장하므로 중단된 탐색은 아무것도 남기지 않는다.
             measured = len(PIMConfigCache(args.cache).measured_results(
-                problem, target_profile(config.target)))
+                problem, target))
             note = "  ← 측정이 너무 적다. 튜닝이 끝까지 돌지 않았다" if measured <= 2 else ""
             print(f"  cache: 측정된 config {measured}개{note}")
-        p_m, p_n, p_k = execution.plan.active_device_grid
+        p_m = execution.config.p_m
+        p_n = execution.config.p_n
+        p_k = execution.config.p_k
         print(f"  plan: {execution.describe()}")
         partial_gib = p_k * m * n * 4 / 2**30
         print(f"  partial[{p_k},{m},{n}] int32 = {partial_gib:.2f} GiB")

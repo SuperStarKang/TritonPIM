@@ -2,10 +2,10 @@
 #
 # 실행:
 #   conda activate pim_triton
-#   python torch_int_mm.py [--split-k P_K]
+#   python torch_int_mm.py
 #
 # 생성된 코드를 보려면:
-#   TORCH_LOGS=output_code python torch_int_mm.py [--split-k P_K]
+#   TORCH_LOGS=output_code python torch_int_mm.py
 #     - PIM 커널은 @triton_heuristics.template(...)로 정의되고, 그 triton_meta에
 #       "compile_backend": "pim"과 "backend_options"가 들어 있어야 한다.
 #     - 커널 본문이 split-K 커널(pid_k, K_PER, tl.dot 누산)이어야 한다.
@@ -16,7 +16,7 @@
 #     - aten._int_mm.default 노드가 있어야 한다 (decompose되지 않았다).
 #
 # 환경변수는 하나도 필요 없다. 필요하면 아래를 확인용으로 넣고 돌려도 된다:
-#   env -u PIM_TARGET -u TRITON_PIM_ACTIVE python torch_int_mm.py [--split-k P_K]
+#   env -u PIM_TARGET -u TRITON_PIM_ACTIVE python torch_int_mm.py
 
 import argparse
 import logging
@@ -31,17 +31,17 @@ import torch  # noqa: E402
 from torch_backend import PIMInductorBackend, PIMTorchConfig  # noqa: E402
 
 
-def build_config(split_k):
+def build_config():
     """실행 계획은 여기서 정하지 않는다.
 
     block/group/execution tile과 축별 device 분할 수는 autotuner가 shape와
     hardware profile(autotuner/targets.py)에서 유도하고, ConstraintEngine이
-    검증한다. 여기서 고르는 것은 "어느 P_K의 seed를 쓸까"뿐이다.
+    검증한다. 여기서는 별도 분할 값을 만들지 않고 기본 seed를 쓴다.
     실제로 고른 config는 실행 시 로그로 찍힌다:
 
         python torch_int_mm.py -v
     """
-    return PIMTorchConfig(target="upmem", strict=True, split_k=split_k)
+    return PIMTorchConfig()
 
 
 def pim_mm(a, b):
@@ -55,16 +55,13 @@ def main():
     parser.add_argument("--n", type=int, default=256)
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="고른 실행 계획(block/group/tile/device 분할)을 찍는다")
-    parser.add_argument("--split-k", type=int, default=4,
-                        help="원하는 K 분할 수 P_K. 이 P_K를 갖는 heuristic "
-                             "seed를 고른다 (1,2,4,8,16)")
     args = parser.parse_args()
 
     if args.verbose:
         logging.basicConfig(level=logging.INFO)
         logging.getLogger("torch_backend").setLevel(logging.INFO)
 
-    config = build_config(args.split_k)
+    config = build_config()
 
     torch.manual_seed(0)
     a = torch.randint(-8, 8, (args.m, args.k), dtype=torch.int8)

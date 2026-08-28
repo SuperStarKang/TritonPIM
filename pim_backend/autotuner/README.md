@@ -1,164 +1,94 @@
-# PIM AutoTuner
+# PIM Common IR AutoTuner
 
-`design/AutoTuner_Design.md`의 구현. Phase 1(§53) 범위 — block / block group /
-execution tile / device distribution / reduction을 하나의 계층적 configuration
-space에서 탐색한다.
-
-## 모듈 ↔ 설계 단계
-
-| 모듈 | 설계 단계 |
-|---|---|
-| `types.py` | §2, §51 — PIMProblem / PIMHardwareProfile / PIMConfig / PIMPlan / PIMPlanFeatures / PIMBenchmarkResult |
-| `space.py` | §4~§7 — config space, derived tile(§5), KSplitFragment(§6), DistributionFragment(§6.1), seed A~F(§7) |
-| `constraints.py` | §8~§13 — Constraint Engine (구조 / local memory / device memory / active grid / target) |
-| `planner.py` | §14~§19 — PIM Planner (tile grid, active grid, scheduling, transfer, reduction plan) |
-| `features.py` | §20~§27 — Plan Feature Extractor와 feature vector |
-| `forest.py` | §36 — Random Forest surrogate (numpy만 사용, decision path 노출) |
-| `search.py` | §33, §37~§44, §52 — LFBO loop: quantile label, search copies, tree-guided neighbor, scoring, diversity, termination |
-| `cache.py` | §45~§46 — config cache, warm start, 측정 이력 저장·재사용 |
-| `targets.py` | target → PIMHardwareProfile 등록표 (사용자가 실측값을 한 번만 적는 곳) |
-| `decorator.py` | `@pim_autotune` — problem만으로 동작하는 사용면 (torch 필요, `__init__`에서 제외) |
-
-## 사용
-
-```python
-from autotuner import PIMProblem, PIMHardwareProfile, PIMBenchmarkResult, tune
-
-problem = PIMProblem(M=1024, N=8192, K=28672)
-hardware = PIMHardwareProfile(
-    target="upmem", num_devices=2048,
-    banks_per_device=1, cores_per_bank=1, lanes_per_core=16,
-    usable_bank_capacity_bytes=60 * 1024 * 1024,
-    usable_local_capacity_bytes=48 * 1024, alignment_bytes=8,
-    # execution tile의 논리 원소 seed 상한 — target 실측으로 지정
-    capacity_limit_m=..., capacity_limit_n=..., capacity_limit_k=...,
-    target_constraints={"k_split_block_multiple": True},
-)
-
-def benchmark_fn(problem, hardware, config, plan):
-    # Stage 6~7: config/plan을 실제 커널 launch로 옮기고 wall-clock을 잰다.
-    ...
-    return PIMBenchmarkResult(total_ms=..., correctness=...)
-
-result = tune(problem, hardware, benchmark_fn)
-result.best.config    # PIMConfig
-result.best.plan      # PIMPlan (active_device_grid, rounds, transfer, reduction)
-result.best.result    # PIMBenchmarkResult
-```
-
-실행 가능한 예시는 `../examples/autotune_gemm.py`(UPMEM split-K GEMM 커널 연결).
-
-## 설계 문서와 다른/구체화한 결정
-
-- **P_M/P_N의 소유**: §51의 PIMConfig는 p_m/p_n/p_k를 갖지만, §6.1대로
-  distribution policy가 tile grid를 보고 P_M/P_N을 결정한다. 구현에서는
-  candidate 생성 시점에 `resolve_distribution`으로 확정해 Config에 넣는다.
-  그래야 §52 pseudocode의 순서(Constraint → Planner)대로 Constraint 4(§12)를
-  Planner 이전에 검사할 수 있다.
-- **DistributionFragment**: §6.1의 6가지 중 K축을 포함하는 policy
-  (NK/MK/MNK-balanced)는 P_K를 KSplitFragment(§6)가 소유하는 것과 겹치므로
-  Phase 1에서는 M-major / N-major / MN-balanced만 둔다.
-- **Random Forest**: pim_triton 환경에 scikit-learn이 없어 numpy만으로
-  구현했다 (`forest.py`). tree-guided search(§38)가 요구하는 per-tree
-  decision path를 직접 노출한다.
-- **S_runtime / S_metadata**: §10, §11의 runtime·metadata 항은 0으로 두었다.
-  배포 환경의 예약량은 `local_memory_bytes` / `device_memory_bytes` 예산에
-  반영해서 준다.
-- **seed는 상수가 아니라 profile 예산에서 유도한다** (target-중립):
-  - block/group — local memory 예산을 채울 때까지 m→n→k 번갈아 2배
-    (MLIR 공통 pass의 block group 자동 산출과 같은 철학).
-  - execution tile — `tile_m/n/k`는 block-group 개수다. 논리 원소 상한은
-    `capacity_limit = BLOCK * GROUP * TILE`로 유도하고 profile의
-    `capacity_limit_*` seed 상한을 넘지 않도록 묶는다. device memory는 별도로 검사한다.
-  - seed는 전략 축(PK / distribution / tile 방향)만 서로 다르게 열고,
-    utilization은 seed 유도에만 쓰며 objective는 항상 실측 total_ms다 (§31).
-- **KSplitFragment 범위**: 문서 예시는 PK≤8이지만 UPMEM 실측 최적점
-  (split_k.py, SPLIT_K=16)이 탐색 범위 안에 있도록 PK=16까지 연다.
-- **reduction 위치는 고정 template 기간 동안 target이 정한다**:
-  커널이 하나뿐이라 reduction 위치를 config가 바꿀 수 없으므로,
-  `build_config_space`가 `TARGET_REDUCTION_POLICY`(upmem→host, aimx→device)로
-  KSplit 전략을 구성해 plan·feature가 실제 실행과 일치하게 한다.
-  표에 없는 target은 KeyError로 명시적으로 실패한다. codegen이
-  `pim.reduction_plan`을 소비해 policy대로 코드를 생성하게 되면 이 표를
-  제거하고 reduction 위치를 다시 탐색 dimension으로 연다. seed는 전략을
-  하드코딩하지 않고 spec에서 P_K 사다리(1·2·4·8·16)로 고른다.
-
-## Phase 2 — Residency / Replication (§53)
-
-Config에 `a_residency`/`b_residency`(stream|resident),
-`replication_policy`(slice|full), `streaming_policy`(per_round|all_rounds)를
-추가했다.
-
-- resident operand는 steady-state H2D(`a_bytes`/`b_bytes`)에서 빠지고 1회
-  placement(`a_resident_bytes`/`b_resident_bytes`)로 계산된다 — transfer
-  minimization이 search space에 반영되는 지점.
-- device memory 검사(§11)가 residency/streaming을 반영한다: resident+slice와
-  stream+all_rounds는 자기 몫 전체(자기 round 조각 × K plane), resident+full은
-  operand 전체 사본, stream+per_round는 temporal window 하나.
-- legality: resident operand가 없으면 replication은 slice여야 한다.
-- Seed G(weight-stationary, B resident)는 space가 resident를 허용할 때만
-  생성된다. residency를 실행에 반영하지 못하는 runtime(현 split_k 러너)은
-  `PIMConfigSpace(residency_policies=("stream",), ...)`로 제한해서 쓴다.
-
-## Phase 3 — Persistent Execution (§53)
-
-PersistenceFragment `(device_set_reuse, descriptor_reuse, command_reuse,
-persistent_execution)` 을 추가했다. 재사용은 단계적으로만 성립하므로
-(descriptor ⇒ device set, command ⇒ descriptor, persistent ⇒ command)
-legal 조합 5개만 나열하고 하나의 categorical knob으로 탐색한다.
-
-- Planner가 descriptor 계획을 산출한다: descriptor는 (device, round) 작업마다
-  하나이고, 재사용이 켜지면 같은 active 모양의 round는 다시 만들지 않는다.
-- Plan feature: `descriptor_build_count`, `descriptor_transfer_bytes`
-  (h2d의 §23 metadata 항으로도 가산), `descriptor_reuse_factor`,
-  `command_build_count`, `kernel_launch_count`, `device_alloc_count`.
-- descriptor 크기는 profile의 `descriptor_bytes`(기본 0 = 무시)로 준다.
-- persistence를 실행에 반영하지 못하는 runtime은 space를 기본 전략
-  `(True, False, False, False)` 하나로 제한해서 쓴다 (현 split_k 러너).
-
-## Cache 동작 (§45~§46 확장)
-
-같은 tuning key(shape·dtype·layout·hardware·version)에 대해 best와
-**측정 이력 전체**를 저장한다. `tune(cache=...)`의 동작:
-
-1. **정확 일치**: 같은 key의 항목이 있으면 탐색 없이 저장된 best를 반환한다
-   (`TuningResult.from_cache=True`). 재탐색은 `retune=True`.
-2. **재탐색(retune)**: 이미 측정한 configuration은 저장된 결과를 재사용하고
-   (`(cache)` 표기, 실측 예산 미소모), 실측은 새 configuration에만 쓴다 —
-   이전 측정 전체가 학습 데이터로 복원되므로 탐색은 이전 best 주변의
-   neighbor 생성부터 사실상 이어진다.
-3. **유사 shape warm start**: context(hardware·dtype·version)가 정확히 같고
-   shape만 다른 항목의 best knob을 seed로 주입한다. context가 하나라도
-   다르면(예: local_memory 변경) 재사용하지 않는다.
-
-## 데코레이터와 torch 연계
-
-`decorator.py`의 `@pim_autotune`은 problem을 텐서에서 추출하고 hardware를
-`targets.py` 등록표에서 얻는다. 동작:
+이 autotuner는 PIM Common IR에 실제로 기록되는 계층과 mapping만 탐색한다.
 
 ```text
-cache 정확 일치   → best config/plan 주입해 실행 (측정·검증 없음)
-cache miss        → tune() 실행 → best를 cache에 저장하고 실행
-retune            → cache에 있어도 재탐색. 이미 잰 config는 저장값 재사용,
-                    실측 예산은 새 후보에만
-search=False      → 탐색하지 않는다. miss면 seed 유도 config 하나로 실행
+Triton Block       [block_m, block_n, block_k]
+Block Group        [group_m, group_n, group_k]
+Execution Tile     [tile_m, tile_n, tile_k]
+Device mapping     [p_m, p_n, p_k]
 ```
 
-정책 두 개(`search`, `retune`)는 데코레이터 인자가 기본값이고 env가 그 위를
-덮어쓴다 — 코드를 고치지 않고 같은 스크립트를 다른 모드로 돌리기 위한 통로다.
+`block_*`는 Triton kernel constexpr이며 Common IR의 `#pim.block`으로 복원된다.
+`group_*`, `tile_*`, `p_*`는 compiler option으로 전달되어 각각
+`#pim.block_group`, `#pim.execution_tile`, `#pim.device_mapping`이 된다.
 
-| 인자 | env | 기본 | 뜻 |
-|---|---|---|---|
-| `search` | `PIM_AUTOTUNE=0\|1` | True | cache miss일 때 탐색할까 |
-| `retune` | `PIM_RETUNE=0\|1` | False | cache에 있어도 다시 탐색할까 |
+## Target 정보
 
-wall-clock 측정과 정답 검증(탐색 중에만, 기본은 균등 표본 위치를 작은 참조
-GEMM으로 직접 계산해 비교, `ref_fn`으로 교체 가능)은 데코레이터가 수행하고,
-config→커널 인자 매핑은 함수 본문이 소유한다(공통부는 `pim_launch_options`).
+compiler와 autotuner는 `backend/target.py`의 동일한 타입과 builder를 사용한다.
 
-torch.compile 경로(`workspace/torch_integration/pim_template.py`)는 같은
-cache의 **소비자**다: lowering이 shape별로 cache를 조회해(없으면 seed 유도값)
-best config를 PIMTemplate 1개 후보로 내고, outer 경쟁 없이 무조건 PIM으로
-확정한다. launch 옵션(group/tile/partitions)은 backend `_ENV_OPTIONS`에 추가된
-env 통로(PIM_GROUP_* / PIM_TILE_* / PIM_DEVICE_AXIS_PARTITIONS)로 전달되며,
-`compile_threads=1`의 순차 컴파일이 shape별 값의 적용을 보장한다.
+```text
+PIMTargetSpec
+  common_profile: PIMTargetProfile
+  runtime_config: UPMEMRuntimeConfig | AiMXRuntimeConfig
+```
+
+`PIMTargetProfile`은 Common IR의 일곱 필드와 정확히 같다. `nr_tasklets`,
+`host_threads`, `batch`, `base_fpga`는 target runtime config이며 Common IR 계층
+변수가 아니다.
+
+초기 후보의 첫 `P`는 problem grid가 허용하는 범위에서
+`p_m*p_n*p_k`가 `num_units`에 가장 가까운 값이다. 이후에는 축별 seed와
+random/LFBO 후보를 측정하므로 최대 device 사용이 최종
+선택으로 고정되지 않는다.
+`(1,1,1)`은 강제하지 않고 problem grid가 unit 하나만 허용할 때만 첫
+seed로 나온다.
+
+UPMEM은 split-K를 충분히 비교할 수 있도록 유효한 각 `p_k` 단계마다
+`p_m*p_n*p_k`가 최대가 되는 `p_m/p_n` 조합을 초기 seed에 포함한다. 따라서
+적은 DPU를 쓰는 K-only 후보가 아니라, 비슷한 전체 device parallelism을
+유지한 상태에서 `p_k` 변화의 실제 실행 시간을 비교한다. LFBO가 partition을
+변경할 때는 같은 축의 Execution Tile만 새 device plane 안에 들어오도록
+줄인 뒤 constraint를 검사한다.
+
+## 탐색 흐름
+
+```text
+PIMProblem
+  -> Common IR config seed/random candidate
+  -> static constraint
+  -> Common IR 값에서 feature 파생
+  -> Random Forest LFBO scoring
+  -> 실제 target lowering 및 실행
+  -> end-to-end 시간 측정
+  -> cache
+```
+
+최종 objective는 실제 end-to-end 실행시간이다. utilization, transfer,
+replication, reduction, padding, memory pressure는 후보를 설명하기 위해 Common IR
+값에서 계산하는 내부 feature일 뿐 compiler option이나 IR attribute로 저장하지 않는다.
+
+## 사용 예
+
+```python
+from autotuner import (
+    PIMBenchmarkResult, PIMProblem, SearchBudget,
+    build_config_space, target_spec, tune,
+)
+
+problem = PIMProblem(M=8192, N=8192, K=128)
+target = target_spec("upmem")
+space = build_config_space(problem, target)
+
+def benchmark(problem, target, config):
+    elapsed_ms = run_kernel(config)
+    return PIMBenchmarkResult(total_ms=elapsed_ms)
+
+result = tune(problem, target, benchmark, space=space,
+              budget=SearchBudget(max_benchmarks=30))
+print(result.best.config)
+```
+
+UPMEM 직접 예제는 실제 장비 크기를 명시할 수 있다.
+
+```bash
+python examples/autotune_gemm.py --m 256 --n 256 --k 256 \
+  --num-units 256 --lanes-per-core 16 --nr-tasklets 16
+```
+
+`num_units`는 profile 상한이고, 각 후보의 실제 DPU 수는
+`p_m*p_n*p_k`다. `nr_tasklets=0`은 `lanes_per_core`를 모두 사용한다.
+
+현재 `PIMProblem`과 byte 계산은 GEMM을 지원한다. 다른 연산을 추가할 때도 별도
+distribution/reduction/residency policy를 Config에 넣지 않고, 해당 연산의
+Block–Group–Tile과 access dependency에서 feature를 계산한다.

@@ -81,10 +81,10 @@ def _build_upmem_runtime() -> str:
     return so_path
 
 
-def _build_upmem_so(host_src: str, device_src: str, local_lanes: int) -> str:
+def _build_upmem_so(host_src: str, device_src: str, nr_tasklets: int) -> str:
     # 소스 번들을 device.elf + host.so로 컴파일하고 host.so 경로를 돌려준다.
     # 소스 해시를 키로 캐시해 같은 커널은 한 번만 컴파일한다(CPULauncher와 동일한 발상).
-    # local_lanes는 소스에 안 박히고 -DNR_TASKLETS 플래그로만 들어가므로 키에 따로 포함한다.
+    # nr_tasklets는 -DNR_TASKLETS 플래그로만 들어가므로 키에 따로 포함한다.
     # dpu_opt도 키에 넣어 최적화 레벨을 바꾸면 캐시가 자동 무효화되게 한다(안 그러면 옛 elf 재사용).
 
     # dpu-upmem-dpurte-clang은 기본 v1B용 바이너리를 만든다. 시뮬레이터를 v1B로 맞춘다.
@@ -97,7 +97,7 @@ def _build_upmem_so(host_src: str, device_src: str, local_lanes: int) -> str:
     # 공유 런타임 .so 경로(=내용 해시)를 키에 포함 → upmem_runtime.c가 바뀌면 host.so도 재빌드되어
     # 모든 host.so가 동일한 최신 런타임을 링크한다(섞이면 set 캐시 globals가 안 공유됨).
     runtime_so = _build_upmem_runtime()
-    key = hashlib.sha256((host_src + device_src + f"|L={local_lanes}|{dpu_opt}|rt={runtime_so}").encode("utf-8")).hexdigest()
+    key = hashlib.sha256((host_src + device_src + f"|T={nr_tasklets}|{dpu_opt}|rt={runtime_so}").encode("utf-8")).hexdigest()
     cache = get_cache_manager(key)
     so_name = "pim_host.so"
     so_path = cache.get_file(so_name)
@@ -110,9 +110,9 @@ def _build_upmem_so(host_src: str, device_src: str, local_lanes: int) -> str:
         Path(device_c).write_text(device_src)
         Path(host_cpp).write_text(host_src)
 
-        # device.c → device.elf. NR_TASKLETS = local_lanes (DPU 내부 tasklet 수). dpu_opt(-O2)는 위에서 정의.
+        # device.c → device.elf. NR_TASKLETS는 실제 활성 tasklet 수다.
         elf_tmp = os.path.join(tmp, "device.elf")
-        subprocess.check_call(["dpu-upmem-dpurte-clang", dpu_opt, f"-DNR_TASKLETS={local_lanes}",
+        subprocess.check_call(["dpu-upmem-dpurte-clang", dpu_opt, f"-DNR_TASKLETS={nr_tasklets}",
                                device_c, "-o", elf_tmp])
         # elf를 캐시에 박아 안정 경로를 확보한다. 실행 중 upmem_acquire(DPU_BINARY)가 이 경로를 dpu_load한다.
         elf_path = cache.put(Path(elf_tmp).read_bytes(), "device.elf", binary=True)
@@ -226,7 +226,8 @@ class PIMLauncher(object):
         # 노출한다는 전제로 공유한다(AiMX가 다른 인자를 요구하면 그때 호출부도 분기).
         if self.pim_target == "upmem":
             # NR_TASKLETS는 컴파일러가 lane 예산 안에서 고른 값이다. 번들에 실려 온다.
-            so_path = _build_upmem_so(bundle["host"], bundle["device"], bundle["lanes"])
+            so_path = _build_upmem_so(
+                bundle["host"], bundle["device"], bundle["nr_tasklets"])
         elif self.pim_target == "aimx":
             so_path = _build_aimx_so(bundle["stub"], bundle["descriptors"],
                                      bundle["base_fpga"])

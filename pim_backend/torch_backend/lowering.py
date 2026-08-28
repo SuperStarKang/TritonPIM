@@ -16,13 +16,11 @@
 # 여기서는 PIMInductorBackend가 켜져 있는 동안에만 lowerings[aten._int_mm]을
 # 갈아 끼우고, 끝나면 되돌린다.
 #
-# [CPU fallback을 두지 않는 이유]
-# strict 모드에서 조건을 어기면 바로 멈춘다. fallback이 있으면 PIM template
-# compile이 실패했는데도 결과가 맞아 테스트가 통과한 것처럼 보인다.
+# 지원 조건을 어기면 CPU fallback 없이 바로 멈춘다.
 #
 # [실행 계획은 여기서 정하지 않는다]
 # 이 파일이 보는 것은 "그래프가 이 template에 들어올 모양인가"뿐이다. block/
-# group/execution tile과 축별 device 분할 수는 plan.resolve_execution_plan이
+# group/execution tile과 축별 device 분할 수는 execution.resolve_execution이
 # autotuner에게서 받아 오고, 그 config가 이 shape에서 성립하는지는 autotuner의
 # ConstraintEngine이 판정한다.
 
@@ -37,7 +35,7 @@ from torch._inductor.lowering import _full, _register_lowering, lowerings
 
 from ._autotuner import PIMProblem
 from .config import PIMTorchConfig, UnsupportedPIMIntMM
-from .plan import resolve_execution_plan
+from .execution import resolve_execution
 from .template import pim_split_k_template
 
 aten = torch.ops.aten
@@ -58,7 +56,7 @@ def validate_pim_int_mm(mat1, mat2, m, n, k) -> PIMProblem:
 
     여기서 보는 것은 "그래프가 이 template에 들어올 모양인가"뿐이다. 실행
     계획이 이 shape에서 성립하는지(memory 예산, 축별 분할 수, alignment)는
-    autotuner의 ConstraintEngine이 본다 — plan.resolve_execution_plan."""
+    autotuner의 ConstraintEngine이 본다 — execution.resolve_execution."""
     if len(mat1.get_size()) != 2 or len(mat2.get_size()) != 2:
         raise UnsupportedPIMIntMM(
             f"PIM _int_mm supports 2-D inputs only, got "
@@ -158,17 +156,12 @@ def generate_pim_split_k_template(mat1, mat2, partial, execution):
     return node
 
 
-def make_pim_int_mm_lowering(config: PIMTorchConfig, fallback):
+def make_pim_int_mm_lowering(config: PIMTorchConfig):
     def pim_int_mm(mat1, mat2, *, layout=None):
-        try:
-            m, n, k, _out_layout, mat1_r, mat2_r = mm_args(
-                mat1, mat2, layout=layout, out_dtype=torch.int32)
-            problem = validate_pim_int_mm(mat1_r, mat2_r, m, n, k)
-            execution = resolve_execution_plan(config, problem)
-        except UnsupportedPIMIntMM:
-            if config.strict:
-                raise
-            return fallback(mat1, mat2, layout=layout)
+        m, n, k, _out_layout, mat1_r, mat2_r = mm_args(
+            mat1, mat2, layout=layout, out_dtype=torch.int32)
+        problem = validate_pim_int_mm(mat1_r, mat2_r, m, n, k)
+        execution = resolve_execution(config, problem)
 
         log.info("PIM _int_mm (M,N,K)=(%d,%d,%d): %s",
                  problem.M, problem.N, problem.K, execution.describe())
@@ -186,13 +179,8 @@ def make_pim_int_mm_lowering(config: PIMTorchConfig, fallback):
         # partial을 읽는 쪽은 mutation 이후의 이름을 보게 된다 (MutationOutput).
         # dtype을 명시하지 않으면 torch.sum 규약대로 int64로 승격된다.
         #
-        # reduction 위치는 target이 정한다 (autotuner의 TARGET_REDUCTION_POLICY).
-        # "host"가 아니면 device가 이미 합친 결과라 여기서 또 합치면 안 된다.
-        if execution.config.reduction_policy not in ("host", "none"):
-            raise UnsupportedPIMIntMM(
-                f"reduction_policy={execution.config.reduction_policy!r} is not "
-                f"supported yet — this lowering always adds a host reduction. "
-                f"target={config.target}")
+        # 각 p_k plane 안의 reduction은 target lowering이 수행한다. 서로 다른
+        # PIM Device가 만든 p_k partial만 이 그래프의 host sum으로 합친다.
         return lowerings[aten.sum](partial, axis=0, dtype=torch.int32)
 
     return pim_int_mm
@@ -222,16 +210,14 @@ class PIMIntMMLowering:
         self._saved = None
 
     def __enter__(self):
-        # stock lowering이 아직 등록 전이면 import로 강제한다 (fallback 확보).
+        # stock lowering이 아직 등록 전이면 import로 강제한다.
         import torch._inductor.kernel.mm  # noqa: F401
 
         keys = _int_mm_lowering_keys()
         self._saved = {key: lowerings.get(key) for key in keys}
-        fallback = self._saved.get(aten._int_mm.default)
-
         wrapped = _register_lowering(
             aten._int_mm,
-            make_pim_int_mm_lowering(self.config, fallback),
+            make_pim_int_mm_lowering(self.config),
             broadcast=False,
             type_promotion_kind=None,
             convert_input_to_bool=False,

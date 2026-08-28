@@ -3,7 +3,7 @@
 #
 # 실행:
 #   conda activate pim_triton
-#   python torch_attention.py --seq 256 --kv 256 --head-dim 128 [--split-k P_K]
+#   python torch_attention.py --seq 256 --kv 256 --head-dim 128
 #
 # 예상 배치:
 #   transpose        CPU Cpp
@@ -60,16 +60,13 @@ def main():
     parser.add_argument("--head-dim", type=int, default=128)  # QK의 K
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="고른 실행 계획(block/group/tile/device 분할)을 찍는다")
-    parser.add_argument("--split-k", type=int, default=4,
-                        help="원하는 K 분할 수 P_K. QK와 PV 둘 다 "
-                             "K %% (P_K*BLOCK_K) == 0 이어야 한다")
     args = parser.parse_args()
 
     if args.verbose:
         logging.basicConfig(level=logging.INFO)
         logging.getLogger("torch_backend").setLevel(logging.INFO)
 
-    config = build_config(args.split_k)
+    config = build_config()
 
     torch.manual_seed(0)
     q = torch.randint(-8, 8, (args.seq, args.head_dim), dtype=torch.int8)

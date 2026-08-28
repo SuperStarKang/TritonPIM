@@ -1,24 +1,21 @@
 # PIMTorchConfig — "무엇을 고를지"와 Inductor 안전장치.
 #
-# 실행 계획(block/group/execution tile, 축별 device 분할 수)은 여기 없다.
-# autotuner/types.py의 PIMConfig가 갖고, 하드웨어 자원은 targets.py의
-# PIMHardwareProfile이 갖는다. 고르는 일은 plan.py가 한다.
+# 실행 계층(block/group/execution tile, p_m/p_n/p_k)은 여기 없다.
+# autotuner의 PIMConfig가 갖고, 하드웨어 자원은 공유 PIMTargetSpec이 갖는다.
 #
 # 여기 남은 것은 셋뿐이다.
-#   1) 어느 target이고, 어떻게 config를 고를 것인가 (seed / autotune cache)
-#   2) autotuner가 모르는 template·runtime knob (num_warps 등)
+#   1) 어느 target spec과 Common IR config를 쓸 것인가
+#   2) Triton template compile knob (num_warps 등)
 #   3) Inductor 쪽 안전장치 (compile_threads, fx_graph_cache)
 
 from dataclasses import dataclass
 from typing import Optional
 
-from ._autotuner import PIMConfig
+from ._autotuner import PIMConfig, PIMTargetSpec
 
 
 class UnsupportedPIMIntMM(RuntimeError):
-    """strict 모드에서 PIM이 못 맡는 _int_mm을 만났을 때. CPU fallback을 하지
-    않으므로 여기서 멈춘다 — fallback이 있으면 PIM template compile이 실패해도
-    테스트가 통과한 것처럼 보인다."""
+    """PIM template이 지원하지 않는 _int_mm을 만났을 때의 진단."""
 
 
 # PIMOptions로 그대로 넘어가는 key 목록. 여기 없는 이름을 backend_options에
@@ -26,6 +23,7 @@ class UnsupportedPIMIntMM(RuntimeError):
 PIM_OPTION_KEYS = (
     "pim_target",
     "num_units",
+    "banks_per_unit", "cores_per_bank",
     "lanes_per_core",
     "bank_capacity_limit_bytes", "local_capacity_limit_bytes",
     "p_m", "p_n", "p_k",
@@ -40,32 +38,19 @@ PIM_OPTION_KEYS = (
 @dataclass(frozen=True)
 class PIMTorchConfig:
     # ── 어느 PIM target인가 ────────────────────────────────────────────────
-    # 하드웨어 수치(num_units, lanes_per_core, memory 상한)는 여기 없다 —
-    # autotuner/targets.py의 등록표에서 온다.
-    target: str = "upmem"
-    # strict: 지원 조건을 하나라도 어기면 즉시 에러. False로 두면 stock Inductor
-    # lowering(CPU)로 되돌아간다. 경로 검증 중에는 True여야 한다.
-    strict: bool = True
-
+    # compiler와 autotuner가 사용하는 같은 target spec. None이면
+    # backend/target.py의 기본 UPMEM spec을 사용한다.
+    spec: Optional[PIMTargetSpec] = None
     # ── config를 고르는 방법 (우선순위 순) ────────────────────────────────
-    # 1) config를 직접 준다. 그대로 쓴다 — 보정도 P_M 고정도 하지 않는다.
+    # 1) config를 직접 준다. 그대로 쓴다.
     #    autotuner가 "이 config를 재라"고 요구할 때 쓰는 통로다. 여기서 값을
     #    바꾸면 잰 것과 기록한 것이 달라진다.
     config: Optional[PIMConfig] = None
     # 2) offline autotune cache의 best (단계 B). cache miss는 fail-fast다 —
     #    조용히 seed로 돌아가면 무엇으로 실행됐는지 알 수 없다.
     autotune_cache_path: Optional[str] = None
-    # 3) 둘 다 없으면 heuristic seed. 정답 확인용이고 성능 숫자를 내는 용도가
-    #    아니다 — seed는 shape를 다 보지 않는다(plan._fit_k_axis 주석 참고).
-    #    이 P_K를 갖는 seed를 고른다.
-    split_k: int = 4
-    # seed 경로에서만 P_M=1로 고정한다. 직접 경로에서 확인된 형태다.
-    # 주입된 config와 cache의 config는 실측 결과이므로 건드리지 않는다.
-    pin_row_partitions: bool = True
-
-    # ── autotuner가 모르는 knob ──────────────────────────────────────────
-    # host가 영역을 모으고 되돌릴 때 쓰는 스레드 수.
-    host_threads: int = 8
+    # 3) 둘 다 없으면 Common IR 값으로 만든 기본 seed.
+    # ── Triton compile config ─────────────────────────────────────────────
     # PIM은 warp/stage 개념이 없지만 triton.compile 옵션 스키마에는 있어서
     # 채운다. PIMOptions의 기본값(num_warps=0, num_stages=1)과 어긋나지 않게 둔다.
     num_warps: int = 1
@@ -85,17 +70,12 @@ class PIMTorchConfig:
     disable_fx_graph_cache: bool = True
 
     def __post_init__(self):
-        if not isinstance(self.split_k, int) or self.split_k < 1:
-            raise ValueError(
-                f"split_k must be a positive int, got {self.split_k!r}")
-        for name in ("host_threads", "num_warps", "num_stages"):
+        for name in ("num_warps", "num_stages"):
             value = getattr(self, name)
             if not isinstance(value, int) or value < 0:
                 raise ValueError(
                     f"PIMTorchConfig.{name} must be a non-negative int, "
                     f"got {value!r}")
-        # target 이름이 등록표에 있는지는 여기서 보지 않는다 — targets.py가
-        # KeyError로 명시적으로 실패한다 (plan.resolve_execution_plan).
 
 
 def validate_pim_options(options: dict) -> dict:

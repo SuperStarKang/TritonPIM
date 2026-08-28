@@ -14,8 +14,9 @@
 #     )
 
 from .backend import PIMInductorBackend
+from ._autotuner import PIMTargetSpec, target_spec
 from .config import PIMTorchConfig, UnsupportedPIMIntMM, validate_pim_options
-from .plan import PIMExecutionPlan, resolve_execution_plan
+from .execution import PIMExecution, resolve_execution
 from .runtime_compat import set_driver_to_backend
 from .scheduling import PIMCombinedScheduling
 from .template import pim_split_k_template
@@ -23,11 +24,13 @@ from .template import pim_split_k_template
 __all__ = [
     "PIMInductorBackend",
     "PIMTorchConfig",
-    "PIMExecutionPlan",
+    "PIMTargetSpec",
+    "PIMExecution",
     "UnsupportedPIMIntMM",
     "PIMCombinedScheduling",
     "pim_split_k_template",
-    "resolve_execution_plan",
+    "resolve_execution",
     "set_driver_to_backend",
+    "target_spec",
     "validate_pim_options",
 ]

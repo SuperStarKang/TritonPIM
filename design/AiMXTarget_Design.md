@@ -39,12 +39,12 @@ Placed PIM Common IR을 AiMX FPGA의 CDMA descriptor stream으로 옮기는 계�
 Compiler option과 target IR의 단위는 다음과 같이 구분한다.
 
 - `tile_m/n/k`: execution tile 하나에 묶는 **block-group 개수**
-- `capacity_limit_m/n/k`: `BLOCK * GROUP * TILE`로 유도한 **유효 논리 원소 상한**
+- `BLOCK * GROUP * TILE`: 저장하지 않고 파생하는 **유효 논리 원소 크기**
 - `t_m/t_n/t_k`: AiMX padding을 반영한 `#aimx.tiling`의 **물리 tile 크기**
 
-`#pim.execution_tile` contract은 논리 원소 상한을 그대로 유지한다. Python
-driver가 `capacity_limit_*`를 Common pass의 내부 `tile-m/n/k` option으로 번역한다.
-AiMX target은 그 결정을 바꾸지 않고 물리 padding만 `t_*`에 반영한다.
+`#pim.execution_tile`은 Block Group 개수만 기록한다. AiMX target은
+`#pim.block`, `#pim.block_group`, `#pim.execution_tile`의 곱에서 논리 원소 크기를
+읽고, 그 결정을 바꾸지 않은 채 물리 padding만 `t_*`에 반영한다.
 
 | 용어 | 뜻 | 크기 |
 | --- | --- | --- |
@@ -1057,44 +1057,28 @@ number_of_parallel_lanes_per_pim_core = 256
 
 ### 4.7 필요한 변경
 
-`pim_backend/backend/compiler.py` 한 파일, 다섯 군데다.
+현재 구현은 `pim_backend/backend/target.py`의 공유 target builder를 사용한다.
 
 ```python
-AIMX_DEVICE_DRAM_BYTES = ...   # 모듈 상단. board/driver 사양에서 선언한 상수
-
-"aimx": {
-    "pim_core_shape": "1",                                # "8,16" → "1"
-    "parallel_execution_kind": "simd",
-    "uniform_instruction_sequence": "true",
-    "lanes": 4096,                                        # 새 항목
-    "devices": 1,                                         # 새 항목. FPGA 개수
-    "capacity": lambda o: (AIMX_DEVICE_DRAM_BYTES, 0),    # (-1, 0) → 선언한 예산, 0
-},
+PIMTargetSpec(
+  common_profile=PIMTargetProfile(
+    target="aimx", num_units=fpga_count,
+    banks_per_unit=256, cores_per_bank=1, lanes_per_core=16,
+    bank_capacity_limit_bytes=AIMX_BANK_CAPACITY_BYTES,
+    local_capacity_limit_bytes=0),
+  runtime_config=AiMXRuntimeConfig(batch=batch, base_fpga=base_fpga))
 ```
 
-`lanes`와 `devices`를 target 표에서 주려면 `_profile_pass`의 두 줄을 바꾼다.
+`num_units`는 `/dev/pl_dma*`에서 보이는 FPGA 개수이거나 명시적으로 전달한 값이다.
+`[p_m,p_n,p_k]`의 곱은 이 수 이하여야 한다.
 
-```python
-f"number-of-pim-devices={t.get('devices', options.num_units)} "
-f"number-of-parallel-lanes-per-pim-core={t.get('lanes', options.local_lanes)} "
-```
+AiMX capacity는 UPMEM 기본값을 공유하지 않는다. target builder가
+runtime heap 사양에서 bank당 `bank_capacity_limit_bytes`를 계산해 Common
+profile에 기록한다. §1.8 (h)처럼 `pim_malloc`은 한계를 넘어도 NULL을
+반환하지 않으므로, 할당 실험으로 capacity를 유추하지 않는다.
 
-**`devices`가 없으면 안 된다.** 지금 `_profile_pass`는 `options.num_units`를 그대로
-싣고 그 기본값이 **2048**이다 (`compiler.py`의 `num_units: int = 2048`). 그러면
-`--pim-map-devices`가 그 수만큼 쪼개므로, `--convert-pim-to-aimx`가 받는 IR은 FPGA
-하나가 아니라 **PIM Device 2048개로 나뉜 IR**이 된다. AiMX의 PIM Device는 FPGA
-하나이므로 (§4.4) 이 값은 target이 정해야 한다.
-
-**`capacity`도 옵션 기본값을 쓰면 안 된다.** `o.unit_memory_bytes`의 기본값은 UPMEM
-MRAM에서 온 32 MiB(`unit_memory_bytes: int = 32 * 1024 * 1024`)라 AiMX가 조용히 32 MiB
-예산을 쓰게 된다. 그리고 §1.8 (h) 때문에 "측정한 예산"이라는 말 자체가 성립하지
-않는다 — `pim_malloc`은 실패해도 NULL을 돌려주지 않고 프로세스를 죽이므로 할당을
-키워 가며 재는 방법으로는 이 값을 얻을 수 없다. **사양에서 받은 상수를 적는다.**
-
-**`pim_core_shape = [1]`인 동안은 PIM dialect(`PIMDialect.td`)와
-`lib/Conversion/TTSharedToPIM/` 아래의 어떤 pass도 건드리지 않는다.** §15 E11이
-성공해서 `[16]`으로 가면 `PIMMapCoresPass`의 `cores != 1` 방어벽(48행)과
-`PIMFormExecutionWavesPass`의 `tilesPerWave != 1` 방어벽(59행)을 확장해야 한다.
+AiMX 물리 실행 눈금 `[batch,4096/batch,256/batch]`는 Common profile에 추가하지
+않고 AiMX lowering이 `batch`로 padding한다.
 
 ### 4.8 이 값으로 공통 pipeline이 끝까지 도는지
 
@@ -1113,20 +1097,13 @@ MRAM에서 온 32 MiB(`unit_memory_bytes: int = 32 * 1024 * 1024`)라 AiMX가 �
 
 ## 5. PIM Common IR에서 얻는 값
 
-`--convert-pim-to-aimx`가 필요로 하는 것이 거의 다 이미 있다. **없는 것은 표의 마지막
-줄 하나 — `usable_bank_capacity_bytes`다.** 지금 `-1`(미측정)이고,
-`PIMSetTargetProfilePass`는 음수면 그 필드를 아예 만들지 않는다. 그런데 그것이 §6.1
-알고리즘의 유일한 필수 입력이므로, 그 값 없이는 execution tile 선택 — 즉
-`--convert-pim-to-aimx`의 첫 단계 — 을 구현할 수 없다.
-
-> **막지 않고 진행하는 법.** §6.1이 이 값을 pass option
-> (`--convert-pim-to-aimx=bank-capacity-bytes=…`)으로도 받게 한다. 그러면 profile 값이
-> 확정되기 전에도 구현하고 시험할 수 있고, 확정되면 option 없이 profile에서 읽는다.
+`--convert-pim-to-aimx`가 필요로 하는 값은 PIM Common IR과 공유 target profile에
+이미 있다.
 
 | 필요한 것 | 어디서 | §3의 어느 단계 |
 | --- | --- | --- |
 | PIM Device 개수와 축별 분할 | `pim.device`의 `#pim.device_mapping` | ① |
-| device 하나가 맡는 직사각형 | `pim.place`의 `capacity` | ①→② |
+| device 하나가 맡는 직사각형 | `pim.place`의 `allocation_shape` | ①→② |
 | 실제 유효 범위 (경계 tile) | `pim.place`의 `size` | padding 결정 |
 | host buffer 안의 위치와 간격 | `pim.place`의 `start`, `strides` | stage/unstage |
 | A / B / C 구분 | `pim.place.direction` + `pim.access.id` ↔ `linalg.matmul` operand | ③ |
@@ -1134,7 +1111,7 @@ MRAM에서 온 32 MiB(`unit_memory_bytes: int = 32 * 1024 * 1024`)라 AiMX가 �
 | logical tile 모양 | `pim.access.sizes` | 진단용 |
 | 같은 데이터를 받는 device | `pim.place.replicated_over` | stage 중복 제거 |
 | padding 값 | `pim.access.pad` (`pim-verify`가 0임을 보장) | §6 |
-| 기계 예산 | `#pim.target_profile.usable_bank_capacity_bytes` | ② |
+| 기계 예산 | `#pim.target_profile.bank_capacity_limit_bytes` | ② |
 
 UPMEM target이 쓰는 것과 정확히 같은 집합이다. 즉 **PIM Common IR은 이미 충분히
 target-neutral하다.**
@@ -1143,19 +1120,16 @@ profile에 채워 넣어야 하는 값:
 
 | 필드 | 지금 | 되어야 하는 값 |
 | --- | --- | --- |
-| `pim_core_shape` | `8,16` | `1` (§4.4) |
-| `number_of_pim_devices` | `num_units` 기본 2048 | FPGA 개수 |
-| `number_of_parallel_lanes_per_pim_core` | `local_lanes` 기본 1 | 4096 |
-| `usable_bank_capacity_bytes` | `-1` (미측정) | device당 PIM DRAM 예산. **사양에서 받은 상수** (§4.7, §1.8 (h)) |
-| `usable_local_capacity_bytes` | `0` | `0` 유지 |
+| `num_units` | FPGA 개수 |
+| `banks_per_unit` | 256 |
+| `cores_per_bank` | 1 |
+| `lanes_per_core` | 16 |
+| `bank_capacity_limit_bytes` | FPGA heap을 256 bank로 나눈 상한 |
+| `local_capacity_limit_bytes` | 0 |
 
-> **이름 주의.** `usable_bank_capacity_bytes`의 정의는 "**PIM Core 하나의** attached bank
-> 중 커널 몫"이다 (`Conversion/TTSharedToPIM/Passes.td:104`). 여기서 FPGA 전체 DRAM
-> 예산으로 쓸 수 있는 것은 `pim_core_shape = [1]`이라 PIM Device당 PIM Core가 하나이기
-> 때문이고, 그때만 두 값이 같다. §4.6이 `[16]`으로 가면 이 등식이 깨지므로 그때는
-> device 단위 예산 필드를 따로 두어야 한다. 그리고 `pim.place`의 `capacity`는 **원소
-> 단위의 logical 직사각형**이지 물리 DRAM 한도가 아니다 (`PIMDialect.td`의 `pim.place`
-> 주석) — 두 개념을 같은 말로 부르지 않는다.
+FPGA 전체 unit 상한은 `banks_per_unit * bank_capacity_limit_bytes`로 파생한다.
+`pim.place.allocation_shape`는 원소 단위의 논리 직사각형이고 byte capacity와 다른
+개념이다.
 
 ---
 
@@ -1882,26 +1856,20 @@ PIM Common IR을 건드리지 않고 tuning된다.
 
 ### 12.4 어떻게 넣는가
 
-측정 결과를 pass option으로 넣는다.
+AiMX lowering이 tile 크기를 다시 선택하지 않는다. autotuner가 고른
+`PIMConfig` 정수 값이 공통 pass에서 다음 속성으로 materialize된다.
 
+```text
+BLOCK_M/N/K       -> #pim.block
+group_m/n/k       -> #pim.block_group
+tile_m/n/k        -> #pim.execution_tile
+p_m/n/k           -> #pim.device_mapping
 ```
---convert-pim-to-aimx=tile-m=16,tile-k=4096,tile-n=4096,bank-capacity-bytes=…
-```
 
-측정된 기본값은 다음과 같다.
-
-| option | 기본값 | 근거 |
-| --- | --- | --- |
-| `tile-m` | **16** | 16 위로 처리량이 평평하고, 전송량 식에 나타나지 않는다 (§6.1). 키우면 chain만 커진다 |
-| `tile-n` | **`n_max`** | B buffer 상한. 클수록 A 재stage가 줄고 B buffer가 커진다 |
-| `tile-k` | **`k_max`** | B·`Arel`·chain buffer 상한. `k_t`는 `k`가 정하므로 이것은 상한일 뿐이다 |
-| `batch` | **1** | §2.5. 독립 option이 아니라 고정값이다 |
-
-`tile-k`·`tile-n`은 **버퍼 상한**이고 실제 tile 모양은 런타임 값이다 (§6.1 3–4단계).
-`bank-capacity-bytes`는 profile의 `usable_bank_capacity_bytes`가 확정되기 전까지 쓰는
-임시 입력이다 (§5).
-Triton의 `@triton.autotune`으로는 `BLOCK_*`과 `num_units`만 흔들 수 있고 execution
-tile은 흔들 수 없으므로, execution tile은 backend option으로 두는 것이 맞다.
+AiMX target option에는 `batch`, `base_fpga`만 남는다. lowering은 Common IR의
+Execution Tile을 `batch` 물리 눈금에 맞게 padding하고 descriptor chain으로
+옮긴다. bank capacity는 `#pim.target_profile` 안의
+`bank_capacity_limit_bytes`를 사용하며 별도 tile/capacity policy를 두지 않는다.
 
 ---
 
@@ -2044,7 +2012,7 @@ compiler의 문제가 아니라 §12가 존재하는 이유 자체다.
 | --- | --- | --- |
 | 1 | `target == "aimx"` | `the module targets <t>` |
 | 2 | `parallel_execution_kind == "simd"` | `AiMX lanes share one descriptor stream, so parallel_execution_kind must be "simd"` |
-| 3 | `usable_bank_capacity_bytes` > 0 | `usable_bank_capacity_bytes is not recorded, so the execution tile cannot be sized` |
+| 3 | `bank_capacity_limit_bytes` > 0 | `bank_capacity_limit_bytes must be positive` |
 | 4 | device 몸체에 `linalg.matmul` 하나 | `the device body has no linalg.matmul` |
 | 5 | A·B·C 원소가 2 byte float | `element type <T> cannot be represented; the AiMX descriptor format moves 2 byte per element` |
 | 6 | 세 buffer의 마지막 축 stride가 1 | `buffer axis <d> is not unit-stride; A, B and C must be row-major` |
@@ -2155,8 +2123,8 @@ E4가 성공하면 이 항목은 무의미해집니다.
 
 ### E5. device당 PIM DRAM 예산
 
-`usable_bank_capacity_bytes`가 `-1`(미측정)이라 §6.1이 tile 크기를 정할 수 없습니다.
-당장은 pass option으로 넘겨 구현을 진행할 수 있습니다 (§5, §12.4).
+현재 구현은 AiMX runtime heap 상수에서 `bank_capacity_limit_bytes`를 계산해 공유
+profile에 기록한다. 별도 임시 capacity option은 사용하지 않는다.
 
 **크기를 키워 가며 재는 방법은 쓸 수 없습니다.** `pim_malloc`은 실패해도 NULL을
 돌려주지 않고 `PIM] OOM`을 찍은 뒤 프로세스를 죽입니다 (exit 255). 게다가 1 MB부터

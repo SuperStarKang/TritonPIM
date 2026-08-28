@@ -21,7 +21,6 @@ from typing import Tuple, Dict
 from types import ModuleType
 from pathlib import Path
 import contextlib
-import glob
 import hashlib
 import functools
 import os
@@ -33,6 +32,13 @@ import subprocess
 
 # CPU backend의 IR 변환 helper / make_ttir을 재사용한다 (클래스가 아닌 모듈로 참조).
 import triton.backends.triton_shared.compiler as cpu_compiler
+
+from .target import (
+    PIMTargetProfile,
+    PIMTargetSpec,
+    aimx_target_spec,
+    upmem_target_spec,
+)
 
 
 def _translate_path() -> str:
@@ -110,78 +116,17 @@ def _run_translate(mlir_text: str, which: str) -> str:
         return subprocess.check_output([tr, which, src]).decode("utf-8")
 
 
-# AiMX runtime의 FPGA별 PIM DRAM heap과 정확히 같은 예산이다.
-# pim_sw/src/mem_src/mdrv_interface.c가 8 GiB에서 runtime 예약분 18 MiB를 뺀
-# 0x1FEE00000 byte를 device 하나의 heap으로 고정한다. Common profile은 용량을
-# bank 단위로 받으므로 이 총량을 256개 bank에 균등하게 나눈다. 32 MiB를 단순히
-# 넣으면 aggregate가 runtime heap보다 18 MiB 커져 경계 config가 다시 OOM 날 수 있다.
-AIMX_BANKS_PER_DEVICE = 256
-AIMX_DEVICE_HEAP_BYTES = 0x1FEE00000
-AIMX_BANK_CAPACITY_BYTES = AIMX_DEVICE_HEAP_BYTES // AIMX_BANKS_PER_DEVICE
-
-
-def _aimx_device_count() -> int:
-    # 런타임(init_mpim_drv)이 /dev/pl_dma<i> 를 i = 0..totalDevNum-1 로 연다. 그러니
-    # 그 node 를 세는 것이 런타임이 보는 개수와 같은 값이다. 감지에 실패하면 1 로
-    # 때우지 않고 멈춘다 — 조용히 FPGA 한 장만 쓰는 것이 가장 알아채기 어렵다.
-    n = len(glob.glob("/dev/pl_dma[0-9]*"))
-    if n == 0:
-        raise RuntimeError(
-            "/dev/pl_dma* 가 없습니다. pim_drv 가 올라와 있는지 확인해 주십시오. "
-            "개수를 직접 주려면 num_units 옵션을 쓰십시오.")
-    return n
-
-@dataclass(frozen=True)
-class PIMTargetProfile:
-    target: str
-    num_units: int
-    banks_per_unit: int
-    cores_per_bank: int
-    lanes_per_core: int
-    bank_capacity_limit_bytes: int
-    local_capacity_limit_bytes: int
-
-
-@dataclass(frozen=True)
-class PIMTargetRuntimeConfig:
-    pass
-
-
-@dataclass(frozen=True)
-class UPMEMRuntimeConfig(PIMTargetRuntimeConfig):
-    nr_tasklets: int
-    host_threads: int
-
-
-@dataclass(frozen=True)
-class AiMXRuntimeConfig(PIMTargetRuntimeConfig):
-    batch: int
-    base_fpga: int
-
-
-@dataclass(frozen=True)
-class PIMTargetSpec:
-    common_profile: PIMTargetProfile
-    runtime_config: PIMTargetRuntimeConfig
-
-
 def _upmem_spec(o) -> PIMTargetSpec:
-    profile = PIMTargetProfile(
-        target="upmem",
-        num_units=o.num_units or 2048,
-        banks_per_unit=1,
-        cores_per_bank=1,
+    return upmem_target_spec(
+        num_units=o.num_units,
+        banks_per_unit=o.banks_per_unit,
+        cores_per_bank=o.cores_per_bank,
         lanes_per_core=o.lanes_per_core,
-        bank_capacity_limit_bytes=(o.bank_capacity_limit_bytes
-                                   or 60 * 1024 * 1024),
-        local_capacity_limit_bytes=(o.local_capacity_limit_bytes
-                                    or 48 * 1024),
-    )
-    runtime = UPMEMRuntimeConfig(
+        bank_capacity_limit_bytes=o.bank_capacity_limit_bytes,
+        local_capacity_limit_bytes=o.local_capacity_limit_bytes,
         nr_tasklets=o.nr_tasklets,
         host_threads=o.host_threads,
     )
-    return PIMTargetSpec(profile, runtime)
 
 
 def _aimx_spec(o) -> PIMTargetSpec:
@@ -193,21 +138,19 @@ def _aimx_spec(o) -> PIMTargetSpec:
     # device 분할 [p_m,p_n,p_k]는 Common IR 옵션에서 그대로 온다. bank 예산은
     # 선언 상수이며(pim_malloc은 실패해도 NULL 대신 프로세스를 종료한다), target
     # lowering도 이 공통 profile 값 하나만 읽는다.
-    profile = PIMTargetProfile(
-        target="aimx",
-        num_units=o.num_units or _aimx_device_count(),
-        banks_per_unit=AIMX_BANKS_PER_DEVICE,
-        cores_per_bank=1,
+    return aimx_target_spec(
+        num_units=o.num_units,
+        banks_per_unit=o.banks_per_unit,
+        cores_per_bank=o.cores_per_bank,
         lanes_per_core=o.lanes_per_core,
-        bank_capacity_limit_bytes=(o.bank_capacity_limit_bytes
-                                   or AIMX_BANK_CAPACITY_BYTES),
-        local_capacity_limit_bytes=0,
+        bank_capacity_limit_bytes=o.bank_capacity_limit_bytes,
+        local_capacity_limit_bytes=o.local_capacity_limit_bytes,
+        batch=o.batch,
+        base_fpga=o.base_fpga,
     )
-    runtime = AiMXRuntimeConfig(batch=o.batch, base_fpga=o.base_fpga)
-    return PIMTargetSpec(profile, runtime)
 
 
-# target 고유 값은 전부 위 두 함수에 있다 — 아래 코드에는 target 이름 분기가 없다.
+# target 고유 값은 backend/target.py의 builder에 있다.
 _TARGET_SPEC = {"upmem": _upmem_spec, "aimx": _aimx_spec}
 
 
@@ -232,7 +175,7 @@ PIM_COMMON_PASSES = [
     "--pim-form-compute",          # 누산기를 matmul 의 outs 로 통합
     "{profile}",                   # 기계 profile 부착. 여기부터 profile 을 읽는다
     "{form_block_groups}",         # 계층 2: 사용자 묶음(group-m/n/k) → #pim.block_group
-    "{form_execution_tiles}",      # large-memory 예산으로 execution tile shape 을 먼저 결정
+    "{form_execution_tiles}",      # 계층 3: 주어진 Block Group 개수 → #pim.execution_tile
     "{map_devices}",               # execution tile grid 를 num_units 이하 active PIM Device grid 에 scheduling
     "--pim-place-data",            # 최종 region·replication·allocation shape materialize
     "--pim-verify",                # 공통 fail-fast 검증
@@ -292,11 +235,11 @@ def _upmem_to_artifact(upmem_ir: str, metadata) -> bytes:
     metadata["name"] = match.group(1)
     # 실제로 쓰는 tasklet 수. UPMEM lowering이 nr_tasklets/profile에서 확정한 값이며,
     # launcher는 이 값을 -DNR_TASKLETS로 써야 IR과 device 빌드가 맞는다.
-    lanes = re.search(r'// pim\.lanes = (\d+)', device_src)
-    if not lanes:
+    nr_tasklets = re.search(r'// pim\.lanes = (\d+)', device_src)
+    if not nr_tasklets:
         raise RuntimeError("generated device.c에서 tasklet 수를 찾지 못함")
     return json.dumps({"host": host_src, "device": device_src,
-                       "lanes": int(lanes.group(1))}).encode("utf-8")
+                       "nr_tasklets": int(nr_tasklets.group(1))}).encode("utf-8")
 
 
 # ── AiMX target 경로 (UPMEM helper와 평행) ───────────────────────────────────
@@ -356,6 +299,8 @@ class PIMOptions:
 
     # #devices (#dpu | #fpga)
     num_units: int = 0
+    banks_per_unit: int = 0
+    cores_per_bank: int = 0
     # block group: local 상주 단위로 묶는 tile 수. group_m × group_n 이 출력 묶음이고
     # group_k 는 reduction strip(적재 한 번이 담는 K tile 수 — 누산기는 그대로다).
     # 0 또는 1 = Block 하나인 항등 group. 값을 주면 그대로 쓴다.
@@ -479,7 +424,7 @@ class PIMBackend(BaseBackend):
 
     @functools.lru_cache()
     def hash(self):
-        return self.target
+        return f"{self.target}-pim-common-ir-v1"
 
     def get_module_map(self) -> Dict[str, ModuleType]:
         return {}

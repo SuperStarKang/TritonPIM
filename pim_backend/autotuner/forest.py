@@ -1,11 +1,6 @@
-# Stage 9 — Random Forest Surrogate (design/AutoTuner_Design.md §36)
-#
-# 수집한 (Config + Plan Features, GOOD/BAD) 데이터로 P(GOOD)를 예측한다.
-# latency regression이 아니라 classification이다 (§34).
-#
-# pim_triton 환경에는 scikit-learn이 없으므로 numpy만으로 구현한다.
-# tree-guided neighbor 생성(§38)이 필요로 하는 decision path 추적을
-# 직접 노출한다.
+# Common IR config와 그 값에서 파생한 feature로 P(GOOD)를 예측하는
+# 간단한 Random Forest classifier. tree-guided neighbor 생성을 위해
+# decision path를 노출한다.
 
 import math
 import random
@@ -100,7 +95,7 @@ class DecisionTreeClassifier:
     def decision_path(self, x):
         """x를 분류할 때 지나간 분기 feature index (등장 순서, 중복 제거).
 
-        tree가 이 configuration을 판단하며 중요하게 사용한 feature다 (§38).
+        tree가 이 configuration을 판단하며 사용한 feature다.
         """
         node = self.root
         path = []
@@ -135,10 +130,10 @@ class RandomForestClassifier:
         return self
 
     def predict_prob(self, x):
-        """P(GOOD) (§36)."""
+        """P(GOOD)."""
         x = np.asarray(x, dtype=float)
         return sum(tree.predict_prob(x) for tree in self.trees) / len(self.trees)
 
     def sample_tree(self, rng):
-        """§52 forest.sample_tree() — neighbor 생성을 guide할 tree 하나."""
+        """Neighbor 생성을 guide할 tree 하나를 고른다."""
         return rng.choice(self.trees)

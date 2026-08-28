@@ -39,9 +39,8 @@ from torch_backend._autotuner import (  # noqa: E402
     PIMConfigCache,
     PIMProblem,
     build_config_space,
-    target_profile,
+    target_spec,
 )
-from torch_backend.plan import SPACE_OVERRIDES  # noqa: E402
 
 from autotuner import PIMBenchmarkResult, SearchBudget, tune  # noqa: E402
 
@@ -82,7 +81,7 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
-    hardware = target_profile("upmem")
+    target = target_spec("upmem")
     problem = PIMProblem(M=args.m, N=args.n, K=args.k,
                          input_dtype="int8", output_dtype="int32",
                          a_layout="row_major", b_layout="row_major")
@@ -92,9 +91,9 @@ def main():
     b = torch.randint(-8, 8, (args.k, args.n), dtype=torch.int8)
     rows, cols, ref_block = sampled_reference(a, b)
 
-    base = PIMTorchConfig(target="upmem", strict=True)
+    base = PIMTorchConfig(spec=target)
 
-    def benchmark_fn(problem, hardware, config, plan):
+    def benchmark_fn(problem, target, config):
         # config마다 새로 컴파일한다. reset이 없으면 dynamo가 앞 config로
         # 컴파일해 둔 것을 그대로 돌려준다 — 입력 shape가 같기 때문이다.
         torch._dynamo.reset()
@@ -104,50 +103,41 @@ def main():
             fullgraph=True,
             dynamic=False,
         )
-        try:
-            # 첫 호출은 compile(TTIR→PIM artifact 빌드 포함)이라 측정에서 뺀다.
+        # 첫 호출은 compile(TTIR→PIM artifact 빌드 포함)이라 측정에서 뺀다.
+        out = compiled(a, b)
+        samples = []
+        for _ in range(args.reps):
+            start = time.perf_counter_ns()
             out = compiled(a, b)
-            samples = []
-            for _ in range(args.reps):
-                start = time.perf_counter_ns()
-                out = compiled(a, b)
-                samples.append((time.perf_counter_ns() - start) / 1e6)
-        except Exception as exc:  # compile/실행 실패는 BAD sample이다 (§35)
-            print(f"    [실패] {type(exc).__name__}: {str(exc).splitlines()[0]}")
-            return PIMBenchmarkResult(total_ms=float("inf"),
-                                      compile_status="error")
+            samples.append((time.perf_counter_ns() - start) / 1e6)
 
         got = out.index_select(0, rows).index_select(1, cols)
         return PIMBenchmarkResult(
             total_ms=statistics.median(samples),
             correctness=bool(torch.equal(got, ref_block)))
 
-    spec = build_config_space(problem, hardware, **SPACE_OVERRIDES)
+    space = build_config_space(problem, target)
     cache = PIMConfigCache(args.cache)
     budget = SearchBudget(max_generations=args.max_generations,
                           max_benchmarks=args.max_benchmarks,
                           max_autotune_seconds=args.max_seconds)
 
     print(f"problem (M,N,K)=({args.m},{args.n},{args.k})  "
-          f"target=upmem num_units={hardware.num_units}")
+          f"target=upmem num_units={target.common_profile.num_units}")
     print(f"cache: {args.cache}")
 
-    result = tune(problem, hardware, benchmark_fn, space=spec, cache=cache,
+    result = tune(problem, target, benchmark_fn, space=space, cache=cache,
                   budget=budget, seed=args.seed, retune=args.retune,
                   verbose=True)
 
     best = result.best
-    c, p = best.config, best.plan
+    c = best.config
     print(f"\nbest {best.result.total_ms:.3f} ms")
     print(f"  block=({c.block_m},{c.block_n},{c.block_k}) "
           f"group=({c.group_m},{c.group_n},{c.group_k}) "
-          f"tile=({c.tile_m},{c.tile_n},{c.tile_k}) "
-          f"capacity_limit=({c.capacity_limit_m},{c.capacity_limit_n},"
-          f"{c.capacity_limit_k})")
-    print(f"  execution_shape={p.execution_tile_shape} "
-          f"devices={p.active_device_grid} rounds={p.num_rounds}")
-    print(f"  distribution={c.distribution_policy} "
-          f"reduction={c.reduction_policy}")
+          f"tile=({c.tile_m},{c.tile_n},{c.tile_k})")
+    print(f"  execution_extent={c.execution_extent} "
+          f"devices=({c.p_m},{c.p_n},{c.p_k})")
     print(f"\ntorch 경로에서 이 결과를 쓰려면:")
     print(f"  PIMTorchConfig(autotune_cache_path={args.cache!r})")
 

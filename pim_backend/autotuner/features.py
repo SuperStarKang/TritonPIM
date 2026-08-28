@@ -1,129 +1,110 @@
-# Stage 5 — Plan Feature Extraction (design/AutoTuner_Design.md §20~§27)
-#
-# AutoTuner는 BM/BN/PK 같은 knob 값만 Random Forest에 넣지 않는다.
-# Planner가 생성한 실제 execution plan으로부터 PIM-specific feature를
-# 계산한다 (§20). utilization은 objective가 아니라 성능을 설명하는
-# feature다 (§31).
+"""Derived search features calculated from PIM Common IR values."""
 
+from dataclasses import dataclass
 import math
 
-from .constraints import device_memory_footprint, local_memory_footprint
-from .space import REDUCTION_POLICIES
-from .types import PIMPlanFeatures
+from .constraints import local_memory_footprint, unit_memory_footprint
+from .types import ceil_div
 
 
-def extract_plan_features(problem, hardware, config, plan):
-    e_m, e_n, e_k = plan.execution_grid
-    p_m, p_n, p_k = plan.active_device_grid
-    t_m, t_n, t_k = plan.execution_tile_shape
+@dataclass(frozen=True)
+class PIMFeatures:
+    active_units: int
+    effective_utilization: float
+    execution_tile_count: int
+    scheduling_rounds: int
+    h2d_bytes: int
+    d2h_bytes: int
+    a_replication_bytes: int
+    b_replication_bytes: int
+    reduction_bytes: int
+    padding_ratio: float
+    load_imbalance: float
+    local_memory_pressure: float
+    unit_memory_pressure: float
+
+
+def extract_features(problem, target, config):
+    profile = target.common_profile
+    t_m, t_n, t_k = config.execution_extent
+    e_m = ceil_div(problem.M, t_m)
+    e_n = ceil_div(problem.N, t_n)
+    p_m, p_n, p_k = config.p_m, config.p_n, config.p_k
     active_units = p_m * p_n * p_k
+    rounds_m = ceil_div(e_m, p_m)
+    rounds_n = ceil_div(e_n, p_n)
+    scheduling_rounds = rounds_m * rounds_n
+    assigned = e_m * e_n * p_k
+    effective_utilization = assigned / (
+        scheduling_rounds * profile.num_units)
 
-    # Feature 1 — effective device utilization (§21):
-    #   U_eff = sum(A_r) / (R * N_units)
-    total_assigned = sum(len(items) for items in plan.device_assignments)
-    effective_utilization = total_assigned / (
-        plan.num_rounds * hardware.num_units)
+    mean_assignments = assigned / active_units
+    max_assignments = rounds_m * rounds_n
+    load_imbalance = max_assignments / mean_assignments
 
-    # Feature 2 — load imbalance (§22): I = max(W_d) / mean(W_d).
-    # W_d는 전체 schedule에서 device d가 받은 (padding 포함) MAC 수다.
-    per_item_mac = t_m * t_n * plan.k_windows_per_plane * t_k
-    counts = [0] * active_units
-    for items in plan.device_assignments:
-        for device, _, _, _ in items:
-            counts[device] += 1
-    workloads = [c * per_item_mac for c in counts]
-    mean_workload = sum(workloads) / active_units
-    load_imbalance = max(workloads) / mean_workload
-
-    # Feature 5 — padding (§25): R_padding = padded work / executed work.
-    executed = total_assigned * per_item_mac
+    k_plane = ceil_div(problem.K, p_k)
+    k_windows = ceil_div(k_plane, t_k)
+    padded_k = k_windows * t_k
+    executed = e_m * t_m * e_n * t_n * p_k * padded_k
     useful = problem.M * problem.N * problem.K
     padding_ratio = (executed - useful) / executed
 
-    # memory pressure (§27).
-    local_memory_pressure = (
-        local_memory_footprint(problem, config) / hardware.local_memory_bytes
-        if hardware.local_memory_bytes > 0 else 0.0)
-    device_memory_pressure = (
-        device_memory_footprint(problem, config) / hardware.device_memory_bytes)
+    input_bytes = problem.input_bytes
+    output_bytes = problem.output_bytes
+    items = e_m * e_n * p_k
+    raw_a_bytes = items * t_m * padded_k * input_bytes
+    raw_b_bytes = items * padded_k * t_n * input_bytes
 
-    transfer = plan.transfer_plan
-    reduction = plan.reduction_plan
-    descriptor = plan.descriptor_plan
-    return PIMPlanFeatures(
-        effective_utilization=effective_utilization,
-        load_imbalance=load_imbalance,
-        h2d_bytes=transfer.h2d_bytes,
-        d2h_bytes=transfer.d2h_bytes,
-        a_replication_bytes=transfer.a_replication_bytes,
-        b_replication_bytes=transfer.b_replication_bytes,
-        reduction_bytes=reduction.reduction_bytes,
-        reduction_rounds=reduction.reduction_rounds,
-        padding_ratio=padding_ratio,
-        scheduling_rounds=plan.num_rounds,
-        local_memory_pressure=local_memory_pressure,
-        device_memory_pressure=device_memory_pressure,
+    # replicated_over=["n"]인 A는 같은 scheduling round의 p_n device들이,
+    # replicated_over=["m"]인 B는 같은 round의 p_m device들이 공유한다.
+    # round가 바뀌면 stage/to_mram이 다시 실행되므로 서로 다른 round까지 한 번의
+    # 전송으로 세면 안 된다.
+    a_bytes = e_m * rounds_n * p_k * t_m * padded_k * input_bytes
+    b_bytes = rounds_m * e_n * p_k * padded_k * t_n * input_bytes
+    output_bytes_per_tile = t_m * t_n * output_bytes
+    d2h_bytes = items * output_bytes_per_tile
+    final_output_bytes = e_m * e_n * output_bytes_per_tile
+    reduction_bytes = max(0, d2h_bytes - final_output_bytes)
+
+    local_limit = profile.local_capacity_limit_bytes
+    unit_limit = profile.banks_per_unit * profile.bank_capacity_limit_bytes
+    return PIMFeatures(
         active_units=active_units,
-        execution_tile_count=e_m * e_n * e_k,
-        a_resident_bytes=transfer.a_resident_bytes,
-        b_resident_bytes=transfer.b_resident_bytes,
-        descriptor_build_count=descriptor.descriptor_build_count,
-        descriptor_transfer_bytes=descriptor.descriptor_transfer_bytes,
-        descriptor_reuse_factor=descriptor.descriptor_reuse_factor,
-        command_build_count=descriptor.command_build_count,
-        kernel_launch_count=descriptor.kernel_launch_count,
-        device_alloc_count=descriptor.device_alloc_count,
+        effective_utilization=effective_utilization,
+        execution_tile_count=e_m * e_n * p_k * k_windows,
+        scheduling_rounds=scheduling_rounds,
+        h2d_bytes=a_bytes + b_bytes,
+        d2h_bytes=d2h_bytes,
+        a_replication_bytes=max(0, raw_a_bytes - a_bytes),
+        b_replication_bytes=max(0, raw_b_bytes - b_bytes),
+        reduction_bytes=reduction_bytes,
+        padding_ratio=padding_ratio,
+        load_imbalance=load_imbalance,
+        local_memory_pressure=(
+            local_memory_footprint(problem, config) / local_limit
+            if local_limit else 0.0),
+        unit_memory_pressure=(
+            unit_memory_footprint(problem, config) / unit_limit),
     )
 
 
-def feature_names(spec):
-    """§27 feature vector의 이름 목록. vector와 같은 순서다."""
-    names = [
+def feature_names():
+    return [
         "log2_block_m", "log2_block_n", "log2_block_k",
         "log2_group_m", "log2_group_n", "log2_group_k",
         "log2_tile_m", "log2_tile_n", "log2_tile_k",
         "p_m", "p_n", "p_k",
+        "active_units", "effective_utilization",
+        "execution_tile_count", "scheduling_rounds",
+        "h2d_bytes", "d2h_bytes",
+        "a_replication_bytes", "b_replication_bytes",
+        "reduction_bytes", "padding_ratio", "load_imbalance",
+        "local_memory_pressure", "unit_memory_pressure",
     ]
-    # 순서 없는 categorical 값은 숫자 크기에 의미가 생기지 않도록
-    # one-hot encoding을 쓴다 (§27).
-    names += [f"distribution={p}" for p in spec.distribution_policies]
-    names += [f"reduction={p}" for p in REDUCTION_POLICIES]
-    # Phase 2 knob (이진이라 열 하나씩이면 충분하다)
-    names += ["a_residency", "b_residency",
-              "replication=full", "streaming=all_rounds"]
-    # Phase 3 knob
-    names += ["device_set_reuse", "descriptor_reuse",
-              "command_reuse", "persistent_execution"]
-    names += [
-        "active_units",
-        "effective_utilization",
-        "execution_tile_count",
-        "scheduling_rounds",
-        "h2d_bytes",
-        "d2h_bytes",
-        "a_replication_bytes",
-        "b_replication_bytes",
-        "reduction_bytes",
-        "reduction_rounds",
-        "padding_ratio",
-        "load_imbalance",
-        "local_memory_pressure",
-        "device_memory_pressure",
-        "a_resident_bytes",
-        "b_resident_bytes",
-        "descriptor_build_count",
-        "descriptor_transfer_bytes",
-        "descriptor_reuse_factor",
-        "command_build_count",
-        "kernel_launch_count",
-        "device_alloc_count",
-    ]
-    return names
 
 
-def config_plan_vector(config, features, spec):
-    """LFBO에 전달할 feature vector: X = [Config, PlanFeature] (§27, §33)."""
-    vector = [
+def config_feature_vector(config, features):
+    return [
         math.log2(config.block_m), math.log2(config.block_n),
         math.log2(config.block_k),
         math.log2(config.group_m), math.log2(config.group_n),
@@ -131,45 +112,13 @@ def config_plan_vector(config, features, spec):
         math.log2(config.tile_m), math.log2(config.tile_n),
         math.log2(config.tile_k),
         float(config.p_m), float(config.p_n), float(config.p_k),
-    ]
-    vector += [1.0 if config.distribution_policy == p else 0.0
-               for p in spec.distribution_policies]
-    vector += [1.0 if config.reduction_policy == p else 0.0
-               for p in REDUCTION_POLICIES]
-    vector += [
-        1.0 if config.a_residency == "resident" else 0.0,
-        1.0 if config.b_residency == "resident" else 0.0,
-        1.0 if config.replication_policy == "full" else 0.0,
-        1.0 if config.streaming_policy == "all_rounds" else 0.0,
-    ]
-    vector += [
-        1.0 if config.device_set_reuse else 0.0,
-        1.0 if config.descriptor_reuse else 0.0,
-        1.0 if config.command_reuse else 0.0,
-        1.0 if config.persistent_execution else 0.0,
-    ]
-    vector += [
-        float(features.active_units),
-        features.effective_utilization,
+        float(features.active_units), features.effective_utilization,
         float(features.execution_tile_count),
         float(features.scheduling_rounds),
-        float(features.h2d_bytes),
-        float(features.d2h_bytes),
+        float(features.h2d_bytes), float(features.d2h_bytes),
         float(features.a_replication_bytes),
         float(features.b_replication_bytes),
-        float(features.reduction_bytes),
-        float(features.reduction_rounds),
-        features.padding_ratio,
-        features.load_imbalance,
-        features.local_memory_pressure,
-        features.device_memory_pressure,
-        float(features.a_resident_bytes),
-        float(features.b_resident_bytes),
-        float(features.descriptor_build_count),
-        float(features.descriptor_transfer_bytes),
-        features.descriptor_reuse_factor,
-        float(features.command_build_count),
-        float(features.kernel_launch_count),
-        float(features.device_alloc_count),
+        float(features.reduction_bytes), features.padding_ratio,
+        features.load_imbalance, features.local_memory_pressure,
+        features.unit_memory_pressure,
     ]
-    return vector

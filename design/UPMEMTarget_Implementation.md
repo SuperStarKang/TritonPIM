@@ -204,7 +204,7 @@ while (perDMA > 1 && (perDMA * rowElems * elemBytes > 2048 || shape[0] % perDMA)
 
 ### 4.3 결정 3 — tasklet 분배
 
-`local_lanes > 1`이면 유닛이 맡은 타일을 tasklet에 나눈다.
+`nr_tasklets > 1`이면 유닛이 맡은 타일을 tasklet에 나눈다.
 
 ```
 병렬 grid loop들을 하나로 합친다 → tasklet 번호부터 tasklet 수만큼 건너뛰며 돈다
@@ -232,7 +232,7 @@ int64_t lanes = localLanes, budget = localMemoryBytes;
 if (wramBytes > budget)
   return dev->emitError("tile buffers need ") << wramBytes
          << " byte of unit fast memory (" << lanes << " tasklet(s)) but the budget is "
-         << budget << " byte; lower local_lanes or the BLOCK sizes";
+         << budget << " byte; lower nr_tasklets or the BLOCK sizes";
 ```
 
 IR을 고치기 **전에** 본다 — 반쯤 바뀐 IR이 오류에 딸려 나오면 읽기 어렵다.
@@ -350,7 +350,7 @@ struct dpu_set_t upmem_acquire(uint32_t num_units, const char *binary_path);
 ### 6.2 빌드 (`driver.py`)
 
 ```
-device.c → device.elf   dpu-upmem-dpurte-clang -O2 -DNR_TASKLETS=<local_lanes>
+device.c → device.elf   dpu-upmem-dpurte-clang -O2 -DNR_TASKLETS=<nr_tasklets>
 host.cpp → host.so      g++ -O2 -std=c++17 -fPIC -shared -fopenmp
                         -DDPU_BINARY="<elf 절대경로>" libupmem_runtime.so -Wl,-rpath,...
 ```
@@ -362,8 +362,8 @@ host.cpp → host.so      g++ -O2 -std=c++17 -fPIC -shared -fopenmp
 경로의 `.so`를 링크해야 동적 로더가 하나만 적재하고, 그래야 집합 캐시 전역이
 프로세스에서 공유된다. 이것이 지속 집합의 핵심이다.
 
-캐시 키는 `host_src + device_src + local_lanes + dpu_opt + runtime_so`다.
-`local_lanes`는 소스에 안 박히고 `-D`로만 들어가므로 따로 넣어야 한다.
+캐시 키는 `host_src + device_src + nr_tasklets + dpu_opt + runtime_so`다.
+`nr_tasklets`는 소스에 안 박히고 `-D`로만 들어가므로 따로 넣어야 한다.
 
 ---
 
@@ -377,8 +377,8 @@ host.cpp → host.so      g++ -O2 -std=c++17 -fPIC -shared -fopenmp
 | DMA 8 byte 정렬, ≤2048 byte | `mram_read`/`write` verifier, `buildDMA`의 행 묶음 쪼개기 |
 | `push_xfer`가 균일 바이트 요구 | `stage`의 `pad_to`, `unstage`의 `capacity`, `unit_data`의 capacity/sizes 분리 |
 | `__mram_noinit`이 상수 크기 요구 | MRAM 버퍼가 유닛 메모리를 나눈 상한, pitch를 `host_var`로 |
-| WRAM 64 KB | `local-memory-bytes` 예산 검사 |
-| 11단 pipeline | tasklet 11개까지는 늘려도 시간이 그대로 → `local_lanes` 선택 기준 |
+| WRAM 64 KB | `local_capacity_limit_bytes` 상한 검사 |
+| 11단 pipeline | tasklet 11개까지는 늘려도 시간이 그대로 → `nr_tasklets` 선택 기준 |
 | 32비트 곱셈기 없음 | (시도했다가 되돌림 — §5.3) |
 | `dpu_alloc` 수백 ms | `upmem.acquire`와 지속 집합 |
 
@@ -386,21 +386,25 @@ host.cpp → host.so      g++ -O2 -std=c++17 -fPIC -shared -fopenmp
 
 ## 8. 백엔드 옵션
 
-`pim_backend/backend/compiler.py`의 `PIMOptions` 중 UPMEM이 읽는 것들이다.
+compiler와 autotuner는 `pim_backend/backend/target.py`의 동일한
+`PIMTargetSpec`을 사용한다.
 
 ```python
-pim_target: str = None                  # "upmem" | "aimx" — 없으면 즉시 에러
-num_units: int = 2048                   # 물리 유닛 수. split의 곱이 넘으면 컴파일 실패
-unit_memory_bytes: int = 32*1024*1024   # 유닛당 큰 메모리 몫
-local_memory_bytes: int = 48*1024       # 유닛당 tile 버퍼 예산
-host_threads: int = 8                   # 영역을 모으고 되돌릴 때 쓰는 스레드 수
-split_m/split_n/split_k: int = 1        # 곱 = 유닛 개수
-local_lanes: int = 1                    # = NR_TASKLETS
+PIMTargetSpec(
+  common_profile=PIMTargetProfile(
+    target="upmem", num_units=2048,
+    banks_per_unit=1, cores_per_bank=1, lanes_per_core=16,
+    bank_capacity_limit_bytes=60 * 1024 * 1024,
+    local_capacity_limit_bytes=48 * 1024),
+  runtime_config=UPMEMRuntimeConfig(
+    nr_tasklets=0,  # 0이면 lanes_per_core 전체
+    host_threads=8))
 ```
 
-`unit_memory_bytes`와 `local_memory_bytes`가 물리 크기(64 MB / 64 KB)보다 작은 이유는
-같다 — **커널이 써도 되는 몫**이라는 뜻이다. DPU 런타임도 MRAM에 자리를 잡고, tasklet
-스택과 런타임도 WRAM에 산다.
+Block–Group–Execution Tile과 device mapping은 따로 복제하지 않고
+`PIMConfig` 정수 값 `group_m/n/k`, `tile_m/n/k`, `p_m/n/k`를 그대로
+compiler option으로 넘긴다. `nr_tasklets`만 UPMEM target runtime 값이며
+`lanes_per_core` 이하에서 활성 tasklet 수를 정한다.
 
 `pim_target`이 `target`이면 안 된다. Triton이 metadata를
 `{"target": GPUTarget, **options.__dict__}`로 만들어서 같은 이름의 옵션이 GPUTarget을
@@ -411,7 +415,7 @@ local_lanes: int = 1                    # = NR_TASKLETS
 ## 9. 성능 — 지금까지 한 것
 
 측정은 `(1024×512)×(512×1024)` i8 GEMM, `BLOCK 32/32/16`, `split=(16,16,1)`
-(256 유닛), `local_lanes=8` 기준이다.
+(256 유닛), `nr_tasklets=8` 기준이다.
 
 | 한 것 | 전 | 후 |
 | --- | ---: | ---: |
@@ -419,7 +423,7 @@ local_lanes: int = 1                    # = NR_TASKLETS
 | 지속 집합 (`upmem.acquire`) | 160.23 ms / 6.70 GOPS | 82.01 ms / 13.09 GOPS |
 | 〃 (가장 작은 경우) | 13.87 ms | 2.23 ms |
 
-지속 집합이 들어간 뒤에야 `local_lanes` 16이 8보다 빨라졌다(9.09 vs 11.26 ms). 그전에는
+지속 집합이 들어간 뒤에야 `nr_tasklets` 16이 8보다 빨라졌다(9.09 vs 11.26 ms). 그전에는
 launch당 약 11.6 ms의 고정 비용이 유닛 내부 병렬의 차이를 덮고 있었다.
 
 되돌린 것도 적어 둔다. `__builtin_mul_sl_sl_rrr`은 커널을 59.04 → 124.91 ms로
