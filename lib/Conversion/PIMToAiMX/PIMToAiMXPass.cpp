@@ -97,6 +97,7 @@ struct ConvertPIMToAiMXPass
     getOperation()->removeAttr("pim.target_profile");
     getOperation().walk([](func::FuncOp f) {
       f->removeAttr("pim.intra_device_plan");
+      f->removeAttr("pim.block");
       f->removeAttr("pim.block_group");
       f->removeAttr("pim.execution_tile");
     });
@@ -210,20 +211,6 @@ struct ConvertPIMToAiMXPass
     Location loc = device.getLoc();
     Block *deviceBody = &device.getBody().front();
 
-    if (!device->getAttrOfType<pim::InterDevicePlanAttr>(
-            "pim.inter_device_plan"))
-      return device->emitError(
-          "convert-pim-to-aimx: the device has no #pim.inter_device_plan");
-    auto reduction =
-        device->getAttrOfType<pim::ReductionPlanAttr>("pim.reduction_plan");
-    if (!reduction)
-      return device->emitError(
-          "convert-pim-to-aimx: the device has no #pim.reduction_plan");
-    if (reduction.getTemporalAccumulation().getValue() != "none" &&
-        reduction.getTemporalAccumulation().getValue() != "host")
-      return device->emitError(
-          "convert-pim-to-aimx: only host temporal accumulation is supported");
-
     auto intra = func->getAttrOfType<pim::IntraDevicePlanAttr>(
         "pim.intra_device_plan");
     if (!intra)
@@ -274,11 +261,9 @@ struct ConvertPIMToAiMXPass
           "convert-pim-to-aimx: A and B must be two-dimensional");
 
     // ── block → block group → execution tile ─────────────────────────────────
-    // 세 계층은 전부 공통 IR 이 정했다. block 은 matmul operand 의 크기(readRoles)로
-    // 보이고, block group 은 --pim-form-block-groups 가 실행 단위에 block 을 채워
-    // #pim.block_group 으로 적어 두었으며, execution tile 상한은 #pim.execution_tile
-    // 이다. 이 pass 가 하는 일은 번역뿐이다 — group 을 상한까지 모아 buffer 를 잡고,
-    // padding(useful < phys)을 stage/unstage 의 group 배치로 옮긴다.
+    // 세 계층은 전부 Common IR 이 정했다. #pim.block은 원소 shape,
+    // #pim.block_group은 Block 개수, #pim.execution_tile은 Group 개수다. 이 pass는
+    // 파생 원소 shape를 물리 눈금으로 번역하고 padding을 stage/unstage에 옮긴다.
     auto bg = func->getAttrOfType<pim::BlockGroupAttr>("pim.block_group");
     if (!bg)
       return func->emitError(
@@ -286,10 +271,15 @@ struct ConvertPIMToAiMXPass
           "--pim-form-block-groups after --pim-set-target-profile");
     int64_t units[] = {batch, aimx::kLanes / batch,
                        aimx::kRegSize / batch};
+    SmallVector<int64_t, 3> commonGroupShape = pim::groupShape(func);
+    if (commonGroupShape.size() != 3)
+      return func->emitError(
+          "convert-pim-to-aimx: cannot derive block-group shape from "
+          "#pim.block and #pim.block_group");
     auto groupAt = [&](int i) {
       BlockGroup g;
-      g.tiles = bg.getTiles().asArrayRef()[i];
-      g.useful = bg.getUseful().asArrayRef()[i];
+      g.tiles = bg.getBlocks().asArrayRef()[i];
+      g.useful = commonGroupShape[i];
       g.phys = (g.useful + units[i] - 1) / units[i] * units[i];
       return g;
     };
@@ -299,25 +289,26 @@ struct ConvertPIMToAiMXPass
     // vecA의 256-element 단위에 부족한 부분은 t_k의 물리 padding이지,
     // 추가 논리 group이 아니다.
 
-    // 상한(유효 원소)이 담는 group 수는 내림이다(최소 1) — 상한은 넘지 않는 약속이다.
-    // host loop 은 유효 크기로 걷고 buffer 는 물리 크기로 잡는다. 세 축의 구체 수치는
-    // 공통 --pim-form-execution-tiles 가 확정했다(사용자 값 또는 예산 탐색 — footprint
-    // 식은 AiMXFootprint.h 로 공유). 이 pass 는 읽기만 하고, 예산 재검증(checkBudget)
-    // 만 방어적으로 유지한다.
-    auto cap =
-        device->getAttrOfType<pim::ExecutionTileAttr>("pim.execution_tile");
-    if (!cap || cap.getM() <= 0 || cap.getN() <= 0 || cap.getK() <= 0)
+    // Tile의 Group 개수는 Common IR이 확정했다. host loop은 파생된 유효 원소 크기로
+    // 걷고 buffer는 물리 크기로 잡는다. 이 pass는 읽기만 하고 예산을 재검사한다.
+    SmallVector<int64_t, 3> commonTileShape =
+        pim::executionTileShape(device);
+    if (!device->getAttrOfType<pim::ExecutionTileAttr>("pim.execution_tile") ||
+        commonTileShape.size() != 3 || commonTileShape[0] <= 0 ||
+        commonTileShape[1] <= 0 || commonTileShape[2] <= 0)
       return device->emitError(
-          "convert-pim-to-aimx: #pim.execution_tile with concrete m, n, k "
-          "caps is required — run --pim-form-execution-tiles (it computes "
-          "missing caps from the profile budget)");
+          "convert-pim-to-aimx: #pim.execution_tile needs positive m, n, k "
+          "group counts — run --pim-form-execution-tiles");
 
-    int64_t mCount = std::max<int64_t>(cap.getM() / mGroup.useful, 1);
+    int64_t mCount =
+        std::max<int64_t>(commonTileShape[0] / mGroup.useful, 1);
     int64_t mUse = mCount * mGroup.useful;
     int64_t mPhys = mCount * mGroup.phys;
     int64_t nMax =
-        std::max<int64_t>(cap.getN() / nGroup.useful, 1) * nGroup.phys;
-    int64_t kCount = std::max<int64_t>(cap.getK() / kGroup.useful, 1);
+        std::max<int64_t>(commonTileShape[1] / nGroup.useful, 1) *
+        nGroup.phys;
+    int64_t kCount =
+        std::max<int64_t>(commonTileShape[2] / kGroup.useful, 1);
     int64_t kMax = (kCount * kGroup.phys + aimx::kRegSize - 1) /
                    aimx::kRegSize * aimx::kRegSize;
 

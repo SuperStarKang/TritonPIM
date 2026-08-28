@@ -1,5 +1,7 @@
 // device-axis-partitions 명시 분할: 자동 인수분해를 대체하고 k 도
-// 나눌 수 있다. 곱이 device 수를 넘으면 진단이다.
+// 나눌 수 있다. 곱이 device 수를 넘으면 진단이다. 이 테스트에는 pim.access가
+// 없다. Device scheduling은 세 hierarchy attribute만으로 완결되어야 하며 실제
+// access shape와의 정합성 검사는 뒤의 pim-verify가 담당한다.
 // RUN: triton-shared-opt "--pim-map-devices=device-axis-partitions=m:2,n:2,k:2" %s | FileCheck %s
 // RUN: triton-shared-opt "--pim-map-devices=device-axis-partitions=m:64" -verify-diagnostics %s
 
@@ -17,7 +19,10 @@ module attributes {pim.target_profile = #pim.target_profile<
 
 // expected-error @below {{the explicit partitions need 64 PIM Devices but the machine has 8}}
 func.func @three_axes(%tr: index, %tc: index, %tp: index)
-    attributes {pim.execution_tile = #pim.execution_tile<m = 0, n = 0, k = 0>} {
+    attributes {
+      pim.block = #pim.block<shape = [1, 1, 1]>,
+      pim.block_group = #pim.block_group<blocks = [1, 1, 1]>,
+      pim.execution_tile = #pim.execution_tile<groups = [1, 1, 0]>} {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   scf.for %x = %c0 to %tr step %c1 {

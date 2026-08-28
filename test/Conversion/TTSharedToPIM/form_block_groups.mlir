@@ -4,15 +4,22 @@
 // RUN: triton-shared-opt "--pim-form-block-groups=group-m=2 group-n=2" %s | FileCheck %s
 // RUN: triton-shared-opt --pim-form-block-groups=group-k=2 %s | FileCheck %s --check-prefix=GK
 // RUN: triton-shared-opt "--pim-set-target-profile=target=aimx number-of-pim-devices=1 number-of-banks-per-pim-device=256 number-of-pim-cores-per-bank=1 number-of-parallel-lanes-per-pim-core=16 parallel-execution-kind=simd usable-bank-capacity-bytes=268435456 usable-local-capacity-bytes=0" "--pim-form-block-groups=group-m=1 group-n=1 group-k=1" "--pim-plan-intra-device=bank-partitions=8,32,1 core-partitions=1,1,1 lanes=16 lane-axis=n" --pim-form-execution-tiles %s | FileCheck %s --check-prefix=AIMX
+// RUN: triton-shared-opt "--pim-form-block-groups=group-m=1 group-n=1 group-k=1" "--pim-form-execution-tiles=tile-m=2 tile-n=3 tile-k=4" %s | FileCheck %s --check-prefix=GEMM-TILE
 
 // AIMX: #pim.target_profile<target = "aimx"
 // AIMX-NOT: execution_unit
-// AIMX: #pim.block_group<tiles = [1, 1, 1], useful = [8, 32, 32]>
-// AIMX: #pim.execution_tile<m = 8, n = 256, k = 7876864>
+// AIMX: #pim.block<shape = [8, 32, 32]>
+// AIMX: #pim.block_group<blocks = [1, 1, 1]>
+// AIMX: #pim.execution_tile<groups = [1, 1, 1]>
 // AIMX: #pim.intra_device_plan<bank_partitions = [8, 32, 1]
 
+// GEMM-TILE: #pim.block<shape = [8, 32, 32]>
+// GEMM-TILE: #pim.block_group<blocks = [1, 1, 1]>
+// GEMM-TILE: #pim.execution_tile<groups = [2, 3, 4]>
+
 // 기본값(전부 1)은 항등이다.
-// IDENT: #pim.block_group<tiles = [1, 1, 1], useful = [8, 32, 32]>
+// IDENT: #pim.block<shape = [8, 32, 32]>
+// IDENT: #pim.block_group<blocks = [1, 1, 1]>
 // IDENT: sizes [8, 32]
 // IDENT: tensor<8x32xi32>
 
@@ -31,7 +38,8 @@
 // 축 loop: 상한 = ceildiv(tiles, 2), 몸체 첫머리가 첫 tile 좌표(iv·2)를 복원한다.
 // 새 상한 둘은 반드시 nest 밖(가장 바깥 축 loop 앞)에 있어야 한다 — pim-map-devices 가
 // nest 밖에서 상한을 읽어 extents 를 만들기 때문이다.
-// CHECK:      #pim.block_group<tiles = [2, 2, 1], useful = [16, 64, 32]>
+// CHECK:      #pim.block<shape = [8, 32, 32]>
+// CHECK:      #pim.block_group<blocks = [2, 2, 1]>
 // CHECK:      arith.ceildivsi
 // CHECK:      arith.ceildivsi
 // CHECK:      scf.for %[[XG:.*]] = %{{.*}} to

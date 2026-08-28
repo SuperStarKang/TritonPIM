@@ -27,7 +27,10 @@ module attributes {pim.target_profile = #pim.target_profile<
 
 func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
                   %K: i32, %N: i32, %ex: index, %ey: index)
-    attributes {pim.intra_device_plan = #pim.intra_device_plan<bank_partitions = [1, 1, 1], core_partitions = [1, 1, 1], lanes = 1, lane_axis = "m">} {
+    attributes {
+      pim.block = #pim.block<shape = [8, 32, 32]>,
+      pim.block_group = #pim.block_group<blocks = [1, 1, 1]>,
+      pim.intra_device_plan = #pim.intra_device_plan<bank_partitions = [1, 1, 1], core_partitions = [1, 1, 1], lanes = 1, lane_axis = "m">} {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c2 = arith.constant 2 : index
@@ -46,16 +49,7 @@ func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
                                  partitions = [2, 4]>
       extents [%ex, %ey]
       attributes {
-        pim.execution_tile = #pim.execution_tile<m = 0, n = 64, k = 0>,
-        pim.inter_device_plan = #pim.inter_device_plan<
-            available_devices = 8,
-            axes = ["m", "n"],
-            active_grid = [2, 4],
-            execution_tile = [0, 64, 0],
-            scheduling_order = ["n", "m"]>,
-        pim.reduction_plan = #pim.reduction_plan<
-            spatial_partials = "none", temporal_accumulation = "none",
-            final_accumulation = "none">} {
+        pim.execution_tile = #pim.execution_tile<groups = [1, 2, 1]>} {
   ^bb0(%px: index, %py: index):
     %capx = arith.ceildivsi %ex, %c2 : index
     %startx = arith.muli %px, %capx : index

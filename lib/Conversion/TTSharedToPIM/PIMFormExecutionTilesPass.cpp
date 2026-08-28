@@ -1,11 +1,11 @@
 #include "triton-shared/Conversion/TTSharedToPIM/TTSharedToPIM.h"
 #include "triton-shared/Dialect/PIM/IR/PIMDialect.h"
 #include "triton-shared/Dialect/PIM/IR/PIMUtils.h"
-#include "triton-shared/Dialect/PIM/IR/TargetSpec.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 
 using namespace mlir;
@@ -26,28 +26,27 @@ struct PIMFormExecutionTilesPass
 
   void runOnOperation() override {
     if (tileM < 0 || tileN < 0 || tileK < 0) {
-      getOperation()->emitError("pim-form-execution-tiles: caps must not be "
-                                "negative (0 means automatic)");
+      getOperation()->emitError(
+          "pim-form-execution-tiles: tile-m, tile-n and tile-k must be "
+          "0 (one block group) or positive");
       return signalPassFailure();
     }
-    profile = pim::targetProfile(getOperation());
     WalkResult res = getOperation().walk([&](func::FuncOp func) {
       bool hasAccess = false;
       func.walk([&](pim::AccessOp) { hasAccess = true; });
       if (!hasAccess)
         return WalkResult::advance();
-      return succeeded(attachCaps(func)) ? WalkResult::advance()
+      return succeeded(attachTile(func)) ? WalkResult::advance()
                                          : WalkResult::interrupt();
     });
     if (res.wasInterrupted())
       signalPassFailure();
   }
 
-  pim::TargetProfileAttr profile;
-
-  LogicalResult attachCaps(func::FuncOp func) {
-    // 상한이 붙는 축의 loop 와 그 축의 group tile 원소수를 찾아 배수 조건을 검사한다.
-    // 눈금보다 잘게 자르면 창 경계가 tile 을 가르므로 진단이다.
+  LogicalResult attachTile(func::FuncOp func) {
+    // Execution Tile은 원소 상한이 아니라 Block Group의 정수 grid다. 이 pass는
+    // 비용을 계산하거나 PIM DRAM을 채우지 않고, 주어진 group 개수를 그대로
+    // Common IR에 materialize한다. 0은 존재하는 축의 최소값인 group 하나다.
     SmallVector<scf::ForOp> loops;
     func.walk<WalkOrder::PreOrder>(
         [&](scf::ForOp l) { loops.push_back(l); });
@@ -79,194 +78,42 @@ struct PIMFormExecutionTilesPass
     };
     scf::ForOp mLoop = axisLoop("m");
     scf::ForOp nLoop = axisLoop("n");
-    scf::ForOp explicitK = axisLoop("k");
     scf::ForOp redLoop = reductionLoop();
-    const pim::TargetSpec *spec =
-        profile ? pim::lookupTargetSpec(profile.getTarget().getValue())
-                : nullptr;
-    auto intra = func->getAttrOfType<pim::IntraDevicePlanAttr>(
-        "pim.intra_device_plan");
-    if (spec && !intra)
+    if (!func->getAttrOfType<pim::BlockAttr>("pim.block") ||
+        !func->getAttrOfType<pim::BlockGroupAttr>("pim.block_group"))
       return func->emitError(
-          "pim-form-execution-tiles: target footprint planning requires "
-          "#pim.intra_device_plan; run --pim-plan-intra-device first");
+          "pim-form-execution-tiles: #pim.block and #pim.block_group are "
+          "required; run --pim-form-block-groups first");
 
-    // execution tile 은 block group 정수 개다. 공통 block group은 유효 원소수만
-    // 기록하고, target의 물리 실행 눈금은 TargetSpec이 profile과 intra-device plan에서
-    // 산출한다. group이 없으면 block 정수 개다.
-    auto group = func->getAttrOfType<pim::BlockGroupAttr>("pim.block_group");
-    auto unitFor = [&](int idx, scf::ForOp loop) -> std::pair<int64_t, int64_t> {
-      if (group && idx >= 0)
-        return {group.getUseful().asArrayRef()[idx],
-                group.getUseful().asArrayRef()[idx]};
-      int64_t e = loop ? pim::tileElementsAlong(loop, loops) : 0;
-      return {e, e};
-    };
-
-    // ── 사용자 값 검증 — 상한은 그 축의 group(없으면 tile) 원소수의 배수다 ────────
-    struct Cap {
-      int64_t cap;
-      StringRef axis;
-      StringRef option;
-    };
-    Cap caps[] = {{tileM, "m", "tile-m"},
-                  {tileN, "n", "tile-n"},
-                  {tileK, "reduction", "tile-k"}};
-    for (const Cap &c : caps) {
-      if (c.cap == 0)
+    scf::ForOp axisLoops[3] = {mLoop, nLoop, redLoop};
+    int64_t requested[3] = {tileM, tileN, tileK};
+    StringRef options[3] = {"tile-m", "tile-n", "tile-k"};
+    StringRef axes[3] = {"m", "n", "reduction"};
+    int64_t tileGroups[3] = {0, 0, 0};
+    SmallVector<int64_t, 3> groupShape = pim::groupShape(func);
+    for (int i = 0; i < 3; ++i) {
+      if (!axisLoops[i]) {
+        if (requested[i] > 0)
+          return func->emitError("pim-form-execution-tiles: ")
+                 << options[i] << " is given but the kernel has no " << axes[i]
+                 << (i == 2 ? " loop" : " axis");
         continue;
-      bool isK = c.axis == "reduction";
-      scf::ForOp loop = isK ? redLoop : axisLoop(c.axis);
-      if (!loop)
-        return func->emitError("pim-form-execution-tiles: ")
-               << c.option << " is given but the kernel has no " << c.axis
-               << (isK ? " loop" : " axis");
-      int idx = isK ? 2 : (c.axis == "m" ? 0 : 1);
-      int64_t elems = unitFor(idx, loop).first;
-      StringRef grain = (group && idx >= 0) ? "block group" : "tile";
-      if (elems <= 0)
-        return func->emitError(
-                   "pim-form-execution-tiles: cannot tell how many elements "
-                   "one ")
-               << c.axis << " tile moves, so the cap cannot be validated";
-      if (c.cap % elems != 0)
-        return func->emitError("pim-form-execution-tiles: ")
-               << c.option << "(" << c.cap << ") is not a multiple of the "
-               << c.axis << " " << grain << " (" << elems << " elements)";
-    }
-
-    int64_t capM = tileM, capN = tileN, capK = tileK;
-
-    // ── 자동 산출 — device 배치 전에 execution tile shape 을 먼저 고른다 ──
-    // 조건: matmul 모양(m·n 축 + reduction loop 하나, k 없음),
-    // target 의 footprint spec 등록됨, bank 예산 알려짐. 조건 밖이면 0 을 그대로
-    // 둔다 — 전부 0 이면 attr 없이 두는 기존 동작이다.
-    bool matmulShaped = mLoop && nLoop && redLoop && !explicitK;
-    std::optional<int64_t> deviceCapacity =
-        pim::usableDeviceCapacityBytes(profile);
-    if ((capM == 0 || capN == 0 || capK == 0) && matmulShaped && spec &&
-        deviceCapacity && *deviceCapacity > 0) {
-      auto [mU, mP] = unitFor(0, mLoop);
-      auto [nU, nP] = unitFor(1, nLoop);
-      auto [kU, kP] = unitFor(2, redLoop);
-      if (mU <= 0 || nU <= 0 || kU <= 0)
-        return func->emitError(
-            "pim-form-execution-tiles: cannot tell the per-axis tile grain, "
-            "so the execution tile cannot be computed automatically");
-      mP = spec->physicalGroupExtent(profile, intra, 0, mU);
-      nP = spec->physicalGroupExtent(profile, intra, 1, nU);
-      kP = spec->physicalGroupExtent(profile, intra, 2, kU);
-      auto [kGrainU, kGrainP] =
-          spec->kGrain(profile, intra, kU, kP);
-
-      if (capM == 0)
-        capM = mU; // group 1개 — 두 target 공통 기본
-      if (capN == 0) {
-        int64_t nGroups = spec->preferredNGroups(profile, intra, nU, nP);
-        capN = std::max<int64_t>(1, nGroups) * nU;
       }
-      // footprint 는 물리 원소 위에서 계산한다 (검증을 통과했으므로 나눗셈은 정확).
-      int64_t mPhys = capM / mU * mP;
-      int64_t nPhys = capN / nU * nP;
-
-      if (capK == 0) {
-        SmallVector<pim::BufferShape> buffers;
-        collectBufferShapes(func, mLoop, nLoop, redLoop, buffers);
-        int64_t budget = *deviceCapacity;
-        auto fits = [&](int64_t u) {
-          return spec->deviceFootprintBytes(profile, intra, buffers, mPhys,
-                                            nPhys, u * kGrainP) <= budget;
-        };
-        if (!fits(1))
-          return func->emitError(
-                     "pim-form-execution-tiles: even one k unit (")
-                 << kGrainP << " elements) does not fit the device budget of "
-                 << budget << " byte";
-        // footprint 는 k 에 단조증가라 "예산에 드는 최대 배수" 는 이분 탐색이 정확하다.
-        int64_t lo = 1;
-        while (fits(lo * 2))
-          lo *= 2;
-        int64_t hi = lo * 2;
-        while (hi - lo > 1) {
-          int64_t mid = lo + (hi - lo) / 2;
-          (fits(mid) ? lo : hi) = mid;
-        }
-        capK = lo * kGrainU;
-      }
+      if (groupShape.size() != 3 || groupShape[i] <= 0)
+        return func->emitError(
+                   "pim-form-execution-tiles: cannot derive the block-group "
+                   "extent on the ")
+               << axes[i] << " axis";
+      tileGroups[i] = requested[i] == 0 ? 1 : requested[i];
     }
-
-    // reduction이 없는 elementwise/map 커널은 각 공간축 block group 하나를 가장
-    // 보수적인 seed execution tile로 쓴다. 이 선택에는 target 실행 눈금이나 연산별
-    // footprint 식이 필요 없다. 더 큰 execution tile은 autotuner가 같은 tile-m/n
-    // 옵션으로 탐색하고, target lowering이 실제 buffer 용량을 다시 검증한다.
-    if (!redLoop && !explicitK) {
-      if (mLoop && capM == 0)
-        capM = unitFor(0, mLoop).first;
-      if (nLoop && capN == 0)
-        capN = unitFor(1, nLoop).first;
-      capK = 0;
-    }
-
-    if (explicitK && (capM == 0 || capN == 0 || capK == 0))
-      return func->emitError(
-          "pim-form-execution-tiles: a kernel with k "
-          "requires concrete tile-m, tile-n, and tile-k; automatic spatial "
-          "plus temporal K planning is not implemented yet");
-
-    if (capM == 0 && capN == 0 && capK == 0)
-      return success(); // 상한 없음 — 배정 전체가 execution tile 하나 (기존 동작)
-    func->setAttr("pim.execution_tile",
-                  pim::ExecutionTileAttr::get(func.getContext(), capM, capN,
-                                              capK));
+    OpBuilder b(func.getContext());
+    func->setAttr(
+        "pim.execution_tile",
+        pim::ExecutionTileAttr::get(func.getContext(),
+                                    b.getDenseI64ArrayAttr(tileGroups)));
     return success();
   }
 
-  // footprint 계산에 쓸 buffer 모양: access 마다 "각 차원이 m/n/k 상한을 따라가는가"
-  // 와 원소 바이트. 원소 타입은 그 access 를 읽고 쓰는 load/store 의 tensor 타입에서
-  // 온다. 상한 축이 몰지 않는 차원(split-K 출력면 같은 것)은 정적 tile 크기 그대로다.
-  void collectBufferShapes(func::FuncOp func, scf::ForOp mLoop,
-                           scf::ForOp nLoop, scf::ForOp redLoop,
-                           SmallVectorImpl<pim::BufferShape> &buffers) {
-    SmallVector<scf::ForOp, 3> axisLoops;
-    scf::ForOp axes[3] = {mLoop, nLoop, redLoop};
-    for (scf::ForOp l : axes)
-      if (l)
-        axisLoops.push_back(l);
-    func.walk([&](pim::AccessOp a) {
-      Type elem;
-      for (Operation *user : a->getUsers()) {
-        if (auto load = dyn_cast<pim::LoadOp>(user))
-          elem = cast<RankedTensorType>(load.getResult().getType())
-                     .getElementType();
-        else if (auto store = dyn_cast<pim::StoreOp>(user))
-          if (!elem)
-            elem = cast<RankedTensorType>(store.getValue().getType())
-                       .getElementType();
-      }
-      if (!elem)
-        return;
-      pim::BufferShape shape;
-      shape.elemBytes =
-          std::max<int64_t>(1, elem.getIntOrFloatBitWidth() / 8);
-      ArrayRef<int64_t> sizes = a.getSizes();
-      for (unsigned d = 0, e = sizes.size(); d < e; d++) {
-        llvm::SmallPtrSet<Operation *, 4> ds;
-        pim::collectDrivers(a.getOrigin()[d], axisLoops, ds);
-        pim::BufferDim dim;
-        dim.staticSize = sizes[d];
-        if (ds.size() == 1) {
-          if (mLoop && ds.contains(mLoop))
-            dim.axis = pim::BufferDim::M;
-          else if (nLoop && ds.contains(nLoop))
-            dim.axis = pim::BufferDim::N;
-          else if (redLoop && ds.contains(redLoop))
-            dim.axis = pim::BufferDim::K;
-        }
-        shape.dims.push_back(dim);
-      }
-      buffers.push_back(shape);
-    });
-  }
 };
 
 } // namespace

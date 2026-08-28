@@ -12,17 +12,17 @@
 // PIM-CLEAN-LABEL: module
 // PIM-CLEAN-NOT: #pim.target_profile
 // PIM-CLEAN-NOT: #pim.intra_device_plan
+// PIM-CLEAN-NOT: #pim.block
 // PIM-CLEAN-NOT: #pim.block_group
 // PIM-CLEAN-NOT: #pim.execution_tile
 
 // 이 attribute는 할당된 buffer와 재사용 descriptor chain의 고정 모양이다.
 // 계층은 Triton block → block group → execution tile이고 전부 공통 IR이 정했다 —
-// block group은 func의 #pim.block_group에서, batch=8은 AiMX target option에서
-// 온다. BLOCK 32는 실행 단위 [8, 512, 32]의 배수라 padding이 없다.
-// 공통 pass가 자동 선택한 execution tile은 m group 하나(32), n 한 device 폭(4096),
-// k 남는 예산 전부다: 1 GiB에서 k_max = 103936 (kUnit 256의 배수), padded_k = 106496.
+// logical Block Group은 Block 하나이고 batch=8은 AiMX target option에서 온다.
+// N Group 32는 target 실행 단위 512로 padding된다. 입력 Common IR의 명시적
+// Execution Tile [1, 8, 3248]에서 n_max=4096, k_max=103936이 파생된다.
 // CHECK-LABEL: func.func @matmul
-// CHECK-SAME:    aimx.tile_group = #aimx.tile_group<block = [32, 32, 32], group = [1, 16, 1], execution = [32, 512, 32]>
+// CHECK-SAME:    aimx.tile_group = #aimx.tile_group<block = [32, 32, 32], group = [1, 1, 1], execution = [32, 512, 32]>
 // CHECK-SAME:    aimx.tiling = #aimx.tiling<batch = 8, t_m = 32, t_n = 4096, t_k = 103936, padded_k = 106496, padded_n = 4096, transposed = false>
 
 // FPGA 하나를 확보하고 그 안에서 buffer를 잡는다.
@@ -32,7 +32,7 @@
 // PMM이 가장 먼저다 — pim_private_malloc이 pim_malloc이 이미 내준 주소를 돌려줄 수 있다.
 // 그다음이 A(32*106496*2), Arel(32*103936*32), B(103936*4096*2), C(32*4096*2),
 // descriptor chain(211152 group * 512). 합쳐서 1,073,258,496 byte로 1 GiB 예산에 찬다 —
-// k 상한이 없으면 execution tile이 PIM DRAM에 맞게 적재되기 때문이다.
+// 명시된 execution tile이 target 물리 눈금으로 padding된 결과다.
 // CHECK:   aimx.alloc %{{.*}} bytes 196608 align 262144 kind pmm
 // CHECK:   aimx.alloc %{{.*}} bytes 6815744 align 512 kind data
 // CHECK:   aimx.alloc %{{.*}} bytes 106430464 align 512 kind data
@@ -97,11 +97,8 @@ module attributes {pim.target_profile = #pim.target_profile<
 func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
                   %K: i32, %N: i32, %ex: index, %ey: index)
     attributes {pim.intra_device_plan = #pim.intra_device_plan<bank_partitions = [8, 32, 1], core_partitions = [1, 1, 1], lanes = 16, lane_axis = "n">,
-        pim.block_group = #pim.block_group<
-            tiles = [1, 16, 1],
-            useful = [32, 512, 32]>,
-        pim.execution_tile = #pim.execution_tile<
-            m = 32, n = 4096, k = 103936>} {
+        pim.block = #pim.block<shape = [32, 32, 32]>,
+        pim.block_group = #pim.block_group<blocks = [1, 1, 1]>} {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c32 = arith.constant 32 : index
@@ -114,16 +111,7 @@ func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
                                  partitions = [1, 1]>
       extents [%ex, %ey]
       attributes {
-        pim.execution_tile = #pim.execution_tile<m = 32, n = 4096, k = 103936>,
-        pim.inter_device_plan = #pim.inter_device_plan<
-            available_devices = 1,
-            axes = ["m", "n"],
-            active_grid = [1, 1],
-            execution_tile = [32, 4096, 103936],
-            scheduling_order = ["n", "m"]>,
-        pim.reduction_plan = #pim.reduction_plan<
-            spatial_partials = "none", temporal_accumulation = "host",
-            final_accumulation = "none">} {
+        pim.execution_tile = #pim.execution_tile<groups = [1, 8, 3248]>} {
   ^bb0(%px: index, %py: index):
     // PIM Device 가 하나라 device 몫이 곧 전체다. 실제 pass 가 내는 모양 그대로 손으로 썼다.
     %capx = arith.ceildivsi %ex, %c1 : index

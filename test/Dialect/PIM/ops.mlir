@@ -36,6 +36,18 @@ func.func @access_clauses(%A: memref<*xf32>, %e: index, %pad: f32) {
   return
 }
 
+// 3계층은 각 층의 기본 단위만 저장한다. Group/Tile 원소 shape는 곱으로 파생된다.
+// CHECK-LABEL: func.func @hierarchy
+// CHECK-SAME: pim.block = #pim.block<shape = [32, 32, 8]>
+// CHECK-SAME: pim.block_group = #pim.block_group<blocks = [1, 4, 1]>
+// CHECK-SAME: pim.execution_tile = #pim.execution_tile<groups = [4, 2, 64]>
+func.func @hierarchy() attributes {
+    pim.block = #pim.block<shape = [32, 32, 8]>,
+    pim.block_group = #pim.block_group<blocks = [1, 4, 1]>,
+    pim.execution_tile = #pim.execution_tile<groups = [4, 2, 64]>} {
+  return
+}
+
 // device region과 배치. block argument는 이 device의 partition 좌표다.
 // CHECK-LABEL: func.func @device_place
 func.func @device_place(%A: memref<*xi8>, %C: memref<*xi32>, %ex: index, %ey: index) {

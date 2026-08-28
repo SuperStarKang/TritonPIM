@@ -7,9 +7,9 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 
 //===----------------------------------------------------------------------===//
 // PIM dialect — target 무관 PIM 공통 IR.
-// 공통 구조는 데이터 3계층이다: block(Triton tile 눈금) ⊂ block group(local 상주·
-// 계산 단위) ⊂ execution tile(PIM Device 하나가 한 번에 맡는 몫). 기계는 각 계층의
-// 소비자로 대응된다 — execution tile 은 PIM Device 가(#pim.inter_device_plan),
+// 공통 구조는 데이터 3계층이다: block(Triton tile 눈금) ⊂ block group(device-local
+// 계산 단위) ⊂ execution tile(PIM Device 하나의 compute+transfer/residency 단위).
+// 기계는 각 계층의 소비자로 대응된다 — execution tile 하나는 PIM Device 하나가,
 // block group 하나는 그 Device 안의 bank -> core -> lane 계층이 함께 분해해
 // 소비한다(#pim.intra_device_plan). target 용어(DPU/tasklet/MRAM/channel 등)는
 // 여기 등장하지 않는다.
@@ -106,60 +106,33 @@ def PIM_IntraDevicePlanAttr
   let genVerifyDecl = 1;
 }
 
-// block group — 데이터 3계층의 둘째 층. Triton block 정수 개를 인접하게 묶은
-// target-neutral 계산 단위다. 축 순서는 [m, n, k]다. target 하드웨어가 요구하는
-// padding은 profile과 intra-device plan을 읽는 TargetSpec/lowering이 계산한다.
+// block — 데이터 3계층의 첫째 층. Triton block 한 개가 각 canonical 축에서
+// 계산하는 유효 원소 수다. 축 순서는 [m, n, k]이고 없는 축은 0이다.
+def PIM_BlockAttr : PIM_Attr<"Block", "block"> {
+  let summary = "The useful element shape of one Triton block";
+  let parameters = (ins "::mlir::DenseI64ArrayAttr":$shape);
+  let assemblyFormat = "`<` struct(params) `>`";
+  let genVerifyDecl = 1;
+}
+
+// block group — 데이터 3계층의 둘째 층. 각 축에서 인접한 Block을 몇 개 묶는지만
+// 저장한다. Group 원소 shape는 #pim.block.shape * blocks로 파생한다.
 def PIM_BlockGroupAttr : PIM_Attr<"BlockGroup", "block_group"> {
   let summary = "An integer grid of adjacent Triton blocks";
-  let parameters = (ins "::mlir::DenseI64ArrayAttr":$tiles,
-                        "::mlir::DenseI64ArrayAttr":$useful);
+  let parameters = (ins "::mlir::DenseI64ArrayAttr":$blocks);
   let assemblyFormat = "`<` struct(params) `>`";
+  let genVerifyDecl = 1;
 }
 
-// execution tile 의 상한 (유효 원소 단위) — 데이터 3계층의 셋째 층. device 하나가
-// launch 1회에 상주시키는 몫의 크기다. --pim-form-execution-tiles가 먼저 func에
-// 모양을 붙이고, --pim-map-devices가 이 경계로 grid를 잘라 scheduling round를 만든다.
-// --pim-form-execution-tiles 가
-// 사용자 값(tile-m/n/k) 또는 자동 산출(m·n 은 기본 단위, k 는 남는 bank 예산 전부 —
-// target 이 등록한 footprint 로 탐색)로 채운다. 0 은 그 축이
-// 커널에 없거나 산출 근거(예산·footprint)가 없다는 뜻이다. target lowering 은 이
-// 값을 읽기만 한다.
+// execution tile — 데이터 3계층의 셋째 층. 각 축에서 Group을 몇 개 상주시킬지만
+// 저장한다. 원소 shape는 Block과 Group에서 파생한다. 없는 축의
+// group 수는 0이다. PIM DRAM 용량은 이 값을 늘리는 목표가 아니라 legality 상한이다.
+// spatial split-K가 있으면 pim.axis="k" 좌표마다 별도 Execution Tile instance가
+// 생기고, groups[k]는 각 spatial plane 내부 temporal reduction residency를 뜻한다.
+// Group 순회 순서는 target 실행 방식에 속하므로 target lowering이 정한다.
 def PIM_ExecutionTileAttr : PIM_Attr<"ExecutionTile", "execution_tile"> {
-  let summary = "Element-count caps of one device's resident share";
-  let parameters = (ins "int64_t":$m, "int64_t":$n, "int64_t":$k);
-  let assemblyFormat = "`<` struct(params) `>`";
-}
-
-// execution tile grid 를 PIM Device set 에 scheduling 하는 공통 plan. target 용어
-// (DPU, FPGA 등)는 들어가지 않는다.
-//   available_devices = 사용 가능한 PIM Device 상한(num_units)
-//   axes/active_grid  = round 하나에서 축별로 동시 사용할 device grid
-//   execution_tile    = [m, n, k] 유효 원소 상한
-//   scheduling_order  = host round loop 밖→안 순서
-// execution grid·round grid 는 M/N/K 가 런타임 값일 수 있어 lowering 이 SSA 로
-// 계산한다. active_grid 곱은 available_devices 를 넘지 않아야 한다.
-def PIM_InterDevicePlanAttr : PIM_Attr<"InterDevicePlan", "inter_device_plan"> {
-  let summary = "Common execution-tile schedule over abstract PIM Devices";
-  let parameters = (ins "int64_t":$available_devices,
-                        "::mlir::ArrayAttr":$axes,
-                        "::mlir::DenseI64ArrayAttr":$active_grid,
-                        "::mlir::DenseI64ArrayAttr":$execution_tile,
-                        "::mlir::ArrayAttr":$scheduling_order);
-  let assemblyFormat = "`<` struct(params) `>`";
-}
-
-// K reduction의 두 단계를 명시한다.
-//   spatial_partials      = none | separate_output_planes
-//   temporal_accumulation = none | host
-//   final_accumulation    = none | external
-// separate_output_planes는 SPLIT_K plane을 서로 다른 출력 slice로 보존한다. temporal
-// window partial은 lowering이 같은 slice에 host 누산하고, spatial plane의 최종 합은
-// kernel 밖의 명시적 소비자(예: torch.sum)가 수행한다.
-def PIM_ReductionPlanAttr : PIM_Attr<"ReductionPlan", "reduction_plan"> {
-  let summary = "Spatial and temporal K reduction contract";
-  let parameters = (ins "::mlir::StringAttr":$spatial_partials,
-                        "::mlir::StringAttr":$temporal_accumulation,
-                        "::mlir::StringAttr":$final_accumulation);
+  let summary = "Resident group grid of one execution tile";
+  let parameters = (ins "::mlir::DenseI64ArrayAttr":$groups);
   let assemblyFormat = "`<` struct(params) `>`";
   let genVerifyDecl = 1;
 }

@@ -6,8 +6,6 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/ADT/STLExtras.h"
-#include <algorithm>
-#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringRef.h"
 
 using namespace mlir;
@@ -37,22 +35,24 @@ static std::pair<int64_t, int64_t> factorize(int64_t n) {
   return {bestRow, bestColumn};
 }
 
-// 한 scheduling round에서 이 PIM Device가 맡는 execution tile 하나로 loop를 좁힌다.
+// 한 scheduling round에서 이 PIM Device가 맡는 Execution Tile 하나로 loop를
+// 좁힌다. Execution Tile은 이미 한 device의 resident Group domain이므로 Device
+// Grid가 그 내부를 다시 나누지 않는다.
 //
 //   executionTile = round * partitions + device
-//   first         = executionTile * unitTiles
+//   first         = executionTile * unitGroups
 //
-// 따라서 6개 execution tile을 3개 device에 배치하면 round 0은 ET0/1/2, round 1은
-// ET3/4/5가 된다. 마지막 round의 빈 device는 trips=0인 no-op이다.
+// reduction 축에서도 같은 식을 쓴다. 동일한 출력 좌표에 서로 다른 K Execution
+// Tile이 배정되면 각 device가 partial을 만들고 target lowering이 이를 결합한다.
 static void scheduleLoop(OpBuilder &b, scf::ForOp loop, Value round,
                          Value device, int64_t partitions,
-                         int64_t unitTiles, Value extent) {
+                         int64_t unitGroups, Value extent) {
   Location loc = loop.getLoc();
   Value lb = loop.getLowerBound(), step = loop.getStep();
   Value c0 = b.create<arith::ConstantIndexOp>(loc, 0);
   Value c1 = b.create<arith::ConstantIndexOp>(loc, 1);
   Value parts = b.create<arith::ConstantIndexOp>(loc, partitions);
-  Value unit = b.create<arith::ConstantIndexOp>(loc, unitTiles);
+  Value unit = b.create<arith::ConstantIndexOp>(loc, unitGroups);
   Value executionTile = b.create<arith::AddIOp>(
       loc, b.create<arith::MulIOp>(loc, round, parts), device);
   Value first =
@@ -118,6 +118,11 @@ struct PIMMapDevicesPass
       return func->emitError(
           "pim-map-devices: the function has no #pim.execution_tile; run "
           "--pim-form-execution-tiles before --pim-map-devices");
+    SmallVector<int64_t, 3> groupShape = pim::groupShape(func);
+    if (groupShape.size() != 3)
+      return func->emitError(
+          "pim-map-devices: #pim.block and #pim.block_group are required "
+          "to derive the group shape");
 
     // 자동 인수분해에서 explicit K 분할은 device 축이 아니다 — A·B의 K 영역이 연속으로
     // 남아 일반 cyclic placement 없이 배치된다. 명시 분할(device-axis-partitions)로는
@@ -181,23 +186,23 @@ struct PIMMapDevicesPass
       partitions[tileAxes[1]] = column;
     }
 
-    // 축별 분할 눈금. 옵션은 **원소 수**로 받는다 — 하드웨어가 아는 것이 그것이고, tile
-    // 하나가 몇 원소인지는 커널의 BLOCK 이 정하므로 target 이 알 수 없다. 여기서 tile 수로
-    // 바꾼다.
+    // 기본 분할 눈금은 Common IR이 확정한 Execution Tile의 Group 개수다. access
+    // shape에서 같은 값을 다시 추론하지 않는다. pim.axis="k"는 spatial split-K
+    // Execution Tile 좌표라서 loop 한 회전 자체가 Tile 하나다.
     SmallVector<int64_t> granularity(loops.size(), 1);
     for (auto [i, name] : llvm::enumerate(names)) {
       StringRef axis = cast<StringAttr>(name).getValue();
-      int64_t cap = axis == "m"      ? execution.getM()
-                    : axis == "n" ? execution.getN()
-                                                    : 0;
-      if (cap <= 0)
+      if (axis == "k")
         continue;
-      int64_t perTile = pim::tileElementsAlong(loops[i], loops);
-      if (perTile <= 0 || cap % perTile != 0)
-        return func->emitError("pim-map-devices: execution tile cap ")
-               << cap << " is not a multiple of the " << axis
-               << " block-group tile size " << perTile;
-      granularity[i] = cap / perTile;
+      int axisNumber = axis == "m" ? 0 : axis == "n" ? 1 : -1;
+      if (axisNumber < 0)
+        return func->emitError("pim-map-devices: unsupported PIM axis ")
+               << axis;
+      int64_t groups = execution.getGroups().asArrayRef()[axisNumber];
+      if (groups <= 0)
+        return func->emitError("pim-map-devices: execution_tile.groups[")
+               << axis << "] must be positive for an existing axis";
+      granularity[i] = groups;
     }
     if (!deviceAxisGranularity.empty()) {
       SmallVector<StringRef> entries;
@@ -217,19 +222,21 @@ struct PIMMapDevicesPass
           continue; // 이 커널에 없는 축이다
         if (partitions[axis] < 2)
           continue; // 눈금은 실제로 나눌 때만 의미가 있다 — 나누지 않는 축은 검사도 없다
-        int64_t perTile = pim::tileElementsAlong(loops[axis], loops);
-        if (perTile <= 0)
-          return func->emitError("pim-map-devices: cannot tell how many "
-                                 "elements one ")
-                 << name.trim() << " tile moves, so it cannot be split in "
-                 << elems << "-element units";
-        if (elems % perTile != 0)
+        StringRef axisName = cast<StringAttr>(names[axis]).getValue();
+        int axisNumber = axisName == "m" ? 0 : axisName == "n" ? 1 : -1;
+        if (axisNumber < 0 || groupShape[axisNumber] <= 0)
+          return func->emitError(
+                     "pim-map-devices: cannot derive the Block Group "
+                     "extent on the ")
+                 << axisName << " axis";
+        int64_t groupElements = groupShape[axisNumber];
+        if (elems % groupElements != 0)
           return func->emitError("pim-map-devices: the ")
-                 << name.trim() << " tile is " << perTile
+                 << axisName << " Block Group is " << groupElements
                  << " elements, which does not divide the requested split unit "
                  << elems
                  << " — pick a BLOCK size that divides the hardware unit";
-        int64_t requested = elems / perTile;
+        int64_t requested = elems / groupElements;
         if (granularity[axis] != 1 && granularity[axis] != requested)
           return func->emitError("pim-map-devices: device-axis-granularity for ")
                  << name.trim() << " conflicts with the execution tile";
@@ -260,9 +267,9 @@ struct PIMMapDevicesPass
       if (!llvm::is_contained(schedulingOrder, name))
         schedulingOrder.push_back(name);
 
-    // execution-tile grid를 먼저 만들고 그 바깥에 scheduling round를 둔다. 각 축의
-    // round 수는 ceil(execution_tiles / active_devices)다. 이 loop들은 host 쪽에 남고,
-    // 그 안의 pim.device 한 개가 해당 round의 모든 PIM Device를 병렬 실행한다.
+    // Execution Tile grid를 먼저 만들고 그 바깥에 scheduling round를 둔다. 각
+    // device coordinate가 서로 다른 Tile instance를 맡으므로 round 수는 축별
+    // Execution Tile 수를 해당 축의 active device partition 수로 나눈 값이다.
     SmallVector<Value> roundIVs(loops.size());
     OpBuilder scheduled(loops.front());
     Value c0 = b.create<arith::ConstantIndexOp>(loc, 0);
@@ -290,25 +297,10 @@ struct PIMMapDevicesPass
         pim::DeviceMappingAttr::get(ctx, ArrayAttr::get(ctx, names),
                                     b.getDenseI64ArrayAttr(partitions)),
         extents);
-    auto plan = pim::InterDevicePlanAttr::get(
-        ctx, devices, ArrayAttr::get(ctx, names),
-        b.getDenseI64ArrayAttr(partitions),
-        b.getDenseI64ArrayAttr(
-            {execution.getM(), execution.getN(), execution.getK()}),
-        ArrayAttr::get(ctx, schedulingOrder));
     device->setAttr("pim.execution_tile", execution);
-    device->setAttr("pim.inter_device_plan", plan);
-    bool hasSpatialK = llvm::any_of(names, [](Attribute name) {
-      return cast<StringAttr>(name).getValue() == "k";
-    });
-    device->setAttr(
-        "pim.reduction_plan",
-        pim::ReductionPlanAttr::get(
-            ctx,
-            StringAttr::get(ctx, hasSpatialK ? "separate_output_planes"
-                                             : "none"),
-            StringAttr::get(ctx, execution.getK() > 0 ? "host" : "none"),
-            StringAttr::get(ctx, hasSpatialK ? "external" : "none")));
+    // FormExecutionTiles는 pim.device가 생기기 전이라 func에 임시로 붙인다.
+    // device에 옮긴 뒤에는 같은 값을 두 군데 유지하지 않는다.
+    func->removeAttr("pim.execution_tile");
     SmallVector<Type> argTys(loops.size(), b.getIndexType());
     SmallVector<Location> argLocs(loops.size(), loc);
     Block *body = b.createBlock(&device.getBody(), {}, argTys, argLocs);

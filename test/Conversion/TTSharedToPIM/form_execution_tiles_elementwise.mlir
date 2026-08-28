@@ -1,9 +1,12 @@
 // Reduction 없는 elementwise/map 커널은 존재하는 공간축마다 block group 하나를
 // 보수적인 자동 execution tile로 선택한다.
 // RUN: triton-shared-opt --pim-form-execution-tiles %s | FileCheck %s
+// RUN: triton-shared-opt "--pim-form-execution-tiles=tile-m=2 tile-n=3" %s | FileCheck %s --check-prefix=EXPLICIT
 
 // CHECK-LABEL: func.func @elementwise
-// CHECK-SAME: pim.execution_tile = #pim.execution_tile<m = 8, n = 32, k = 0>
+// CHECK-SAME: pim.execution_tile = #pim.execution_tile<groups = [1, 1, 0]>
+// EXPLICIT-LABEL: func.func @elementwise
+// EXPLICIT-SAME: pim.execution_tile = #pim.execution_tile<groups = [2, 3, 0]>
 
 module attributes {pim.target_profile = #pim.target_profile<
     target = "upmem", number_of_pim_devices = 8,
@@ -16,8 +19,8 @@ module attributes {pim.target_profile = #pim.target_profile<
 
 func.func @elementwise(%A: memref<*xf32>, %B: memref<*xf32>,
                        %tm: index, %tn: index) attributes {
-    pim.block_group = #pim.block_group<tiles = [1, 1, 1],
-                                       useful = [8, 32, 1]>,
+    pim.block = #pim.block<shape = [8, 32, 0]>,
+    pim.block_group = #pim.block_group<blocks = [1, 1, 1]>,
     pim.intra_device_plan = #pim.intra_device_plan<
         bank_partitions = [1, 1, 1], core_partitions = [1, 1, 1],
         lanes = 4, lane_axis = "m">} {

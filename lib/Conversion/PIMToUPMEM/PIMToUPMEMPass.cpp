@@ -170,6 +170,7 @@ struct ConvertPIMToUPMEMPass
     getOperation()->removeAttr("pim.target_profile");
     getOperation().walk([](func::FuncOp f) {
       f->removeAttr("pim.intra_device_plan");
+      f->removeAttr("pim.block");
       f->removeAttr("pim.block_group");
       f->removeAttr("pim.execution_tile");
     });
@@ -210,26 +211,6 @@ struct ConvertPIMToUPMEMPass
     Location loc = device.getLoc();
     Block *deviceBody = &device.getBody().front();
 
-    if (!device->getAttrOfType<pim::InterDevicePlanAttr>(
-            "pim.inter_device_plan")) {
-      device->emitError(
-          "convert-pim-to-upmem: the device has no #pim.inter_device_plan");
-      return signalPassFailure();
-    }
-    auto reduction =
-        device->getAttrOfType<pim::ReductionPlanAttr>("pim.reduction_plan");
-    if (!reduction) {
-      device->emitError(
-          "convert-pim-to-upmem: the device has no #pim.reduction_plan");
-      return signalPassFailure();
-    }
-    if (reduction.getTemporalAccumulation().getValue() != "none" &&
-        reduction.getTemporalAccumulation().getValue() != "host") {
-      device->emitError(
-          "convert-pim-to-upmem: only host temporal accumulation is supported");
-      return signalPassFailure();
-    }
-
     auto intra = func->getAttrOfType<pim::IntraDevicePlanAttr>(
         "pim.intra_device_plan");
     if (!intra) {
@@ -253,9 +234,14 @@ struct ConvertPIMToUPMEMPass
           "axis");
       return signalPassFailure();
     }
-    if (auto group =
-            func->getAttrOfType<pim::BlockGroupAttr>("pim.block_group")) {
-      int64_t rows = group.getUseful().asArrayRef()[0];
+    if (func->getAttrOfType<pim::BlockGroupAttr>("pim.block_group")) {
+      SmallVector<int64_t, 3> shape = pim::groupShape(func);
+      if (shape.size() != 3) {
+        func->emitError("convert-pim-to-upmem: cannot derive block-group "
+                        "shape from #pim.block and #pim.block_group");
+        return signalPassFailure();
+      }
+      int64_t rows = shape[0];
       if (rows % lanes != 0) {
         func->emitError("convert-pim-to-upmem: block-group m extent ")
             << rows << " is not divisible by " << lanes << " tasklets";
@@ -310,6 +296,12 @@ struct ConvertPIMToUPMEMPass
     // 누산되고, 서로 다른 spatial plane의 최종 합산은 그 출력의 소비자가 수행한다.
     auto tiles =
         device->getAttrOfType<pim::ExecutionTileAttr>("pim.execution_tile");
+    SmallVector<int64_t, 3> tileShape = pim::executionTileShape(device);
+    if (tiles && tileShape.size() != 3) {
+      device->emitError("convert-pim-to-upmem: cannot derive execution tile "
+                        "shape from the Common IR hierarchy");
+      return signalPassFailure();
+    }
     // reduction loop: pim.axis 없이 access 의 origin 을 모는 loop, 하나일 때만.
     scf::ForOp kLoop;
     {
@@ -335,7 +327,7 @@ struct ConvertPIMToUPMEMPass
     // 생기는 temporal K window만 남긴다.
     SmallVector<Window> windows;
     if (tiles) {
-      if (tiles.getK() > 0) {
+      if (tileShape[2] > 0) {
         if (!kLoop) {
           device->emitError(
               "convert-pim-to-upmem: the execution tile has a k cap but the "
@@ -345,7 +337,7 @@ struct ConvertPIMToUPMEMPass
         }
         Window w;
         w.kLoop = kLoop;
-        w.cap = tiles.getK();
+        w.cap = tileShape[2];
         w.trips = kLoop.getUpperBound();
         windows.push_back(w);
       }

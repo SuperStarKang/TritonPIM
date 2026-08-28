@@ -234,6 +234,7 @@ struct PIMPlaceDataPass
     if (!execution)
       return device->emitError(
           "pim-place-data: the device has no #pim.execution_tile");
+    ArrayRef<int64_t> tileGroups = execution.getGroups().asArrayRef();
     llvm::DenseMap<Operation *, LoopRange> ranges;
     IRMapping firstMap;
     unsigned axisIndex = 0;
@@ -265,18 +266,17 @@ struct PIMPlaceDataPass
         r.axis = name.getName();
         r.partitions = partitions[axisIndex];
         StringRef axis = name.getName().getValue();
-        int64_t cap = axis == "m"      ? execution.getM()
-                      : axis == "n" ? execution.getN()
-                      : axis == "k" ? execution.getK()
-                                                         : 0;
-        int64_t perTile = pim::tileElementsAlong(l, loops);
-        int64_t capacityTiles = 1;
-        if (axis != "k") {
-          if (cap <= 0 || perTile <= 0 || cap % perTile != 0)
-            return l->emitError("pim-place-data: execution tile capacity for ")
-                   << axis << " is not an integer number of block groups";
-          capacityTiles = cap / perTile;
-        }
+        // spatial k loop 한 회전이 이미 split-K Execution Tile 하나다.
+        // execution_tile.groups[k]는 그 plane 내부 temporal reduction window이므로
+        // spatial placement capacity에는 곱하지 않는다.
+        int axisNumber = axis == "m" ? 0 : axis == "n" ? 1
+                                                     : axis == "k" ? 2 : -1;
+        if (axisNumber < 0)
+          return l->emitError("pim-place-data: unsupported PIM axis ") << axis;
+        int64_t capacityTiles = axis == "k" ? 1 : tileGroups[axisNumber];
+        if (capacityTiles <= 0)
+          return l->emitError("pim-place-data: execution_tile.groups[")
+                 << axis << "] must be positive for an existing axis";
         r.capacityTiles =
             b.create<arith::ConstantIndexOp>(loc, capacityTiles);
         axisIndex++;

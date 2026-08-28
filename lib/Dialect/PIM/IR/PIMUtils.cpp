@@ -19,6 +19,45 @@ mlir::pim::TargetProfileAttr mlir::pim::targetProfile(Operation *op) {
                 : TargetProfileAttr();
 }
 
+namespace {
+
+template <typename AttrTy>
+AttrTy lookupPlanAttr(Operation *op, StringRef name) {
+  for (Operation *current = op; current; current = current->getParentOp())
+    if (auto attr = current->getAttrOfType<AttrTy>(name))
+      return attr;
+  return AttrTy();
+}
+
+} // namespace
+
+SmallVector<int64_t, 3> mlir::pim::blockShape(Operation *op) {
+  auto block = lookupPlanAttr<BlockAttr>(op, "pim.block");
+  if (!block)
+    return {};
+  return SmallVector<int64_t, 3>(block.getShape().asArrayRef());
+}
+
+SmallVector<int64_t, 3> mlir::pim::groupShape(Operation *op) {
+  SmallVector<int64_t, 3> shape = blockShape(op);
+  auto group = lookupPlanAttr<BlockGroupAttr>(op, "pim.block_group");
+  if (shape.size() != 3 || !group || group.getBlocks().size() != 3)
+    return {};
+  for (unsigned i = 0; i < 3; ++i)
+    shape[i] *= group.getBlocks().asArrayRef()[i];
+  return shape;
+}
+
+SmallVector<int64_t, 3> mlir::pim::executionTileShape(Operation *op) {
+  SmallVector<int64_t, 3> shape = groupShape(op);
+  auto tile = lookupPlanAttr<ExecutionTileAttr>(op, "pim.execution_tile");
+  if (shape.size() != 3 || !tile || tile.getGroups().size() != 3)
+    return {};
+  for (unsigned i = 0; i < 3; ++i)
+    shape[i] *= tile.getGroups().asArrayRef()[i];
+  return shape;
+}
+
 std::optional<int64_t>
 mlir::pim::usableDeviceCapacityBytes(TargetProfileAttr profile) {
   if (!profile)

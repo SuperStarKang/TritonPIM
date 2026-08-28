@@ -1,6 +1,5 @@
 add_triton_library(UPMEMIR
   UPMEMDialect.cpp
-  UPMEMTargetSpec.cpp
 
   DEPENDS
   UPMEMTableGen

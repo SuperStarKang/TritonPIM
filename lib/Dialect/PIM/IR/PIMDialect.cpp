@@ -90,35 +90,38 @@ LogicalResult DeviceOp::verify() {
     return emitOpError("axis_extents must have one entry per axis");
   if (getBody().front().getNumArguments() != n)
     return emitOpError("body must take one partition coordinate per axis");
-  auto plan =
-      (*this)->getAttrOfType<InterDevicePlanAttr>("pim.inter_device_plan");
-  if (!plan)
-    return success();
-  if (plan.getAxes() != mapping.getAxes())
-    return emitOpError("device plan axes must equal device mapping axes");
-  if (plan.getActiveGrid() != mapping.getPartitions())
-    return emitOpError(
-        "device plan active_grid must equal device mapping partitions");
-  if (plan.getExecutionTile().size() != 3)
-    return emitOpError("device plan execution_tile must be [m, n, k]");
-  if (plan.getAvailableDevices() < 1)
-    return emitOpError("device plan available_devices must be positive");
-  if (plan.getSchedulingOrder().size() != n)
-    return emitOpError(
-        "device plan scheduling_order must contain every axis once");
-  for (Attribute axis : mapping.getAxes()) {
-    if (llvm::count(plan.getSchedulingOrder(), axis) != 1)
-      return emitOpError(
-          "device plan scheduling_order must be a permutation of axes");
-  }
-  int64_t active = 1;
-  for (int64_t p : plan.getActiveGrid().asArrayRef()) {
-    if (p < 1)
-      return emitOpError("device plan active_grid entries must be positive");
-    active *= p;
-  }
-  if (active > plan.getAvailableDevices())
-    return emitOpError("device plan uses more devices than are available");
+  for (int64_t partition : mapping.getPartitions().asArrayRef())
+    if (partition < 1)
+      return emitOpError("mapping partition counts must be positive");
+  return success();
+}
+
+LogicalResult BlockAttr::verify(function_ref<InFlightDiagnostic()> emitError,
+                                DenseI64ArrayAttr shape) {
+  if (shape.size() != 3)
+    return emitError() << "shape must be [m, n, k]";
+  if (llvm::any_of(shape.asArrayRef(), [](int64_t value) { return value < 0; }))
+    return emitError() << "shape entries must not be negative";
+  return success();
+}
+
+LogicalResult BlockGroupAttr::verify(
+    function_ref<InFlightDiagnostic()> emitError,
+    DenseI64ArrayAttr blocks) {
+  if (blocks.size() != 3)
+    return emitError() << "blocks must be [m, n, k]";
+  if (llvm::any_of(blocks.asArrayRef(), [](int64_t value) { return value < 1; }))
+    return emitError() << "block counts must be positive";
+  return success();
+}
+
+LogicalResult ExecutionTileAttr::verify(
+    function_ref<InFlightDiagnostic()> emitError,
+    DenseI64ArrayAttr groups) {
+  if (groups.size() != 3)
+    return emitError() << "groups must be [m, n, k]";
+  if (llvm::any_of(groups.asArrayRef(), [](int64_t value) { return value < 0; }))
+    return emitError() << "group counts must not be negative";
   return success();
 }
 
@@ -161,24 +164,5 @@ LogicalResult PlaceOp::verify() {
   StringRef dir = getDirection();
   if (dir != "in" && dir != "out")
     return emitOpError("direction must be \"in\" or \"out\"");
-  return success();
-}
-
-LogicalResult ReductionPlanAttr::verify(
-    function_ref<InFlightDiagnostic()> emitError, StringAttr spatialPartials,
-    StringAttr temporalAccumulation, StringAttr finalAccumulation) {
-  StringRef spatial = spatialPartials.getValue();
-  StringRef temporal = temporalAccumulation.getValue();
-  StringRef finalKind = finalAccumulation.getValue();
-  if (spatial != "none" && spatial != "separate_output_planes")
-    return emitError() << "spatial_partials must be none or "
-                          "separate_output_planes";
-  if (temporal != "none" && temporal != "host")
-    return emitError() << "temporal_accumulation must be none or host";
-  if (finalKind != "none" && finalKind != "external")
-    return emitError() << "final_accumulation must be none or external";
-  if ((spatial == "none") != (finalKind == "none"))
-    return emitError() << "separate spatial partials require external final "
-                          "accumulation";
   return success();
 }

@@ -11,13 +11,22 @@ module attributes {pim.target_profile = #pim.target_profile<
 
 // expected-error @below {{intra-device plan needs 8 banks but a PIM Device has 4}}
 func.func @too_many_banks(%arg0: memref<*xi8>) attributes {
+    pim.block = #pim.block<shape = [1, 0, 0]>,
+    pim.block_group = #pim.block_group<blocks = [1, 1, 1]>,
     pim.intra_device_plan = #pim.intra_device_plan<
         bank_partitions = [2, 4, 1], core_partitions = [1, 1, 1],
         lanes = 8, lane_axis = "n">} {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
-  %0 = pim.access %arg0 offset %c0 sizes [1] strides[%c1] origin[%c0]
-      {id = 0 : i64} : memref<*xi8> -> !pim.access
+  pim.device #pim.device_mapping<axes = ["m"], partitions = [1]>
+      extents[%c1] attributes {
+        pim.execution_tile = #pim.execution_tile<groups = [1, 0, 0]>} {
+  ^bb0(%device_m: index):
+    scf.for %m = %c0 to %c1 step %c1 {
+      %0 = pim.access %arg0 offset %m sizes [1] strides[%c1] origin[%m]
+          {id = 0 : i64} : memref<*xi8> -> !pim.access
+    } {pim.axis = #pim.axis<"m">}
+  }
   return
 }
 }

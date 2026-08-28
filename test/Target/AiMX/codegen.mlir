@@ -61,9 +61,8 @@ module attributes {pim.target_profile = #pim.target_profile<
 func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
                   %K: i32, %N: i32, %ex: index, %ey: index)
     attributes {pim.intra_device_plan = #pim.intra_device_plan<bank_partitions = [8, 32, 1], core_partitions = [1, 1, 1], lanes = 16, lane_axis = "n">,
-        pim.block_group = #pim.block_group<
-            tiles = [1, 16, 1],
-            useful = [32, 512, 32]>} {
+        pim.block = #pim.block<shape = [32, 32, 32]>,
+        pim.block_group = #pim.block_group<blocks = [1, 1, 1]>} {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c32 = arith.constant 32 : index
@@ -76,16 +75,7 @@ func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
                                  partitions = [1, 1]>
       extents [%ex, %ey]
       attributes {
-        pim.execution_tile = #pim.execution_tile<m = 32, n = 4096, k = 103936>,
-        pim.inter_device_plan = #pim.inter_device_plan<
-            available_devices = 1,
-            axes = ["m", "n"],
-            active_grid = [1, 1],
-            execution_tile = [32, 4096, 103936],
-            scheduling_order = ["n", "m"]>,
-        pim.reduction_plan = #pim.reduction_plan<
-            spatial_partials = "none", temporal_accumulation = "host",
-            final_accumulation = "none">} {
+        pim.execution_tile = #pim.execution_tile<groups = [1, 8, 3248]>} {
   ^bb0(%px: index, %py: index):
     // PIM Device 가 하나라 device 몫이 곧 전체다. 실제 pass 가 내는 모양 그대로 손으로 썼다.
     %capx = arith.ceildivsi %ex, %c1 : index

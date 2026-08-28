@@ -75,7 +75,12 @@ struct PIMPlanIntraDevicePass
     auto group = func->getAttrOfType<pim::BlockGroupAttr>("pim.block_group");
     int axis = laneAxis == "m" ? 0 : laneAxis == "n" ? 1 : 2;
     if (lanes == 0 && group) {
-      int64_t extent = group.getUseful().asArrayRef()[axis];
+      SmallVector<int64_t, 3> shape = pim::groupShape(func);
+      if (shape.size() != 3)
+        return func->emitError(
+            "pim-plan-intra-device: #pim.block and #pim.block_group are "
+            "required to derive the group shape");
+      int64_t extent = shape[axis];
       extent /= banks[axis] * cores[axis];
       while (selectedLanes > 1 && extent % selectedLanes != 0)
         --selectedLanes;

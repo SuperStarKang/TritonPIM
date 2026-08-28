@@ -54,10 +54,13 @@ config.test_source_root = os.path.dirname(__file__)
 # test_exec_root: The root path where tests should be run.
 config.test_exec_root = os.path.join(config.triton_shared_obj_root, 'test')
 config.triton_tools_dir = os.path.join(config.triton_shared_obj_root, 'tools/triton-shared-opt')
+config.triton_translate_tools_dir = os.path.join(
+    config.triton_shared_obj_root, 'tools/triton-shared-translate')
 config.filecheck_dir = os.path.join(config.triton_obj_root, 'bin', 'FileCheck')
 
 tool_dirs = [
     config.triton_tools_dir,
+    config.triton_translate_tools_dir,
     config.llvm_tools_dir,
     config.filecheck_dir]
 
@@ -67,6 +70,7 @@ for d in tool_dirs:
 tools = [
     'opt',
     'triton-shared-opt',
+    'triton-shared-translate',
     ToolSubst('%PYTHON', config.python_executable, unresolved='ignore'),
 ]
 

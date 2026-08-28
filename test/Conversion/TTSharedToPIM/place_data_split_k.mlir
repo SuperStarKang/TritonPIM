@@ -17,7 +17,10 @@ module attributes {pim.target_profile = #pim.target_profile<
 func.func @split_k(%A: memref<*xi8>, %C: memref<*xi8>,
                    %tr: index, %tc: index, %tp: index,
                    %tk: index, %kper: index, %lda: index)
-    attributes {pim.execution_tile = #pim.execution_tile<m = 8, n = 1, k = 0>} {
+    attributes {
+      pim.block = #pim.block<shape = [8, 1, 16]>,
+      pim.block_group = #pim.block_group<blocks = [1, 1, 1]>,
+      pim.execution_tile = #pim.execution_tile<groups = [1, 1, 1]>} {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c2 = arith.constant 2 : index

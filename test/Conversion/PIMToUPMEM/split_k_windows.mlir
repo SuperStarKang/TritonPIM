@@ -21,7 +21,7 @@
 // DEVICE: matmul_split_k_kernel_tiles_reduction_k
 
 module attributes {pim.target_profile = #pim.target_profile<target = "upmem", number_of_pim_devices = 2048, number_of_banks_per_pim_device = 1, number_of_pim_cores_per_bank = 1, number_of_parallel_lanes_per_pim_core = 16, parallel_execution_kind = "multithread", usable_bank_capacity_bytes = 62914560 : i64, usable_local_capacity_bytes = 49152 : i64>} {
-  func.func @matmul_split_k_kernel(%arg0: memref<*xi8> {tt.divisibility = 16 : i32}, %arg1: memref<*xi8> {tt.divisibility = 16 : i32}, %arg2: memref<*xi32> {tt.divisibility = 16 : i32}, %arg3: i32 {tt.divisibility = 16 : i32}, %arg4: i32 {tt.divisibility = 16 : i32}, %arg5: i32 {tt.divisibility = 16 : i32}, %arg6: i32 {tt.divisibility = 16 : i32}, %arg7: i32 {tt.divisibility = 16 : i32}, %arg8: i32 {tt.divisibility = 16 : i32}, %arg9: i32 {tt.divisibility = 16 : i32}, %arg10: i32, %arg11: i32, %arg12: i32) attributes {pim.block_group = #pim.block_group<tiles = [2, 2, 2], useful = [64, 64, 32]>, pim.execution_tile = #pim.execution_tile<m = 256, n = 512, k = 1792>, pim.intra_device_plan = #pim.intra_device_plan<bank_partitions = [1, 1, 1], core_partitions = [1, 1, 1], lanes = 16, lane_axis = "m">} {
+  func.func @matmul_split_k_kernel(%arg0: memref<*xi8> {tt.divisibility = 16 : i32}, %arg1: memref<*xi8> {tt.divisibility = 16 : i32}, %arg2: memref<*xi32> {tt.divisibility = 16 : i32}, %arg3: i32 {tt.divisibility = 16 : i32}, %arg4: i32 {tt.divisibility = 16 : i32}, %arg5: i32 {tt.divisibility = 16 : i32}, %arg6: i32 {tt.divisibility = 16 : i32}, %arg7: i32 {tt.divisibility = 16 : i32}, %arg8: i32 {tt.divisibility = 16 : i32}, %arg9: i32 {tt.divisibility = 16 : i32}, %arg10: i32, %arg11: i32, %arg12: i32) attributes {pim.block = #pim.block<shape = [32, 32, 16]>, pim.block_group = #pim.block_group<blocks = [2, 2, 2]>, pim.intra_device_plan = #pim.intra_device_plan<bank_partitions = [1, 1, 1], core_partitions = [1, 1, 1], lanes = 16, lane_axis = "m">} {
     %c512 = arith.constant 512 : index
     %c256 = arith.constant 256 : index
     %c0_i8 = arith.constant 0 : i8
@@ -56,7 +56,7 @@ module attributes {pim.target_profile = #pim.target_profile<target = "upmem", nu
         %11 = arith.ceildivsi %6, %c4 : index
         %12 = arith.ceildivsi %11, %c4 : index
         scf.for %arg15 = %c0 to %12 step %c1 {
-          pim.device <axes = ["m", "n", "k"], partitions = [4, 16, 16]> extents[%6, %7, %5] attributes {pim.execution_tile = #pim.execution_tile<m = 256, n = 512, k = 1792>, pim.inter_device_plan = #pim.inter_device_plan<available_devices = 2048, axes = ["m", "n", "k"], active_grid = [4, 16, 16], execution_tile = [256, 512, 1792], scheduling_order = ["n", "k", "m"]>, pim.reduction_plan = #pim.reduction_plan<spatial_partials = "separate_output_planes", temporal_accumulation = "host", final_accumulation = "external">} {
+          pim.device <axes = ["m", "n", "k"], partitions = [4, 16, 16]> extents[%6, %7, %5] attributes {pim.execution_tile = #pim.execution_tile<groups = [4, 8, 56]>} {
           ^bb0(%arg16: index, %arg17: index, %arg18: index):
             %13 = arith.muli %arg15, %c4 : index
             %14 = arith.addi %13, %arg16 : index
@@ -194,6 +194,3 @@ module attributes {pim.target_profile = #pim.target_profile<target = "upmem", nu
     return
   }
 }
-
-
-

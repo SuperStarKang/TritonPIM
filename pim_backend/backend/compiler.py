@@ -178,11 +178,11 @@ def _aimx_profile(o) -> TargetProfile:
     # lowering에서 검증하고 padding한다.
     # device 분할 순서는 n→m 이다 — 행을 쪼개면 가장 큰 buffer 인 B 가
     # device 수만큼 복제된다(설계 §6.1). 분할 눈금은 target 의 물리 폭 4096을
-    # profile 문자열로 다시 넣지 않고, TargetSpec을 통해 공통 pass가 확정한
-    # #pim.execution_tile에서 유도한다. bank 예산은 선언 상수(pim_malloc은
+    # profile 문자열로 다시 넣지 않고 Common IR의 #pim.execution_tile과 AiMX
+    # lowering의 물리 눈금에서 유도한다. bank 예산은 선언 상수(pim_malloc은
     # 실패해도 NULL 대신 프로세스를 죽여 재 보는 방법이 없다)이고,
-    # bank_capacity_bytes 옵션은 공통 pass의 k 상한 탐색과
-    # --convert-pim-to-aimx 재검증이 같은 값을 보도록 profile에 싣는다.
+    # bank_capacity_bytes 옵션은 --convert-pim-to-aimx의 allocation legality
+    # 검사가 같은 값을 보도록 profile에 싣는다.
     batch = o.batch or 8
     return TargetProfile(
         parallel_execution_kind="simd",
@@ -205,7 +205,7 @@ _TARGET_PROFILE = {"upmem": _upmem_profile, "aimx": _aimx_profile}
 
 
 def _axis_options(prefix: str, m: int, n: int, k: int) -> str:
-    # group-m/n/k, tile-m/n/k 를 축별로 적는다. 0 = 자동 = pass 기본값이라 적지 않는다.
+    # group-m/n/k, tile-m/n/k 를 축별로 적는다. 0 = 한 단위 = pass 기본값이라 적지 않는다.
     return " ".join(s for s in (
         f"{prefix}-m={m}" if m else "",
         f"{prefix}-n={n}" if n else "",
@@ -269,10 +269,9 @@ def _ttsharedir_to_pim_common(ttshared: str, options) -> str:
         f"lanes={plan_lanes} lane-axis={lane_axis}")
     bg = _axis_options("group", options.group_m, options.group_n, options.group_k)
     form_block_groups = "--pim-form-block-groups" + (f"={bg}" if bg else "")
-    # Common pass의 tile-m/n/k는 논리 원소 상한이다. 공개 option의
-    # tile_m/n/k(block-group 개수)와 혼합하지 않고 별도 값을 넘긴다.
-    et = _axis_options("tile", options.capacity_limit_m,
-                       options.capacity_limit_n, options.capacity_limit_k)
+    # Common pass의 tile-m/n/k는 Execution Tile에 묶는 Block Group 개수다.
+    # lowering은 이 값을 그대로 materialize하고 비용식이나 용량 최대화를 하지 않는다.
+    et = _axis_options("tile", options.tile_m, options.tile_n, options.tile_k)
     form_execution_tiles = "--pim-form-execution-tiles" + (f"={et}" if et else "")
     return _run_opt(ttshared, [p.format(profile=profile,
                                         form_block_groups=form_block_groups,
@@ -371,19 +370,15 @@ class PIMOptions:
     num_units: int = 0
     # block group: local 상주 단위로 묶는 tile 수. group_m × group_n 이 출력 묶음이고
     # group_k 는 reduction strip(적재 한 번이 담는 K tile 수 — 누산기는 그대로다).
-    # 0 = 자동: upmem - 공통 pass 가 local(WRAM) 예산에 들어갈
-    # 때까지 m → n → k 번갈아 키우고(협력 모드에서만)
-    # aimx - 실행 단위 채움이 담당하므로 항등과 같다. 값을 주면 그대로 쓴다(1 = 항등).
+    # 0 또는 1 = Block 하나인 항등 group. 값을 주면 그대로 쓴다.
     # 두 target 모두 공통 pass(--pim-form-block-groups)가 IR 수준에서 묶는다 —
     # 지나고 나면 target lowering 이 보는 "block" 이 곧 group 이다.
     group_m: int = 0
     group_n: int = 0
     group_k: int = 0
-    # ③ execution tile: device 하나가 launch 1회에 상주시키는 몫 (원소 단위).
-    # 0 = 자동: 공통 pass(--pim-form-execution-tiles)가 m·n 은 기본 단위(m: block
-    # group 1개, n: target 기본 — aimx 는 한 device 폭 4096), k 는 남는 큰 메모리
-    # 예산 전부(target 이 등록한 footprint 로 이분 탐색)로 채워 #pim.execution_tile
-    # 에 구체값으로 부착한다. 값을 주면 그대로 쓴다(축의 group 원소수 배수여야 함).
+    # ③ execution tile: device 하나가 launch 1회에 상주시키는 Block Group 개수.
+    # 0 또는 1 = 존재하는 축에서 Group 하나. 공통 lowering은 값을 그대로
+    # #pim.execution_tile에 기록하고 PIM DRAM을 채우기 위한 탐색은 하지 않는다.
     # target lowering 은 읽기만 한다:
     #   upmem  창(round) 반복 — 배정이 상한 안이면 창 1개. K 가 k 상한을 넘으면
     #          k 창마다 부분합이 나와 host 가 누산한다(unstage accumulate).
@@ -392,8 +387,8 @@ class PIMOptions:
     tile_m: int = 0
     tile_n: int = 0
     tile_k: int = 0
-    # #pim.execution_tile에 넣는 유효 논리 원소 상한. tile_m/n/k는
-    # block-group 개수이고 helper가 BLOCK * GROUP * TILE로 이 값을 유도한다.
+    # 기존 planner와의 호환용 파생 원소 크기. Common lowering의 인터페이스는
+    # tile_m/n/k(Block Group 개수) 하나만 사용한다.
     capacity_limit_m: int = 0
     capacity_limit_n: int = 0
     capacity_limit_k: int = 0
@@ -437,18 +432,6 @@ class PIMOptions:
                 "PIMBackend requires an explicit `pim_target` option. "
                 "Supported values: 'upmem', 'aimx'."
             )
-        for axis in "mnk":
-            tile = getattr(self, f"tile_{axis}")
-            limit = getattr(self, f"capacity_limit_{axis}")
-            if tile and not limit:
-                raise ValueError(
-                    f"tile_{axis} is a block-group count and cannot be "
-                    "converted without BLOCK/GROUP context; use "
-                    "inter_device_plan/pim_launch_options or also provide "
-                    f"capacity_limit_{axis}=BLOCK_{axis.upper()}*"
-                    f"group_{axis}*tile_{axis}"
-                )
-
     def hash(self):
         key = '_'.join([f'{name}-{val}' for name, val in self.__dict__.items()])
         return hashlib.sha256(key.encode("utf-8")).hexdigest()

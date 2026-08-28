@@ -8,6 +8,7 @@
 // PIM-CLEAN-LABEL: module
 // PIM-CLEAN-NOT: #pim.target_profile
 // PIM-CLEAN-NOT: #pim.intra_device_plan
+// PIM-CLEAN-NOT: #pim.block
 // PIM-CLEAN-NOT: #pim.block_group
 // PIM-CLEAN-NOT: #pim.execution_tile
 // PIM-CLEAN-NOT: pim.axis
@@ -63,8 +64,6 @@
 // CHECK:           upmem.stage
 // CHECK-SAME:        dedup_over = ["m"]
 // CHECK:           upmem.to_mram %{{.*}}, %{{.*}}, @matmul_mram_1
-// 반복 횟수는 device마다 다르므로 broadcast가 아니라 device별 전송이다.
-// CHECK:           upmem.to_host_var %{{.*}}, %{{.*}}, @matmul_tiles_m : index
 // CHECK:         upmem.launch %[[SET]]
 // 출력은 집합 전체에서 한 번에 회수한 뒤 device마다 되돌린다.
 // CHECK:         %[[P:.*]] = upmem.gather %[[SET]], @matmul_mram_2
@@ -86,10 +85,8 @@ module attributes {pim.target_profile = #pim.target_profile<
 func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
                   %K: i32, %N: i32, %ex: index, %ey: index)
     attributes {pim.intra_device_plan = #pim.intra_device_plan<bank_partitions = [1, 1, 1], core_partitions = [1, 1, 1], lanes = 1, lane_axis = "m">,
-        pim.block_group = #pim.block_group<
-            tiles = [1, 1, 1],
-            useful = [8, 32, 32]>,
-        pim.execution_tile = #pim.execution_tile<m = 8, n = 32, k = 32>} {
+        pim.block = #pim.block<shape = [8, 32, 32]>,
+        pim.block_group = #pim.block_group<blocks = [1, 1, 1]>} {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c2 = arith.constant 2 : index
@@ -105,15 +102,7 @@ func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
                                  partitions = [2, 4]>
       extents [%ex, %ey]
       attributes {
-        pim.inter_device_plan = #pim.inter_device_plan<
-            available_devices = 8,
-            axes = ["m", "n"],
-            active_grid = [2, 4],
-            execution_tile = [0, 0, 0],
-            scheduling_order = ["n", "m"]>,
-        pim.reduction_plan = #pim.reduction_plan<
-            spatial_partials = "none", temporal_accumulation = "none",
-            final_accumulation = "none">} {
+        pim.execution_tile = #pim.execution_tile<groups = [1, 1, 1]>} {
   ^bb0(%px: index, %py: index):
     // device 범위. 실제 pass가 내는 것과 같은 모양으로 손으로 썼다.
     %capx = arith.ceildivsi %ex, %c2 : index

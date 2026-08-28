@@ -18,6 +18,12 @@ namespace pim {
 // op을 담은 module에 붙은 공통 profile. 없으면 널이다.
 TargetProfileAttr targetProfile(Operation *op);
 
+// func/device에 기록된 3계층으로부터 원소 shape를 계산한다. 배열의 고정 순서는
+// [m, n, k]다. 없는 축은 0이다. 파생 shape를 attribute에 중복 저장하지 않는다.
+SmallVector<int64_t, 3> blockShape(Operation *op);
+SmallVector<int64_t, 3> groupShape(Operation *op);
+SmallVector<int64_t, 3> executionTileShape(Operation *op);
+
 // homogeneous bank topology의 device 전체 usable capacity. bank 용량이 기록되지
 // 않았거나 곱이 int64 범위를 넘으면 nullopt다.
 std::optional<int64_t> usableDeviceCapacityBytes(TargetProfileAttr profile);
@@ -40,8 +46,8 @@ void collectDrivers(Value v, ArrayRef<scf::ForOp> loops,
 
 // 이 축 loop 가 tile 하나에서 옮기는 원소 수. pim.access 의 sizes 가 그 값이고, 어느
 // 차원인지는 origin 을 이 loop 가 단독으로 모는가로 가른다. 축을 모는 차원이 여럿인데
-// 크기가 다르면 답이 하나가 아니므로 0 을 돌려준다. pim-map-devices(분할 눈금)와
-// pim-form-execution-tiles(상한 검증)가 같은 판정을 쓴다.
+// 크기가 다르면 답이 하나가 아니므로 0 을 돌려준다. block-group 형성,
+// device mapping, hierarchy 검증이 같은 판정을 쓴다.
 int64_t tileElementsAlong(scf::ForOp axis, ArrayRef<scf::ForOp> loops);
 
 } // namespace pim

@@ -23,13 +23,10 @@ def ConvertPIMToAiMX : Pass<"convert-pim-to-aimx", "mlir::ModuleOp"> {
       k_max, n_max : buffer 를 잡는 크기. compile time. 공통 execution tile이 정한다
       t_k,   t_n   : descriptor program 이 실제로 도는 길이. 런타임. pim.place 에서 온다
 
-    선택 (§6.1): 세 계층은 전부 공통 IR 이 정한다. block group 은 `#pim.block_group`
-    (Triton block 정수 개를 묶은 target-neutral 단위), execution
-    tile 은 `#pim.execution_tile` 이다 (원소 단위, 유효 데이터 기준 — 공통
-    pim-form-execution-tiles 가 사용자 값 또는 예산 탐색으로 세 축 모두 구체값을
-    확정한다. footprint 식은 AiMXFootprint.h 로 공유된다). batch 는 이 target
-    lowering의 option이며 profile에는 들어가지 않는다. 이 pass는 block-group useful
-    shape을 [batch, 4096/batch, 256/batch] 눈금으로 padding하고 buffer를 잡는다.
+    선택 (§6.1): 세 계층은 전부 공통 IR 이 정한다. `#pim.block`은 원소 shape,
+    `#pim.block_group`은 Block 개수, `#pim.execution_tile`은 Group 개수를 저장한다.
+    파생된 Group shape를 [batch, 4096/batch, 256/batch] 눈금으로 padding하고 buffer를
+    잡는다. batch는 target lowering의 option이며 profile에는 들어가지 않는다.
 
       t_m   = group 수 × 물리 group 높이 — 전송량 식에서 t_m 는 A 의
               ceil(M/t_m)*t_m 항에만 나타나므로 작을수록 좋다
@@ -51,18 +48,16 @@ def ConvertPIMToAiMX : Pass<"convert-pim-to-aimx", "mlir::ModuleOp"> {
     I1(chain 을 재배치용과 계산용으로 분리)이 구현된 뒤에만 의미가 있다 — 지금은 chain
     하나에 둘 다 붙어 있어 invoke 마다 재배치가 다시 돈다.
 
-    **k 를 자르는 것은 손해이고 마지막 수단이다.** k tile 하나가 통째로 한 chain 에
-    들어가면 reduction 이 vACC 안에서 끝나고 bf16 반올림이 출력당 한 번뿐이다. 자르면
+    k Group 여러 개가 한 Execution Tile에 들어가면 reduction은 한 chain의 vACC 안에서
+    끝난다. Execution Tile 경계로 k를 자르면
     부분합이 tile 마다 PIM 밖으로 나오므로 C 전송과 C drain descriptor 가 k tile 수만큼
     곱해지고 반올림도 그만큼 늘어난다. vACC 는 출력 block 하나 깊이(주소가
-    `pmm + VACC_OFFSET` 하나)라 invoke 를 건너 들고 있을 수 없어 이것은 피할 수 있는
-    비용이 아니다.
-
-    그래서 k 상한이 없으면 남는 예산 전부가 k_max 가 되고, `k > k_max` 일
-    때만 k loop 이 두 번 이상 돈다. 그때 두 번째 tile 부터는
+    `pmm + VACC_OFFSET` 하나)라 invoke 를 건너 들고 있을 수 없다. Common IR은
+    `execution_tile.groups[k]`를 그대로 전달하며 이 pass가 예산을 최대한 채우도록
+    값을 변경하지 않는다. 전체 reduction 범위가 그 크기보다 클 때 k loop이 두 번
+    이상 돌고, 두 번째 tile부터는
     `aimx.unstage` 의 `accumulate` 가 1 이 되어 host 가 이전 부분합에 더한다 — host 가
-    f32 면 그것이 fp32 누산이다. 현실적인 k 는 전부 한 번에 들어가므로 이 경로는
-    쓰이지 않는다.
+    f32 면 그것이 fp32 누산이다.
 
     전치(C^T = B^T*A^T)는 아직 고르지 않는다. 유리한 쪽을 정하는 규칙이 `m` 과 `n` 의
     비교인데 둘 다 런타임 값이라 compile time 에 답이 없다. IR 은 이미 그것을 표현할 수

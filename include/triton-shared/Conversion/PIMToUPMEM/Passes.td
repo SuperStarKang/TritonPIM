@@ -45,15 +45,16 @@ def ConvertPIMToUPMEM : Pass<"convert-pim-to-upmem", "mlir::ModuleOp"> {
       `linalg.generic` pointwise 연산을 지원한다. 모든 operand를 같은 m 행으로 자르고,
       scalar `arith` body를 하나의 C loop로 내므로 add/mul 같은 fusion이 보존된다.
 
-    시간(창) 분할은 공통 IR 의 `#pim.execution_tile` 에서 온다. 축 상한 하나가
-    창 하나이고, 창의 tile 수 = 상한 / 그 축의 group tile 원소수다. host loop 은
+    시간(창) 분할은 공통 IR 의 `#pim.execution_tile` 에서 온다. attribute의 Group
+    개수가 창 하나의 반복 수이고 원소 shape는 Block×Group×Tile로 파생한다. host loop 은
     n → k → m 순서로 중첩되고, 창마다 [창 반복 횟수 갱신 + 그 level 이 가장 안쪽
     창인 입력의 재전송] 을 한 뒤 가장 안쪽에서 launch 와 회수를 한다 — B(k·n)는
     k level, A(m·k)는 m level 에서 재전송되고, 어느 창에도 매이지 않은 입력은
     처음 한 번만 전송된다. 배정이 상한 안이면 창 수가 런타임에 1 로 퇴화한다.
     k(reduction) 창은 launch 마다 K 의 한 구간만 누적한 부분합을 내므로 host 가
-    창을 건너 누산한다(`upmem.unstage` 의 accumulate). 단 k
-    축이 있으면 k 상한은 공간 분할(SPLIT_K)의 눈금이라 창을 만들지 않는다.
+    창을 건너 누산한다(`upmem.unstage` 의 accumulate). spatial `pim.axis = "k"`가
+    있어도 그것은 서로 다른 Execution Tile plane이고, `execution_tile.groups[k]`는
+    각 plane 내부의 temporal reduction 창으로 그대로 유지된다.
     device 바이너리는 loop 상한이 host 변수로 오므로 창이 있어도 변하지 않는다.
   }];
   let constructor = "mlir::triton::createConvertPIMToUPMEMPass()";

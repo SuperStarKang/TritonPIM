@@ -4,10 +4,12 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/Matchers.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/STLExtras.h"
 
 using namespace mlir;
@@ -56,6 +58,85 @@ struct PIMVerifyPass
       func.walk([&](pim::AccessOp) { hasAccess = true; });
       if (!hasAccess)
         return WalkResult::advance();
+      auto block = func->getAttrOfType<pim::BlockAttr>("pim.block");
+      auto group =
+          func->getAttrOfType<pim::BlockGroupAttr>("pim.block_group");
+      if (!block || !group) {
+        func->emitError(
+            "pim-verify: every PIM function needs #pim.block and "
+            "#pim.block_group");
+        return WalkResult::interrupt();
+      }
+
+      // hierarchy metadata가 실제 local compute tile과 같은 크기를 말하는지 확인한다.
+      // m/n은 이름 붙은 logical axis, k는 access origin을 모는 유일한 reduction
+      // loop다. 이 검사가 없으면 block_group.blocks를 바꿔도 linalg/access shape는
+      // 예전 값인 모순된 Common IR이 target lowering까지 내려간다.
+      SmallVector<scf::ForOp> loops;
+      func.walk<WalkOrder::PreOrder>([&](scf::ForOp loop) {
+        // pim.device 바깥의 scheduling round도 tag 없는 scf.for다. 그것을
+        // reduction loop로 오인하지 않고 device-local compute loop만 본다.
+        if (loop->getParentOfType<pim::DeviceOp>())
+          loops.push_back(loop);
+      });
+      scf::ForOp hierarchyAxes[3];
+      for (scf::ForOp loop : loops) {
+        auto axis = loop->getAttrOfType<pim::AxisAttr>("pim.axis");
+        if (!axis)
+          continue;
+        if (axis.getName().getValue() == "m")
+          hierarchyAxes[0] = loop;
+        else if (axis.getName().getValue() == "n")
+          hierarchyAxes[1] = loop;
+      }
+      llvm::SmallPtrSet<Operation *, 4> reductions;
+      func.walk([&](pim::AccessOp access) {
+        for (Value origin : access.getOrigin()) {
+          llvm::SmallPtrSet<Operation *, 4> drivers;
+          pim::collectDrivers(origin, loops, drivers);
+          for (Operation *driver : drivers)
+            if (!driver->getAttrOfType<pim::AxisAttr>("pim.axis"))
+              reductions.insert(driver);
+        }
+      });
+      if (reductions.size() == 1)
+        hierarchyAxes[2] = cast<scf::ForOp>(*reductions.begin());
+
+      SmallVector<int64_t, 3> groupShape = pim::groupShape(func);
+      pim::DeviceOp device;
+      func.walk([&](pim::DeviceOp candidate) {
+        if (!device)
+          device = candidate;
+      });
+      auto execution =
+          device ? device->getAttrOfType<pim::ExecutionTileAttr>(
+                       "pim.execution_tile")
+                 : pim::ExecutionTileAttr();
+      if (!execution) {
+        func->emitError(
+            "pim-verify: every PIM function needs a pim.device with "
+            "#pim.execution_tile");
+        return WalkResult::interrupt();
+      }
+      ArrayRef<int64_t> tileGroups = execution.getGroups().asArrayRef();
+      static const char *axisNames[3] = {"m", "n", "k"};
+      for (int i = 0; i < 3; ++i) {
+        bool hasComputeAxis = static_cast<bool>(hierarchyAxes[i]);
+        if (hasComputeAxis != (tileGroups[i] > 0)) {
+          func->emitError("pim-verify: execution_tile.groups[")
+              << axisNames[i] << "] disagrees with the device-local compute axis";
+          return WalkResult::interrupt();
+        }
+        if (groupShape.size() != 3 || !hasComputeAxis)
+          continue;
+        int64_t actual = pim::tileElementsAlong(hierarchyAxes[i], loops);
+        if (actual != groupShape[i]) {
+          func->emitError("pim-verify: #pim.block × #pim.block_group gives ")
+              << groupShape[i] << " elements on " << axisNames[i]
+              << " but the local compute tile uses " << actual;
+          return WalkResult::interrupt();
+        }
+      }
       auto plan = func->getAttrOfType<pim::IntraDevicePlanAttr>(
           "pim.intra_device_plan");
       if (!plan) {
@@ -125,42 +206,17 @@ struct PIMVerifyPass
 
   LogicalResult verifyDevice(pim::DeviceOp device,
                              pim::TargetProfileAttr profile) {
-    auto plan =
-        device->getAttrOfType<pim::InterDevicePlanAttr>(
-            "pim.inter_device_plan");
-    if (!plan)
-      return device->emitError(
-          "pim-verify: every pim.device needs #pim.inter_device_plan");
     auto execution =
         device->getAttrOfType<pim::ExecutionTileAttr>("pim.execution_tile");
     if (!execution)
       return device->emitError(
           "pim-verify: every pim.device needs #pim.execution_tile");
-    auto reduction =
-        device->getAttrOfType<pim::ReductionPlanAttr>("pim.reduction_plan");
-    if (!reduction)
+    SmallVector<int64_t, 3> executionShape =
+        pim::executionTileShape(device);
+    if (executionShape.size() != 3)
       return device->emitError(
-          "pim-verify: every pim.device needs #pim.reduction_plan");
-    ArrayRef<int64_t> tile = plan.getExecutionTile().asArrayRef();
-    if (tile.size() != 3 || tile[0] != execution.getM() ||
-        tile[1] != execution.getN() || tile[2] != execution.getK())
-      return device->emitError(
-          "pim-verify: device plan and execution tile disagree");
-
-    bool hasSpatialK = llvm::any_of(
-        device.getMapping().getAxes(), [](Attribute axis) {
-          return cast<StringAttr>(axis).getValue() == "k";
-        });
-    if (hasSpatialK !=
-        (reduction.getSpatialPartials().getValue() ==
-         "separate_output_planes"))
-      return device->emitError(
-          "pim-verify: reduction plan spatial_partials disagrees with the "
-          "k axis");
-    if (execution.getK() > 0 &&
-        reduction.getTemporalAccumulation().getValue() != "host")
-      return device->emitError(
-          "pim-verify: a finite tile-k requires host temporal accumulation");
+          "pim-verify: cannot derive the execution tile shape from the "
+          "three hierarchy attributes");
 
     int64_t used = 1;
     for (int64_t p : device.getMapping().getPartitions().asArrayRef())

@@ -7,15 +7,15 @@
 
 // BATCH-ERR: intra-device plan must use bank_partitions=[batch, 256/batch, 1]
 
-// batch=2는 AiMX target option에서 온다. 공통 #pim.block_group의 useful shape을
+// batch=2는 AiMX target option에서 온다. 공통 Block×Group shape을
 // target lowering이 [2, 2048, 128] 눈금으로 padding한다:
-//   n: Triton block 21개 = 2016 유효 + 32 padding = 물리 2048 (출력 block 1개)
-//   k: Triton block 5개  =  120 유효 +  8 padding = 물리 128  (reduction step 1개)
+//   n: logical Group 96 유효 + 1952 padding = 물리 2048 (출력 block 1개)
+//   k: logical Group 24 유효 + 104 padding = 물리 128  (reduction step 1개)
 //   m: BLOCK_M=32는 단위 2의 배수 — block 1개 = 32 유효 = 물리 32, padding 0
 // 입력 PIM IR의 유효 k 상한 111616은 block-group useful 눈금 240으로 내림한 뒤,
 // 물리 눈금 256으로 바뀐다: k_max = 119040, padded_k = 122880.
 // CHECK-LABEL: func.func @matmul
-// CHECK-SAME:    aimx.tile_group = #aimx.tile_group<block = [32, 96, 24], group = [1, 21, 5], execution = [32, 2048, 128]>
+// CHECK-SAME:    aimx.tile_group = #aimx.tile_group<block = [32, 96, 24], group = [1, 1, 1], execution = [32, 2048, 128]>
 // CHECK-SAME:    aimx.tiling = #aimx.tiling<batch = 2, t_m = 32, t_n = 4096, t_k = 119040, padded_k = 122880, padded_n = 4096, transposed = false>
 
 // buffer 크기는 물리 크기에서 나온다. A(32*122880*2), Arel(32*119040*32),
@@ -56,9 +56,8 @@ module attributes {pim.target_profile = #pim.target_profile<
 func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
                   %K: i32, %N: i32, %ex: index, %ey: index)
     attributes {pim.intra_device_plan = #pim.intra_device_plan<bank_partitions = [2, 128, 1], core_partitions = [1, 1, 1], lanes = 16, lane_axis = "n">,
-        pim.block_group = #pim.block_group<
-            tiles = [1, 21, 5],
-            useful = [32, 2016, 120]>} {
+        pim.block = #pim.block<shape = [32, 96, 24]>,
+        pim.block_group = #pim.block_group<blocks = [1, 1, 1]>} {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c24 = arith.constant 24 : index
@@ -73,16 +72,7 @@ func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
                                  partitions = [1, 1]>
       extents [%ex, %ey]
       attributes {
-        pim.execution_tile = #pim.execution_tile<m = 32, n = 4096, k = 111616>,
-        pim.inter_device_plan = #pim.inter_device_plan<
-            available_devices = 1,
-            axes = ["m", "n"],
-            active_grid = [1, 1],
-            execution_tile = [32, 4096, 111616],
-            scheduling_order = ["n", "m"]>,
-        pim.reduction_plan = #pim.reduction_plan<
-            spatial_partials = "none", temporal_accumulation = "host",
-            final_accumulation = "none">} {
+        pim.execution_tile = #pim.execution_tile<groups = [1, 2, 930]>} {
   ^bb0(%px: index, %py: index):
     %capx = arith.ceildivsi %ex, %c1 : index
     %startx = arith.muli %px, %capx : index

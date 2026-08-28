@@ -36,9 +36,8 @@ func.func @matvec(%A: memref<*xf32>, %x: memref<*xf32>, %y: memref<*xf32>)
       pim.intra_device_plan = #pim.intra_device_plan<
           bank_partitions = [1, 1, 1], core_partitions = [1, 1, 1],
           lanes = 4, lane_axis = "m">,
-      pim.block_group = #pim.block_group<tiles = [1, 1, 1],
-                                         useful = [8, 1, 16]>,
-      pim.execution_tile = #pim.execution_tile<m = 8, n = 0, k = 16>} {
+      pim.block = #pim.block<shape = [8, 0, 16]>,
+      pim.block_group = #pim.block_group<blocks = [1, 1, 1]>} {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c8 = arith.constant 8 : index
@@ -47,13 +46,7 @@ func.func @matvec(%A: memref<*xf32>, %x: memref<*xf32>, %y: memref<*xf32>)
 
   pim.device #pim.device_mapping<axes = ["m"], partitions = [1]>
       extents [%c1] attributes {
-        pim.execution_tile = #pim.execution_tile<m = 8, n = 0, k = 16>,
-        pim.inter_device_plan = #pim.inter_device_plan<
-            available_devices = 1, axes = ["m"], active_grid = [1],
-            execution_tile = [8, 0, 16], scheduling_order = ["m"]>,
-        pim.reduction_plan = #pim.reduction_plan<
-            spatial_partials = "none", temporal_accumulation = "host",
-            final_accumulation = "none">} {
+        pim.execution_tile = #pim.execution_tile<groups = [1, 0, 1]>} {
   ^bb0(%pm: index):
     pim.place %A start[%c0, %c0] size[%c8, %c16] capacity[%c8, %c16]
         strides[%c16, %c1] {direction = "in", access = 0 : i64,
