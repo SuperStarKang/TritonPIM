@@ -51,7 +51,6 @@ inline void registerTritonSharedDialects(mlir::DialectRegistry &registry) {
   mlir::triton::registerPIMFormComputePass();
   mlir::triton::registerPIMFormBlockGroupsPass();
   mlir::triton::registerPIMSetTargetProfilePass();
-  mlir::triton::registerPIMPlanIntraDevicePass();
   mlir::triton::registerPIMMapDevicesPass();
   mlir::triton::registerPIMFormExecutionTilesPass();
   mlir::triton::registerPIMPlaceDataPass();

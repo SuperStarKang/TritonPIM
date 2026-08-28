@@ -59,14 +59,11 @@ SmallVector<int64_t, 3> mlir::pim::executionTileShape(Operation *op) {
 }
 
 std::optional<int64_t>
-mlir::pim::usableDeviceCapacityBytes(TargetProfileAttr profile) {
+mlir::pim::unitCapacityLimitBytes(TargetProfileAttr profile) {
   if (!profile)
     return std::nullopt;
-  IntegerAttr bank = profile.getUsableBankCapacityBytes();
-  if (!bank)
-    return std::nullopt;
-  int64_t banks = profile.getNumberOfBanksPerPimDevice();
-  int64_t bytes = bank.getInt();
+  int64_t banks = profile.getBanksPerUnit();
+  int64_t bytes = profile.getBankCapacityLimitBytes();
   if (banks < 1 || bytes < 0 ||
       (bytes != 0 && banks > std::numeric_limits<int64_t>::max() / bytes))
     return std::nullopt;

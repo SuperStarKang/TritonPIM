@@ -5,13 +5,9 @@
 // RUN: triton-shared-opt --convert-pim-to-aimx --aimx-lower-matmul %s | FileCheck %s --check-prefix=PIM-CLEAN
 // RUN: triton-shared-opt --convert-pim-to-aimx --aimx-lower-matmul %s | triton-shared-translate --aimx-to-runtime-stub > /dev/null
 // RUN: triton-shared-opt --convert-pim-to-aimx --aimx-lower-matmul %s | triton-shared-translate --aimx-to-descriptors > /dev/null
-// RUN: not triton-shared-opt "--convert-pim-to-aimx=batch=8 bank-capacity-bytes=4192415" %s 2>&1 | FileCheck %s --check-prefix=BANK-OOM
-
-// BANK-OOM: allocation-wise interleaved footprint needs 4192416 byte in each of 256 banks
 
 // PIM-CLEAN-LABEL: module
 // PIM-CLEAN-NOT: #pim.target_profile
-// PIM-CLEAN-NOT: #pim.intra_device_plan
 // PIM-CLEAN-NOT: #pim.block
 // PIM-CLEAN-NOT: #pim.block_group
 // PIM-CLEAN-NOT: #pim.execution_tile
@@ -27,7 +23,7 @@
 
 // FPGA 하나를 확보하고 그 안에서 buffer를 잡는다.
 // CHECK: aimx.acquire 1 : !aimx.device_set
-// CHECK: aimx.foreach_device %{{.*}} : !aimx.device_set axes ["m", "n"] counts [1, 1]
+// CHECK: aimx.foreach_device %{{.*}} : !aimx.device_set axes ["m", "n", "k"] counts [1, 1, 1]
 
 // PMM이 가장 먼저다 — pim_private_malloc이 pim_malloc이 이미 내준 주소를 돌려줄 수 있다.
 // 그다음이 A(32*106496*2), Arel(32*103936*32), B(103936*4096*2), C(32*4096*2),
@@ -85,18 +81,17 @@
 // PROGRAM:         aimx.desc src(%{{.*}}, %{{.*}}) pitch %{{.*}} dst(%{{.*}}, %{{.*}}) pitch %{{.*}} len 1024 opcode c_mask|matmul|stride
 
 module attributes {pim.target_profile = #pim.target_profile<
-    target = "aimx", number_of_pim_devices = 1,
-    number_of_banks_per_pim_device = 256,
-    number_of_pim_cores_per_bank = 1,
-    number_of_parallel_lanes_per_pim_core = 16,
-    parallel_execution_kind = "simd",
-    usable_bank_capacity_bytes = 268435456, usable_local_capacity_bytes = 0>} {
+    target = "aimx", num_units = 1,
+    banks_per_unit = 256,
+    cores_per_bank = 1,
+    lanes_per_core = 16,
+    bank_capacity_limit_bytes = 268435456, local_capacity_limit_bytes = 0>} {
 
 // pim.block_group은 --pim-form-block-groups가 만든 target-neutral block 묶음이다.
 // AiMX lowering이 useful 크기를 실행 단위 [8, 512, 32]에 맞춰 padding한다.
 func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
                   %K: i32, %N: i32, %ex: index, %ey: index)
-    attributes {pim.intra_device_plan = #pim.intra_device_plan<bank_partitions = [8, 32, 1], core_partitions = [1, 1, 1], lanes = 16, lane_axis = "n">,
+    attributes {
         pim.block = #pim.block<shape = [32, 32, 32]>,
         pim.block_group = #pim.block_group<blocks = [1, 1, 1]>} {
   %c0 = arith.constant 0 : index
@@ -107,12 +102,10 @@ func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
   %ldb = arith.index_cast %N : i32 to index
   %kk = arith.index_cast %K : i32 to index
 
-  pim.device #pim.device_mapping<axes = ["m", "n"],
-                                 partitions = [1, 1]>
-      extents [%ex, %ey]
+  pim.device #pim.device_mapping<partitions = [1, 1, 1]>
       attributes {
         pim.execution_tile = #pim.execution_tile<groups = [1, 8, 3248]>} {
-  ^bb0(%px: index, %py: index):
+  ^bb0(%px: index, %py: index, %device_k_unused: index):
     // PIM Device 가 하나라 device 몫이 곧 전체다. 실제 pass 가 내는 모양 그대로 손으로 썼다.
     %capx = arith.ceildivsi %ex, %c1 : index
     %startx = arith.muli %px, %capx : index
@@ -126,26 +119,22 @@ func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
     %arn = arith.muli %tripsx, %c32 : index
     %arc = arith.muli %capx, %c32 : index
     %akn = arith.muli %tripsk, %c32 : index
-    pim.place %A start[%ar, %c0] size[%arn, %akn] capacity[%arc, %akn]
+    pim.place %A start[%ar, %c0] size[%arn, %akn] allocation_shape[%arc, %akn]
         strides[%lda, %c1]
         {direction = "in", access = 0 : i64,
-         mapping = #pim.place_mapping<axis_sources = ["m", ""]>,
          replicated_over = ["n"]} : memref<*xf32>
 
     %bc = arith.muli %starty, %c32 : index
     %bcn = arith.muli %tripsy, %c32 : index
     %bcc = arith.muli %capy, %c32 : index
-    pim.place %B start[%c0, %bc] size[%akn, %bcn] capacity[%akn, %bcc]
+    pim.place %B start[%c0, %bc] size[%akn, %bcn] allocation_shape[%akn, %bcc]
         strides[%ldb, %c1]
         {direction = "in", access = 1 : i64,
-         mapping = #pim.place_mapping<axis_sources = ["", "n"]>,
          replicated_over = ["m"]} : memref<*xf32>
 
-    pim.place %C start[%ar, %bc] size[%arn, %bcn] capacity[%arc, %bcc]
+    pim.place %C start[%ar, %bc] size[%arn, %bcn] allocation_shape[%arc, %bcc]
         strides[%ldb, %c1]
-        {direction = "out", access = 2 : i64,
-         mapping = #pim.place_mapping<axis_sources = ["m",
-                                                      "n"]>} : memref<*xf32>
+        {direction = "out", access = 2 : i64} : memref<*xf32>
 
     scf.for %tx = %c0 to %tripsx step %c1 {
       %gx = arith.addi %startx, %tx {pim.device_origin} : index

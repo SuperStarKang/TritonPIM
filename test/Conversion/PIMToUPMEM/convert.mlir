@@ -7,7 +7,6 @@
 
 // PIM-CLEAN-LABEL: module
 // PIM-CLEAN-NOT: #pim.target_profile
-// PIM-CLEAN-NOT: #pim.intra_device_plan
 // PIM-CLEAN-NOT: #pim.block
 // PIM-CLEAN-NOT: #pim.block_group
 // PIM-CLEAN-NOT: #pim.execution_tile
@@ -55,7 +54,7 @@
 // CHECK-LABEL: func.func @matmul
 // 확보와 적재는 한 op이다. 런타임이 같은 device 수·같은 프로그램이면 쥐고 있던 것을 준다.
 // CHECK:         %[[SET:.*]] = upmem.acquire 8, @matmul_device : !upmem.set
-// CHECK:         upmem.foreach_unit %[[SET]] : !upmem.set axes ["m", "n"] counts [2, 4]
+// CHECK:         upmem.foreach_unit %[[SET]] : !upmem.set axes ["m", "n", "k"] counts [2, 4, 1]
 // A는 column 축 device끼리 같은 것을 받는다. pad_to는 size가 아니라 capacity다 —
 // device마다 같은 바이트 수를 보내야 하므로.
 // CHECK:           %[[SA:.*]] = upmem.stage %{{.*}} origin[%{{.*}}, %{{.*}}] sizes[%{{.*}}, %{{.*}}] strides[%{{.*}}, %{{.*}}] pad_to[%{{.*}}, %{{.*}}] tile [8, 32]
@@ -67,24 +66,24 @@
 // CHECK:         upmem.launch %[[SET]]
 // 출력은 집합 전체에서 한 번에 회수한 뒤 device마다 되돌린다.
 // CHECK:         %[[P:.*]] = upmem.gather %[[SET]], @matmul_mram_2
-// CHECK:         upmem.foreach_group %[[P]] : {{.*}} axes ["m", "n"] counts [2, 4]
+// CHECK:         upmem.foreach_group %[[P]] : {{.*}} axes ["m", "n", "k"] counts [2, 4, 1]
 // 되돌릴 때 읽는 범위는 실제 크기(size)지만 축 사이 간격은 배정량(capacity)이다.
-// CHECK:           upmem.unstage %{{.*}} into %{{.*}} origin[%{{.*}}, %{{.*}}] sizes[%{{.*}}, %{{.*}}] strides[%{{.*}}, %{{.*}}] capacity[%{{.*}}, %{{.*}}] tile [8, 32]
+// execution_tile의 temporal K window를 host에서 합치므로 accumulate가 명시된다.
+// CHECK:           upmem.unstage %{{.*}} into %{{.*}} origin[%{{.*}}, %{{.*}}] sizes[%{{.*}}, %{{.*}}] strides[%{{.*}}, %{{.*}}] capacity[%{{.*}}, %{{.*}}] accumulate %{{.*}} tile [8, 32]
 // pim 쪽은 남지 않는다.
 // CHECK-NOT:     pim.device
 // CHECK-NOT:     pim.place
 
 module attributes {pim.target_profile = #pim.target_profile<
-    target = "upmem", number_of_pim_devices = 8,
-    number_of_banks_per_pim_device = 1,
-    number_of_pim_cores_per_bank = 1,
-    number_of_parallel_lanes_per_pim_core = 1,
-    parallel_execution_kind = "multithread",
-    usable_bank_capacity_bytes = 3072, usable_local_capacity_bytes = 49152>} {
+    target = "upmem", num_units = 8,
+    banks_per_unit = 1,
+    cores_per_bank = 1,
+    lanes_per_core = 1,
+    bank_capacity_limit_bytes = 3072, local_capacity_limit_bytes = 49152>} {
 
 func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
                   %K: i32, %N: i32, %ex: index, %ey: index)
-    attributes {pim.intra_device_plan = #pim.intra_device_plan<bank_partitions = [1, 1, 1], core_partitions = [1, 1, 1], lanes = 1, lane_axis = "m">,
+    attributes {
         pim.block = #pim.block<shape = [8, 32, 32]>,
         pim.block_group = #pim.block_group<blocks = [1, 1, 1]>} {
   %c0 = arith.constant 0 : index
@@ -98,12 +97,10 @@ func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
   %ldb = arith.index_cast %N : i32 to index
   %kk = arith.index_cast %K : i32 to index
 
-  pim.device #pim.device_mapping<axes = ["m", "n"],
-                                 partitions = [2, 4]>
-      extents [%ex, %ey]
+  pim.device #pim.device_mapping<partitions = [2, 4, 1]>
       attributes {
         pim.execution_tile = #pim.execution_tile<groups = [1, 1, 1]>} {
-  ^bb0(%px: index, %py: index):
+  ^bb0(%px: index, %py: index, %device_k_unused: index):
     // device 범위. 실제 pass가 내는 것과 같은 모양으로 손으로 썼다.
     %capx = arith.ceildivsi %ex, %c2 : index
     %startx = arith.muli %px, %capx : index
@@ -117,26 +114,22 @@ func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
     %arn = arith.muli %tripsx, %c8 : index
     %arc = arith.muli %capx, %c8 : index
     %akn = arith.muli %tripsk, %c32 : index
-    pim.place %A start[%ar, %c0] size[%arn, %akn] capacity[%arc, %akn]
+    pim.place %A start[%ar, %c0] size[%arn, %akn] allocation_shape[%arc, %akn]
         strides[%lda, %c1]
         {direction = "in", access = 0 : i64,
-         mapping = #pim.place_mapping<axis_sources = ["m", ""]>,
          replicated_over = ["n"]} : memref<*xi8>
 
     %bc = arith.muli %starty, %c32 : index
     %bcn = arith.muli %tripsy, %c32 : index
     %bcc = arith.muli %capy, %c32 : index
-    pim.place %B start[%c0, %bc] size[%akn, %bcn] capacity[%akn, %bcc]
+    pim.place %B start[%c0, %bc] size[%akn, %bcn] allocation_shape[%akn, %bcc]
         strides[%ldb, %c1]
         {direction = "in", access = 1 : i64,
-         mapping = #pim.place_mapping<axis_sources = ["", "n"]>,
          replicated_over = ["m"]} : memref<*xi8>
 
-    pim.place %C start[%ar, %bc] size[%arn, %bcn] capacity[%arc, %bcc]
+    pim.place %C start[%ar, %bc] size[%arn, %bcn] allocation_shape[%arc, %bcc]
         strides[%ldb, %c1]
-        {direction = "out", access = 2 : i64,
-         mapping = #pim.place_mapping<axis_sources = ["m",
-                                                      "n"]>} : memref<*xi32>
+        {direction = "out", access = 2 : i64} : memref<*xi32>
 
     // device가 실행하는 부분. 축 loop는 0부터 실제 횟수까지 돌고, 전역 좌표는 몸체
     // 첫머리에서 복원한다.

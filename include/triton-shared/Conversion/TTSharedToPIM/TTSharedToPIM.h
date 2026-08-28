@@ -28,7 +28,6 @@ std::unique_ptr<OperationPass<ModuleOp>> createPIMRecoverAccessOriginPass();
 std::unique_ptr<OperationPass<ModuleOp>> createPIMFormComputePass();
 std::unique_ptr<OperationPass<ModuleOp>> createPIMFormBlockGroupsPass();
 std::unique_ptr<OperationPass<ModuleOp>> createPIMSetTargetProfilePass();
-std::unique_ptr<OperationPass<ModuleOp>> createPIMPlanIntraDevicePass();
 std::unique_ptr<OperationPass<ModuleOp>> createPIMMapDevicesPass();
 std::unique_ptr<OperationPass<ModuleOp>> createPIMFormExecutionTilesPass();
 std::unique_ptr<OperationPass<ModuleOp>> createPIMPlaceDataPass();

@@ -26,7 +26,7 @@ SmallVector<int64_t, 3> executionTileShape(Operation *op);
 
 // homogeneous bank topology의 device 전체 usable capacity. bank 용량이 기록되지
 // 않았거나 곱이 int64 범위를 넘으면 nullopt다.
-std::optional<int64_t> usableDeviceCapacityBytes(TargetProfileAttr profile);
+std::optional<int64_t> unitCapacityLimitBytes(TargetProfileAttr profile);
 
 // scope 안에서 tile 버퍼를 새로 잡아야 하는 tensor 값(roots)과, 모든 tensor 값에서
 // 그 값이 사는 버퍼의 대표 값으로 가는 대응(owner)을 만든다.

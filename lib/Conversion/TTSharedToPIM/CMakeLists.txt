@@ -6,7 +6,6 @@ add_triton_library(TTSharedToPIM
   PIMFormComputePass.cpp
   PIMFormBlockGroupsPass.cpp
   PIMSetTargetProfilePass.cpp
-  PIMPlanIntraDevicePass.cpp
   PIMMapDevicesPass.cpp
   PIMFormExecutionTilesPass.cpp
   PIMPlaceDataPass.cpp

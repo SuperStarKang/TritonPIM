@@ -46,23 +46,28 @@ void PIMDialect::initialize() {
 
 LogicalResult TargetProfileAttr::verify(
     function_ref<InFlightDiagnostic()> emitError, StringAttr target,
-    int64_t numberOfPimDevices, int64_t numberOfBanksPerPimDevice,
-    int64_t numberOfPimCoresPerBank,
-    int64_t numberOfParallelLanesPerPimCore,
-    StringAttr parallelExecutionKind, IntegerAttr usableBankCapacityBytes,
-    IntegerAttr usableLocalCapacityBytes) {
+    int64_t numUnits, int64_t banksPerUnit, int64_t coresPerBank,
+    int64_t lanesPerCore, int64_t bankCapacityLimitBytes,
+    int64_t localCapacityLimitBytes) {
   if (target.getValue().empty())
     return emitError() << "target must not be empty";
-  if (numberOfPimDevices < 1 || numberOfBanksPerPimDevice < 1 ||
-      numberOfPimCoresPerBank < 1 || numberOfParallelLanesPerPimCore < 1)
-    return emitError() << "device, bank, core, and lane topology values must be positive";
-  StringRef kind = parallelExecutionKind.getValue();
-  if (kind != "multithread" && kind != "simd")
-    return emitError() << "parallel_execution_kind must be multithread or simd";
-  if (usableBankCapacityBytes && usableBankCapacityBytes.getInt() < 0)
-    return emitError() << "usable_bank_capacity_bytes must not be negative";
-  if (usableLocalCapacityBytes && usableLocalCapacityBytes.getInt() < 0)
-    return emitError() << "usable_local_capacity_bytes must not be negative";
+  if (numUnits < 1 || banksPerUnit < 1 || coresPerBank < 1 ||
+      lanesPerCore < 1)
+    return emitError()
+           << "unit, bank, core, and lane topology values must be positive";
+  if (bankCapacityLimitBytes < 0 || localCapacityLimitBytes < 0)
+    return emitError() << "capacity limits must not be negative";
+  return success();
+}
+
+LogicalResult DeviceMappingAttr::verify(
+    function_ref<InFlightDiagnostic()> emitError,
+    DenseI64ArrayAttr partitions) {
+  if (partitions.size() != 3)
+    return emitError() << "partitions must be [p_m, p_n, p_k]";
+  if (llvm::any_of(partitions.asArrayRef(),
+                   [](int64_t value) { return value < 1; }))
+    return emitError() << "partition counts must be positive";
   return success();
 }
 
@@ -82,17 +87,8 @@ LogicalResult AccessOp::verify() {
 }
 
 LogicalResult DeviceOp::verify() {
-  DeviceMappingAttr mapping = getMapping();
-  size_t n = mapping.getAxes().size();
-  if (mapping.getPartitions().size() != n)
-    return emitOpError("mapping must have one partition count per axis");
-  if (getAxisExtents().size() != n)
-    return emitOpError("axis_extents must have one entry per axis");
-  if (getBody().front().getNumArguments() != n)
-    return emitOpError("body must take one partition coordinate per axis");
-  for (int64_t partition : mapping.getPartitions().asArrayRef())
-    if (partition < 1)
-      return emitOpError("mapping partition counts must be positive");
+  if (getBody().front().getNumArguments() != 3)
+    return emitOpError("body must take the [m, n, k] unit coordinates");
   return success();
 }
 
@@ -133,34 +129,12 @@ LogicalResult AxisAttr::verify(function_ref<InFlightDiagnostic()> emitError,
   return success();
 }
 
-LogicalResult IntraDevicePlanAttr::verify(
-    function_ref<InFlightDiagnostic()> emitError,
-    DenseI64ArrayAttr bankPartitions, DenseI64ArrayAttr corePartitions,
-    int64_t lanes, StringAttr laneAxis) {
-  if (bankPartitions.size() != 3 || corePartitions.size() != 3)
-    return emitError() << "bank_partitions and core_partitions must be [m, n, k]";
-  for (int64_t p : bankPartitions.asArrayRef())
-    if (p < 1)
-      return emitError() << "bank_partitions entries must be positive";
-  for (int64_t p : corePartitions.asArrayRef())
-    if (p < 1)
-      return emitError() << "core_partitions entries must be positive";
-  if (lanes < 1)
-    return emitError() << "lanes must be positive";
-  StringRef axis = laneAxis.getValue();
-  if (axis != "m" && axis != "n" && axis != "k")
-    return emitError() << "lane_axis must be m, n, or k";
-  return success();
-}
-
 LogicalResult PlaceOp::verify() {
   size_t rank = getStart().size();
-  if (getSize().size() != rank || getCapacity().size() != rank ||
+  if (getSize().size() != rank || getAllocationShape().size() != rank ||
       getStrides().size() != rank)
     return emitOpError(
-        "start, size, capacity, and strides must have the same rank");
-  if (getMapping().getAxisSources().size() != rank)
-    return emitOpError("mapping must have one axis source per buffer axis");
+        "start, size, allocation_shape, and strides must have the same rank");
   StringRef dir = getDirection();
   if (dir != "in" && dir != "out")
     return emitOpError("direction must be \"in\" or \"out\"");

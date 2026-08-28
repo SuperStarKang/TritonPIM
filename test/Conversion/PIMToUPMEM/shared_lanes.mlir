@@ -41,19 +41,17 @@
 // CHECK-NOT:     memref.alloc() : memref<4x
 
 module attributes {pim.target_profile = #pim.target_profile<
-    target = "upmem", number_of_pim_devices = 8,
-    number_of_banks_per_pim_device = 1,
-    number_of_pim_cores_per_bank = 1,
-    number_of_parallel_lanes_per_pim_core = 4,
-    parallel_execution_kind = "multithread",
-    usable_bank_capacity_bytes = 3072, usable_local_capacity_bytes = 49152>} {
+    target = "upmem", num_units = 8,
+    banks_per_unit = 1,
+    cores_per_bank = 1,
+    lanes_per_core = 4,
+    bank_capacity_limit_bytes = 3072, local_capacity_limit_bytes = 49152>} {
 
 func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
                   %K: i32, %N: i32, %ex: index, %ey: index)
     attributes {
       pim.block = #pim.block<shape = [8, 32, 32]>,
-      pim.block_group = #pim.block_group<blocks = [1, 1, 1]>,
-      pim.intra_device_plan = #pim.intra_device_plan<bank_partitions = [1, 1, 1], core_partitions = [1, 1, 1], lanes = 4, lane_axis = "m">} {
+      pim.block_group = #pim.block_group<blocks = [1, 1, 1]>} {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c2 = arith.constant 2 : index
@@ -65,12 +63,10 @@ func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
   %ldb = arith.index_cast %N : i32 to index
   %kk = arith.index_cast %K : i32 to index
 
-  pim.device #pim.device_mapping<axes = ["m", "n"],
-                                 partitions = [2, 4]>
-      extents [%ex, %ey]
+  pim.device #pim.device_mapping<partitions = [2, 4, 1]>
       attributes {
         pim.execution_tile = #pim.execution_tile<groups = [1, 1, 1]>} {
-  ^bb0(%px: index, %py: index):
+  ^bb0(%px: index, %py: index, %device_k_unused: index):
     %capx = arith.ceildivsi %ex, %c2 : index
     %startx = arith.muli %px, %capx : index
     %tripsx = arith.minsi %capx, %capx : index
@@ -83,26 +79,22 @@ func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
     %arn = arith.muli %tripsx, %c8 : index
     %arc = arith.muli %capx, %c8 : index
     %akn = arith.muli %tripsk, %c32 : index
-    pim.place %A start[%ar, %c0] size[%arn, %akn] capacity[%arc, %akn]
+    pim.place %A start[%ar, %c0] size[%arn, %akn] allocation_shape[%arc, %akn]
         strides[%lda, %c1]
         {direction = "in", access = 0 : i64,
-         mapping = #pim.place_mapping<axis_sources = ["m", ""]>,
          replicated_over = ["n"]} : memref<*xi8>
 
     %bc = arith.muli %starty, %c32 : index
     %bcn = arith.muli %tripsy, %c32 : index
     %bcc = arith.muli %capy, %c32 : index
-    pim.place %B start[%c0, %bc] size[%akn, %bcn] capacity[%akn, %bcc]
+    pim.place %B start[%c0, %bc] size[%akn, %bcn] allocation_shape[%akn, %bcc]
         strides[%ldb, %c1]
         {direction = "in", access = 1 : i64,
-         mapping = #pim.place_mapping<axis_sources = ["", "n"]>,
          replicated_over = ["m"]} : memref<*xi8>
 
-    pim.place %C start[%ar, %bc] size[%arn, %bcn] capacity[%arc, %bcc]
+    pim.place %C start[%ar, %bc] size[%arn, %bcn] allocation_shape[%arc, %bcc]
         strides[%ldb, %c1]
-        {direction = "out", access = 2 : i64,
-         mapping = #pim.place_mapping<axis_sources = ["m",
-                                                      "n"]>} : memref<*xi32>
+        {direction = "out", access = 2 : i64} : memref<*xi32>
 
     scf.for %tx = %c0 to %tripsx step %c1 {
       %gx = arith.addi %startx, %tx {pim.device_origin} : index

@@ -9,8 +9,8 @@ def ConvertPIMToUPMEM : Pass<"convert-pim-to-upmem", "mlir::ModuleOp"> {
     `pim.device` + `pim.place` 를 UPMEM 의 host/device 구조로 옮긴다. PIM IR 이 정하지
     않은 것을 여기서 정한다: 메모리 계층, 전송 단위, 재배치.
 
-    진입 즉시 legality gate 를 지난다 — target 이 upmem 이고, lane 이 독립 스레드이며,
-    bank 용량이 기록돼 있어야 한다.
+    진입 즉시 legality gate 를 지난다 — target 이 upmem 이고 UPMEM topology와 bank
+    용량이 기록돼 있어야 한다.
 
     모듈 수준:
     - `upmem.mram` = device 의 MRAM 버퍼. pim.place 마다 하나다. 모든 차원이 창
@@ -38,29 +38,32 @@ def ConvertPIMToUPMEM : Pass<"convert-pim-to-upmem", "mlir::ModuleOp"> {
     - tile 은 WRAM 버퍼가 되고 계산은 그 위에서 memref 형태 linalg 로 돈다.
     - `pim.load`/`pim.store` 는 타일 하나를 옮기는 DMA 가 된다. 타일이 2048 byte 를 넘으면
       행 묶음으로 쪼갠다.
-    - tasklet 이 여럿이면 `#pim.intra_device_plan`의 `lane_axis = "m"`에 따라 block
-      group의 행을 연속 구간으로 나눠 협력 실행한다. WRAM buffer는 공유하고 DMA를
-      분담하므로 적재와 계산 사이를 barrier로 구분한다.
-    - matmul/fill 외에 identity indexing map과 all-parallel iterator를 가진
-      `linalg.generic` pointwise 연산을 지원한다. 모든 operand를 같은 m 행으로 자르고,
-      scalar `arith` body를 하나의 C loop로 내므로 add/mul 같은 fusion이 보존된다.
+    - tasklet 이 여럿이면 target option `nr-tasklets`에 따라 block group의 행을 연속
+      구간으로 나눠 협력 실행한다. 이 값은 profile의 lanes_per_core 이하이어야 한다.
+      어느 operand가 m을 따르는지는
+      연산 이름이 아니라 linalg indexing map으로 판정한다. 따라서 matmul의 A/C,
+      matvec의 A/y, identity pointwise의 모든 operand가 같은 규칙으로 잘리고 B/x처럼
+      m을 쓰지 않는 operand는 전체 tile을 공유한다.
+    - compute leaf는 fill, matmul, matvec와 identity indexing map + all-parallel
+      iterator를 가진 `linalg.generic`을 지원한다. generic의 scalar `arith` body는 하나의
+      C loop로 내려가므로 elementwise fusion이 보존된다.
 
-    시간(창) 분할은 공통 IR 의 `#pim.execution_tile` 에서 온다. attribute의 Group
-    개수가 창 하나의 반복 수이고 원소 shape는 Block×Group×Tile로 파생한다. host loop 은
-    n → k → m 순서로 중첩되고, 창마다 [창 반복 횟수 갱신 + 그 level 이 가장 안쪽
-    창인 입력의 재전송] 을 한 뒤 가장 안쪽에서 launch 와 회수를 한다 — B(k·n)는
-    k level, A(m·k)는 m level 에서 재전송되고, 어느 창에도 매이지 않은 입력은
-    처음 한 번만 전송된다. 배정이 상한 안이면 창 수가 런타임에 1 로 퇴화한다.
-    k(reduction) 창은 launch 마다 K 의 한 구간만 누적한 부분합을 내므로 host 가
-    창을 건너 누산한다(`upmem.unstage` 의 accumulate). spatial `pim.axis = "k"`가
-    있어도 그것은 서로 다른 Execution Tile plane이고, `execution_tile.groups[k]`는
-    각 plane 내부의 temporal reduction 창으로 그대로 유지된다.
+    M/N execution-tile 반복은 PIM Common IR의 `pim.scheduling_axis` loop를 그대로
+    소비하며 target에서 다시 자르지 않는다. `upmem.acquire`는 그 loop 밖에 있어 같은
+    DPU set과 device binary를 round 사이에 재사용하고, stage/launch/gather만 반복된다.
+    `#pim.execution_tile`의 K 크기는 한 device 내부의 temporal reduction residency다.
+    reduction 범위가 더 크면 K를 쓰는 입력만 window마다 다시 전송하고, launch가 낸
+    부분합은 host가 `upmem.unstage accumulate`로 합친다. spatial `pim.axis = "k"`가
+    있으면 각 값은 서로 다른 Execution Tile plane이며, 그 plane 내부에서만 temporal K
+    window가 적용된다. spatial plane 사이의 최종 결합은 출력의 소비자가 담당한다.
     device 바이너리는 loop 상한이 host 변수로 오므로 창이 있어도 변하지 않는다.
   }];
   let constructor = "mlir::triton::createConvertPIMToUPMEMPass()";
   let options = [
     Option<"hostThreads", "host-threads", "int64_t", "8",
            "host가 영역을 모으고 되돌릴 때 쓰는 스레드 수. 1이면 순차.">,
+    Option<"nrTasklets", "nr-tasklets", "int64_t", "0",
+           "DPU마다 활성화할 tasklet 수. 0이면 profile의 lanes_per_core.">,
   ];
   let dependentDialects = ["mlir::upmem::UPMEMDialect", "mlir::pim::PIMDialect",
                            "mlir::arith::ArithDialect", "mlir::scf::SCFDialect",

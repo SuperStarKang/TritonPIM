@@ -1,18 +1,18 @@
 // k 를 device 축으로 나눈 blocked 분할: 나뉜 k_part 축이 reduction loop 와 함께
 // 버퍼의 K 축을 몰아도, reduction 이 정확히 tile(16)씩 전진하므로 device 의 K 영역은
 // 연속 구간 하나다 — 배치가 성립한다.
-// RUN: triton-shared-opt "--pim-map-devices=device-axis-partitions=m:2,n:2,k:2" --pim-place-data %s | FileCheck %s
+// RUN: triton-shared-opt "--pim-map-devices=p-m=2 p-n=2 p-k=2" --pim-place-data %s | FileCheck %s
 
-// CHECK: pim.place %arg0 {{.*}}axis_sources = ["m", "k"]
-// CHECK: pim.place %arg0 {{.*}}axis_sources = ["m", "k"]
+// CHECK: pim.place %arg0
+// CHECK-SAME: allocation_shape
+// CHECK-SAME: replicated_over = ["n"]
 
 module attributes {pim.target_profile = #pim.target_profile<
-    target = "upmem", number_of_pim_devices = 8,
-    number_of_banks_per_pim_device = 1,
-    number_of_pim_cores_per_bank = 1,
-    number_of_parallel_lanes_per_pim_core = 1,
-    parallel_execution_kind = "multithread",
-    usable_bank_capacity_bytes = 3072, usable_local_capacity_bytes = 49152>} {
+    target = "upmem", num_units = 8,
+    banks_per_unit = 1,
+    cores_per_bank = 1,
+    lanes_per_core = 1,
+    bank_capacity_limit_bytes = 3072, local_capacity_limit_bytes = 49152>} {
 
 func.func @split_k(%A: memref<*xi8>, %C: memref<*xi8>,
                    %tr: index, %tc: index, %tp: index,

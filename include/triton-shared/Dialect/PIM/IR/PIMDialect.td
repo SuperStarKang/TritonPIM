@@ -10,9 +10,9 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 // 공통 구조는 데이터 3계층이다: block(Triton tile 눈금) ⊂ block group(device-local
 // 계산 단위) ⊂ execution tile(PIM Device 하나의 compute+transfer/residency 단위).
 // 기계는 각 계층의 소비자로 대응된다 — execution tile 하나는 PIM Device 하나가,
-// block group 하나는 그 Device 안의 bank -> core -> lane 계층이 함께 분해해
-// 소비한다(#pim.intra_device_plan). target 용어(DPU/tasklet/MRAM/channel 등)는
-// 여기 등장하지 않는다.
+// block group 하나는 그 Device 안의 계산 단위다. bank/core/lane으로 실제 실행하는
+// 방식은 target lowering이 정하며 target 용어(DPU/tasklet/MRAM/channel 등)는 여기
+// 등장하지 않는다.
 //===----------------------------------------------------------------------===//
 
 def PIM_Dialect : Dialect {
@@ -50,22 +50,20 @@ class PIM_Attr<string name, string _mnemonic>
 //===----------------------------------------------------------------------===//
 
 // 기계 profile. --pim-set-target-profile 이 module 에 붙이고, 그 뒤의 pass 들이 읽는다.
-// 데이터 3계층이 하드웨어에서 필요로 하는 것만 담는다 — device/bank/core/lane
-// topology와 capacity(execution tile 의 예산).
-// usable_*_capacity_bytes 는 세 상태를 구분한다: 값이 있으면 알려진 용량, 0 이면 그
-// 저장소가 존재하지 않아 검사가 성립하지 않음, 필드가 없으면 미측정이라 그 값을
-// 필요로 하는 검사에 도달하는 순간 진단을 낸다.
+// 데이터 3계층이 하드웨어에서 필요로 하는 공통 topology와 byte 상한만 담는다.
+// target별 실행 방식(tasklet/SIMD), 실제 활성 lane 수, runtime/toolchain 설정은
+// target lowering/config의 책임이다. capacity limit은 항상 존재하며 0은 해당 저장소가
+// 없음을 뜻한다.
 def PIM_TargetProfileAttr : PIM_Attr<"TargetProfile", "target_profile"> {
   let summary = "Common machine profile shared by every PIM target";
   let parameters = (ins
       "::mlir::StringAttr":$target,
-      "int64_t":$number_of_pim_devices,
-      "int64_t":$number_of_banks_per_pim_device,
-      "int64_t":$number_of_pim_cores_per_bank,
-      "int64_t":$number_of_parallel_lanes_per_pim_core,
-      "::mlir::StringAttr":$parallel_execution_kind,
-      OptionalParameter<"::mlir::IntegerAttr">:$usable_bank_capacity_bytes,
-      OptionalParameter<"::mlir::IntegerAttr">:$usable_local_capacity_bytes);
+      "int64_t":$num_units,
+      "int64_t":$banks_per_unit,
+      "int64_t":$cores_per_bank,
+      "int64_t":$lanes_per_core,
+      "int64_t":$bank_capacity_limit_bytes,
+      "int64_t":$local_capacity_limit_bytes);
   let assemblyFormat = "`<` struct(params) `>`";
   let genVerifyDecl = 1;
 }
@@ -84,24 +82,10 @@ def PIM_AxisAttr : PIM_Attr<"Axis", "axis"> {
 // 이 dialect 가 target 무관하다는 전제가 깨지고, 공통 pass 가 읽지 않는 값이면 target IR 에
 // 두면 된다. 공통 pass 가 정말로 필요로 하는 기계 값은 위 target_profile 의 필드가 된다.
 
-// pim.device 의 필수 파라미터. logical 축마다 device partition 수 하나다.
+// pim.device 의 필수 파라미터. 고정 축 순서 [m,n,k]의 partition 수다. 없는 축은 1이다.
 def PIM_DeviceMappingAttr : PIM_Attr<"DeviceMapping", "device_mapping"> {
-  let summary = "Logical axes and the number of PIM Device partitions on each";
-  let parameters = (ins "::mlir::ArrayAttr":$axes,
-                        "::mlir::DenseI64ArrayAttr":$partitions);
-  let assemblyFormat = "`<` struct(params) `>`";
-}
-
-// 하나의 block group 자체를 device 안에서 bank -> core -> lane 순서로 분할한다.
-// partition vector의 고정 축 순서는 [m, n, k]다. 여러 block group을 서로 다른
-// bank/core에 통째로 배정하는 attribute가 아니다.
-def PIM_IntraDevicePlanAttr
-    : PIM_Attr<"IntraDevicePlan", "intra_device_plan"> {
-  let summary = "Bank, core, and lane decomposition of one block group";
-  let parameters = (ins "::mlir::DenseI64ArrayAttr":$bank_partitions,
-                        "::mlir::DenseI64ArrayAttr":$core_partitions,
-                        "int64_t":$lanes,
-                        "::mlir::StringAttr":$lane_axis);
+  let summary = "PIM Device partitions in canonical [m,n,k] order";
+  let parameters = (ins "::mlir::DenseI64ArrayAttr":$partitions);
   let assemblyFormat = "`<` struct(params) `>`";
   let genVerifyDecl = 1;
 }
@@ -135,14 +119,6 @@ def PIM_ExecutionTileAttr : PIM_Attr<"ExecutionTile", "execution_tile"> {
   let parameters = (ins "::mlir::DenseI64ArrayAttr":$groups);
   let assemblyFormat = "`<` struct(params) `>`";
   let genVerifyDecl = 1;
-}
-
-// pim.place 가 어떤 logical 축을 따라 나뉘었는지 적는 정적 metadata. 버퍼 축마다
-// 하나이고, 나뉘지 않은 축은 "" 다. 검증과 진단에만 쓰이고 target lowering 은 읽지 않는다.
-def PIM_PlaceMappingAttr : PIM_Attr<"PlaceMapping", "place_mapping"> {
-  let summary = "Which logical axis partitions each buffer axis";
-  let parameters = (ins "::mlir::ArrayAttr":$axis_sources);
-  let assemblyFormat = "`<` struct(params) `>`";
 }
 
 //===----------------------------------------------------------------------===//
@@ -198,16 +174,15 @@ def PIM_StoreOp : PIM_Op<"store", [MemoryEffects<[MemWrite]>]> {
 }
 
 // PIM Device 하나가 하는 일을 담는 region. region 밖 = host(데이터 준비·배포·회수),
-// region 안 = device 하나. block argument 는 이 device 의 partition 좌표다(axes 순서).
-// axis_extents 는 나누기 전의 축별 logical tile 개수로, 배치 pass 가 여기서 device 하나의
-// 배정량을 다시 계산한다.
+// region 안 = device 하나.
+// block argument는 고정 순서 [m,n,k]의 device 좌표다. 없는 축은 partition 1과 좌표 0을
+// 사용한다. 전체 logical extent는 scheduling loop에 이미 materialize되므로 복사해 두지 않는다.
 def PIM_DeviceOp : PIM_Op<"device", [NoTerminator]> {
   let summary = "Per-device region: the body is what one PIM Device executes";
-  let arguments = (ins PIM_DeviceMappingAttr:$mapping,
-                       Variadic<Index>:$axis_extents);
+  let arguments = (ins PIM_DeviceMappingAttr:$mapping);
   let regions = (region SizedRegion<1>:$body);
   let assemblyFormat = [{
-    $mapping `extents` `[` $axis_extents `]` attr-dict-with-keyword $body
+    $mapping attr-dict-with-keyword $body
   }];
   let hasVerifier = 1;
 }
@@ -216,7 +191,7 @@ def PIM_DeviceOp : PIM_Op<"device", [NoTerminator]> {
 //   start    = 이 device 의 첫 원소 (balanced block 이 낸 값 그대로)
 //   size     = 실제로 맡는 원소 수. 경계 tile 의 유효 범위까지 반영된 값이라
 //              언제나 start + size 가 원본 버퍼 안이다.
-//   capacity = device 에 배정된 크기. device 불변이라 버퍼 크기가 여기서 나온다.
+//   allocation_shape = device 에 배정된 고정 크기. 실제 target buffer 모양이 여기서 나온다.
 //   strides  = 원본 버퍼 안의 축별 간격
 // direction: "in"(host→device) | "out"(device→host).
 // access: 이 영역을 유도한 pim.access 의 id.
@@ -225,13 +200,12 @@ def PIM_PlaceOp : PIM_Op<"place", [AttrSizedOperandSegments]> {
   let summary = "Final placement of one buffer on one PIM Device";
   let arguments = (ins AnyRankedOrUnrankedMemRef:$buffer,
                        Variadic<Index>:$start, Variadic<Index>:$size,
-                       Variadic<Index>:$capacity, Variadic<Index>:$strides,
+                       Variadic<Index>:$allocation_shape, Variadic<Index>:$strides,
                        StrAttr:$direction, I64Attr:$access,
-                       PIM_PlaceMappingAttr:$mapping,
                        OptionalAttr<StrArrayAttr>:$replicated_over);
   let assemblyFormat = [{
     $buffer `start` `[` $start `]` `size` `[` $size `]`
-    `capacity` `[` $capacity `]` `strides` `[` $strides `]`
+    `allocation_shape` `[` $allocation_shape `]` `strides` `[` $strides `]`
     attr-dict `:` type($buffer)
   }];
   let hasVerifier = 1;

@@ -237,7 +237,6 @@ struct PIMPlaceDataPass
     ArrayRef<int64_t> tileGroups = execution.getGroups().asArrayRef();
     llvm::DenseMap<Operation *, LoopRange> ranges;
     IRMapping firstMap;
-    unsigned axisIndex = 0;
     for (scf::ForOp l : loops) {
       Value lb = rebuild(b, l.getLowerBound(), firstMap, nest);
       Value ub = rebuild(b, l.getUpperBound(), firstMap, nest);
@@ -264,7 +263,6 @@ struct PIMPlaceDataPass
       r.partitions = 1;
       if (auto name = l->getAttrOfType<pim::AxisAttr>("pim.axis")) {
         r.axis = name.getName();
-        r.partitions = partitions[axisIndex];
         StringRef axis = name.getName().getValue();
         // spatial k loop 한 회전이 이미 split-K Execution Tile 하나다.
         // execution_tile.groups[k]는 그 plane 내부 temporal reduction window이므로
@@ -273,13 +271,13 @@ struct PIMPlaceDataPass
                                                      : axis == "k" ? 2 : -1;
         if (axisNumber < 0)
           return l->emitError("pim-place-data: unsupported PIM axis ") << axis;
+        r.partitions = partitions[axisNumber];
         int64_t capacityTiles = axis == "k" ? 1 : tileGroups[axisNumber];
         if (capacityTiles <= 0)
           return l->emitError("pim-place-data: execution_tile.groups[")
                  << axis << "] must be positive for an existing axis";
         r.capacityTiles =
             b.create<arith::ConstantIndexOp>(loc, capacityTiles);
-        axisIndex++;
       }
       ranges[l] = r;
       firstMap.map(r.key, r.first);
@@ -311,8 +309,7 @@ struct PIMPlaceDataPass
       firstMap.map(r.key, r.first);
     }
 
-    SmallVector<Value> start, size, capacity, strides;
-    SmallVector<Attribute> axisSources;
+    SmallVector<Value> start, size, allocationShape, strides;
     for (unsigned d = 0; d < rank; d++) {
       Value origin = rebuild(b, access.getOrigin()[d], firstMap, nest);
       Value stride = rebuild(b, access.getStrides()[d], firstMap, nest);
@@ -325,7 +322,6 @@ struct PIMPlaceDataPass
       Value tile = b.create<arith::ConstantIndexOp>(loc, access.getSizes()[d]);
       Value trips, capacityTiles;
       bool first = true;
-      StringAttr source = StringAttr::get(ctx, "");
       for (scf::ForOp l : loops) {
         if (!drivers.contains(l))
           continue;
@@ -336,8 +332,6 @@ struct PIMPlaceDataPass
             failed(checkBlockedComposite(access, d, l, r.axis, loops, ranges,
                                          drivers)))
           return failure();
-        if (r.axis)
-          source = r.axis;
         trips = first ? r.trips
                       : b.create<arith::MulIOp>(loc, trips, r.trips).getResult();
         capacityTiles = first ? r.capacityTiles
@@ -374,8 +368,7 @@ struct PIMPlaceDataPass
       start.push_back(origin);
       strides.push_back(stride);
       size.push_back(length);
-      capacity.push_back(capacityElems);
-      axisSources.push_back(source);
+      allocationShape.push_back(capacityElems);
     }
 
     // 입력이 어느 logical 축에 불변이면 그 축만 다른 device들은 같은 데이터를 받는다.
@@ -397,9 +390,8 @@ struct PIMPlaceDataPass
     }
 
     b.create<pim::PlaceOp>(
-        loc, access.getBase(), start, size, capacity, strides,
+        loc, access.getBase(), start, size, allocationShape, strides,
         StringAttr::get(ctx, isOutput ? "out" : "in"), access.getIdAttr(),
-        pim::PlaceMappingAttr::get(ctx, ArrayAttr::get(ctx, axisSources)),
         replicated.empty() ? ArrayAttr() : ArrayAttr::get(ctx, replicated));
     return success();
   }

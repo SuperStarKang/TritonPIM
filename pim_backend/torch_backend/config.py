@@ -26,22 +26,21 @@ class UnsupportedPIMIntMM(RuntimeError):
 PIM_OPTION_KEYS = (
     "pim_target",
     "num_units",
-    "local_lanes",
+    "lanes_per_core",
+    "bank_capacity_limit_bytes", "local_capacity_limit_bytes",
+    "p_m", "p_n", "p_k",
+    "nr_tasklets",
     "host_threads",
     "group_m", "group_n", "group_k",
     "tile_m", "tile_n", "tile_k",
-    "capacity_limit_m", "capacity_limit_n", "capacity_limit_k",
-    "device_axis_partitions",
-    "bank_partitions", "core_partitions",
-    "intra_device_lanes", "lane_axis",
-    "batch",
+    "batch", "base_fpga",
 )
 
 
 @dataclass(frozen=True)
 class PIMTorchConfig:
     # ── 어느 PIM target인가 ────────────────────────────────────────────────
-    # 하드웨어 수치(num_units, local_lanes, memory 예산)는 여기 없다 —
+    # 하드웨어 수치(num_units, lanes_per_core, memory 상한)는 여기 없다 —
     # autotuner/targets.py의 등록표에서 온다.
     target: str = "upmem"
     # strict: 지원 조건을 하나라도 어기면 즉시 에러. False로 두면 stock Inductor

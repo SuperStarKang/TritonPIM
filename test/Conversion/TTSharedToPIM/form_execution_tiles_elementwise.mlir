@@ -9,21 +9,17 @@
 // EXPLICIT-SAME: pim.execution_tile = #pim.execution_tile<groups = [2, 3, 0]>
 
 module attributes {pim.target_profile = #pim.target_profile<
-    target = "upmem", number_of_pim_devices = 8,
-    number_of_banks_per_pim_device = 1,
-    number_of_pim_cores_per_bank = 1,
-    number_of_parallel_lanes_per_pim_core = 4,
-    parallel_execution_kind = "multithread",
-    usable_bank_capacity_bytes = 62914560,
-    usable_local_capacity_bytes = 49152>} {
+    target = "upmem", num_units = 8,
+    banks_per_unit = 1,
+    cores_per_bank = 1,
+    lanes_per_core = 4,
+    bank_capacity_limit_bytes = 62914560,
+    local_capacity_limit_bytes = 49152>} {
 
 func.func @elementwise(%A: memref<*xf32>, %B: memref<*xf32>,
                        %tm: index, %tn: index) attributes {
     pim.block = #pim.block<shape = [8, 32, 0]>,
-    pim.block_group = #pim.block_group<blocks = [1, 1, 1]>,
-    pim.intra_device_plan = #pim.intra_device_plan<
-        bank_partitions = [1, 1, 1], core_partitions = [1, 1, 1],
-        lanes = 4, lane_axis = "m">} {
+    pim.block_group = #pim.block_group<blocks = [1, 1, 1]>} {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c8 = arith.constant 8 : index

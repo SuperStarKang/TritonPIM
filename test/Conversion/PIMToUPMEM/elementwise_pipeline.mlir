@@ -1,6 +1,6 @@
 // Triton Shared IR의 메모리 관용구부터 시작해 PIM Common의 세 계층을 계획하고,
 // identity pointwise add+mul을 UPMEM DPU C까지 내리는 전체 경로를 확인한다.
-// RUN: triton-shared-opt --pim-normalize-address -cse -loop-invariant-code-motion -canonicalize --convert-ttshared-to-pim --pim-build-logical-grid --pim-recover-access-origin --pim-form-compute "--pim-set-target-profile=target=upmem number-of-pim-devices=1 number-of-banks-per-pim-device=1 number-of-pim-cores-per-bank=1 number-of-parallel-lanes-per-pim-core=4 parallel-execution-kind=multithread usable-bank-capacity-bytes=62914560 usable-local-capacity-bytes=49152" "--pim-form-block-groups=group-m=1 group-n=1 group-k=1" "--pim-plan-intra-device=bank-partitions=1,1,1 core-partitions=1,1,1 lanes=4 lane-axis=m" --pim-form-execution-tiles --pim-map-devices --pim-place-data --pim-verify -cse -canonicalize --convert-pim-to-upmem %s | triton-shared-translate --upmem-to-device | FileCheck %s
+// RUN: triton-shared-opt --pim-normalize-address -cse -loop-invariant-code-motion -canonicalize --convert-ttshared-to-pim --pim-build-logical-grid --pim-recover-access-origin --pim-form-compute "--pim-set-target-profile=target=upmem num-units=1 banks-per-unit=1 cores-per-bank=1 lanes-per-core=4 bank-capacity-limit-bytes=62914560 local-capacity-limit-bytes=49152" "--pim-form-block-groups=group-m=1 group-n=1 group-k=1" --pim-form-execution-tiles --pim-map-devices --pim-place-data --pim-verify -cse -canonicalize "--convert-pim-to-upmem=nr-tasklets=4" %s | triton-shared-translate --upmem-to-device | FileCheck %s
 
 #map = affine_map<(d0, d1) -> (d0, d1)>
 

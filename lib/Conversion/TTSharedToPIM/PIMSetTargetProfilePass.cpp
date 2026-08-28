@@ -23,19 +23,12 @@ struct PIMSetTargetProfilePass
   void runOnOperation() override {
     ModuleOp module = getOperation();
     OpBuilder b(&getContext());
-    // 음수는 미측정이라는 뜻이라 필드를 만들지 않는다. 0은 그 저장소가 존재하지 않는다는
-    // 뜻이므로 값 0을 그대로 싣는다.
-    auto optional = [&](int64_t v) {
-      return v < 0 ? IntegerAttr() : b.getI64IntegerAttr(v);
-    };
     module->setAttr(
         "pim.target_profile",
         pim::TargetProfileAttr::get(
-            &getContext(), b.getStringAttr(target), numberOfPIMDevices,
-            banksPerDevice, coresPerBank, lanesPerCore,
-            b.getStringAttr(parallelExecutionKind),
-            optional(usableBankCapacityBytes),
-            optional(usableLocalCapacityBytes)));
+            &getContext(), b.getStringAttr(target), numUnits, banksPerUnit,
+            coresPerBank, lanesPerCore, bankCapacityLimitBytes,
+            localCapacityLimitBytes));
   }
 };
 

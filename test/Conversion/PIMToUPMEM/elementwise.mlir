@@ -28,19 +28,15 @@
 // DEVICE: {{.*}}[_i] = {{.*}};
 
 module attributes {pim.target_profile = #pim.target_profile<
-    target = "upmem", number_of_pim_devices = 1,
-    number_of_banks_per_pim_device = 1,
-    number_of_pim_cores_per_bank = 1,
-    number_of_parallel_lanes_per_pim_core = 4,
-    parallel_execution_kind = "multithread",
-    usable_bank_capacity_bytes = 12288,
-    usable_local_capacity_bytes = 49152>} {
+    target = "upmem", num_units = 1,
+    banks_per_unit = 1,
+    cores_per_bank = 1,
+    lanes_per_core = 4,
+    bank_capacity_limit_bytes = 12288,
+    local_capacity_limit_bytes = 49152>} {
 
 func.func @elementwise(%A: memref<*xf32>, %B: memref<*xf32>,
                        %C: memref<*xf32>) attributes {
-    pim.intra_device_plan = #pim.intra_device_plan<
-        bank_partitions = [1, 1, 1], core_partitions = [1, 1, 1],
-        lanes = 4, lane_axis = "m">,
     pim.block = #pim.block<shape = [8, 32, 0]>,
     pim.block_group = #pim.block_group<blocks = [1, 1, 1]>} {
   %c0 = arith.constant 0 : index
@@ -48,21 +44,17 @@ func.func @elementwise(%A: memref<*xf32>, %B: memref<*xf32>,
   %c8 = arith.constant 8 : index
   %c32 = arith.constant 32 : index
 
-  pim.device #pim.device_mapping<axes = ["m", "n"], partitions = [1, 1]>
-      extents [%c1, %c1] attributes {
+  pim.device #pim.device_mapping<partitions = [1, 1, 1]> attributes {
         pim.execution_tile = #pim.execution_tile<groups = [1, 1, 0]>} {
-  ^bb0(%pm: index, %pn: index):
-    pim.place %A start[%c0, %c0] size[%c8, %c32] capacity[%c8, %c32]
-        strides[%c32, %c1] {direction = "in", access = 0 : i64,
-        mapping = #pim.place_mapping<axis_sources = ["m", "n"]>}
+  ^bb0(%pm: index, %pn: index, %device_k_unused: index):
+    pim.place %A start[%c0, %c0] size[%c8, %c32] allocation_shape[%c8, %c32]
+        strides[%c32, %c1] {direction = "in", access = 0 : i64}
         : memref<*xf32>
-    pim.place %B start[%c0, %c0] size[%c8, %c32] capacity[%c8, %c32]
-        strides[%c32, %c1] {direction = "in", access = 1 : i64,
-        mapping = #pim.place_mapping<axis_sources = ["m", "n"]>}
+    pim.place %B start[%c0, %c0] size[%c8, %c32] allocation_shape[%c8, %c32]
+        strides[%c32, %c1] {direction = "in", access = 1 : i64}
         : memref<*xf32>
-    pim.place %C start[%c0, %c0] size[%c8, %c32] capacity[%c8, %c32]
-        strides[%c32, %c1] {direction = "out", access = 2 : i64,
-        mapping = #pim.place_mapping<axis_sources = ["m", "n"]>}
+    pim.place %C start[%c0, %c0] size[%c8, %c32] allocation_shape[%c8, %c32]
+        strides[%c32, %c1] {direction = "out", access = 2 : i64}
         : memref<*xf32>
 
     scf.for %i = %c0 to %c1 step %c1 {

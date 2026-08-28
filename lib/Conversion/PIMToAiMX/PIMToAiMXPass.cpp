@@ -18,7 +18,6 @@
 #include "llvm/ADT/Twine.h"
 
 #include <algorithm>
-#include <limits>
 
 using namespace mlir;
 
@@ -96,7 +95,6 @@ struct ConvertPIMToAiMXPass
     // IR만 받는다는 경계가 깨진다.
     getOperation()->removeAttr("pim.target_profile");
     getOperation().walk([](func::FuncOp f) {
-      f->removeAttr("pim.intra_device_plan");
       f->removeAttr("pim.block");
       f->removeAttr("pim.block_group");
       f->removeAttr("pim.execution_tile");
@@ -110,20 +108,18 @@ struct ConvertPIMToAiMXPass
     if (profile.getTarget() != "aimx")
       return m->emitError("convert-pim-to-aimx: the module targets ")
              << profile.getTarget().getValue();
-    if (profile.getParallelExecutionKind() != "simd")
-      return m->emitError(
-          "convert-pim-to-aimx: AiMX lanes are address-decoded SIMD slots, so "
-          "parallel_execution_kind must be \"simd\"");
-    if (profile.getNumberOfBanksPerPimDevice() !=
-            aimx::kNumBanks * aimx::kNumChannels ||
-        profile.getNumberOfPimCoresPerBank() != 1 ||
-        profile.getNumberOfParallelLanesPerPimCore() != aimx::kALUSize)
+    if (profile.getBanksPerUnit() != aimx::kNumBanks * aimx::kNumChannels ||
+        profile.getCoresPerBank() != 1 ||
+        profile.getLanesPerCore() != aimx::kALUSize)
       return m->emitError(
                  "convert-pim-to-aimx: AiMX topology must be 256 banks per "
-                 "device, one core per bank, and 16 lanes per core; got ")
-             << profile.getNumberOfBanksPerPimDevice() << " banks, "
-             << profile.getNumberOfPimCoresPerBank() << " cores, and "
-             << profile.getNumberOfParallelLanesPerPimCore();
+                 "unit, one core per bank, and 16 lanes per core; got ")
+             << profile.getBanksPerUnit() << " banks, "
+             << profile.getCoresPerBank() << " cores, and "
+             << profile.getLanesPerCore();
+    if (profile.getBankCapacityLimitBytes() <= 0)
+      return m->emitError(
+          "convert-pim-to-aimx: bank_capacity_limit_bytes must be positive");
     if (!isBatch(batch))
       return m->emitError(
                  "convert-pim-to-aimx: batch must be one of 1, 2, 4, 8; got ")
@@ -135,26 +131,14 @@ struct ConvertPIMToAiMXPass
   // execution tile
   //===--------------------------------------------------------------------===//
 
-  // 예산은 pass option 이 이기고, 없으면 profile 을 쓴다. 둘 다 없으면 tile 을 고를 수
-  // 없다 — 할당해 보고 물러서는 길이 없으므로(§1.8 (h)) 여기서 멈추는 것이 맞다.
   LogicalResult budgetBytes(Operation *at, int64_t &budget) {
-    if (bankCapacityBytes >= 0) {
-      if (bankCapacityBytes != 0 &&
-          profile.getNumberOfBanksPerPimDevice() >
-          std::numeric_limits<int64_t>::max() / bankCapacityBytes)
-        return at->emitError("convert-pim-to-aimx: bank capacity overflows the device budget");
-      budget = bankCapacityBytes * profile.getNumberOfBanksPerPimDevice();
-      return success();
-    }
     if (std::optional<int64_t> capacity =
-            pim::usableDeviceCapacityBytes(profile)) {
+            pim::unitCapacityLimitBytes(profile)) {
       budget = *capacity;
       return success();
     }
     return at->emitError(
-        "convert-pim-to-aimx: neither usable_bank_capacity_bytes nor "
-        "bank-capacity-bytes gives the per-bank PIM DRAM budget, so the execution tile "
-        "cannot be chosen");
+        "convert-pim-to-aimx: the profile capacity overflows the unit budget");
   }
 
   // §6.1. (t_m, t_k, t_n)은 buffer와 재사용 descriptor chain의 고정 모양이다.
@@ -183,16 +167,14 @@ struct ConvertPIMToAiMXPass
         failed(checkAllocation("C", fp.c)) ||
         failed(checkAllocation("descriptor chain", fp.chain)))
       return failure();
-    int64_t banks = profile.getNumberOfBanksPerPimDevice();
-    int64_t bankBudget = bankCapacityBytes >= 0
-                             ? bankCapacityBytes
-                             : profile.getUsableBankCapacityBytes().getInt();
+    int64_t banks = profile.getBanksPerUnit();
+    int64_t bankBudget = profile.getBankCapacityLimitBytes();
     int64_t perBank = fp.maxBankBytes();
     if (perBank > bankBudget)
       return at->emitError("convert-pim-to-aimx: the allocation-wise interleaved "
                            "footprint needs ")
              << perBank << " byte in each of " << banks
-             << " banks but usable_bank_capacity_bytes is " << bankBudget;
+             << " banks but bank_capacity_limit_bytes is " << bankBudget;
     if (fp.total() > budget)
       return at->emitError("convert-pim-to-aimx: the buffer bound (t_m=")
              << mT << ", t_k=" << kMax << ", t_n=" << nMax << ") needs "
@@ -210,24 +192,6 @@ struct ConvertPIMToAiMXPass
     MLIRContext *ctx = &getContext();
     Location loc = device.getLoc();
     Block *deviceBody = &device.getBody().front();
-
-    auto intra = func->getAttrOfType<pim::IntraDevicePlanAttr>(
-        "pim.intra_device_plan");
-    if (!intra)
-      return func->emitError(
-          "convert-pim-to-aimx: the function has no #pim.intra_device_plan");
-    ArrayRef<int64_t> bp = intra.getBankPartitions().asArrayRef();
-    ArrayRef<int64_t> cp = intra.getCorePartitions().asArrayRef();
-    bool validBanks = bp.size() == 3 && bp[0] == batch &&
-                      bp[1] == aimx::kNumBanks * aimx::kNumChannels / batch &&
-                      bp[2] == 1;
-    bool validCores = cp.size() == 3 && cp[0] == 1 && cp[1] == 1 && cp[2] == 1;
-    if (!validBanks || !validCores || intra.getLanes() != aimx::kALUSize ||
-        intra.getLaneAxis().getValue() != "n")
-      return func->emitError(
-          "convert-pim-to-aimx: intra-device plan must use "
-          "bank_partitions=[batch, 256/batch, 1], "
-          "core_partitions=[1, 1, 1], lanes=16, lane_axis=n");
 
     Roles roles;
     if (failed(readRoles(device, roles)))
@@ -365,14 +329,14 @@ struct ConvertPIMToAiMXPass
     Value set = setup.create<aimx::AcquireOp>(
         loc, setTy, setup.getI64IntegerAttr(numDevices));
     OpBuilder hb(scheduleRoot);
-    ArrayAttr axes = device.getMapping().getAxes();
+    ArrayAttr axes = hb.getStrArrayAttr({"m", "n", "k"});
     auto counts = hb.getDenseI64ArrayAttr(
         device.getMapping().getPartitions().asArrayRef());
     auto foreach = hb.create<aimx::ForeachDeviceOp>(loc, set, axes, counts);
 
     SmallVector<Type> argTys{aimx::DeviceType::get(ctx)};
     SmallVector<Location> argLocs{loc};
-    for (unsigned i = 0, e = axes.size(); i < e; i++) {
+    for (unsigned i = 0; i < 3; i++) {
       argTys.push_back(hb.getIndexType());
       argLocs.push_back(loc);
     }
@@ -386,7 +350,7 @@ struct ConvertPIMToAiMXPass
     auto deviceIt = device->getIterator();
     roundBody->getOperations().splice(deviceIt, deviceBody->getOperations(),
                                       deviceBody->begin(), deviceBody->end());
-    for (unsigned i = 0, e = axes.size(); i < e; i++)
+    for (unsigned i = 0; i < 3; i++)
       deviceBody->getArgument(i).replaceAllUsesWith(fdBody->getArgument(i + 1));
 
     // 논리 tile loop nest 는 통째로 사라진다. AiMX 에는 device program 이 없고

@@ -55,43 +55,35 @@ func.func @device_place(%A: memref<*xi8>, %C: memref<*xi32>, %ex: index, %ey: in
   %c1 = arith.constant 1 : index
   %c32 = arith.constant 32 : index
 
- // CHECK: pim.device <axes = ["m", "n"], partitions = [2, 4]> extents[%{{.*}}, %{{.*}}]
-  pim.device #pim.device_mapping<axes = ["m", "n"],
-                                 partitions = [2, 4]>
-      extents [%ex, %ey] {
-  ^bb0(%px: index, %py: index):
-    // CHECK: pim.place %{{.*}} start[%{{.*}}, %{{.*}}] size[%{{.*}}, %{{.*}}] capacity[%{{.*}}, %{{.*}}] strides[%{{.*}}, %{{.*}}] {{.*}}replicated_over = ["n"]
-    pim.place %A start[%c0, %c0] size[%c32, %c32] capacity[%c32, %c32]
+ // CHECK: pim.device #pim.device_mapping<partitions = [2, 4, 1]>
+  pim.device #pim.device_mapping<partitions = [2, 4, 1]> {
+  ^bb0(%px: index, %py: index, %device_k_unused: index):
+    // CHECK: pim.place %{{.*}} start[%{{.*}}, %{{.*}}] size[%{{.*}}, %{{.*}}] allocation_shape[%{{.*}}, %{{.*}}] strides[%{{.*}}, %{{.*}}] {{.*}}replicated_over = ["n"]
+    pim.place %A start[%c0, %c0] size[%c32, %c32] allocation_shape[%c32, %c32]
         strides[%c32, %c1]
         {direction = "in", access = 0 : i64,
-         mapping = #pim.place_mapping<axis_sources = ["m", ""]>,
          replicated_over = ["n"]} : memref<*xi8>
     // CHECK: pim.place %{{.*}} start[%{{.*}}, %{{.*}}] size[%{{.*}}, %{{.*}}]
-    pim.place %C start[%c0, %c0] size[%c32, %c32] capacity[%c32, %c32]
+    pim.place %C start[%c0, %c0] size[%c32, %c32] allocation_shape[%c32, %c32]
         strides[%c32, %c1]
-        {direction = "out", access = 1 : i64,
-         mapping = #pim.place_mapping<axis_sources = ["m",
-                                                      "n"]>} : memref<*xi32>
+        {direction = "out", access = 1 : i64} : memref<*xi32>
     scf.for %i = %c0 to %c32 step %c1 {
     } {pim.axis = #pim.axis<"m">}
   }
   return
 }
 
-// 기계 profile은 module에, core mapping은 func에 붙는다.
+// 공통 기계 profile은 module에 붙는다.
 // CHECK: pim.target_profile = #pim.target_profile<target = "upmem"
 module attributes {
     pim.target_profile = #pim.target_profile<
-        target = "upmem", number_of_pim_devices = 2048,
-        number_of_banks_per_pim_device = 1,
-        number_of_pim_cores_per_bank = 1,
-        number_of_parallel_lanes_per_pim_core = 16,
-        parallel_execution_kind = "multithread",
-        usable_bank_capacity_bytes = 33554432,
-        usable_local_capacity_bytes = 49152>} {
-  // CHECK: pim.intra_device_plan = #pim.intra_device_plan<bank_partitions = [1, 1, 1], core_partitions = [1, 1, 1], lanes = 16, lane_axis = "m">
-  func.func @profiled() attributes {
-      pim.intra_device_plan = #pim.intra_device_plan<bank_partitions = [1, 1, 1], core_partitions = [1, 1, 1], lanes = 16, lane_axis = "m">} {
+        target = "upmem", num_units = 2048,
+        banks_per_unit = 1,
+        cores_per_bank = 1,
+        lanes_per_core = 16,
+        bank_capacity_limit_bytes = 33554432,
+        local_capacity_limit_bytes = 49152>} {
+  func.func @profiled() {
     return
   }
 }

@@ -10,9 +10,9 @@ def ConvertPIMToAiMX : Pass<"convert-pim-to-aimx", "mlir::ModuleOp"> {
     build_descriptors / invoke / unstage)로 옮긴다. PIM IR 이 정하지 않은 것을 여기서
     정한다: target 물리 padding, PIM DRAM 안의 pitch layout, 전치 여부.
 
-    진입 즉시 legality gate 를 지난다 — target 이 aimx 이고, lane 이 SIMD 이며,
-    Device 하나가 256 bank, bank 하나가 core 하나, core 하나가 16 lane 이어야 한다.
-    한 block group은 `#pim.intra_device_plan`에 따라 이 계층 전체에 분해된다.
+    진입 즉시 legality gate 를 지난다 — target 이 aimx 이고, unit 하나가 256 bank,
+    bank 하나가 core 하나, core 하나가 16 lane 이어야 한다. AiMX는 profile의
+    lanes_per_core 전체를 사용하며 batch에 맞는 bank 분해는 이 target lowering이 한다.
 
     **buffer 크기만 compile time 상수여야 하고, tile 모양은 아니다.** `pim_malloc` 은
     실패해도 NULL 을 돌려주지 않고 프로세스를 죽이므로 할당량은 compile time 에
@@ -67,10 +67,7 @@ def ConvertPIMToAiMX : Pass<"convert-pim-to-aimx", "mlir::ModuleOp"> {
   let constructor = "mlir::triton::createConvertPIMToAiMXPass()";
   let options = [
     Option<"batch", "batch", "int64_t", "8",
-           "AiMX matmul batch. 1, 2, 4, 8 중 하나이며 intra-device plan과 일치해야 한다.">,
-    Option<"bankCapacityBytes", "bank-capacity-bytes", "int64_t", "-1",
-           "bank 당 usable PIM DRAM 예산. 음수면 profile 의 "
-           "usable_bank_capacity_bytes 를 쓴다.">,
+           "AiMX matmul batch. 1, 2, 4, 8 중 하나.">,
   ];
   let dependentDialects = ["mlir::aimx::AiMXDialect", "mlir::pim::PIMDialect",
                            "mlir::arith::ArithDialect", "mlir::scf::SCFDialect",

@@ -3,7 +3,7 @@
 // RUN: triton-shared-opt --pim-form-block-groups %s | FileCheck %s --check-prefix=IDENT
 // RUN: triton-shared-opt "--pim-form-block-groups=group-m=2 group-n=2" %s | FileCheck %s
 // RUN: triton-shared-opt --pim-form-block-groups=group-k=2 %s | FileCheck %s --check-prefix=GK
-// RUN: triton-shared-opt "--pim-set-target-profile=target=aimx number-of-pim-devices=1 number-of-banks-per-pim-device=256 number-of-pim-cores-per-bank=1 number-of-parallel-lanes-per-pim-core=16 parallel-execution-kind=simd usable-bank-capacity-bytes=268435456 usable-local-capacity-bytes=0" "--pim-form-block-groups=group-m=1 group-n=1 group-k=1" "--pim-plan-intra-device=bank-partitions=8,32,1 core-partitions=1,1,1 lanes=16 lane-axis=n" --pim-form-execution-tiles %s | FileCheck %s --check-prefix=AIMX
+// RUN: triton-shared-opt "--pim-set-target-profile=target=aimx num-units=1 banks-per-unit=256 cores-per-bank=1 lanes-per-core=16 bank-capacity-limit-bytes=268435456 local-capacity-limit-bytes=0" "--pim-form-block-groups=group-m=1 group-n=1 group-k=1" --pim-form-execution-tiles %s | FileCheck %s --check-prefix=AIMX
 // RUN: triton-shared-opt "--pim-form-block-groups=group-m=1 group-n=1 group-k=1" "--pim-form-execution-tiles=tile-m=2 tile-n=3 tile-k=4" %s | FileCheck %s --check-prefix=GEMM-TILE
 
 // AIMX: #pim.target_profile<target = "aimx"
@@ -11,7 +11,6 @@
 // AIMX: #pim.block<shape = [8, 32, 32]>
 // AIMX: #pim.block_group<blocks = [1, 1, 1]>
 // AIMX: #pim.execution_tile<groups = [1, 1, 1]>
-// AIMX: #pim.intra_device_plan<bank_partitions = [8, 32, 1]
 
 // GEMM-TILE: #pim.block<shape = [8, 32, 32]>
 // GEMM-TILE: #pim.block_group<blocks = [1, 1, 1]>

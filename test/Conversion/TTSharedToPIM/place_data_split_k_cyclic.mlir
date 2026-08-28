@@ -1,15 +1,14 @@
 // cyclic 분할(k_part 가 tile 간격으로 시작하고 reduction 이 SPLIT_K·tile 씩 건너뜀)은
 // 나뉜 device 의 K 영역이 띄엄띄엄이라 배치가 성립하지 않는다 — 진단으로 막는다.
 // reduction 항의 계수 256 ≠ tile 16 이 판정 근거다.
-// RUN: triton-shared-opt "--pim-map-devices=device-axis-partitions=k:2" --pim-place-data -verify-diagnostics %s
+// RUN: triton-shared-opt "--pim-map-devices=p-k=2" --pim-place-data -verify-diagnostics %s
 
 module attributes {pim.target_profile = #pim.target_profile<
-    target = "upmem", number_of_pim_devices = 8,
-    number_of_banks_per_pim_device = 1,
-    number_of_pim_cores_per_bank = 1,
-    number_of_parallel_lanes_per_pim_core = 1,
-    parallel_execution_kind = "multithread",
-    usable_bank_capacity_bytes = 3072, usable_local_capacity_bytes = 49152>} {
+    target = "upmem", num_units = 8,
+    banks_per_unit = 1,
+    cores_per_bank = 1,
+    lanes_per_core = 1,
+    bank_capacity_limit_bytes = 3072, local_capacity_limit_bytes = 49152>} {
 
 func.func @split_k_cyclic(%A: memref<*xi8>, %tr: index, %tp: index, %tk: index,
                           %lda: index)

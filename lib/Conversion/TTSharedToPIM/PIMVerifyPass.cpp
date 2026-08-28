@@ -12,6 +12,9 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/STLExtras.h"
 
+#include <algorithm>
+#include <limits>
+
 using namespace mlir;
 
 namespace mlir {
@@ -52,7 +55,7 @@ struct PIMVerifyPass
   }
 
   LogicalResult verifyCores(pim::TargetProfileAttr profile) {
-    IntegerAttr local = profile.getUsableLocalCapacityBytes();
+    int64_t local = profile.getLocalCapacityLimitBytes();
     WalkResult res = getOperation().walk([&](func::FuncOp func) {
       bool hasAccess = false;
       func.walk([&](pim::AccessOp) { hasAccess = true; });
@@ -137,66 +140,14 @@ struct PIMVerifyPass
           return WalkResult::interrupt();
         }
       }
-      auto plan = func->getAttrOfType<pim::IntraDevicePlanAttr>(
-          "pim.intra_device_plan");
-      if (!plan) {
-        func->emitError(
-            "pim-verify: every PIM function needs #pim.intra_device_plan");
-        return WalkResult::interrupt();
-      }
-      auto product = [](ArrayRef<int64_t> values) {
-        int64_t value = 1;
-        for (int64_t v : values)
-          value *= v;
-        return value;
-      };
-      int64_t banks = product(plan.getBankPartitions().asArrayRef());
-      int64_t cores = product(plan.getCorePartitions().asArrayRef());
-      if (banks > profile.getNumberOfBanksPerPimDevice()) {
-        func->emitError("pim-verify: intra-device plan needs ")
-            << banks << " banks but a PIM Device has "
-            << profile.getNumberOfBanksPerPimDevice();
-        return WalkResult::interrupt();
-      }
-      if (cores > profile.getNumberOfPimCoresPerBank()) {
-        func->emitError("pim-verify: intra-device plan needs ")
-            << cores << " cores per bank but a bank has "
-            << profile.getNumberOfPimCoresPerBank();
-        return WalkResult::interrupt();
-      }
-      if (plan.getLanes() > profile.getNumberOfParallelLanesPerPimCore()) {
-        func->emitError("pim-verify: intra-device plan needs ")
-            << plan.getLanes() << " lanes per core but a core has "
-            << profile.getNumberOfParallelLanesPerPimCore();
-        return WalkResult::interrupt();
-      }
-      ArrayRef<int64_t> bp = plan.getBankPartitions().asArrayRef();
-      ArrayRef<int64_t> cp = plan.getCorePartitions().asArrayRef();
-      bool laneReducesK =
-          plan.getLaneAxis().getValue() == "k" && plan.getLanes() > 1;
-      if (bp[2] > 1 || cp[2] > 1 || laneReducesK) {
-        func->emitError(
-            "pim-verify: intra-device k partitioning needs an explicit "
-            "bank/core/lane reduction contract; it is not materialized yet");
-        return WalkResult::interrupt();
-      }
-      // 축별 divisibility와 padding은 target의 물리 실행 눈금에 의존한다. 공통
-      // verifier는 topology 사용량만 검사하고, target lowering이 실제 subtile을
-      // materialize하면서 나눗셈과 padding legality를 검사한다.
-      // 하나의 group을 협력 실행하므로 local buffer는 lane마다 복제되지 않는다.
-      if (!local) {
-        func->emitError("pim-verify: usable_local_capacity_bytes is not "
-                        "recorded, so the lane budget cannot be checked");
-        return WalkResult::interrupt();
-      }
-      if (local.getInt() == 0)
+      // bank/core/lane 분해와 물리 padding은 target lowering의 책임이다. Common IR은
+      // block group의 working set이 공통 local capacity 상한을 넘는지만 검사한다.
+      if (local == 0)
         return WalkResult::advance();
       int64_t bytes = pim::localTileBytes(func);
-      int64_t need = bytes;
-      if (need > local.getInt()) {
+      if (bytes > local) {
         func->emitError("pim-verify: tile buffers need ")
-            << need << " byte of local storage but a PIM Core has "
-            << local.getInt();
+            << bytes << " byte of local storage but a PIM Core has " << local;
         return WalkResult::interrupt();
       }
       return WalkResult::advance();
@@ -221,10 +172,10 @@ struct PIMVerifyPass
     int64_t used = 1;
     for (int64_t p : device.getMapping().getPartitions().asArrayRef())
       used *= p;
-    if (used > profile.getNumberOfPimDevices())
+    if (used > profile.getNumUnits())
       return device->emitError("pim-verify: the partition counts need ")
-             << used << " PIM Devices but the machine has "
-             << profile.getNumberOfPimDevices();
+             << used << " PIM units but the profile has "
+             << profile.getNumUnits();
 
     llvm::DenseMap<int64_t, pim::AccessOp> accessIds;
     llvm::DenseSet<int64_t> placeIds;
@@ -249,7 +200,8 @@ struct PIMVerifyPass
     if (res.wasInterrupted())
       return failure();
 
-    ArrayAttr axes = device.getMapping().getAxes();
+    int64_t staticAllocationBytes = 0;
+    bool allAllocationsStatic = true;
     for (Operation &op : device.getBody().front()) {
       auto place = dyn_cast<pim::PlaceOp>(&op);
       if (!place)
@@ -261,12 +213,8 @@ struct PIMVerifyPass
         return place->emitError("pim-verify: no pim.access with id ")
                << place.getAccess() << " in this device";
       pim::AccessOp access = it->second;
-      for (Attribute a : place.getMapping().getAxisSources()) {
-        StringRef source = cast<StringAttr>(a).getValue();
-        if (!source.empty() && !llvm::is_contained(axes, a))
-          return place->emitError("pim-verify: axis source ")
-                 << source << " is not a device mapping axis";
-      }
+      int64_t elements = 1;
+      bool allocationStatic = true;
       for (auto [d, s] : llvm::enumerate(place.getSize())) {
         // mask 가 있는 축만 잘라야 한다. 없으면 도는 범위가 그대로 영역이다.
         bool masked = !access.getValid().empty() &&
@@ -275,21 +223,59 @@ struct PIMVerifyPass
           return place->emitError("pim-verify: the size of buffer axis ")
                  << d << " is not clamped to the buffer extent";
         std::optional<int64_t> size = getConstantIntValue(s);
-        std::optional<int64_t> capacity =
-            getConstantIntValue(place.getCapacity()[d]);
+        std::optional<int64_t> allocation =
+            getConstantIntValue(place.getAllocationShape()[d]);
         if (size && *size < 0)
           return place->emitError("pim-verify: negative size on buffer axis ")
                  << d;
-        if (size && capacity && *size > *capacity)
+        if (allocation && *allocation < 0)
+          return place->emitError(
+                     "pim-verify: negative allocation_shape on buffer axis ")
+                 << d;
+        if (size && allocation && *size > *allocation)
           return place->emitError("pim-verify: buffer axis ")
-                 << d << " needs " << *size << " elements but only " << *capacity
+                 << d << " needs " << *size << " elements but only " << *allocation
                  << " are allocated per device";
+        if (!allocation) {
+          allocationStatic = false;
+        } else if (*allocation != 0 &&
+                   elements > std::numeric_limits<int64_t>::max() /
+                                  *allocation) {
+          return place->emitError(
+              "pim-verify: allocation_shape element count overflows i64");
+        } else {
+          elements *= *allocation;
+        }
+      }
+      if (!allocationStatic) {
+        allAllocationsStatic = false;
+      } else {
+        Type elementType =
+            cast<BaseMemRefType>(place.getBuffer().getType()).getElementType();
+        int64_t elementBytes = std::max<int64_t>(
+            1, elementType.getIntOrFloatBitWidth() / 8);
+        if (elements != 0 &&
+            elementBytes > std::numeric_limits<int64_t>::max() / elements)
+          return place->emitError(
+              "pim-verify: allocation byte count overflows i64");
+        int64_t bytes = elements * elementBytes;
+        if (staticAllocationBytes >
+            std::numeric_limits<int64_t>::max() - bytes)
+          return place->emitError(
+              "pim-verify: total allocation byte count overflows i64");
+        staticAllocationBytes += bytes;
       }
     }
     if (accessIds.size() != placeIds.size())
       return device->emitError("pim-verify: ")
              << accessIds.size() << " accesses but " << placeIds.size()
              << " placements";
+    std::optional<int64_t> unitLimit = pim::unitCapacityLimitBytes(profile);
+    if (allAllocationsStatic && unitLimit && *unitLimit > 0 &&
+        staticAllocationBytes > *unitLimit)
+      return device->emitError("pim-verify: the execution tile needs ")
+             << staticAllocationBytes << " byte but one PIM unit is limited to "
+             << *unitLimit << " byte";
     return success();
   }
 };
