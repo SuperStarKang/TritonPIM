@@ -19,7 +19,8 @@ namespace pim {
 TargetProfileAttr targetProfile(Operation *op);
 
 // func/device에 기록된 3계층으로부터 원소 shape를 계산한다. 배열의 고정 순서는
-// [m, n, k]다. 없는 축은 0이다. 파생 shape를 attribute에 중복 저장하지 않는다.
+// [m, n, k]다. 없는 축은 곱의 항등원인 1이다. 파생 shape를 attribute에 중복
+// 저장하지 않는다.
 SmallVector<int64_t, 3> blockShape(Operation *op);
 SmallVector<int64_t, 3> groupShape(Operation *op);
 SmallVector<int64_t, 3> executionTileShape(Operation *op);

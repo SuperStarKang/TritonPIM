@@ -4,9 +4,9 @@
 // RUN: triton-shared-opt "--pim-form-execution-tiles=tile-m=2 tile-n=3" %s | FileCheck %s --check-prefix=EXPLICIT
 
 // CHECK-LABEL: func.func @elementwise
-// CHECK-SAME: pim.execution_tile = #pim.execution_tile<groups = [1, 1, 0]>
+// CHECK-SAME: pim.execution_tile = #pim.execution_tile<groups = [1, 1, 1]>
 // EXPLICIT-LABEL: func.func @elementwise
-// EXPLICIT-SAME: pim.execution_tile = #pim.execution_tile<groups = [2, 3, 0]>
+// EXPLICIT-SAME: pim.execution_tile = #pim.execution_tile<groups = [2, 3, 1]>
 
 module attributes {pim.target_profile = #pim.target_profile<
     target = "upmem", num_units = 8,
@@ -18,7 +18,7 @@ module attributes {pim.target_profile = #pim.target_profile<
 
 func.func @elementwise(%A: memref<*xf32>, %B: memref<*xf32>,
                        %tm: index, %tn: index) attributes {
-    pim.block = #pim.block<shape = [8, 32, 0]>,
+    pim.block = #pim.block<shape = [8, 32, 1]>,
     pim.block_group = #pim.block_group<blocks = [1, 1, 1]>} {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index

@@ -6,7 +6,7 @@ AutoTuner는 PIM 실행 의미를 새로 정의하지 않는다. 후보마다 PI
 기록될 값만 선택하고, 같은 lowering을 실제로 실행해 end-to-end 시간을 비교한다.
 
 ```text
-PIMProblem + PIMTargetSpec
+PIMProblem(access dependency) + PIMTargetSpec
              │
              ▼
   [Block, Group, Execution Tile, p_m/p_n/p_k]
@@ -44,6 +44,21 @@ extent_axis = block_axis * group_axis * tile_axis
 
 `distribution_policy`, `reduction_policy`, `capacity_limit_*`, residency,
 streaming, persistence, bank/core partition은 Config가 아니다.
+
+`PIMProblem`은 별도 실행 policy가 아니라 PIM Common IR에서 읽은 다음 의미만
+정규화한다.
+
+```text
+compute_kind
+axis extents [m,n,k]
+unique pim.place buffers
+  direction, dtype, layout, access-dependent axes, irregular 여부
+```
+
+입력 access가 사용하지 않는 logical axis가 `replicated_over`다. Reduction axis는
+input access에는 있지만 output access에는 없는 `k`로 파생한다. `axis_sources`,
+residency flag, reduction policy는 추가하지 않는다. 연산 종류는 target별 선택 knob가
+아니라 Common IR의 compute op를 식별하기 위해서만 사용한다.
 
 ## 3. Target 정보
 
@@ -106,10 +121,10 @@ compile 전에 수학적으로 실행 불가능한 후보만 제거한다.
 7. AiMX의 물리 padding과 allocation 상한은 AiMX runtime config의 `batch`로
    계산한다.
 
-현재 split-K GEMM runner의 kernel legality로
-`K % (p_k * block_k) == 0`도 확인한다. 이것은 Common IR 속성이 아니라
-각 spatial K plane이 Block K 경계에서 시작해야 하는 현재 Triton kernel의
-지원 조건이다.
+Reduction이 있는 현재 Triton kernel legality로
+`K % (p_k * block_k) == 0`도 확인한다. 이것은 Common IR 속성이 아니라 각 spatial
+K plane이 Block K 경계에서 시작해야 하는 현재 kernel template의 지원 조건이다.
+사용하지 않는 축은 Block, Group, Tile, partition을 모두 1로 고정한다.
 
 Target lowering이 이미 검사하는 alignment나 reduction 위치를 공통 Config의
 정책으로 복제하지 않는다.
@@ -120,7 +135,7 @@ Target lowering이 이미 검사하는 alignment나 reduction 위치를 공통 C
 
 - active units와 scheduling rounds
 - effective utilization과 load imbalance
-- A/B transfer 및 `replicated_over`에 해당하는 replication 양
+- 모든 input placement의 transfer 및 `replicated_over`에 따른 reuse 양
 - p_k partial output과 reduction data 양
 - padding ratio
 - local/unit memory pressure
@@ -140,11 +155,12 @@ Random Forest의 decision path에서 중요하게 사용된 feature를 Block, Gr
 그렇지 않으면 유효한 `p_k` 증가도 이전 `tile_k` 때문에 생성 직후 제거되기
 때문이다.
 
-Cache key에는 problem shape/dtype/layout, 일곱 common profile 값, target runtime
-config, compiler/template version을 포함한다. 이전 policy 기반 Config cache는 새
-schema와 key가 달라 재사용하지 않는다. UPMEM `p_k` 단계별 seed를 추가한
-search-v2도 이전 search 결과를 best로 곧바로 반환하지 않도록 별도 cache
-schema를 사용한다.
+Cache key에는 problem shape, compute kind, access별 dtype/layout/dependency, 일곱
+common profile 값, target runtime config, compiler/template version을 포함한다. 이전
+policy 기반 Config cache는 새
+schema와 key가 달라 재사용하지 않는다. Access 기반 공통 분석을 사용하는
+search-v3도 이전 GEMM 전용 feature 결과를 best로 곧바로 반환하지 않도록 별도
+cache schema를 사용한다.
 
 ## 8. Target lowering과의 경계
 
@@ -154,6 +170,7 @@ schema를 사용한다.
   고정 의미이며 autotuner boolean knob가 아니다.
 - autotuner는 `p_k`를 포함한 후보 전체를 실제로 실행한 시간으로 비교한다.
 
-현재 문제/footprint 모델은 GEMM을 구현한다. GEMV, elementwise, reduction,
-convolution, fused operator, gather/scatter를 추가할 때도 Config 스키마는 바꾸지
-않고 연산별 axis와 access dependency로 constraint/feature만 계산한다.
+공통 problem/footprint 모델은 GEMV/GEMM, elementwise, reduction, flattened
+convolution, fused placement, irregular access를 같은 access dependency로 표현한다.
+각 연산의 frontend lowering과 target compute lowering은 별도 구현 범위지만 Config
+schema와 LFBO search는 바꾸지 않는다.

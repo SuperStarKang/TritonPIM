@@ -14,7 +14,7 @@ from .features import (
     feature_names,
 )
 from .forest import RandomForestClassifier
-from .space import build_config_space, heuristic_seeds, make_config
+from .space import axis_values, build_config_space, heuristic_seeds, make_config
 from .space import random_valid_configs
 from .types import PIMBenchmarkResult, ceil_div
 
@@ -58,8 +58,8 @@ FEATURE_INFLUENCE = {
     "h2d_bytes": (
         "p_m", "p_n", "p_k", "tile_m", "tile_n", "tile_k"),
     "d2h_bytes": ("p_k", "tile_m", "tile_n"),
-    "a_replication_bytes": ("p_n", "tile_m", "tile_k"),
-    "b_replication_bytes": ("p_m", "tile_n", "tile_k"),
+    "input_reuse_bytes": (
+        "p_m", "p_n", "p_k", "tile_m", "tile_n", "tile_k"),
     "reduction_bytes": ("p_k", "tile_m", "tile_n"),
     "padding_ratio": ("tile_m", "tile_n", "tile_k"),
     "load_imbalance": (
@@ -110,23 +110,27 @@ def semantic_mutate(problem, config, fragment_kinds, spec):
     for kind in fragment_kinds:
         axis = _AXIS_INDEX[kind[-1]]
         if kind.startswith("block_"):
-            for value in _step_values(spec.block_values, blocks[axis]):
+            for value in _step_values(
+                    axis_values(problem, spec, "block", axis), blocks[axis]):
                 new = list(blocks)
                 new[axis] = value
                 neighbors.append(rebuild(new_blocks=tuple(new)))
         elif kind.startswith("group_"):
-            for value in _step_values(spec.group_values, groups[axis]):
+            for value in _step_values(
+                    axis_values(problem, spec, "group", axis), groups[axis]):
                 new = list(groups)
                 new[axis] = value
                 neighbors.append(rebuild(new_groups=tuple(new)))
         elif kind.startswith("tile_"):
-            for value in _step_values(spec.tile_values, tiles[axis]):
+            for value in _step_values(
+                    axis_values(problem, spec, "tile", axis), tiles[axis]):
                 new = list(tiles)
                 new[axis] = value
                 neighbors.append(rebuild(new_tiles=tuple(new)))
         elif kind.startswith("p_"):
             for value in _step_values(
-                    spec.partition_values, partitions[axis]):
+                    axis_values(problem, spec, "partition", axis),
+                    partitions[axis]):
                 new = list(partitions)
                 new[axis] = value
                 # partition을 늘리면 한 device plane의 group 수가 줄어든다.

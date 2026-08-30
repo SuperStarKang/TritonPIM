@@ -28,7 +28,7 @@ struct PIMFormExecutionTilesPass
     if (tileM < 0 || tileN < 0 || tileK < 0) {
       getOperation()->emitError(
           "pim-form-execution-tiles: tile-m, tile-n and tile-k must be "
-          "0 (one block group) or positive");
+          "0 (default) or positive");
       return signalPassFailure();
     }
     WalkResult res = getOperation().walk([&](func::FuncOp func) {
@@ -89,11 +89,15 @@ struct PIMFormExecutionTilesPass
     int64_t requested[3] = {tileM, tileN, tileK};
     StringRef options[3] = {"tile-m", "tile-n", "tile-k"};
     StringRef axes[3] = {"m", "n", "reduction"};
-    int64_t tileGroups[3] = {0, 0, 0};
+    // 모든 hierarchy vector는 고정 [m,n,k] 양수 표현이다. 실제 loop가 없는
+    // 축도 곱의 항등원인 Group 하나로 기록한다.
+    int64_t tileGroups[3] = {1, 1, 1};
     SmallVector<int64_t, 3> groupShape = pim::groupShape(func);
     for (int i = 0; i < 3; ++i) {
       if (!axisLoops[i]) {
-        if (requested[i] > 0)
+        // 0은 pass option의 기본값이고 1은 Common IR의 항등값이다. 둘 다
+        // 비활성 축의 Group 하나로 정규화한다. 2 이상은 묶을 loop가 없다.
+        if (requested[i] > 1)
           return func->emitError("pim-form-execution-tiles: ")
                  << options[i] << " is given but the kernel has no " << axes[i]
                  << (i == 2 ? " loop" : " axis");

@@ -1,7 +1,7 @@
 """Static constraints for values represented by PIM Common IR."""
 
 from .targets import AiMXRuntimeConfig
-from .types import ceil_div
+from .types import AXES, ceil_div
 
 
 AIMX_PMM_BYTES = 0x30000
@@ -13,12 +13,17 @@ def _round_up(value, unit):
     return ceil_div(value, unit) * unit
 
 
-def gemm_footprint_bytes(problem, size_m, size_n, size_k):
-    return (
-        size_m * size_k * problem.input_bytes
-        + size_k * size_n * problem.input_bytes
-        + size_m * size_n * problem.output_bytes
+def access_footprint_bytes(problem, extents):
+    """Allocation footprint of all unique ``pim.place`` buffers."""
+    return sum(
+        access.elements(extents) * access.element_bytes
+        for access in problem.accesses
     )
+
+
+def gemm_footprint_bytes(problem, size_m, size_n, size_k):
+    """Compatibility name for callers that still construct a GEMM problem."""
+    return access_footprint_bytes(problem, (size_m, size_n, size_k))
 
 
 def group_extent(config):
@@ -30,11 +35,11 @@ def group_extent(config):
 
 
 def local_memory_footprint(problem, config):
-    return gemm_footprint_bytes(problem, *group_extent(config))
+    return access_footprint_bytes(problem, group_extent(config))
 
 
 def unit_memory_footprint(problem, config):
-    return gemm_footprint_bytes(problem, *config.execution_extent)
+    return access_footprint_bytes(problem, config.execution_extent)
 
 
 def aimx_runtime_allocations(problem, target, config):
@@ -83,6 +88,31 @@ class ConstraintEngine:
         values = config.key()
         if min(values) < 1:
             return "Block, Group, Tile, partition 값은 모두 1 이상이어야 한다"
+        if min(problem.axis_extents) < 1:
+            return "m/n/k axis extent는 모두 1 이상이어야 한다"
+        if not problem.output_accesses:
+            return "PIM problem에는 output access가 하나 이상 필요하다"
+        for access in problem.accesses:
+            if access.direction not in ("in", "out", "inout"):
+                return f"지원하지 않는 PIM access direction: {access.direction}"
+            if any(axis not in AXES for axis in access.axes):
+                return f"지원하지 않는 PIM access axis: {access.axes}"
+        if any(axis != "k" for axis in problem.reduction_axes):
+            return "현재 PIM hierarchy의 reduction axis는 k여야 한다"
+        if problem.K > 1 and not problem.has_reduction:
+            return "reduction이 없는 연산은 k extent를 1로 두어야 한다"
+
+        blocks = (config.block_m, config.block_n, config.block_k)
+        groups = (config.group_m, config.group_n, config.group_k)
+        tiles = (config.tile_m, config.tile_n, config.tile_k)
+        partitions = (config.p_m, config.p_n, config.p_k)
+        for axis, extent in enumerate(problem.axis_extents):
+            if extent == 1 and (
+                    blocks[axis] != 1 or groups[axis] != 1
+                    or tiles[axis] != 1 or partitions[axis] != 1):
+                return (
+                    f"extent가 1인 {AXES[axis]} axis의 "
+                    "Block/Group/Tile/partition은 모두 1이어야 한다")
 
         local_bytes = local_memory_footprint(problem, config)
         if (profile.local_capacity_limit_bytes > 0
@@ -93,7 +123,8 @@ class ConstraintEngine:
 
         unit_limit = (
             profile.banks_per_unit * profile.bank_capacity_limit_bytes)
-        if profile.target == "aimx":
+        if (profile.target == "aimx"
+                and problem.uses_aimx_matmul_primitive):
             allocations = aimx_runtime_allocations(problem, self.target, config)
             for name, size in allocations.items():
                 if size > AIMX_MAX_SINGLE_ALLOCATION_BYTES:
@@ -116,7 +147,8 @@ class ConstraintEngine:
 
         p_m, p_n, p_k = config.p_m, config.p_n, config.p_k
         split_k_granularity = p_k * config.block_k
-        if problem.K % split_k_granularity:
+        if (problem.has_reduction
+                and problem.K % split_k_granularity):
             return (
                 f"K({problem.K}) must be divisible by "
                 f"p_k*block_k({split_k_granularity})")
@@ -138,7 +170,7 @@ class ConstraintEngine:
             return f"p_k({p_k})가 Execution Tile grid K({e_k})보다 크다"
 
         k_plane = ceil_div(problem.K, p_k)
-        if t_k > k_plane:
+        if problem.has_reduction and t_k > k_plane:
             return (
                 f"Execution Tile K extent({t_k})가 K plane"
                 f"({k_plane})보다 크다")

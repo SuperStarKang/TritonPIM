@@ -83,8 +83,7 @@ def main():
 
     target = target_spec("upmem")
     problem = PIMProblem(M=args.m, N=args.n, K=args.k,
-                         input_dtype="int8", output_dtype="int32",
-                         a_layout="row_major", b_layout="row_major")
+                         input_dtype="int8", output_dtype="int32")
 
     torch.manual_seed(args.seed)
     a = torch.randint(-8, 8, (args.m, args.k), dtype=torch.int8)

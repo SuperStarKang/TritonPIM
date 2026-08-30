@@ -236,7 +236,8 @@ struct PIMFormBlockGroupsPass
       axis[2] = cast<scf::ForOp>(*reds.begin());
     static const char *name[3] = {"m", "n", "k"};
     int64_t blocks[3] = {g[0], g[1], g[2]};
-    int64_t blockShape[3] = {0, 0, 0};
+    // 고정 [m,n,k] 표현에서 실제 compute loop가 없는 축은 곱의 항등원 1이다.
+    int64_t blockShape[3] = {1, 1, 1};
     for (int i = 0; i < 3; i++) {
       if (!axis[i])
         continue;

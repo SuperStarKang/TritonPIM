@@ -96,8 +96,8 @@ LogicalResult BlockAttr::verify(function_ref<InFlightDiagnostic()> emitError,
                                 DenseI64ArrayAttr shape) {
   if (shape.size() != 3)
     return emitError() << "shape must be [m, n, k]";
-  if (llvm::any_of(shape.asArrayRef(), [](int64_t value) { return value < 0; }))
-    return emitError() << "shape entries must not be negative";
+  if (llvm::any_of(shape.asArrayRef(), [](int64_t value) { return value < 1; }))
+    return emitError() << "shape entries must be positive";
   return success();
 }
 
@@ -116,8 +116,8 @@ LogicalResult ExecutionTileAttr::verify(
     DenseI64ArrayAttr groups) {
   if (groups.size() != 3)
     return emitError() << "groups must be [m, n, k]";
-  if (llvm::any_of(groups.asArrayRef(), [](int64_t value) { return value < 0; }))
-    return emitError() << "group counts must not be negative";
+  if (llvm::any_of(groups.asArrayRef(), [](int64_t value) { return value < 1; }))
+    return emitError() << "group counts must be positive";
   return success();
 }
 

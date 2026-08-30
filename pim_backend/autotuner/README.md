@@ -45,6 +45,7 @@ UPMEM은 split-K를 충분히 비교할 수 있도록 유효한 각 `p_k` 단계
 
 ```text
 PIMProblem
+  -> compute op와 pim.place access dependency 분석
   -> Common IR config seed/random candidate
   -> static constraint
   -> Common IR 값에서 feature 파생
@@ -55,8 +56,14 @@ PIMProblem
 ```
 
 최종 objective는 실제 end-to-end 실행시간이다. utilization, transfer,
-replication, reduction, padding, memory pressure는 후보를 설명하기 위해 Common IR
+input reuse, reduction, padding, memory pressure는 후보를 설명하기 위해 Common IR
 값에서 계산하는 내부 feature일 뿐 compiler option이나 IR attribute로 저장하지 않는다.
+
+`PIMProblem`은 연산별 policy를 갖지 않는다. `compute_kind`는 PIM compute op의
+종류를 식별하는 의미 값이고, 각 `PIMAccess`는 unique buffer의 direction, dtype,
+logical axis dependency를 나타낸다. 입력 access가 사용하지 않는 축은 Common IR의
+`replicated_over`와 같은 의미다. Cache와 constraint/feature는 이 access 구성을
+포함하므로 서로 다른 연산 결과를 섞지 않는다.
 
 ## 사용 예
 
@@ -79,6 +86,23 @@ result = tune(problem, target, benchmark, space=space,
 print(result.best.config)
 ```
 
+같은 tuner에 다른 연산을 전달할 때도 `PIMConfig` 필드는 바뀌지 않는다.
+
+```python
+elementwise = PIMProblem.elementwise(
+    M=1 << 20, input_dtypes=("float32", "float32"))
+matvec = PIMProblem.matvec(M=8192, K=4096)
+reduction = PIMProblem.reduction(M=8192, K=4096)
+convolution = PIMProblem.convolution(
+    spatial=56 * 56, output_channels=256,
+    reduction_extent=3 * 3 * 128)
+```
+
+Fused operator와 gather/scatter는 PIM Common IR에서 unique `pim.place`마다
+`PIMAccess`를 하나씩 만들면 된다. Irregular access는 `irregular=True`로 cache에서
+구분한다. Feature의 byte 수는 placement allocation 범위를 사용하고, 최종 선택은
+항상 실제 target 실행시간으로 결정한다.
+
 UPMEM 직접 예제는 실제 장비 크기를 명시할 수 있다.
 
 ```bash
@@ -89,6 +113,8 @@ python examples/autotune_gemm.py --m 256 --n 256 --k 256 \
 `num_units`는 profile 상한이고, 각 후보의 실제 DPU 수는
 `p_m*p_n*p_k`다. `nr_tasklets=0`은 `lanes_per_core`를 모두 사용한다.
 
-현재 `PIMProblem`과 byte 계산은 GEMM을 지원한다. 다른 연산을 추가할 때도 별도
-distribution/reduction/residency policy를 Config에 넣지 않고, 해당 연산의
-Block–Group–Tile과 access dependency에서 feature를 계산한다.
+현재 공통 problem/footprint/transfer/reduction 분석은 elementwise, GEMV/GEMM,
+reduction, flattened convolution, fused placement와 irregular access를 표현한다.
+실제로 실행하려면 해당 연산을 PIM Common IR로 만드는 frontend lowering과 target
+compute lowering이 존재해야 한다. Autotuner는 없는 target 연산 구현을 대신 만들지
+않는다.

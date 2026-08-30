@@ -275,21 +275,15 @@ struct ConvertPIMToUPMEMPass
     // 전체 문제의 round 수만큼 중복 실행하게 된다. 여기에는 reduction loop 안에서만
     // 생기는 temporal K window만 남긴다.
     SmallVector<Window> windows;
-    if (tiles) {
-      if (tileShape[2] > 0) {
-        if (!kLoop) {
-          device->emitError(
-              "convert-pim-to-upmem: the execution tile has a k cap but the "
-              "kernel has neither a k axis nor a single "
-              "reduction loop to window");
-          return signalPassFailure();
-        }
-        Window w;
-        w.kLoop = kLoop;
-        w.cap = tileShape[2];
-        w.trips = kLoop.getUpperBound();
-        windows.push_back(w);
-      }
+    // 비활성 K도 Common IR에서는 항등 extent 1이므로 tileShape[2]의 양수
+    // 여부로 reduction을 판별하지 않는다. 실제 reduction loop가 있을 때만
+    // temporal K window를 만든다.
+    if (tiles && kLoop) {
+      Window w;
+      w.kLoop = kLoop;
+      w.cap = tileShape[2];
+      w.trips = kLoop.getUpperBound();
+      windows.push_back(w);
     }
 
     // 각 place에서 reduction loop가 움직이는 buffer 축을 찾는다. 한 place의 두 축이

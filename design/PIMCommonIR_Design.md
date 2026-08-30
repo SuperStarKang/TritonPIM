@@ -60,8 +60,9 @@ UPMEM runtime config는 `nr_tasklets`, `host_threads`를 가진다. `nr_tasklets
 
 ## 3. 세 hierarchy attribute
 
-세 attribute의 축 순서는 항상 `[m,n,k]`다. 없는 축은 Block과 Execution Tile에서 0,
-Block Group에서는 곱의 항등원인 1이다.
+세 attribute의 축 순서는 항상 `[m,n,k]`다. 실제 compute loop가 없는 축도 모든
+계층에서 곱의 항등원인 1로 기록한다. 축의 의미와 loop 존재 여부는 hierarchy 값이
+아니라 `pim.axis`, reduction loop, `pim.access` origin과 compute op에서 판단한다.
 
 ```mlir
 pim.block = #pim.block<shape = [32, 32, 16]>
@@ -193,3 +194,10 @@ chain 및 vACC reduction을 만든다. Common IR의 연산 의미나 device mapp
 
 Target lowering은 Common IR의 access와 compute 의미를 인식해 target primitive로 옮긴다.
 연산마다 별도의 Common IR policy나 target 선택 변수를 추가하지 않는다.
+
+Autotuner의 `PIMProblem`은 이 의미를 Python에서 정규화한 분석 결과다. PIM compute
+op에서 `compute_kind`를 읽고, unique `pim.place`마다 direction, dtype, layout,
+access-dependent axis를 갖는 `PIMAccess` 하나를 만든다. 입력 access가 사용하지 않는
+축은 `replicated_over`가 되고, input에는 있지만 최종 output에는 없는 `k`는 reduction
+축이 된다. 이 분석 값은 Config나 새 IR attribute가 아니며, 동일한 12개 hierarchy와
+device mapping 값을 탐색하기 위한 footprint/transfer 계산에만 사용한다.

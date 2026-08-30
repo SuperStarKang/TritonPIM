@@ -19,6 +19,7 @@ from autotuner import (  # noqa: E402
     ConstraintEngine,
     PIMConfig,
     PIMConfigCache,
+    PIMAccess,
     PIMProblem,
     PIMTargetSpec,
     build_config_space,
@@ -32,7 +33,8 @@ from autotuner.decorator import (  # noqa: E402
 )
 
 __all__ = [
-    "ConstraintEngine", "PIMConfig", "PIMConfigCache", "PIMProblem",
+    "ConstraintEngine", "PIMAccess", "PIMConfig", "PIMConfigCache",
+    "PIMProblem",
     "PIMTargetSpec", "build_config_space",
     "heuristic_seeds", "target_spec",
     "DEFAULT_CACHE_PATH", "pim_launch_options",

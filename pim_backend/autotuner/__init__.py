@@ -21,7 +21,7 @@ from .targets import (
     UPMEMRuntimeConfig,
     target_spec,
 )
-from .types import PIMBenchmarkResult, PIMConfig, PIMProblem
+from .types import PIMAccess, PIMBenchmarkResult, PIMConfig, PIMProblem
 
 
 __all__ = [name for name in globals() if not name.startswith("_")]

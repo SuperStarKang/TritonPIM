@@ -187,18 +187,19 @@ def PIMFormExecutionTiles : Pass<"pim-form-execution-tiles", "mlir::ModuleOp"> {
     선택된 모양과 pim.place capacity를 소비할 뿐 전체 문제를 다시 분할하지 않는다.
 
     tile-m/n/k는 각 축에서 상주시킬 Block Group 개수다. 양수면 그대로 쓰고,
-    0이면 존재하는 축은 Group 하나, 존재하지 않는 축은 0으로 기록한다. 따라서
+    option 기본값 0은 Group 하나로 정규화한다. 존재하지 않는 축도 곱의 항등원인
+    1로 기록하며 명시적인 1은 허용하고 2 이상은 거부한다. 따라서
     기본 lowering은 항상 가장 작은 Execution Tile을 만들며, 문제 크기가 크면
     pim-map-devices가 이 Tile을 여러 scheduling round에서 반복 실행한다.
     PIM DRAM 용량은 Tile을 키우는 목표가 아니며 target lowering의 legality 상한이다.
   }];
   let options = [
     Option<"tileM", "tile-m", "int64_t", "0",
-           "m 방향 Block Group 수. 0 = 한 Group">,
+           "m 방향 Block Group 수. 0 또는 1 = 한 Group">,
     Option<"tileN", "tile-n", "int64_t", "0",
-           "n 방향 Block Group 수. 0 = 한 Group">,
+           "n 방향 Block Group 수. 0 또는 1 = 한 Group">,
     Option<"tileK", "tile-k", "int64_t", "0",
-           "각 spatial K plane 내부 reduction 방향 Block Group 수. 0 = 한 Group. "
+           "각 spatial K plane 내부 reduction 방향 Block Group 수. 0 또는 1 = 한 Group. "
            "k은 독립된 spatial output 축이고 tile-k는 그 plane "
            "내부의 temporal window다. 여러 window의 partial 결합 방식은 target "
            "lowering이 정한다.">,

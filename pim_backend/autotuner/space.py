@@ -30,6 +30,19 @@ class PIMConfigSpace:
     partition_values: tuple = (1,)
 
 
+def axis_values(problem, spec, kind, axis):
+    """Values for one hierarchy level, fixing unused logical axes to one."""
+    if problem.axis_extents[axis] == 1:
+        return (1,)
+    values = {
+        "block": spec.block_values,
+        "group": spec.group_values,
+        "tile": spec.tile_values,
+        "partition": spec.partition_values,
+    }
+    return values[kind]
+
+
 def build_config_space(problem, target, **overrides):
     fields = {
         "partition_values": _powers_of_two(
@@ -64,23 +77,23 @@ def _partition_seeds(problem, target, blocks, groups, spec):
         ceil_div(problem.K, g_k),
     )
     candidates = []
-    for p_m in spec.partition_values:
+    for p_m in axis_values(problem, spec, "partition", 0):
         if p_m > grid[0]:
             continue
-        for p_n in spec.partition_values:
+        for p_n in axis_values(problem, spec, "partition", 1):
             if p_n > grid[1]:
                 continue
-            for p_k in spec.partition_values:
+            for p_k in axis_values(problem, spec, "partition", 2):
                 active = p_m * p_n * p_k
                 if active > profile.num_units or p_k > grid[2]:
                     continue
-                if problem.K % (p_k * blocks[2]):
+                if (problem.has_reduction
+                        and problem.K % (p_k * blocks[2])):
                     continue
                 candidates.append((p_m, p_n, p_k))
 
     if not candidates:
-        raise ValueError(
-            "no [p_m,p_n,p_k] seed satisfies K % (p_k*block_k) == 0")
+        raise ValueError("no valid [p_m,p_n,p_k] seed")
 
     # 같은 active-unit 수라면 p_k가 작은 것을 먼저 둔다. 현재 GEMM runner는
     # p_k마다 MxN partial을 만들기 때문에, 첫 측정부터 불필요하게 큰 host
@@ -98,8 +111,8 @@ def _partition_seeds(problem, target, blocks, groups, spec):
     # UPMEM은 split-K가 중요하므로 각 p_k 단계를 K-only로 재지 않고,
     # 그 p_k를 고정한 채 p_m/p_n을 채워 총 active unit을 최대화한다.
     # 그러면 비슷한 전체 parallelism에서 K 분할 효과를 비교할 수 있다.
-    if profile.target == "upmem":
-        for p_k in spec.partition_values:
+    if profile.target == "upmem" and problem.has_reduction:
+        for p_k in axis_values(problem, spec, "partition", 2):
             with_p_k = [p for p in candidates if p[2] == p_k]
             if with_p_k:
                 seeds.append(max(
@@ -108,6 +121,8 @@ def _partition_seeds(problem, target, blocks, groups, spec):
                 ))
 
     for axis in range(3):
+        if problem.axis_extents[axis] == 1:
+            continue
         along_axis = [
             p for p in candidates
             if all(p[i] == 1 for i in range(3) if i != axis)
@@ -116,7 +131,7 @@ def _partition_seeds(problem, target, blocks, groups, spec):
             seeds.append(max(along_axis, key=lambda p: p[axis]))
 
     balanced = [p for p in candidates if p[0] == p[1]]
-    if balanced:
+    if problem.M > 1 and problem.N > 1 and balanced:
         seeds.append(min(
             balanced,
             key=lambda p: (-(p[0] * p[1] * p[2]), p[2]),
@@ -171,7 +186,10 @@ def _derive_tiles(problem, target, blocks, groups, partitions, spec):
 
 def heuristic_seeds(problem, target, spec):
     """Initial configs expressed only with Common IR values."""
-    blocks = (spec.block_values[0],) * 3
+    blocks = tuple(
+        axis_values(problem, spec, "block", axis)[0]
+        for axis in range(3)
+    )
     groups = (1, 1, 1)
     configs = []
     for partitions in _partition_seeds(
@@ -189,10 +207,14 @@ def random_valid_configs(problem, target, spec, count, rng, engine):
     while len(configs) < count and attempts < max_attempts:
         attempts += 1
         config = make_config(
-            tuple(rng.choice(spec.block_values) for _ in range(3)),
-            tuple(rng.choice(spec.group_values) for _ in range(3)),
-            tuple(rng.choice(spec.tile_values) for _ in range(3)),
-            tuple(rng.choice(spec.partition_values) for _ in range(3)),
+            tuple(rng.choice(axis_values(
+                problem, spec, "block", axis)) for axis in range(3)),
+            tuple(rng.choice(axis_values(
+                problem, spec, "group", axis)) for axis in range(3)),
+            tuple(rng.choice(axis_values(
+                problem, spec, "tile", axis)) for axis in range(3)),
+            tuple(rng.choice(axis_values(
+                problem, spec, "partition", axis)) for axis in range(3)),
         )
         if engine.valid(config):
             configs.append(config)

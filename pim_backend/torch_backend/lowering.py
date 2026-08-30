@@ -75,8 +75,7 @@ def validate_pim_int_mm(mat1, mat2, m, n, k) -> PIMProblem:
     # 검사가 problem.input_bytes / output_bytes를 쓴다.
     return PIMProblem(
         M=_static_int(m, "M"), N=_static_int(n, "N"), K=_static_int(k, "K"),
-        input_dtype="int8", output_dtype="int32",
-        a_layout="row_major", b_layout="row_major")
+        input_dtype="int8", output_dtype="int32")
 
 
 def _zeroed_partial(device, split_k, m, n):

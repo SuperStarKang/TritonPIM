@@ -8,7 +8,7 @@ from dataclasses import asdict
 from .types import PIMBenchmarkResult, PIMConfig
 
 
-CACHE_SCHEMA = "pim-common-ir-search-v2"
+CACHE_SCHEMA = "pim-common-ir-search-v3"
 RESULT_FIELDS = (
     "total_ms", "correctness",
 )
@@ -34,7 +34,8 @@ class PIMConfigCache:
         return "|".join(str(value) for value in (
             CACHE_SCHEMA,
             problem.input_dtype, problem.output_dtype,
-            problem.a_layout, problem.b_layout,
+            problem.compute_kind,
+            problem.access_key(),
             profile.target, profile.num_units,
             profile.banks_per_unit, profile.cores_per_bank,
             profile.lanes_per_core,

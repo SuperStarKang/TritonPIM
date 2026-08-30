@@ -15,8 +15,7 @@ class PIMFeatures:
     scheduling_rounds: int
     h2d_bytes: int
     d2h_bytes: int
-    a_replication_bytes: int
-    b_replication_bytes: int
+    input_reuse_bytes: int
     reduction_bytes: int
     padding_ratio: float
     load_imbalance: float
@@ -49,21 +48,30 @@ def extract_features(problem, target, config):
     useful = problem.M * problem.N * problem.K
     padding_ratio = (executed - useful) / executed
 
-    input_bytes = problem.input_bytes
-    output_bytes = problem.output_bytes
-    items = e_m * e_n * p_k
-    raw_a_bytes = items * t_m * padded_k * input_bytes
-    raw_b_bytes = items * padded_k * t_n * input_bytes
+    # 입력 transfer는 pim.place의 access dependency에서 계산한다. access가
+    # 의존하는 축은 모든 Execution Tile을 방문하고, replicated_over 축은 같은
+    # device scheduling round 안에서 재사용한다. 이 식은 GEMM A(m,k), B(k,n)
+    # 뿐 아니라 GEMV, reduction, convolution과 fused placement에도 동일하다.
+    raw_instances = e_m * e_n * p_k * k_windows
+    raw_input_bytes = 0
+    h2d_bytes = 0
+    for access in problem.input_accesses:
+        tile_bytes = access.elements((t_m, t_n, t_k)) \
+            * access.element_bytes
+        raw_input_bytes += raw_instances * tile_bytes
+        staged_m = e_m if "m" in access.axes else rounds_m
+        staged_n = e_n if "n" in access.axes else rounds_n
+        staged_k = p_k * k_windows if "k" in access.axes else 1
+        h2d_bytes += staged_m * staged_n * staged_k * tile_bytes
 
-    # replicated_over=["n"]인 A는 같은 scheduling round의 p_n device들이,
-    # replicated_over=["m"]인 B는 같은 round의 p_m device들이 공유한다.
-    # round가 바뀌면 stage/to_mram이 다시 실행되므로 서로 다른 round까지 한 번의
-    # 전송으로 세면 안 된다.
-    a_bytes = e_m * rounds_n * p_k * t_m * padded_k * input_bytes
-    b_bytes = rounds_m * e_n * p_k * padded_k * t_n * input_bytes
-    output_bytes_per_tile = t_m * t_n * output_bytes
-    d2h_bytes = items * output_bytes_per_tile
-    final_output_bytes = e_m * e_n * output_bytes_per_tile
+    partials = p_k if problem.has_reduction else 1
+    d2h_bytes = 0
+    final_output_bytes = 0
+    for access in problem.output_accesses:
+        tile_bytes = access.elements((t_m, t_n, t_k)) \
+            * access.element_bytes
+        d2h_bytes += e_m * e_n * partials * tile_bytes
+        final_output_bytes += e_m * e_n * tile_bytes
     reduction_bytes = max(0, d2h_bytes - final_output_bytes)
 
     local_limit = profile.local_capacity_limit_bytes
@@ -73,10 +81,9 @@ def extract_features(problem, target, config):
         effective_utilization=effective_utilization,
         execution_tile_count=e_m * e_n * p_k * k_windows,
         scheduling_rounds=scheduling_rounds,
-        h2d_bytes=a_bytes + b_bytes,
+        h2d_bytes=h2d_bytes,
         d2h_bytes=d2h_bytes,
-        a_replication_bytes=max(0, raw_a_bytes - a_bytes),
-        b_replication_bytes=max(0, raw_b_bytes - b_bytes),
+        input_reuse_bytes=max(0, raw_input_bytes - h2d_bytes),
         reduction_bytes=reduction_bytes,
         padding_ratio=padding_ratio,
         load_imbalance=load_imbalance,
@@ -97,7 +104,7 @@ def feature_names():
         "active_units", "effective_utilization",
         "execution_tile_count", "scheduling_rounds",
         "h2d_bytes", "d2h_bytes",
-        "a_replication_bytes", "b_replication_bytes",
+        "input_reuse_bytes",
         "reduction_bytes", "padding_ratio", "load_imbalance",
         "local_memory_pressure", "unit_memory_pressure",
     ]
@@ -116,8 +123,7 @@ def config_feature_vector(config, features):
         float(features.execution_tile_count),
         float(features.scheduling_rounds),
         float(features.h2d_bytes), float(features.d2h_bytes),
-        float(features.a_replication_bytes),
-        float(features.b_replication_bytes),
+        float(features.input_reuse_bytes),
         float(features.reduction_bytes), features.padding_ratio,
         features.load_imbalance, features.local_memory_pressure,
         features.unit_memory_pressure,

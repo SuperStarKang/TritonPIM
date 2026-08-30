@@ -10,12 +10,12 @@ module attributes {pim.target_profile = #pim.target_profile<
 
 // expected-error @below {{#pim.block × #pim.block_group gives 2 elements on m but the local compute tile uses 1}}
 func.func @inconsistent_group_shape(%arg0: memref<*xi8>) attributes {
-    pim.block = #pim.block<shape = [2, 0, 0]>,
+    pim.block = #pim.block<shape = [2, 1, 1]>,
     pim.block_group = #pim.block_group<blocks = [1, 1, 1]>} {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   pim.device #pim.device_mapping<partitions = [1, 1, 1]> attributes {
-        pim.execution_tile = #pim.execution_tile<groups = [1, 0, 0]>} {
+        pim.execution_tile = #pim.execution_tile<groups = [1, 1, 1]>} {
   ^bb0(%device_m: index, %device_n_unused: index, %device_k_unused: index):
     scf.for %m = %c0 to %c1 step %c1 {
       %0 = pim.access %arg0 offset %m sizes [1] strides[%c1] origin[%m]

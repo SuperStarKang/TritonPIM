@@ -91,7 +91,7 @@ def PIM_DeviceMappingAttr : PIM_Attr<"DeviceMapping", "device_mapping"> {
 }
 
 // block — 데이터 3계층의 첫째 층. Triton block 한 개가 각 canonical 축에서
-// 계산하는 유효 원소 수다. 축 순서는 [m, n, k]이고 없는 축은 0이다.
+// 계산하는 유효 원소 수다. 축 순서는 [m, n, k]이고 없는 축은 1이다.
 def PIM_BlockAttr : PIM_Attr<"Block", "block"> {
   let summary = "The useful element shape of one Triton block";
   let parameters = (ins "::mlir::DenseI64ArrayAttr":$shape);
@@ -110,7 +110,8 @@ def PIM_BlockGroupAttr : PIM_Attr<"BlockGroup", "block_group"> {
 
 // execution tile — 데이터 3계층의 셋째 층. 각 축에서 Group을 몇 개 상주시킬지만
 // 저장한다. 원소 shape는 Block과 Group에서 파생한다. 없는 축의
-// group 수는 0이다. PIM DRAM 용량은 이 값을 늘리는 목표가 아니라 legality 상한이다.
+// group 수도 곱의 항등원인 1이다. PIM DRAM 용량은 이 값을 늘리는 목표가 아니라
+// legality 상한이다.
 // spatial split-K가 있으면 pim.axis="k" 좌표마다 별도 Execution Tile instance가
 // 생기고, groups[k]는 각 spatial plane 내부 temporal reduction residency를 뜻한다.
 // Group 순회 순서는 target 실행 방식에 속하므로 target lowering이 정한다.

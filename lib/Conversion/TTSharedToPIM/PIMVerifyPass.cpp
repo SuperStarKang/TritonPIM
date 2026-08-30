@@ -125,12 +125,16 @@ struct PIMVerifyPass
       static const char *axisNames[3] = {"m", "n", "k"};
       for (int i = 0; i < 3; ++i) {
         bool hasComputeAxis = static_cast<bool>(hierarchyAxes[i]);
-        if (hasComputeAxis != (tileGroups[i] > 0)) {
-          func->emitError("pim-verify: execution_tile.groups[")
-              << axisNames[i] << "] disagrees with the device-local compute axis";
+        if (!hasComputeAxis &&
+            (groupShape.size() != 3 || groupShape[i] != 1 ||
+             tileGroups[i] != 1)) {
+          func->emitError("pim-verify: inactive ")
+              << axisNames[i]
+              << " axis must have identity Block, Block Group, and "
+                 "Execution Tile extents of 1";
           return WalkResult::interrupt();
         }
-        if (groupShape.size() != 3 || !hasComputeAxis)
+        if (!hasComputeAxis)
           continue;
         int64_t actual = pim::tileElementsAlong(hierarchyAxes[i], loops);
         if (actual != groupShape[i]) {

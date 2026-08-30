@@ -5,7 +5,7 @@
 ```text
 torch.compile
   -> aten._int_mm lowering
-  -> PIMProblem(M,N,K,dtype,layout)
+  -> PIMProblem(M,N,K,compute op,pim.place accesses)
   -> PIMConfig 선택
        직접 지정 | offline autotune cache | heuristic seed
   -> Triton split-K template
@@ -27,7 +27,7 @@ Torch integration은 별도 실행 plan을 만들지 않는다.
 
 | 값 | 소유자 |
 |---|---|
-| M/N/K, dtype, layout | `PIMProblem` |
+| M/N/K, compute op, dtype/layout별 access dependency | `PIMProblem` |
 | 일곱 common hardware 필드 | `PIMTargetSpec.common_profile` |
 | `nr_tasklets`, `host_threads`, `batch`, `base_fpga` | target runtime config |
 | Block–Group–Execution Tile, `[p_m,p_n,p_k]` | `PIMConfig` |

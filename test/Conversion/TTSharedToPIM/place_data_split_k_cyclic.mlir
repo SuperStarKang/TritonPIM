@@ -13,9 +13,9 @@ module attributes {pim.target_profile = #pim.target_profile<
 func.func @split_k_cyclic(%A: memref<*xi8>, %tr: index, %tp: index, %tk: index,
                           %lda: index)
     attributes {
-      pim.block = #pim.block<shape = [8, 0, 16]>,
+      pim.block = #pim.block<shape = [8, 1, 16]>,
       pim.block_group = #pim.block_group<blocks = [1, 1, 1]>,
-      pim.execution_tile = #pim.execution_tile<groups = [1, 0, 1]>} {
+      pim.execution_tile = #pim.execution_tile<groups = [1, 1, 1]>} {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c8 = arith.constant 8 : index

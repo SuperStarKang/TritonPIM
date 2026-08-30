@@ -37,7 +37,7 @@ module attributes {pim.target_profile = #pim.target_profile<
 
 func.func @elementwise(%A: memref<*xf32>, %B: memref<*xf32>,
                        %C: memref<*xf32>) attributes {
-    pim.block = #pim.block<shape = [8, 32, 0]>,
+    pim.block = #pim.block<shape = [8, 32, 1]>,
     pim.block_group = #pim.block_group<blocks = [1, 1, 1]>} {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
@@ -45,7 +45,7 @@ func.func @elementwise(%A: memref<*xf32>, %B: memref<*xf32>,
   %c32 = arith.constant 32 : index
 
   pim.device #pim.device_mapping<partitions = [1, 1, 1]> attributes {
-        pim.execution_tile = #pim.execution_tile<groups = [1, 1, 0]>} {
+        pim.execution_tile = #pim.execution_tile<groups = [1, 1, 1]>} {
   ^bb0(%pm: index, %pn: index, %device_k_unused: index):
     pim.place %A start[%c0, %c0] size[%c8, %c32] allocation_shape[%c8, %c32]
         strides[%c32, %c1] {direction = "in", access = 0 : i64}
