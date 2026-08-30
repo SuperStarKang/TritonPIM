@@ -12,6 +12,9 @@
 // PIM-CLEAN-NOT: #pim.execution_tile
 // PIM-CLEAN-NOT: pim.axis
 // PIM-CLEAN-NOT: pim.device_origin
+// PIM-CLEAN-NOT: pim.temporal_reduction
+// PIM-CLEAN-NOT: pim.scheduling_axis
+// PIM-CLEAN-NOT: pim.combine
 
 // 버퍼마다 MRAM 심볼 하나. i8은 1024개, i32는 256개다.
 // CHECK-DAG: upmem.mram @matmul_mram_0 : memref<1024xi8, #upmem<space mram>>
@@ -68,7 +71,7 @@
 // CHECK:         %[[P:.*]] = upmem.gather %[[SET]], @matmul_mram_2
 // CHECK:         upmem.foreach_group %[[P]] : {{.*}} axes ["m", "n", "k"] counts [2, 4, 1]
 // 되돌릴 때 읽는 범위는 실제 크기(size)지만 축 사이 간격은 배정량(capacity)이다.
-// execution_tile의 temporal K window를 host에서 합치므로 accumulate가 명시된다.
+// Common pim.combine과 reduction_k round가 명시한 partial 결합을 그대로 전달한다.
 // CHECK:           upmem.unstage %{{.*}} into %{{.*}} origin[%{{.*}}, %{{.*}}] sizes[%{{.*}}, %{{.*}}] strides[%{{.*}}, %{{.*}}] capacity[%{{.*}}, %{{.*}}] accumulate %{{.*}} tile [8, 32]
 // pim 쪽은 남지 않는다.
 // CHECK-NOT:     pim.device
@@ -96,7 +99,9 @@ func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
   %lda = arith.index_cast %K : i32 to index
   %ldb = arith.index_cast %N : i32 to index
   %kk = arith.index_cast %K : i32 to index
+  %reductionRounds = arith.ceildivsi %kk, %c32 : index
 
+  scf.for %reductionRound = %c0 to %reductionRounds step %c1 {
   pim.device #pim.device_mapping<partitions = [2, 4, 1]>
       attributes {
         pim.execution_tile = #pim.execution_tile<groups = [1, 1, 1]>} {
@@ -108,13 +113,16 @@ func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
     %capy = arith.ceildivsi %ey, %c4 : index
     %starty = arith.muli %py, %capy : index
     %tripsy = arith.minsi %capy, %capy : index
-    %tripsk = arith.ceildivsi %kk, %c32 : index
+    %remainingk0 = arith.subi %reductionRounds, %reductionRound : index
+    %remainingk = arith.maxsi %remainingk0, %c0 : index
+    %tripsk = arith.minsi %remainingk, %c1 : index
+    %startk = arith.muli %reductionRound, %c32 : index
 
     %ar = arith.muli %startx, %c8 : index
     %arn = arith.muli %tripsx, %c8 : index
     %arc = arith.muli %capx, %c8 : index
     %akn = arith.muli %tripsk, %c32 : index
-    pim.place %A start[%ar, %c0] size[%arn, %akn] allocation_shape[%arc, %akn]
+    pim.place %A start[%ar, %startk] size[%arn, %akn] allocation_shape[%arc, %c32]
         strides[%lda, %c1]
         {direction = "in", access = 0 : i64,
          replicated_over = ["n"]} : memref<*xi8>
@@ -122,7 +130,7 @@ func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
     %bc = arith.muli %starty, %c32 : index
     %bcn = arith.muli %tripsy, %c32 : index
     %bcc = arith.muli %capy, %c32 : index
-    pim.place %B start[%c0, %bc] size[%akn, %bcn] allocation_shape[%akn, %bcc]
+    pim.place %B start[%startk, %bc] size[%akn, %bcn] allocation_shape[%c32, %bcc]
         strides[%ldb, %c1]
         {direction = "in", access = 1 : i64,
          replicated_over = ["m"]} : memref<*xi8>
@@ -143,7 +151,8 @@ func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
         %init = linalg.fill ins(%c0_i32 : i32) outs(%e : tensor<8x32xi32>) -> tensor<8x32xi32>
         %r = scf.for %tk = %c0 to %tripsk step %c1
              iter_args(%acc = %init) -> (tensor<8x32xi32>) {
-          %k = arith.muli %tk, %c32 : index
+          %globalTk = arith.addi %reductionRound, %tk {pim.device_origin} : index
+          %k = arith.muli %globalTk, %c32 : index
           %da = pim.access %A offset %m sizes [8, 32] strides[%lda, %c1] origin[%m, %k]
                 {id = 0 : i64} : memref<*xi8> -> !pim.access
           %ta = pim.load %da : !pim.access -> tensor<8x32xi8>
@@ -153,13 +162,14 @@ func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
           %mm = linalg.matmul ins(%ta, %tb : tensor<8x32xi8>, tensor<32x32xi8>)
                 outs(%acc : tensor<8x32xi32>) -> tensor<8x32xi32>
           scf.yield %mm : tensor<8x32xi32>
-        }
+        } {pim.temporal_reduction}
         %dc = pim.access %C offset %n sizes [8, 32] strides[%ldb, %c1] origin[%m, %n]
               {id = 2 : i64} : memref<*xi32> -> !pim.access
-        pim.store %r, %dc : tensor<8x32xi32>, !pim.access
+        pim.store %r, %dc {pim.combine = "add"} : tensor<8x32xi32>, !pim.access
       } {pim.axis = #pim.axis<"n">}
     } {pim.axis = #pim.axis<"m">}
   }
+  } {pim.scheduling_axis = "reduction_k"}
   return
 }
 }

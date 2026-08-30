@@ -313,8 +313,8 @@ class PIMOptions:
     # 0 또는 1 = 존재하는 축에서 Group 하나. 공통 lowering은 값을 그대로
     # #pim.execution_tile에 기록하고 PIM DRAM을 채우기 위한 탐색은 하지 않는다.
     # target lowering 은 읽기만 한다:
-    #   upmem  창(round) 반복 — 배정이 상한 안이면 창 1개. K 가 k 상한을 넘으면
-    #          k 창마다 부분합이 나와 host 가 누산한다(unstage accumulate).
+    #   upmem  Common lowering이 만든 round/place/combine을 stage/launch/gather와
+    #          unstage accumulate로 그대로 옮긴다. target이 K를 다시 자르지 않는다.
     #   aimx   상한이 담는 block group 수 × 물리 group 크기가 m_t·n_max·k_max.
     #          k 는 host 누산 창이라 split-K kernel 이 필요 없다.
     tile_m: int = 0

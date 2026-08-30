@@ -40,13 +40,15 @@ func.func @matvec(%A: memref<*xf32>, %x: memref<*xf32>, %y: memref<*xf32>)
   %c16 = arith.constant 16 : index
   %cst = arith.constant 0.0 : f32
 
+  scf.for %reductionRound = %c0 to %c1 step %c1 {
   pim.device #pim.device_mapping<partitions = [1, 1, 1]> attributes {
         pim.execution_tile = #pim.execution_tile<groups = [1, 1, 1]>} {
   ^bb0(%pm: index, %device_n_unused: index, %device_k_unused: index):
-    pim.place %A start[%c0, %c0] size[%c8, %c16] allocation_shape[%c8, %c16]
+    %kStart = arith.muli %reductionRound, %c16 : index
+    pim.place %A start[%c0, %kStart] size[%c8, %c16] allocation_shape[%c8, %c16]
         strides[%c16, %c1] {direction = "in", access = 0 : i64}
         : memref<*xf32>
-    pim.place %x start[%c0] size[%c16] allocation_shape[%c16] strides[%c1]
+    pim.place %x start[%kStart] size[%c16] allocation_shape[%c16] strides[%c1]
         {direction = "in", access = 1 : i64,
          replicated_over = ["m"]} : memref<*xf32>
     pim.place %y start[%c0] size[%c8] allocation_shape[%c8] strides[%c1]
@@ -54,13 +56,16 @@ func.func @matvec(%A: memref<*xf32>, %x: memref<*xf32>, %y: memref<*xf32>)
         : memref<*xf32>
 
     scf.for %mTile = %c0 to %c1 step %c1 {
-      %m = arith.muli %mTile, %c8 : index
+      %globalMTile = arith.addi %c0, %mTile {pim.device_origin} : index
+      %m = arith.muli %globalMTile, %c8 : index
       %empty = tensor.empty() : tensor<8xf32>
       %init = linalg.fill ins(%cst : f32) outs(%empty : tensor<8xf32>)
           -> tensor<8xf32>
       %result = scf.for %kTile = %c0 to %c1 step %c1
           iter_args(%acc = %init) -> tensor<8xf32> {
-        %k = arith.muli %kTile, %c16 : index
+        %globalKTile = arith.addi %reductionRound, %kTile
+            {pim.device_origin} : index
+        %k = arith.muli %globalKTile, %c16 : index
         %aAccess = pim.access %A offset %m sizes [8, 16]
             strides[%c16, %c1] origin[%m, %k] {id = 0 : i64}
             : memref<*xf32> -> !pim.access
@@ -72,12 +77,14 @@ func.func @matvec(%A: memref<*xf32>, %x: memref<*xf32>, %y: memref<*xf32>)
             ins(%aTile, %xTile : tensor<8x16xf32>, tensor<16xf32>)
             outs(%acc : tensor<8xf32>) -> tensor<8xf32>
         scf.yield %partial : tensor<8xf32>
-      }
+      } {pim.temporal_reduction}
       %yAccess = pim.access %y offset %m sizes [8] strides[%c1]
           origin[%m] {id = 2 : i64} : memref<*xf32> -> !pim.access
-      pim.store %result, %yAccess : tensor<8xf32>, !pim.access
+      pim.store %result, %yAccess {pim.combine = "add"}
+          : tensor<8xf32>, !pim.access
     } {pim.axis = #pim.axis<"m">}
   }
+  } {pim.scheduling_axis = "reduction_k"}
   return
 }
 }

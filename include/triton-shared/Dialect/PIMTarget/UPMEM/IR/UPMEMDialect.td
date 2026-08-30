@@ -218,9 +218,10 @@ def UPMEM_ForeachGroupOp : UPMEM_Op<"foreach_group", [NoTerminator]> {
 //                sizes로 간격을 재면 엉뚱한 자리를 읽는다.
 //   tile       = upmem.stage와 같은 뜻. 유닛 버퍼가 타일 단위로 쓰여 있으므로 되돌릴 때도
 //                같은 순서로 읽어야 한다.
-//   accumulate = k 창 번호. 없으면 언제나 대입이고, 있으면 0(첫 부분합)은 대입,
-//                그 뒤는 누산(+=)이다 — k 창은 launch 마다 K 의 한 구간만 누적한
-//                부분합을 내므로 host 가 창을 건너 더해야 완성값이 된다.
+//   accumulate = PIM Common IR이 정한 reduction_k scheduling round. 없으면 언제나
+//                대입이고, 있으면 0(첫 partial)은 대입, 그 뒤는 누산(+=)이다.
+//                UPMEM lowering은 이 값을 새로 계산하지 않고 pim.combine과 Common
+//                scheduling loop에서 그대로 받는다.
 def UPMEM_UnstageOp : UPMEM_Op<"unstage", [AttrSizedOperandSegments]> {
   let summary = "Scatter a tile-major buffer back into a strided region";
   let arguments = (ins AnyMemRef:$buffer, AnyRankedOrUnrankedMemRef:$dst,
