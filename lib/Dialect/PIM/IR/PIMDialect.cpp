@@ -140,3 +140,11 @@ LogicalResult PlaceOp::verify() {
     return emitOpError("direction must be \"in\" or \"out\"");
   return success();
 }
+
+LogicalResult StoreOp::verify() {
+  auto combine = (*this)->getAttrOfType<StringAttr>("pim.combine");
+  if (combine && combine.getValue() != "add")
+    return emitOpError(
+        "pim.combine currently supports only the normalized add combiner");
+  return success();
+}

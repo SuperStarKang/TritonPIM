@@ -14,8 +14,9 @@ Tile들을 `[p_m,p_n,p_k]` device grid에 배치하고, Tile 수가 active unit 
 
 Common IR은 연산별 target 구현을 선택하지 않는다. `pim.access/load/store`, linalg
 compute, 세 hierarchy attribute, placement만 만들고 UPMEM/AiMX lowering이 이 의미를
-각 target IR로 옮긴다. Reduction 위치, 물리 padding, descriptor program, tasklet 협력
-방식은 target lowering의 책임이다.
+각 target IR로 옮긴다. Reduction 축·temporal window·partial combiner는 Common IR이
+확정한다. 그 combiner를 host accumulation, vACC 등 어느 target primitive로 구현할지와
+물리 padding, descriptor program, tasklet 협력 방식만 target lowering의 책임이다.
 
 ## 2. 공통 hardware profile
 
@@ -139,6 +140,18 @@ pim.place %A
 - `strides`: 원본 buffer stride
 - `replicated_over`: 접근이 불변이라 같은 데이터를 받는 partition 축
 
+이 계약은 reduction K에도 예외가 없다. spatial split-K plane이 Execution Tile의
+K residency보다 크면 Common IR이 `pim.scheduling_axis = "reduction_k"` loop를 만들고
+device-local reduction loop를 `execution_tile.groups[k]` Group 이하로 제한한다. 따라서
+GEMM의 A/B `allocation_shape[K]`는 항상 `block_k × group_k × tile_k`이며 spatial
+plane 전체 K가 아니다. 각 temporal round의 `start[K]`와 tail `size[K]`도 Common
+IR에 이미 계산되어 있다.
+
+여러 K window가 만드는 partial output은 `pim.store`의 `pim.combine`에 원래 reduction
+combiner를 기록한다. 현재 정규화되는 GEMM/GEMV는 `pim.combine = "add"`다. UPMEM은
+이를 host accumulation으로, AiMX는 vACC로 구현할 수 있지만 window 경계나 combine
+종류를 다시 추론하거나 바꿀 수는 없다.
+
 `replicated_over`는 access dependency에서 파생한다. 별도의 `axis_sources`는 없다.
 예를 들어 GEMM의 A는 `(m,k)`에 의존하므로 n partition에서 복제되고, B는 `(k,n)`에
 의존하므로 m partition에서 복제된다.
@@ -160,9 +173,11 @@ TTShared IR
   -> UPMEM IR 또는 AiMX IR
 ```
 
-Common verifier는 hierarchy 정합성, access/place 일대일 대응, local working set 상한,
-정적으로 계산 가능한 Execution Tile allocation의 unit capacity 상한을 검사한다. 동적
-allocation과 target 물리 padding을 포함한 최종 용량은 target lowering이 검사한다.
+Common verifier는 hierarchy 정합성, temporal K round와 local window의 대응,
+access/place 일대일 대응, hierarchy에서 파생한 정확한 resident allocation,
+partial store의 explicit combine, local working set 상한과 Execution Tile allocation의
+unit capacity 상한을 검사한다. target 물리 padding을 포함한 최종 용량은 target
+lowering이 검사한다.
 
 ## 7. GEMM 예시
 
@@ -175,7 +190,10 @@ Triton Block이 `[32,32,16]`, Group이 `[2,2,2]` Block, Execution Tile이
 4. device `(dm,dn,0)`는 해당 m/n Execution Tile 하나를 맡는다.
 5. 전체 m/n Tile 수가 4×16보다 크면 바깥 scheduling round가 같은 device를 다음
    Execution Tile에 다시 사용한다.
-6. A placement에는 `replicated_over=["n"]`, B에는 `replicated_over=["m"]`가 붙는다.
+6. 한 spatial K plane이 1792보다 크면 `reduction_k` scheduling round마다 같은 device가
+   다음 K Execution Tile을 실행하며 A/B placement의 K allocation은 항상 1792다.
+7. 각 K round의 C partial store에는 `pim.combine="add"`가 붙는다.
+8. A placement에는 `replicated_over=["n"]`, B에는 `replicated_over=["m"]`가 붙는다.
 
 UPMEM lowering은 이 구조를 DPU별 MRAM/WRAM과 tasklet 협력 실행으로 옮긴다. UPMEM에서
 reduction window가 여러 개면 host가 partial을 합친다. AiMX lowering은 같은 Common

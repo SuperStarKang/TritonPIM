@@ -68,9 +68,10 @@ def PIM_TargetProfileAttr : PIM_Attr<"TargetProfile", "target_profile"> {
   let genVerifyDecl = 1;
 }
 
-// PIM Common IR의 축은 [m, n, k]로 고정한다. m/n은 병렬 출력 축이고 k는
-// reduction 축이다. 축의 이름 자체가 의미를 가지므로 별도의 scope/kind 문자열은
-// 두지 않는다.
+// PIM Common IR의 좌표 이름은 [m, n, k]로 고정한다. m/n은 병렬 출력 축이고
+// pim.axis<"k">는 서로 다른 partial output을 만드는 spatial split-K plane이다.
+// plane 내부의 temporal reduction loop는 pim.temporal_reduction으로 명시한다.
+// 축의 이름 자체가 의미를 가지므로 별도의 scope/kind 문자열은 두지 않는다.
 def PIM_AxisAttr : PIM_Attr<"Axis", "axis"> {
   let summary = "Canonical m, n, or k axis identity";
   let parameters = (ins "::mlir::StringAttr":$name);
@@ -82,7 +83,8 @@ def PIM_AxisAttr : PIM_Attr<"Axis", "axis"> {
 // 이 dialect 가 target 무관하다는 전제가 깨지고, 공통 pass 가 읽지 않는 값이면 target IR 에
 // 두면 된다. 공통 pass 가 정말로 필요로 하는 기계 값은 위 target_profile 의 필드가 된다.
 
-// pim.device 의 필수 파라미터. 고정 축 순서 [m,n,k]의 partition 수다. 없는 축은 1이다.
+// pim.device 의 필수 파라미터. 고정 축 순서 [m,n,spatial-k]의 partition 수다.
+// 없는 축은 1이다.
 def PIM_DeviceMappingAttr : PIM_Attr<"DeviceMapping", "device_mapping"> {
   let summary = "PIM Device partitions in canonical [m,n,k] order";
   let parameters = (ins "::mlir::DenseI64ArrayAttr":$partitions);
@@ -114,7 +116,8 @@ def PIM_BlockGroupAttr : PIM_Attr<"BlockGroup", "block_group"> {
 // legality 상한이다.
 // spatial split-K가 있으면 pim.axis="k" 좌표마다 별도 Execution Tile instance가
 // 생기고, groups[k]는 각 spatial plane 내부 temporal reduction residency를 뜻한다.
-// Group 순회 순서는 target 실행 방식에 속하므로 target lowering이 정한다.
+// Common scheduling이 각 Tile의 Group 범위와 반복 순서를 명시한다. target lowering은
+// 그 경계를 바꾸지 않고 고정된 Tile 내부 실행을 target op로 옮긴다.
 def PIM_ExecutionTileAttr : PIM_Attr<"ExecutionTile", "execution_tile"> {
   let summary = "Resident group grid of one execution tile";
   let parameters = (ins "::mlir::DenseI64ArrayAttr":$groups);
@@ -167,11 +170,14 @@ def PIM_LoadOp : PIM_Op<"load", [MemoryEffects<[MemRead]>]> {
   let assemblyFormat = "$access attr-dict `:` type($access) `->` type($result)";
 }
 
-// local→host 전송.
+// local→host 전송. temporal reduction 또는 spatial split-K의 partial이면
+// `pim.combine = "add"`처럼 최종 buffer에 결합할 연산 의미를 명시한다. 이 값은
+// target policy가 아니라 원래 reduction의 combiner이며 target은 이를 재추론하지 않는다.
 def PIM_StoreOp : PIM_Op<"store", [MemoryEffects<[MemWrite]>]> {
   let summary = "Store a tile through a PIM access";
   let arguments = (ins AnyRankedTensor:$value, PIM_AccessType:$access);
   let assemblyFormat = "$value `,` $access attr-dict `:` type($value) `,` type($access)";
+  let hasVerifier = 1;
 }
 
 // PIM Device 하나가 하는 일을 담는 region. region 밖 = host(데이터 준비·배포·회수),

@@ -166,6 +166,11 @@ def PIMMapDevices : Pass<"pim-map-devices", "mlir::ModuleOp"> {
     여러 round에서 재사용한다. 마지막 round에 Tile이 없는 device는 0회 loop인 no-op이다.
     device 안에서 좌표를 0부터 세고, 전역 좌표는 몸체 첫머리에서 다시 만들어
     `pim.device_origin` 표시를 단다. round loop는 pim.device 바깥 host IR에 남는다.
+    이름 없는 reduction loop도 execution_tile.groups[k] 범위로 좁히고
+    `pim.scheduling_axis = "reduction_k"` round를 device 바깥에 만든다. 따라서
+    `pim.device` 한 번은 정확히 한 resident Execution Tile만 실행한다. 여러 temporal
+    window가 만드는 partial output의 결합 연산은 `pim.store`의 `pim.combine`에
+    명시하며 target은 window나 combiner를 다시 추론하지 않는다.
   }];
   let options = [
     Option<"pM", "p-m", "int64_t", "1", "m축 device partition 수.">,
@@ -201,8 +206,8 @@ def PIMFormExecutionTiles : Pass<"pim-form-execution-tiles", "mlir::ModuleOp"> {
     Option<"tileK", "tile-k", "int64_t", "0",
            "각 spatial K plane 내부 reduction 방향 Block Group 수. 0 또는 1 = 한 Group. "
            "k은 독립된 spatial output 축이고 tile-k는 그 plane "
-           "내부의 temporal window다. 여러 window의 partial 결합 방식은 target "
-           "lowering이 정한다.">,
+           "내부의 temporal window다. 여러 window의 partial 결합 의미는 Common "
+           "IR에 기록하고 실제 host/device 구현만 target lowering이 정한다.">,
   ];
   let constructor = "mlir::triton::createPIMFormExecutionTilesPass()";
   let dependentDialects = ["mlir::pim::PIMDialect"];
@@ -233,11 +238,17 @@ def PIMVerify : Pass<"pim-verify", "mlir::ModuleOp"> {
     - device partition 의 곱이 profile의 num_units를 넘지 않는다.
     - `pim.device`에 `#pim.execution_tile`이 존재하고 Block×Group에서 파생한
       shape 및 device mapping과 일치한다.
+    - `pim.place.allocation_shape`가 hierarchy에서 파생한 Execution Tile 하나의
+      고정 resident extent와 정확히 일치한다.
+    - temporal K scheduling round와 device-local reduction window가 함께 존재하고,
+      local window가 `execution_tile.groups[k]` 이하로 제한되며 partial store가
+      combiner를 명시한다.
     - 한 Group의 local buffer 한 벌이 local_capacity_limit_bytes 안이다. lane들은
       같은 Group을 협력 실행하므로 buffer를 lane 수만큼 복제하지 않는다.
     - 정적으로 아는 값끼리는 start·size·allocation_shape 부등식을 직접 검사한다. 런타임 값이면
       배치 pass 가 clamp 식을 만들었는지 구조로 확인한다.
-    버퍼별 용량 검사는 버퍼를 어떻게 나누는지가 target lowering policy 라 여기 두지 않는다.
+    정적으로 계산 가능한 모든 resident allocation의 합은 한 PIM unit의 공통 capacity
+    limit도 넘지 않아야 한다. target은 이 placement를 더 작게 다시 자르지 않는다.
   }];
   let constructor = "mlir::triton::createPIMVerifyPass()";
   let dependentDialects = ["mlir::pim::PIMDialect"];

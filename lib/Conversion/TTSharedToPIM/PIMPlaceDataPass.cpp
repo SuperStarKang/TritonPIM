@@ -115,6 +115,15 @@ static std::optional<int64_t> stepOfTerm(Value term) {
     term = c.getIn();
   if (isa<BlockArgument>(term))
     return 1;
+  if (Operation *origin = term.getDefiningOp();
+      origin && origin->hasAttr("pim.device_origin")) {
+    auto add = dyn_cast<arith::AddIOp>(origin);
+    if (!add)
+      return std::nullopt;
+    // start + local*step에서 scheduling round에 의존하는 start는 loop 한
+    // 회전의 전진 폭과 무관하다. local 쪽 scaled 항만 따라간다.
+    return stepOfTerm(add.getRhs());
+  }
   auto mul = term.getDefiningOp<arith::MulIOp>();
   if (!mul)
     return std::nullopt;
@@ -255,18 +264,21 @@ struct PIMPlaceDataPass
                         b.create<arith::CeilDivSIOp>(
                             loc, b.create<arith::SubIOp>(loc, ub, lb), step));
 
-      // 축 loop의 MRAM capacity는 전체 문제를 device 수로 나눈 값이 아니라 execution
-      // tile 하나의 고정 크기다. 여러 scheduling round가 같은 buffer를 재사용하므로
-      // 마지막 round의 실제 trips가 작더라도 capacity는 변하지 않는다.
+      // 모든 hierarchy loop의 capacity는 Execution Tile 하나의 고정 크기다.
+      // 여러 scheduling round가 같은 buffer를 재사용하므로 마지막 round의 실제
+      // trips가 작더라도 allocation_shape는 변하지 않는다.
       r.capacityTiles = r.trips;
       r.axis = StringAttr();
       r.partitions = 1;
+      if (l->hasAttr("pim.temporal_reduction"))
+        r.capacityTiles =
+            b.create<arith::ConstantIndexOp>(loc, tileGroups[2]);
       if (auto name = l->getAttrOfType<pim::AxisAttr>("pim.axis")) {
         r.axis = name.getName();
         StringRef axis = name.getName().getValue();
-        // spatial k loop 한 회전이 이미 split-K Execution Tile 하나다.
-        // execution_tile.groups[k]는 그 plane 내부 temporal reduction window이므로
-        // spatial placement capacity에는 곱하지 않는다.
+        // spatial k loop 한 회전은 split-K plane 하나다. 그 plane 내부 temporal
+        // reduction loop에는 위 pim.temporal_reduction 표시가 있고, 그 loop가
+        // execution_tile.groups[k]를 placement capacity에 반영한다.
         int axisNumber = axis == "m" ? 0 : axis == "n" ? 1
                                                      : axis == "k" ? 2 : -1;
         if (axisNumber < 0)

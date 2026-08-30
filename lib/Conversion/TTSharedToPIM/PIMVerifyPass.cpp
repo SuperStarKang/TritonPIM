@@ -34,6 +34,51 @@ static bool isClamped(Value v) {
          isa_and_nonnull<arith::SelectOp, arith::MinSIOp, arith::MaxSIOp>(def);
 }
 
+// pim-map-devices가 만드는 local window의 upper bound는
+// min(execution_tile.groups[k], remaining)이다. operand 순서가 바뀌어도 같은
+// 계약으로 보고, 다른 임의의 clamp는 temporal K window로 인정하지 않는다.
+static bool isClampedTo(Value value, int64_t limit) {
+  auto min = value.getDefiningOp<arith::MinSIOp>();
+  if (!min)
+    return false;
+  return getConstantIntValue(min.getLhs()) == limit ||
+         getConstantIntValue(min.getRhs()) == limit;
+}
+
+static std::optional<int64_t> constantIndexExpr(Value value) {
+  if (std::optional<int64_t> constant = getConstantIntValue(value))
+    return constant;
+  if (auto cast = value.getDefiningOp<arith::IndexCastOp>())
+    return constantIndexExpr(cast.getIn());
+  if (auto mul = value.getDefiningOp<arith::MulIOp>()) {
+    std::optional<int64_t> lhs = constantIndexExpr(mul.getLhs());
+    std::optional<int64_t> rhs = constantIndexExpr(mul.getRhs());
+    if (!lhs || !rhs)
+      return std::nullopt;
+    if (*lhs < 0 || *rhs < 0 ||
+        (*lhs != 0 &&
+         *rhs > std::numeric_limits<int64_t>::max() / *lhs))
+      return std::nullopt;
+    return *lhs * *rhs;
+  }
+  return std::nullopt;
+}
+
+static bool dependsOn(Value value, ValueRange roots) {
+  SmallVector<Value> work{value};
+  llvm::DenseSet<Value> seen;
+  while (!work.empty()) {
+    Value current = work.pop_back_val();
+    if (!seen.insert(current).second)
+      continue;
+    if (llvm::is_contained(roots, current))
+      return true;
+    if (Operation *def = current.getDefiningOp())
+      work.append(def->getOperands().begin(), def->getOperands().end());
+  }
+  return false;
+}
+
 struct PIMVerifyPass
     : public mlir::triton::impl::PIMVerifyBase<PIMVerifyPass> {
   using PIMVerifyBase::PIMVerifyBase;
@@ -136,6 +181,13 @@ struct PIMVerifyPass
         }
         if (!hasComputeAxis)
           continue;
+        if (i == 2 &&
+            !hierarchyAxes[i]->hasAttr("pim.temporal_reduction")) {
+          func->emitError(
+              "pim-verify: the reduction loop is not materialized as a "
+              "temporal K Execution Tile");
+          return WalkResult::interrupt();
+        }
         int64_t actual = pim::tileElementsAlong(hierarchyAxes[i], loops);
         if (actual != groupShape[i]) {
           func->emitError("pim-verify: #pim.block × #pim.block_group gives ")
@@ -172,6 +224,45 @@ struct PIMVerifyPass
       return device->emitError(
           "pim-verify: cannot derive the execution tile shape from the "
           "three hierarchy attributes");
+    if (llvm::any_of(executionShape,
+                     [](int64_t extent) { return extent < 1; }))
+      return device->emitError(
+          "pim-verify: execution tile extents must be positive");
+
+    SmallVector<scf::ForOp> deviceLoops;
+    device.getBody().walk<WalkOrder::PreOrder>(
+        [&](scf::ForOp loop) { deviceLoops.push_back(loop); });
+    SmallVector<scf::ForOp> temporalReductions;
+    for (scf::ForOp loop : deviceLoops)
+      if (loop->hasAttr("pim.temporal_reduction"))
+        temporalReductions.push_back(loop);
+    if (temporalReductions.size() > 1)
+      return device->emitError(
+          "pim-verify: one Execution Tile may have only one temporal K "
+          "reduction loop");
+
+    if (!temporalReductions.empty()) {
+      scf::ForOp reduction = temporalReductions.front();
+      int64_t tileK = execution.getGroups().asArrayRef()[2];
+      if (!matchPattern(reduction.getLowerBound(), m_Zero()) ||
+          getConstantIntValue(reduction.getStep()) != 1 ||
+          !isClampedTo(reduction.getUpperBound(), tileK))
+        return reduction->emitError(
+            "pim-verify: the temporal K loop must be a zero-based unit-step "
+            "window clamped to execution_tile.groups[k] = ")
+               << tileK;
+    }
+
+    bool hasTemporalRound = false;
+    for (Operation *parent = device->getParentOp(); parent;
+         parent = parent->getParentOp())
+      if (auto loop = dyn_cast<scf::ForOp>(parent))
+        if (auto axis = loop->getAttrOfType<StringAttr>("pim.scheduling_axis"))
+          hasTemporalRound |= axis.getValue() == "reduction_k";
+    if (hasTemporalRound != !temporalReductions.empty())
+      return device->emitError(
+          "pim-verify: temporal K scheduling round and device-local "
+          "reduction window must occur together");
 
     int64_t used = 1;
     for (int64_t p : device.getMapping().getPartitions().asArrayRef())
@@ -229,6 +320,48 @@ struct PIMVerifyPass
         std::optional<int64_t> size = getConstantIntValue(s);
         std::optional<int64_t> allocation =
             getConstantIntValue(place.getAllocationShape()[d]);
+
+        // placement가 실제 Execution Tile 하나의 resident buffer인지 hierarchy와
+        // 독립적으로 맞춰 본다. access dimension을 모는 m/n loop는 해당 Tile의
+        // Group 수만큼, spatial split-K는 plane 하나만큼, temporal reduction은
+        // tile_k Group 수만큼 상주해야 한다.
+        llvm::SmallPtrSet<Operation *, 4> drivers;
+        pim::collectDrivers(access.getOrigin()[d], deviceLoops, drivers);
+        int64_t expected = access.getSizes()[d];
+        bool hierarchyOnly = true;
+        for (Operation *driver : drivers) {
+          if (auto axis = driver->getAttrOfType<pim::AxisAttr>("pim.axis")) {
+            StringRef name = axis.getName().getValue();
+            ArrayRef<int64_t> groups = execution.getGroups().asArrayRef();
+            int64_t factor = name == "m"   ? groups[0]
+                             : name == "n" ? groups[1]
+                             : name == "k" ? 1
+                                           : 0;
+            if (factor < 1 ||
+                expected > std::numeric_limits<int64_t>::max() / factor)
+              return place->emitError(
+                  "pim-verify: resident allocation extent overflows i64");
+            expected *= factor;
+          } else if (driver->hasAttr("pim.temporal_reduction")) {
+            int64_t factor = execution.getGroups().asArrayRef()[2];
+            if (expected > std::numeric_limits<int64_t>::max() / factor)
+              return place->emitError(
+                  "pim-verify: resident allocation extent overflows i64");
+            expected *= factor;
+          } else {
+            hierarchyOnly = false;
+          }
+        }
+        if (hierarchyOnly) {
+          allocation = constantIndexExpr(place.getAllocationShape()[d]);
+          if (!allocation)
+            return place->emitError("pim-verify: resident allocation_shape[")
+                   << d << "] must be a static Execution Tile extent";
+          if (*allocation != expected)
+            return place->emitError("pim-verify: allocation_shape[")
+                   << d << "] is " << *allocation
+                   << " but the Execution Tile requires " << expected;
+        }
         if (size && *size < 0)
           return place->emitError("pim-verify: negative size on buffer axis ")
                  << d;
@@ -274,6 +407,26 @@ struct PIMVerifyPass
       return device->emitError("pim-verify: ")
              << accessIds.size() << " accesses but " << placeIds.size()
              << " placements";
+
+    if (!temporalReductions.empty() &&
+        temporalReductions.front().getNumResults() != 0) {
+      bool sawPartialStore = false;
+      bool missingCombine = false;
+      device.walk([&](pim::StoreOp store) {
+        if (!dependsOn(store.getValue(), temporalReductions.front().getResults()))
+          return;
+        sawPartialStore = true;
+        missingCombine |=
+            !store->getAttrOfType<StringAttr>("pim.combine");
+      });
+      if (!sawPartialStore)
+        return device->emitError(
+            "pim-verify: temporal K reduction has no partial output store");
+      if (missingCombine)
+        return device->emitError(
+            "pim-verify: every temporal K partial store needs an explicit "
+            "pim.combine");
+    }
     std::optional<int64_t> unitLimit = pim::unitCapacityLimitBytes(profile);
     if (allAllocationsStatic && unitLimit && *unitLimit > 0 &&
         staticAllocationBytes > *unitLimit)
