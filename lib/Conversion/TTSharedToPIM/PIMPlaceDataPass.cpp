@@ -109,7 +109,7 @@ struct LoopRange {
   Value first;         // 첫 반복의 좌표
   Value trips;         // 실제로 도는 횟수
   Value capacityTiles; // 배정량. device 불변이다.
-  StringAttr axis;     // pim.axis 이름. 축 loop가 아니면 널.
+  StringAttr axis;     // canonical device axis. semantic reduction은 k.
   int64_t partitions;  // 이 축의 device partition 수
 };
 
@@ -119,7 +119,7 @@ struct LoopRange {
 // 구간이라 기존 span/capacity 식이 그대로 맞는다. 함께 모는 loop 가 tile 보다 크게
 // 전진하면(cyclic 분할) 영역이 띄엄띄엄이므로 진단한다.
 // P 의 전진 폭(= 안쪽 loop 의 전체 구간)은 런타임 값이라 여기서 증명하지 못한다 —
-// kernel 이 연속 구간을 만들도록 쓰였다는 것이 계약이다(split_k.py 의 blocked 형태).
+// partitioned logical coordinate가 연속 구간을 만들도록 정규화됐다는 것이 계약이다.
 static LogicalResult
 checkBlockedComposite(pim::AccessOp access, unsigned d, Operation *partitioned,
                       StringAttr axisName, ArrayRef<scf::ForOp> loops,
@@ -228,20 +228,23 @@ struct PIMPlaceDataPass
       r.capacityTiles = Value();
       r.axis = StringAttr();
       r.partitions = 1;
-      if (l->hasAttr("pim.temporal_reduction"))
+      if (l->hasAttr("pim.temporal_reduction")) {
+        r.axis = b.getStringAttr("k");
+        r.partitions = partitions[2];
         r.capacityTiles =
             b.create<arith::ConstantIndexOp>(loc, tileGroups[2]);
+      }
       if (auto name = l->getAttrOfType<pim::AxisAttr>("pim.axis")) {
         r.axis = name.getName();
         StringRef axis = name.getName().getValue();
-        // spatial k loop 한 회전은 split-K plane 하나다. 그 plane 내부 temporal
-        // reduction loop에는 위 pim.temporal_reduction 표시가 있고, 그 loop가
-        // execution_tile.groups[k]를 placement capacity에 반영한다.
-        int axisNumber = axis == "m" ? 0 : axis == "n" ? 1 : 2;
+        if (axis == "k")
+          return l->emitError(
+              "pim-place-data: source-level pim.axis=\"k\" is not part of "
+              "the Common IR hierarchy; use the semantic pim.reduction loop");
+        int axisNumber = axis == "m" ? 0 : 1;
         r.partitions = partitions[axisNumber];
-        int64_t capacityTiles = axis == "k" ? 1 : tileGroups[axisNumber];
         r.capacityTiles =
-            b.create<arith::ConstantIndexOp>(loc, capacityTiles);
+            b.create<arith::ConstantIndexOp>(loc, tileGroups[axisNumber]);
       }
       ranges[l] = r;
       firstMap.map(r.key, r.first);

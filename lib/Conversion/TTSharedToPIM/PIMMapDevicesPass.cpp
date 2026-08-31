@@ -189,10 +189,10 @@ struct PIMMapDevicesPass
     }
     if (duplicateAxis)
       return func->emitError(
-          "pim-map-devices: each canonical axis m, n, and k may occur at most once");
+          "pim-map-devices: each source pim.axis may occur at most once");
 
-    // Execution Tile의 K는 spatial pim.axis="k"가 아니라 그 plane 안에서
-    // PIMFormCompute가 명시한 semantic reduction을 자른다. 주소를 모는 loop를
+    // Execution Tile의 K는 source pim.axis="k"가 아니라 PIMFormCompute가
+    // 명시한 하나의 semantic reduction을 자른다. 주소를 모는 loop를
     // 보고 연산 의미를 재해석하지 않는다.
     SmallVector<scf::ForOp> reductions;
     for (scf::ForOp loop : allLoops)
@@ -210,18 +210,14 @@ struct PIMMapDevicesPass
     scf::ForOp reductionLoop =
         reductions.empty() ? scf::ForOp() : reductions.front();
 
-    // pim.axis="k" is the spatial split-K plane coordinate.  Once such a
-    // kernel writes a value, the plane is not an independent output axis: it
-    // is one partial of the semantic reduction.  Require that meaning to have
-    // been fixed by PIMFormCompute instead of letting a target infer it from
-    // addresses or from the name of a linalg op.  Access-only tests/analysis
-    // kernels remain legal because they do not claim an output value.
-    bool hasStore = false;
-    func.walk([&](pim::StoreOp) { hasStore = true; });
-    if (seen[2] && hasStore && !reductionLoop)
+    // K는 source grid의 독립 plane이 아니다. PIMFormCompute가 만든 하나의
+    // semantic reduction domain을 이 pass가 p_k와 tile_k로 직접 분할한다.
+    // 수동 작성 IR도 같은 계약을 지키게 하여 두 K domain이 공존하지 않게 한다.
+    if (seen[2])
       return func->emitError(
-          "pim-map-devices: a spatial K output needs one semantic "
-          "pim.reduction before device mapping");
+          "pim-map-devices: source-level pim.axis=\"k\" is not supported; "
+          "represent K with one pim.reduction loop and partition that "
+          "semantic domain with p_k");
 
     if (loops.empty() && !reductionLoop)
       return success();
@@ -239,9 +235,16 @@ struct PIMMapDevicesPass
       if (partition < 1)
         return func->emitError(
             "pim-map-devices: p_m, p_n, and p_k must be positive");
-      if (!seen[axis] && partition != 1)
+      const bool hasSemanticAxis =
+          axis == 2 ? static_cast<bool>(reductionLoop) : seen[axis];
+      if (!hasSemanticAxis && partition != 1) {
+        if (axis == 2)
+          return func->emitError(
+              "pim-map-devices: p_k > 1 requires one semantic "
+              "pim.reduction loop");
         return func->emitError(
-            "pim-map-devices: a missing axis must have partition 1");
+            "pim-map-devices: a missing M/N axis must have partition 1");
+      }
       product *= partition;
     }
     if (product > profile.getNumUnits())
@@ -253,8 +256,7 @@ struct PIMMapDevicesPass
     SmallVector<int64_t> granularity;
     for (StringAttr name : names) {
       int64_t axis = canonicalAxis(name.getValue());
-      int64_t groups = name.getValue() == "k" ? 1 : tileGroups[axis];
-      granularity.push_back(groups);
+      granularity.push_back(tileGroups[axis]);
     }
 
     scf::ForOp rootLoop;
@@ -371,14 +373,18 @@ struct PIMMapDevicesPass
       scheduled.setInsertionPointToStart(round.getBody());
     }
 
-    // Spatial device grid가 정해진 뒤 같은 device set이 temporal K Execution
-    // Tile들을 반복한다. 이 loop와 reduction loop의 local bound가 Common IR에
-    // 남으므로 target은 K축을 다시 찾거나 window 수를 계산하지 않는다.
+    // 하나의 semantic K domain을 (round, device_k)로 나눈다. 각 device는 한
+    // round에 tile_k Block Group을 담당한다. 따라서 K round 수는
+    // ceildiv(ceildiv(total_k_groups, tile_k), p_k)이다.
     scf::ForOp reductionRound;
     if (reductionLoop) {
       Value unit = scheduled.create<arith::ConstantIndexOp>(loc, tileGroups[2]);
-      Value rounds = scheduled.create<arith::CeilDivSIOp>(
+      Value executionTiles = scheduled.create<arith::CeilDivSIOp>(
           loc, reductionRange.extent, unit);
+      Value active =
+          scheduled.create<arith::ConstantIndexOp>(loc, partitions[2]);
+      Value rounds =
+          scheduled.create<arith::CeilDivSIOp>(loc, executionTiles, active);
       reductionRound = scheduled.create<scf::ForOp>(loc, c0, rounds, c1);
       reductionRound->setAttr("pim.scheduling_axis",
                               scheduled.getStringAttr("reduction_k"));
@@ -416,15 +422,14 @@ struct PIMMapDevicesPass
     }
 
     if (reductionLoop) {
-      Value noDevicePartition = b.create<arith::ConstantIndexOp>(loc, 0);
       scheduleLoop(b, reductionLoop, reductionRound.getInductionVar(),
-                   noDevicePartition, /*partitions=*/1, tileGroups[2],
+                   body->getArgument(2), partitions[2], tileGroups[2],
                    reductionRange);
       reductionLoop->setAttr("pim.temporal_reduction", b.getUnitAttr());
 
       // Window마다 accumulator가 identity에서 다시 시작하므로 reduction 결과는
-      // 하나의 partial contribution이다. spatial pim.axis="k"가 있으면 서로 다른
-      // plane/device도 같은 final M/N destination의 contribution이다. 원래 store의
+      // 하나의 partial contribution이다. 서로 다른 (round, device_k)는 같은 final
+      // M/N destination의 contribution이다. 원래 store의
       // access가 operation의 최종 논리 destination이므로 pim.combine이 value와 그
       // access를 직접 연결한다. target은 destination이나 reduction 여부를 access
       // rank에서 다시 추론하지 않는다. combine 전에 epilogue가 끼면 partial들을

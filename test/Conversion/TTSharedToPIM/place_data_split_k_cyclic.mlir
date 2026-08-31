@@ -1,6 +1,6 @@
-// cyclic 분할(k_part 가 tile 간격으로 시작하고 reduction 이 SPLIT_K·tile 씩 건너뜀)은
-// 나뉜 device 의 K 영역이 띄엄띄엄이라 배치가 성립하지 않는다 — 진단으로 막는다.
-// reduction 항의 계수 256 ≠ tile 16 이 판정 근거다.
+// source kernel이 만든 cyclic split-K plane은 Common scheduling 전에 K를 확정하므로
+// 더 이상 placement 대상으로 받지 않는다. 하나의 semantic reduction domain으로
+// 정규화되지 않은 pim.axis="k"를 mapping 단계에서 즉시 거부한다.
 // RUN: triton-shared-opt "--pim-map-devices=p-k=2" --pim-place-data -verify-diagnostics %s
 
 module attributes {pim.target_profile = #pim.target_profile<
@@ -10,6 +10,7 @@ module attributes {pim.target_profile = #pim.target_profile<
     lanes_per_core = 1,
     bank_capacity_limit_bytes = 3072, local_capacity_limit_bytes = 49152>} {
 
+// expected-error @below {{source-level pim.axis="k" is not supported}}
 func.func @split_k_cyclic(%A: memref<*xi8>, %tr: index, %tp: index, %tk: index,
                           %lda: index)
     attributes {
@@ -28,7 +29,6 @@ func.func @split_k_cyclic(%A: memref<*xi8>, %tr: index, %tp: index, %tk: index,
       scf.for %i = %c0 to %tk step %c1 {
         %koff = arith.muli %i, %c256 : index
         %k = arith.addi %kbase, %koff : index
-        // expected-error @below {{not a blocked split}}
         %da = pim.access %A offset %k sizes [8, 16] strides[%lda, %c1]
               origin[%m, %k] {id = 0 : i64} : memref<*xi8> -> !pim.access
       } {pim.reduction = "add"}

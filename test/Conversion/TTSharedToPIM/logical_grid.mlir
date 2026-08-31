@@ -22,13 +22,12 @@ func.func @plain(%A: memref<*xf32>, %npx: i32, %npy: i32, %npz: i32,
 
 // -----
 
-// pid / d 와 pid % d 쌍은 한 축을 두 logical 축으로 가른다. 남는 source 축이 명시적 K 분할이다.
+// pid / d 와 pid % d 쌍은 한 축을 두 output logical 축으로 가른다.
 // 행 tile 수는 IR에 없으므로 ceildiv(grid, d)로 유도한다.
 // CHECK-LABEL: func.func @div_rem
 // CHECK:         %[[D:.*]] = arith.divsi
 // CHECK:         %[[R:.*]] = arith.ceildivsi %arg1, %[[D]]
 // CHECK:         scf.for %{{.*}} = %{{.*}} to %{{.*}}
-// CHECK:           } {pim.axis = #pim.axis<"k">}
 // CHECK:         } {pim.axis = #pim.axis<"n">}
 // CHECK:         } {pim.axis = #pim.axis<"m">}
 func.func @div_rem(%A: memref<*xf32>, %npx: i32, %npy: i32, %npz: i32,
@@ -43,10 +42,8 @@ func.func @div_rem(%A: memref<*xf32>, %npx: i32, %npy: i32, %npz: i32,
   %col = arith.remsi %pidx, %d : i32
   %m = arith.index_cast %row : i32 to index
   %n = arith.index_cast %col : i32 to index
-  %k = arith.index_cast %pidy : i32 to index
   %o = arith.addi %m, %n : index
-  %o2 = arith.addi %o, %k : index
-  %rc = memref.reinterpret_cast %A to offset: [%o2], sizes: [8], strides: [%c1]
+  %rc = memref.reinterpret_cast %A to offset: [%o], sizes: [8], strides: [%c1]
       : memref<*xf32> to memref<8xf32, strided<[?], offset: ?>>
   %v = memref.load %rc[%c0] : memref<8xf32, strided<[?], offset: ?>>
   return

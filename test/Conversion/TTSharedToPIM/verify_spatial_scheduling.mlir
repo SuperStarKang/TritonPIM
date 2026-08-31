@@ -1,5 +1,5 @@
-// M/N/spatial-K 모두 PIMMapDevices가 만드는 동일한 Execution Tile scheduling
-// 식을 따라야 한다.
+// M/N은 spatial Execution Tile scheduling 식을 따르고, source spatial-K는
+// semantic reduction scheduling과 중복되므로 거부한다.
 // RUN: triton-shared-opt --split-input-file --pim-verify -verify-diagnostics %s
 
 module attributes {pim.target_profile = #pim.target_profile<
@@ -82,13 +82,13 @@ module attributes {pim.target_profile = #pim.target_profile<
     banks_per_unit = 1, cores_per_bank = 1, lanes_per_core = 1,
     bank_capacity_limit_bytes = 1024, local_capacity_limit_bytes = 0>} {
 
-func.func @spatial_k_uses_two_planes_per_device(%total: index) attributes {
+func.func @source_spatial_k_is_rejected(%total: index) attributes {
     pim.block = #pim.block<shape = [1, 1, 1]>,
     pim.block_group = #pim.block_group<blocks = [1, 1, 1]>} {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c2 = arith.constant 2 : index
-  // spatial K의 Execution Tile 단위는 plane 하나다.
+  // 아래는 제거된 source spatial-K 표현이다.
   %tiles = arith.ceildivsi %total, %c1 : index
   %rounds = arith.ceildivsi %tiles, %c2 : index
   scf.for %round = %c0 to %rounds step %c1 {
@@ -99,9 +99,9 @@ func.func @spatial_k_uses_two_planes_per_device(%total: index) attributes {
       %first = arith.addi %roundBase, %device_k : index
       %left = arith.subi %total, %first : index
       %nonnegative = arith.maxsi %left, %c0 : index
-      // 잘못된 식: spatial K plane을 local loop에서 두 개 처리한다.
+      // scheduling 식과 무관하게 source pim.axis="k" 자체가 불법이다.
       %window = arith.minsi %c2, %nonnegative : index
-      // expected-error @below {{the device-local spatial k loop does not use its Execution Tile group count}}
+      // expected-error @below {{source-level pim.axis="k" is not a Common IR spatial axis}}
       scf.for %local = %c0 to %window step %c1 {
         %start = arith.addi %c0, %first : index
         %scaled = arith.muli %local, %c1 : index

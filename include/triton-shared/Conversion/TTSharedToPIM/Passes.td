@@ -43,8 +43,10 @@ def PIMBuildLogicalGrid : Pass<"pim-build-logical-grid", "mlir::ModuleOp"> {
     - `pid / d` 와 `pid % d` 쌍: 한 축이 두 logical 축으로 갈라진다.
     - GROUP_M 순서: 그룹 좌표 사슬을 (m, n) 로 되돌린다.
       순서 자체는 배치에 영향이 없으므로 사슬은 통째로 죽는다.
-    앞의 두 logical 축이 m 과 n 이고, 남는 source 축은
-    k 이다. 각 loop 에 `pim.axis` 로 이름을 단다.
+    복원된 logical 축은 output tile 좌표인 m 과 n 뿐이며 각 loop에 `pim.axis`로
+    이름을 단다. source program_id가 별도의 split-K plane을 이미 만들었다면
+    진단한다. K는 이 pass가 source grid에서 만들지 않고, `pim-form-compute`가
+    linalg accumulator 의미에서 찾은 하나의 `pim.reduction` domain으로 남긴다.
     복원할 수 없는 형태는 진단을 낸다.
   }];
   let constructor = "mlir::triton::createPIMBuildLogicalGridPass()";
@@ -59,8 +61,7 @@ def PIMRecoverAccessOrigin : Pass<"pim-recover-access-origin", "mlir::ModuleOp">
     항을 좌표 쪽과 간격 쪽으로 가르고, 간격 쪽을 index_cast 와 상수 곱을 벗겨 낸
     기준 값으로 access 의 strides 와 대조한다. SSA 동일성으로 대조하면 같은 간격을
     다른 식으로 쓴 항이 어긋난다.
-    어느 축과도 맞지 않는 간격이면 크기 1 의 축을 앞에 새로 만든다 — split-K 의
-    출력면처럼 원본 버퍼에는 있는데 tile 에는 없는 축이 이 경우다.
+    어느 축과도 맞지 않는 간격이면 크기 1 의 축을 앞에 새로 만든다.
   }];
   let constructor = "mlir::triton::createPIMRecoverAccessOriginPass()";
   let dependentDialects = ["mlir::pim::PIMDialect", "mlir::arith::ArithDialect"];
@@ -165,10 +166,12 @@ def PIMMapDevices : Pass<"pim-map-devices", "mlir::ModuleOp"> {
     `#pim.execution_tile` 이 먼저 결정된 뒤 logical 축마다 동시에 사용할 PIM Device
     수 `[p_m,p_n,p_k]`를 받아 loop nest 를 `pim.device` region 으로 감싼다. Execution Tile은 device
     하나의 resident 실행 단위이며, Device Grid의 각 좌표는 서로 다른 Execution Tile
-    instance를 맡는다. reduction 축의 서로 다른 Tile은 같은 출력 좌표의 partial을 만든다.
-    현재 Common IR에서 pim.axis="k"는 spatial split-K Tile 좌표이고,
-    execution_tile.groups[k]는 그 Tile 내부 temporal reduction window다.
-    없는 축의 partition은 반드시 1이다. Common IR은 비용식이나 자동 device 수 선택을
+    instance를 맡는다. m/n은 `pim.axis` output domain이고, K는 하나의
+    `pim.reduction` semantic domain이다. source-level `pim.axis="k"`는 허용하지 않는다.
+    `p_k`는 전체 semantic K Block Group을 동시에 몇 device에 나눌지 정하고,
+    `execution_tile.groups[k]`는 device 하나가 round 한 번에 처리할 K Block Group 수다.
+    없는 M/N 축과 semantic reduction이 없는 K의 partition은 반드시 1이다.
+    Common IR은 비용식이나 자동 device 수 선택을
     수행하지 않는다. 형상을 아는 호출자나 autotuner가 정한 정수 세 개만 materialize한다.
     전체 block-group grid 를 execution-tile grid 로 먼저 자른 뒤 각 축에 대해
       execution_tile_index = round * active_devices + device_coordinate
@@ -177,13 +180,17 @@ def PIMMapDevices : Pass<"pim-map-devices", "mlir::ModuleOp"> {
     여러 round에서 재사용한다. 마지막 round에 Tile이 없는 device는 0회 loop인 no-op이다.
     device 안에서 좌표를 0부터 세고, 전역 좌표는 몸체 첫머리에서 다시 만들어
     `pim.device_origin` 표시를 단다. round loop는 pim.device 바깥 host IR에 남는다.
-    `pim.reduction`으로 명시된 loop도 execution_tile.groups[k] 범위로 좁히고
+    `pim.reduction`으로 명시된 loop는 다음 식으로 직접 나누고
+      k_tiles = ceildiv(total_k_groups, execution_tile.groups[k])
+      k_rounds = ceildiv(k_tiles, p_k)
+      first_k_group = (round * p_k + device_k) * execution_tile.groups[k]
+      local_k_groups = min(execution_tile.groups[k],
+                           max(total_k_groups - first_k_group, 0))
     `pim.scheduling_axis = "reduction_k"` round를 device 바깥에 만든다. 따라서
     `pim.device` 한 번은 정확히 한 resident Execution Tile만 실행한다. 여러 temporal
-    window가 만드는 partial contribution은 `pim.combine partial into final_access`로
-    명시한다. spatial `pim.axis="k"`가 있으면 그 scheduling round와 `p_k` device가
-    만드는 결과도 같은 최종 access의 contribution이다. 따라서 target은 명시된
-    spatial K, temporal `reduction_k`, device mapping, combiner와 destination을
+    round와 K device가 만드는 partial contribution은
+    `pim.combine partial into final_access`로 명시한다. 따라서 target은 명시된
+    semantic K schedule, device mapping, combiner와 destination을
     소비하며 결합 범위나 연산을 access rank에서 다시 추론하지 않는다.
 
     M/N 축이 없는 K-only reduction에서는 zero-init tensor chain과 direct output
@@ -224,9 +231,8 @@ def PIMFormExecutionTiles : Pass<"pim-form-execution-tiles", "mlir::ModuleOp"> {
     Option<"tileN", "tile-n", "int64_t", "0",
            "n 방향 Block Group 수. 0 또는 1 = 한 Group">,
     Option<"tileK", "tile-k", "int64_t", "0",
-           "각 spatial K plane 내부 reduction 방향 Block Group 수. 0 또는 1 = 한 Group. "
-           "k은 독립된 spatial output 축이고 tile-k는 그 plane "
-           "내부의 temporal window다. 여러 window의 partial 결합 의미는 Common "
+           "device 하나가 K round 한 번에 처리할 semantic reduction Block Group 수. "
+           "0 또는 1 = 한 Group. 여러 (round, device_k) partial의 결합 의미는 Common "
            "IR에 기록하고 실제 host/device 구현만 target lowering이 정한다.">,
   ];
   let constructor = "mlir::triton::createPIMFormExecutionTilesPass()";
@@ -265,27 +271,26 @@ def PIMVerify : Pass<"pim-verify", "mlir::ModuleOp"> {
       shape 및 device mapping과 일치한다.
     - `pim.place.allocation_shape`가 hierarchy에서 파생한 Execution Tile 하나의
       고정 resident extent와 정확히 일치한다.
-    - temporal K scheduling round가 정확히 하나 존재한다. round는
-      `0 .. ceildiv(total_groups, groups[k])`의 unit-step loop이고, device-local
-      reduction은 같은 total_groups에서 `first = round * groups[k]`,
+    - semantic K scheduling round가 정확히 하나 존재한다. round는
+      `0 .. ceildiv(ceildiv(total_groups, groups[k]), p_k)`의 unit-step loop이고,
+      device-local reduction은 같은 total_groups에서
+      `first = (round * p_k + device_k) * groups[k]`,
       `trips = min(groups[k], total_groups-first)`로 만든 window다. marked global K
       origin과 K placement start도 같은 first를 쓰며 partial contribution은
       `pim.combine`으로 final destination과 combiner를 명시한다.
-    - spatial `pim.axis="k"` output은 semantic `pim.reduction`을 가지며, `p_k`가
-      1보다 크면 그 축이 명시적으로 존재한다. temporal/spatial K의 `pim.combine`은
-      semantic combiner와 같고 의미 없는 독립 combine은 거부한다.
+    - source-level spatial `pim.axis="k"`는 거부한다. `p_k`가 1보다 크면 semantic
+      `pim.reduction`이 명시적으로 존재해야 한다. K의 `pim.combine`은 semantic
+      combiner와 같고 의미 없는 독립 combine은 거부한다.
     - `pim.store`와 `pim.combine`의 최종 output access는 `direction = "out"` placement를
-      가지며 temporal K window, spatial K plane, device K 좌표에 의존하지 않는다.
+      가지며 K round, local K coordinate, device K 좌표에 의존하지 않는다.
       K는 scheduling/reduction 좌표이지 operation output 차원이 아니다.
     - output이 있는 semantic reduction은 정확히 하나의 tensor accumulator/result와
       정확히 하나의 direct `pim.combine partial into final_access`를 가진다.
-    - spatial m/n/k도 각각 정확히 하나의 matching scheduling round를 가진다.
+    - spatial m/n은 각각 정확히 하나의 matching scheduling round를 가진다.
       `execution_tiles=ceildiv(total_groups,groups_per_tile)`,
       `rounds=ceildiv(execution_tiles,p_axis)`,
       `first=(round*p_axis+device)*groups_per_tile`,
       `trips=min(groups_per_tile,max(total_groups-first,0))`를 검증한다.
-      spatial k의 groups_per_tile은 plane 하나인 1이고 Execution Tile의 k Group 수는
-      별도 temporal reduction_k에서 검증한다.
     - 모든 `pim.place.allocation_shape`는 Block-Group-Execution Tile hierarchy에서
       파생된 정적 fixed-slot extent다. runtime start와 tail size는 허용하지만 runtime
       trip count를 allocation capacity로 사용하는 fallback은 허용하지 않는다.

@@ -429,14 +429,16 @@ static LogicalResult verifySpatialSchedule(scf::ForOp round,
   return success();
 }
 
-// Verify that the host round and device-local temporal K loop are two views of
-// the same Execution Tile window:
-//   round       = 0 .. ceildiv(totalGroups, tileK)
-//   first       = round * tileK
+// Verify that the host round and device-local semantic K loop are two views of
+// the same partitioned Execution Tile window:
+//   kTiles      = ceildiv(totalGroups, tileK)
+//   round       = 0 .. ceildiv(kTiles, pK)
+//   first       = (round * pK + deviceK) * tileK
 //   local trips = min(tileK, max(totalGroups - first, 0))
 // The marked global origin must use both first and the local induction value.
 static LogicalResult verifyTemporalSchedule(scf::ForOp round,
                                             scf::ForOp reduction,
+                                            Value deviceK, int64_t pK,
                                             int64_t tileK,
                                             Value &first) {
   if (!matchPattern(round.getLowerBound(), m_Zero()) ||
@@ -447,11 +449,30 @@ static LogicalResult verifyTemporalSchedule(scf::ForOp round,
 
   Value roundUpper = stripIndexCasts(round.getUpperBound());
   auto roundCount = roundUpper.getDefiningOp<arith::CeilDivSIOp>();
-  if (!roundCount || getConstantIntValue(roundCount.getRhs()) != tileK)
+  Value totalGroups;
+  // 둘 다 1이면 두 ceildiv가 모두 canonicalization으로 사라질 수 있다.
+  if (!roundCount && pK == 1 && tileK == 1)
+    totalGroups = roundUpper;
+  else if (!roundCount)
     return round->emitError(
         "pim-verify: the temporal K scheduling round upper bound must be "
+        "ceildiv(K Execution Tiles, p_k)");
+  if (roundCount && getConstantIntValue(roundCount.getRhs()) == pK) {
+    auto executionTiles = stripIndexCasts(roundCount.getLhs())
+                              .getDefiningOp<arith::CeilDivSIOp>();
+    if (executionTiles &&
+        getConstantIntValue(executionTiles.getRhs()) == tileK)
+      totalGroups = stripIndexCasts(executionTiles.getLhs());
+  }
+  // ceildiv(x, 1)은 canonicalization으로 사라질 수 있다. p_k=1일 때는
+  // ceildiv(totalGroups, tileK)도 같은 계약의 canonical form이다.
+  if (roundCount && !totalGroups && pK == 1 &&
+      getConstantIntValue(roundCount.getRhs()) == tileK)
+    totalGroups = stripIndexCasts(roundCount.getLhs());
+  if (!totalGroups)
+    return round->emitError(
+        "pim-verify: the K Execution Tile count must be "
         "ceildiv(total reduction groups, execution_tile.groups[k])");
-  Value totalGroups = stripIndexCasts(roundCount.getLhs());
 
   Value localUpper = stripIndexCasts(reduction.getUpperBound());
   auto window = localUpper.getDefiningOp<arith::MinSIOp>();
@@ -490,12 +511,21 @@ static LogicalResult verifyTemporalSchedule(scf::ForOp round,
         "pim-verify: the temporal K host round and local window do not use "
         "the same total reduction-group count");
   first = stripIndexCasts(left.getRhs());
-  std::optional<LinearForm> form =
-      linearForm(first, round.getInductionVar());
-  if (!form || form->coefficient != tileK || form->constant != 0)
+  std::optional<SpatialLinearForm> form =
+      spatialLinearForm(first, round.getInductionVar(), deviceK);
+  std::optional<int64_t> roundCoefficient = checkedLinearValue(
+      static_cast<__int128>(pK) * tileK);
+  const bool canonicalDeviceCoefficient =
+      form && form->deviceCoefficient == tileK;
+  const bool foldedUnitDevice =
+      form && pK == 1 && form->deviceCoefficient == 0;
+  if (!form || !roundCoefficient ||
+      form->roundCoefficient != *roundCoefficient ||
+      (!canonicalDeviceCoefficient && !foldedUnitDevice) ||
+      form->constant != 0)
     return reduction->emitError(
-        "pim-verify: the temporal K window start must be round * "
-        "execution_tile.groups[k]");
+        "pim-verify: the semantic K window start must be "
+        "(round * p_k + device_k) * execution_tile.groups[k]");
 
   Operation *origin = nullptr;
   for (Operation &op : *reduction.getBody()) {
@@ -699,6 +729,11 @@ struct PIMVerifyPass
       return device->emitError(
           "pim-verify: one Execution Tile may have only one semantic "
           "reduction loop");
+    if (!spatialAxes[2].empty())
+      return spatialAxes[2].front()->emitError(
+          "pim-verify: source-level pim.axis=\"k\" is not a Common IR "
+          "spatial axis; K must be represented by one semantic "
+          "pim.reduction loop");
     static const char *axisNames[3] = {"m", "n", "k"};
     for (int64_t axis = 0; axis < 3; ++axis)
       if (spatialAxes[axis].size() > 1)
@@ -708,19 +743,16 @@ struct PIMVerifyPass
 
     ArrayRef<int64_t> partitions =
         device.getMapping().getPartitions().asArrayRef();
-    for (int64_t axis = 0; axis < 3; ++axis)
+    for (int64_t axis = 0; axis < 2; ++axis)
       if (partitions[axis] > 1 && spatialAxes[axis].empty())
         return device->emitError("pim-verify: p_")
                << axisNames[axis]
                << " greater than one requires an explicit spatial pim.axis=\""
                << axisNames[axis] << "\"";
-
-    bool hasOutput = false;
-    device.walk([&](pim::StoreOp) { hasOutput = true; });
-    device.walk([&](pim::CombineOp) { hasOutput = true; });
-    if (!spatialAxes[2].empty() && hasOutput && semanticReductions.empty())
+    if (partitions[2] > 1 && semanticReductions.empty())
       return device->emitError(
-          "pim-verify: a spatial K output needs one semantic pim.reduction");
+          "pim-verify: p_k greater than one requires one semantic "
+          "pim.reduction loop");
 
     scf::ForOp temporalReduction;
     Value temporalFirst;
@@ -768,17 +800,17 @@ struct PIMVerifyPass
           "pim-verify: one temporal K reduction requires exactly one "
           "reduction_k scheduling round");
     if (temporalReduction &&
-        failed(verifyTemporalSchedule(temporalRounds.front(), temporalReduction,
-                                      execution.getGroups().asArrayRef()[2],
-                                      temporalFirst)))
+        failed(verifyTemporalSchedule(
+            temporalRounds.front(), temporalReduction,
+            device.getBody().front().getArgument(2), partitions[2],
+            execution.getGroups().asArrayRef()[2], temporalFirst)))
       return failure();
 
     Value spatialFirst[3];
-    for (int64_t axis = 0; axis < 3; ++axis) {
+    for (int64_t axis = 0; axis < 2; ++axis) {
       if (spatialAxes[axis].size() != 1 || spatialRounds[axis].size() != 1)
         continue;
-      int64_t groupsPerTile =
-          axis == 2 ? 1 : execution.getGroups().asArrayRef()[axis];
+      int64_t groupsPerTile = execution.getGroups().asArrayRef()[axis];
       if (failed(verifySpatialSchedule(
               spatialRounds[axis].front(), spatialAxes[axis].front(),
               device.getBody().front().getArgument(axis), axisNames[axis],
@@ -857,8 +889,7 @@ struct PIMVerifyPass
 
         // placement가 실제 Execution Tile 하나의 resident buffer인지 hierarchy와
         // 독립적으로 맞춰 본다. access dimension을 모는 m/n loop는 해당 Tile의
-        // Group 수만큼, spatial split-K는 plane 하나만큼, temporal reduction은
-        // tile_k Group 수만큼 상주해야 한다.
+        // Group 수만큼, semantic reduction은 tile_k Group 수만큼 상주해야 한다.
         llvm::SmallPtrSet<Operation *, 4> drivers;
         pim::collectDrivers(access.getOrigin()[d], deviceLoops, drivers);
         // The resident K slice for this round must begin at the same window
@@ -898,7 +929,7 @@ struct PIMVerifyPass
                      << " but size does not use the current local Tile "
                         "length";
             ArrayRef<int64_t> groups = execution.getGroups().asArrayRef();
-            int64_t factor = axisNumber == 2 ? 1 : groups[axisNumber];
+            int64_t factor = groups[axisNumber];
             if (expected > std::numeric_limits<int64_t>::max() / factor)
               return place->emitError(
                   "pim-verify: resident allocation extent overflows i64");
@@ -978,18 +1009,14 @@ struct PIMVerifyPass
 
     // K is an execution/reduction coordinate, not an output dimension.  A
     // final store/combine destination may depend on M/N scheduling, but its
-    // address must not select a temporal window, spatial plane, or K device.
+    // address must not select a K round, local K coordinate, or K device.
     // Otherwise Common would still expose a hidden [p_k,...] partial ABI and a
     // target would have to reinterpret it.
     SmallVector<Value> kSchedulingRoots;
     kSchedulingRoots.push_back(device.getBody().front().getArgument(2));
     for (scf::ForOp loop : temporalReductions)
       kSchedulingRoots.push_back(loop.getInductionVar());
-    for (scf::ForOp loop : spatialAxes[2])
-      kSchedulingRoots.push_back(loop.getInductionVar());
     for (scf::ForOp loop : temporalRounds)
-      kSchedulingRoots.push_back(loop.getInductionVar());
-    for (scf::ForOp loop : spatialRounds[2])
       kSchedulingRoots.push_back(loop.getInductionVar());
 
     auto accessDependsOnK = [&](pim::AccessOp access) {
@@ -1019,8 +1046,8 @@ struct PIMVerifyPass
             "pim-verify: final output access must have an out placement");
       if (accessDependsOnK(access))
         return write->emitError(
-            "pim-verify: final output access must not depend on temporal, "
-            "spatial, or device K scheduling");
+            "pim-verify: final output access must not depend on K round, "
+            "local K, or device K scheduling");
       return success();
     };
 
@@ -1049,9 +1076,9 @@ struct PIMVerifyPass
 
     // pim.combine is the original semantic combiner and final destination for
     // every partial source.
-    // The sources are explicit in Common IR: reduction_k ancestors are temporal
-    // windows and pim.axis="k" plus mapping.partitions[k] are spatial planes and
-    // devices.  A target may choose where to perform the combine, but it must
+    // The sources are explicit in Common IR: reduction_k ancestors are rounds
+    // and mapping.partitions[k] supplies the device_k coordinate over the same
+    // semantic reduction domain. A target may choose where to perform the combine, but it must
     // not rediscover either the operation or its scope from access arithmetic.
     if (!semanticReductions.empty() &&
         semanticReductions.front().getNumResults() != 0) {

@@ -1,6 +1,5 @@
-// Spatial K output은 주소 모양만 보고 reduction으로 추측하지 않는다. linalg 의미에서
-// 확정된 pim.reduction이 없으면 target이 partial combine을 재해석해야 하므로 Common
-// lowering 단계에서 진단한다.
+// source-level pim.axis="k"는 output 유무와 관계없이 거부한다. K는 linalg 의미에서
+// 확정된 하나의 pim.reduction domain이어야 한다.
 // RUN: triton-shared-opt "--pim-map-devices=p-m=1 p-n=1 p-k=1" -verify-diagnostics %s
 
 module attributes {pim.target_profile = #pim.target_profile<
@@ -9,7 +8,7 @@ module attributes {pim.target_profile = #pim.target_profile<
     bank_capacity_limit_bytes = 1024,
     local_capacity_limit_bytes = 0>} {
 
-// expected-error @below {{a spatial K output needs one semantic pim.reduction before device mapping}}
+// expected-error @below {{source-level pim.axis="k" is not supported}}
 func.func @spatial_k_without_reduction(%Partial: memref<*xi32>,
                                        %planes: index) attributes {
     pim.block = #pim.block<shape = [1, 1, 1]>,

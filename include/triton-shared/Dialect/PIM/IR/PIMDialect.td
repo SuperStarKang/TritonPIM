@@ -68,11 +68,10 @@ def PIM_TargetProfileAttr : PIM_Attr<"TargetProfile", "target_profile"> {
   let genVerifyDecl = 1;
 }
 
-// PIM Common IR의 좌표 이름은 [m, n, k]로 고정한다. m/n은 병렬 출력 축이고
-// pim.axis<"k">는 최종 output에 합쳐질 contribution을 만드는 spatial split-K
-// plane이다.
-// plane 내부의 temporal reduction loop는 pim.temporal_reduction으로 명시한다.
-// 축의 이름 자체가 의미를 가지므로 별도의 scope/kind 문자열은 두지 않는다.
+// PIM Common IR의 canonical 좌표 순서는 [m, n, k]로 고정한다. m/n의 독립 output
+// loop는 pim.axis로 표시한다. K slot은 hierarchy와 device mapping에 그대로 존재하지만
+// compute domain은 별도 source plane이 아니라 pim.reduction loop 하나로 표현한다.
+// scheduling 뒤 그 loop의 local window는 pim.temporal_reduction으로 명시한다.
 def PIM_AxisAttr : PIM_Attr<"Axis", "axis"> {
   let summary = "Canonical m, n, or k axis identity";
   let parameters = (ins "::mlir::StringAttr":$name);
@@ -84,8 +83,8 @@ def PIM_AxisAttr : PIM_Attr<"Axis", "axis"> {
 // 이 dialect 가 target 무관하다는 전제가 깨지고, 공통 pass 가 읽지 않는 값이면 target IR 에
 // 두면 된다. 공통 pass 가 정말로 필요로 하는 기계 값은 위 target_profile 의 필드가 된다.
 
-// pim.device 의 필수 파라미터. 고정 축 순서 [m,n,spatial-k]의 partition 수다.
-// 없는 축은 1이다.
+// pim.device 의 필수 파라미터. 고정 축 순서 [m,n,semantic-k]의 partition 수다.
+// m/n axis 또는 K reduction이 없으면 해당 값은 1이다.
 def PIM_DeviceMappingAttr : PIM_Attr<"DeviceMapping", "device_mapping"> {
   let summary = "PIM Device partitions in canonical [m,n,k] order";
   let parameters = (ins "::mlir::DenseI64ArrayAttr":$partitions);
@@ -115,8 +114,8 @@ def PIM_BlockGroupAttr : PIM_Attr<"BlockGroup", "block_group"> {
 // 저장한다. 원소 shape는 Block과 Group에서 파생한다. 없는 축의
 // group 수도 곱의 항등원인 1이다. PIM DRAM 용량은 이 값을 늘리는 목표가 아니라
 // legality 상한이다.
-// spatial split-K가 있으면 pim.axis="k" 좌표마다 별도 Execution Tile instance가
-// 생기고, groups[k]는 각 spatial plane 내부 temporal reduction residency를 뜻한다.
+// groups[k]는 device 하나가 K round 한 번에 처리할 semantic reduction Group 수다.
+// p_k와 K round는 이 하나의 domain을 spatial/temporal 차원으로 함께 나눈다.
 // Common scheduling이 각 Tile의 Group 범위와 반복 순서를 명시한다. target lowering은
 // 그 경계를 바꾸지 않고 고정된 Tile 내부 실행을 target op로 옮긴다.
 def PIM_ExecutionTileAttr : PIM_Attr<"ExecutionTile", "execution_tile"> {

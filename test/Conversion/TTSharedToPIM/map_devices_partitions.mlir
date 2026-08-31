@@ -1,4 +1,5 @@
-// [p_m,p_n,p_k] 명시 분할은 k도 나눌 수 있다. 곱이 unit 수를 넘으면 진단이다.
+// [p_m,p_n,p_k] 명시 분할에서 p_k는 semantic reduction을 직접 나눈다.
+// 곱이 unit 수를 넘으면 진단이다.
 // 이 테스트에는 pim.access가
 // 없다. Device scheduling은 세 hierarchy attribute만으로 완결되어야 하며 실제
 // access shape와의 정합성 검사는 뒤의 pim-verify가 담당한다.
@@ -24,7 +25,7 @@ func.func @three_axes(%tr: index, %tc: index, %tp: index)
   scf.for %x = %c0 to %tr step %c1 {
     scf.for %y = %c0 to %tc step %c1 {
       scf.for %p = %c0 to %tp step %c1 {
-      } {pim.axis = #pim.axis<"k">}
+      } {pim.reduction = "add"}
     } {pim.axis = #pim.axis<"n">}
   } {pim.axis = #pim.axis<"m">}
   return

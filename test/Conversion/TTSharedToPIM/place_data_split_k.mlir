@@ -1,6 +1,5 @@
-// k 를 device 축으로 나눈 blocked 분할: 나뉜 k_part 축이 reduction loop 와 함께
-// 버퍼의 K 축을 몰아도, reduction 이 정확히 tile(16)씩 전진하므로 device 의 K 영역은
-// 연속 구간 하나다 — 배치가 성립한다.
+// semantic reduction K를 p_k가 직접 나눈다. 별도 k_part/source plane 없이
+// (round, device_k)가 선택한 K Execution Tile의 연속 resident 영역을 만든다.
 // RUN: triton-shared-opt "--pim-map-devices=p-m=2 p-n=2 p-k=2" --pim-place-data %s | FileCheck %s
 
 // CHECK: pim.place %arg0
@@ -32,23 +31,19 @@ func.func @split_k(%A: memref<*xi8>, %C: memref<*xi8>,
       %n = arith.muli %y, %c1 : index
       %dc = pim.access %C offset %n sizes [1] strides[%c1]
             origin[%n] {id = 2 : i64} : memref<*xi8> -> !pim.access
-      scf.for %p = %c0 to %tp step %c1 {
-        // blocked: k_part 의 시작 = p · (연속 구간 크기), reduction 은 16 씩 전진.
-        %kbase = arith.muli %p, %kper : index
         scf.for %i = %c0 to %tk step %c1 {
           %koff = arith.muli %i, %c16 : index
-          %k = arith.addi %kbase, %koff : index
+          %k = arith.addi %c0, %koff : index
           %da = pim.access %A offset %k sizes [8, 16] strides[%lda, %c1]
                 origin[%m, %k] {id = 0 : i64} : memref<*xi8> -> !pim.access
           // group-k 가 끼면 계수가 사슬(muli·muli)이 된다 — 곱을 벗겨 2·16 = 32 == tile
           // 로 판정해야 한다.
           %kg = arith.muli %i, %c2 : index
           %koff2 = arith.muli %kg, %c16 : index
-          %k2 = arith.addi %kbase, %koff2 : index
+          %k2 = arith.addi %c0, %koff2 : index
           %db = pim.access %A offset %k2 sizes [8, 32] strides[%lda, %c1]
                 origin[%m, %k2] {id = 1 : i64} : memref<*xi8> -> !pim.access
         } {pim.reduction = "add"}
-      } {pim.axis = #pim.axis<"k">}
     } {pim.axis = #pim.axis<"n">}
   } {pim.axis = #pim.axis<"m">}
   return

@@ -65,7 +65,7 @@ func.func @wrong_round_count(%totalGroups: index, %A: memref<*xi8>)
   %c8 = arith.constant 8 : index
   // tileK=2인데 전체 Group 수를 1로 나눠 round를 너무 많이 만든다.
   %rounds = arith.ceildivsi %totalGroups, %c1 : index
-  // expected-error @below {{the temporal K scheduling round upper bound must be ceildiv(total reduction groups, execution_tile.groups[k])}}
+  // expected-error @below {{the K Execution Tile count must be ceildiv(total reduction groups, execution_tile.groups[k])}}
   scf.for %round = %c0 to %rounds step %c1 {
     %first = arith.muli %round, %c2 : index
     %left = arith.subi %totalGroups, %first : index

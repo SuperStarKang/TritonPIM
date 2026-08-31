@@ -23,9 +23,10 @@ namespace {
 // triton-shared ABI: 커널 인자 끝 6개 = num_programs(축 0,1,2) 다음 program_id(축 0,1,2).
 static constexpr unsigned kGridRank = 3;
 
-// logical 축 이름. 앞의 둘이 출력 tile 좌표이고 그다음이 명시적 K 분할이다.
-static constexpr StringRef kAxisNames[] = {
-    "m", "n", "k"};
+// Source program grid는 서로 독립적인 output tile 좌표만 표현한다. Reduction K는
+// PIMFormCompute가 linalg accumulator 의미에서 찾은 semantic reduction loop이며,
+// source program_id로 미리 만든 split-K plane이 아니다.
+static constexpr StringRef kAxisNames[] = {"m", "n"};
 
 // 복원된 logical 축 하나. 축의 tile 개수는 extent 이거나, divideBy 가 있으면
 // ceildiv(extent, divideBy) 다. 둘 다 func 인자와 상수만으로 계산된다.
@@ -184,10 +185,11 @@ struct PIMBuildLogicalGridPass
         continue;
       axes.push_back({programId[axis], numPrograms[axis], Value()});
     }
-    if (axes.size() > kGridRank)
-      return func->emitError("pim-build-logical-grid: ")
-             << axes.size() << " logical tile axes but only " << kGridRank
-             << " are named";
+    if (axes.size() > 2)
+      return func->emitError(
+          "pim-build-logical-grid: source-level split-K is not a Common IR "
+          "logical axis; use one semantic reduction loop and let "
+          "pim-map-devices partition it with p_k");
 
     // 상한을 먼저 전부 만든다. loop를 쌓으면서 만들면 안쪽 loop의 상한이 바깥 loop 안에
     // 들어가 loop-invariant인 채로 남는다.
