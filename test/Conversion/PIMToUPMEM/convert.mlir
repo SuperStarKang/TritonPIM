@@ -161,10 +161,10 @@ func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
           %mm = linalg.matmul ins(%ta, %tb : tensor<8x32xi8>, tensor<32x32xi8>)
                 outs(%acc : tensor<8x32xi32>) -> tensor<8x32xi32>
           scf.yield %mm : tensor<8x32xi32>
-        } {pim.temporal_reduction}
+        } {pim.reduction = "add", pim.temporal_reduction}
         %dc = pim.access %C offset %n sizes [8, 32] strides[%ldb, %c1] origin[%m, %n]
               {id = 2 : i64} : memref<*xi32> -> !pim.access
-        pim.store %r, %dc {pim.combine = "add"} : tensor<8x32xi32>, !pim.access
+        pim.combine %r into %dc kind "add" : tensor<8x32xi32>, !pim.access
       } {pim.axis = #pim.axis<"n">}
     } {pim.axis = #pim.axis<"m">}
   }

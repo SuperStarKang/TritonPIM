@@ -160,7 +160,6 @@ struct ConvertPIMToUPMEMPass
       op->removeAttr("pim.device_origin");
       op->removeAttr("pim.temporal_reduction");
       op->removeAttr("pim.scheduling_axis");
-      op->removeAttr("pim.combine");
     });
   }
 
@@ -216,11 +215,20 @@ struct ConvertPIMToUPMEMPass
     SmallVector<Axis> axes;
     if (failed(collectAxes(device, axes)))
       return signalPassFailure();
+    scf::ForOp sourceKAxis;
+    device.walk([&](scf::ForOp loop) {
+      if (auto axis = loop->getAttrOfType<pim::AxisAttr>("pim.axis"))
+        if (axis.getName().getValue() == "k")
+          sourceKAxis = loop;
+    });
+    if (sourceKAxis) {
+      sourceKAxis->emitError(
+          "convert-pim-to-upmem: source pim.axis=\"k\" is not part of PIM "
+          "Common IR; K must be the semantic pim.reduction loop");
+      return signalPassFailure();
+    }
     bool hasM = llvm::any_of(axes, [](const Axis &axis) {
       return axis.name.getValue() == "m";
-    });
-    bool hasSpatialK = llvm::any_of(axes, [](const Axis &axis) {
-      return axis.name.getValue() == "k";
     });
     bool hasReduce = false;
     device.walk([&](linalg::ReduceOp) { hasReduce = true; });
@@ -278,7 +286,7 @@ struct ConvertPIMToUPMEMPass
     }
     scf::ForOp temporalLoop =
         temporalLoops.empty() ? scf::ForOp() : temporalLoops.front();
-    scf::ForOp temporalRound, spatialKRound;
+    scf::ForOp temporalRound;
     for (Operation *parent = device->getParentOp(); parent;
          parent = parent->getParentOp()) {
       auto loop = dyn_cast<scf::ForOp>(parent);
@@ -295,22 +303,15 @@ struct ConvertPIMToUPMEMPass
         }
         temporalRound = loop;
       } else if (axis.getValue() == "k") {
-        if (spatialKRound) {
-          device->emitError("convert-pim-to-upmem: Common IR has more than one "
-                            "spatial k scheduling round");
-          return signalPassFailure();
-        }
-        spatialKRound = loop;
+        device->emitError(
+            "convert-pim-to-upmem: source spatial K scheduling is not part "
+            "of PIM Common IR; use device_k with the reduction_k round");
+        return signalPassFailure();
       }
     }
     if (static_cast<bool>(temporalLoop) != static_cast<bool>(temporalRound)) {
       device->emitError("convert-pim-to-upmem: pim.temporal_reduction and "
                         "reduction_k scheduling round must occur together");
-      return signalPassFailure();
-    }
-    if (hasSpatialK != static_cast<bool>(spatialKRound)) {
-      device->emitError("convert-pim-to-upmem: a spatial pim.axis=\"k\" and "
-                        "its Common k scheduling round must occur together");
       return signalPassFailure();
     }
     arith::AddIOp temporalOrigin;
@@ -323,41 +324,33 @@ struct ConvertPIMToUPMEMPass
       }
     }
 
-    // partial 결합도 loop 구조에서 추론하지 않는다. Common pim.store의 명시적인
-    // pim.combine을 access id별로 옮긴다.
+    // partial 결합도 loop 구조에서 추론하지 않는다. Common pim.combine op가
+    // 명시한 destination과 kind를 access id별로 옮긴다.
     llvm::DenseMap<int64_t, StringAttr> combineOf;
-    llvm::DenseMap<int64_t, int64_t> combinedValueRankOf;
-    WalkResult combineResult = device.walk([&](pim::StoreOp store) {
-      auto combine = store->getAttrOfType<StringAttr>("pim.combine");
-      if (!combine)
-        return WalkResult::advance();
-      auto access = store.getAccess().getDefiningOp<pim::AccessOp>();
+    WalkResult combineResult = device.walk([&](pim::CombineOp combine) {
+      auto access =
+          combine.getDestination().getDefiningOp<pim::AccessOp>();
       if (!access) {
-        store->emitError("convert-pim-to-upmem: store access is not defined by "
-                         "pim.access");
+        combine->emitError(
+            "convert-pim-to-upmem: combine destination is not defined by "
+            "pim.access");
         return WalkResult::interrupt();
       }
-      if (combine.getValue() != "add") {
-        store->emitError("convert-pim-to-upmem: UPMEM supports only the Common "
-                         "add combiner");
+      if (combine.getKind() != "add") {
+        combine->emitError(
+            "convert-pim-to-upmem: UPMEM supports only the Common add "
+            "combiner");
         return WalkResult::interrupt();
       }
+      StringAttr kind = combine->getAttrOfType<StringAttr>("kind");
       StringAttr &known = combineOf[access.getId()];
-      if (known && known != combine) {
-        store->emitError("convert-pim-to-upmem: stores for one access disagree "
-                         "on pim.combine");
+      if (known && known != kind) {
+        combine->emitError(
+            "convert-pim-to-upmem: combines for one access disagree on "
+            "their kind");
         return WalkResult::interrupt();
       }
-      known = combine;
-      int64_t valueRank =
-          cast<RankedTensorType>(store.getValue().getType()).getRank();
-      auto [rankIt, inserted] =
-          combinedValueRankOf.try_emplace(access.getId(), valueRank);
-      if (!inserted && rankIt->second != valueRank) {
-        store->emitError("convert-pim-to-upmem: stores for one combined access "
-                         "have different value ranks");
-        return WalkResult::interrupt();
-      }
+      known = kind;
       return WalkResult::advance();
     });
     if (combineResult.wasInterrupted())
@@ -581,24 +574,17 @@ struct ConvertPIMToUPMEMPass
     hb.setInsertionPointAfter(foreach);
     hb.create<upmem::LaunchOp>(loc, set);
     for (pim::PlaceOp place : outputs) {
-      // Common store가 add partial이라고 명시한 output만 partial 순서를 만든다.
-      // 0인 경우는 spatial round=0, temporal round=0, device_k=0뿐이다.
-      // device_k는 foreach_group 안에서 더하고, 여기서는 scheduling round만 합친다.
+      // Common combine이 명시된 output만 partial 판정값을 만든다. reduction_k
+      // round와 device_k가 모두 0인 첫 contribution에서만 값이 0이다.
       Value partialRound;
       bool combined = combineOf.count(place.getAccess());
-      if (combined) {
+      if (combined)
         partialRound = temporalRound.getInductionVar();
-        if (spatialKRound)
-          partialRound = hb.create<arith::AddIOp>(
-              loc, partialRound, spatialKRound.getInductionVar());
-      }
       OpBuilder::InsertionGuard guard(hb);
       if (failed(buildOutput(hb, place, set, numUnits, axisNames, counts,
                              mramOf[place], foreach,
                              byAccess[place.getAccess()].tile, partialRound,
-                             hasSpatialK && combined,
-                             combined ? combinedValueRankOf[place.getAccess()]
-                                      : -1)))
+                             combined)))
         return signalPassFailure();
     }
 
@@ -612,10 +598,11 @@ struct ConvertPIMToUPMEMPass
       return signalPassFailure();
   }
 
-  // 실제로 존재하는 m/n/k loop와, 그 loop가 device 몫으로 좁혀지며 생긴 상한 및
-  // 전역 좌표 복원 op을 canonical 순서로 모은다.
+  // 실제로 존재하는 m/n output loop와, 그 loop가 device 몫으로 좁혀지며 생긴
+  // 상한 및 전역 좌표 복원 op을 canonical 순서로 모은다. K는 별도 pim.axis가
+  // 아니라 pim.temporal_reduction loop이므로 위에서 독립적으로 처리한다.
   LogicalResult collectAxes(pim::DeviceOp device, SmallVectorImpl<Axis> &axes) {
-    StringRef canonical[] = {"m", "n", "k"};
+    StringRef canonical[] = {"m", "n"};
     for (StringRef axisName : canonical) {
       auto name = StringAttr::get(&getContext(), axisName);
       scf::ForOp loop;
@@ -830,27 +817,37 @@ struct ConvertPIMToUPMEMPass
       return failure();
 
     // 전송을 DMA로 내린다. 협력 모드에서는 chunk를 tasklet이 나눠 옮긴다.
-    SmallVector<Operation *> oldLoads, oldStores;
+    SmallVector<Operation *> oldLoads, oldWrites;
     dev.walk([&](Operation *op) {
       if (auto load = dyn_cast<pim::LoadOp>(op)) {
         buildDMA(load, load.getAccess(), bufferOf(load.getResult()), byAccess,
                  pitchOf, /*isRead=*/true, taskletId, lanes);
         oldLoads.push_back(op);
-      } else if (auto store = dyn_cast<pim::StoreOp>(op)) {
+      } else if (isa<pim::StoreOp, pim::CombineOp>(op)) {
+        Value access;
+        Value value;
+        if (auto store = dyn_cast<pim::StoreOp>(op)) {
+          access = store.getAccess();
+          value = store.getValue();
+        } else {
+          auto combine = cast<pim::CombineOp>(op);
+          access = combine.getDestination();
+          value = combine.getPartial();
+        }
         // 협력 모드의 저장도 chunk 분담이라 다른 tasklet의 행을 읽는다. 앞 barrier는
         // 전 행의 계산이 끝났음을(matmul이 없는 적재→저장 커널의 경로도 여기서 닫힌다),
         // 뒤 barrier는 다음 tile의 fill이 누산기를 덮기 전에 저장이 끝났음을 보장한다.
         if (cooperative) {
-          OpBuilder b(store);
-          b.create<upmem::BarrierOp>(store.getLoc());
+          OpBuilder b(op);
+          b.create<upmem::BarrierOp>(op->getLoc());
         }
-        buildDMA(store, store.getAccess(), bufferOf(store.getValue()), byAccess,
-                 pitchOf, /*isRead=*/false, taskletId, lanes);
+        buildDMA(op, access, bufferOf(value), byAccess, pitchOf,
+                 /*isRead=*/false, taskletId, lanes);
         if (cooperative) {
-          OpBuilder b(store);
-          b.create<upmem::BarrierOp>(store.getLoc());
+          OpBuilder b(op);
+          b.create<upmem::BarrierOp>(op->getLoc());
         }
-        oldStores.push_back(op);
+        oldWrites.push_back(op);
       }
     });
 
@@ -858,7 +855,7 @@ struct ConvertPIMToUPMEMPass
     dev.walk([&](scf::ForOp l) { loops.push_back(l); });
 
     // 소비하는 쪽부터 지운다. 순서를 지키지 않으면 아직 쓰이는 값을 지우게 된다.
-    for (Operation *op : oldStores)
+    for (Operation *op : oldWrites)
       op->erase();
     for (scf::ForOp l : loops)
       if (l.getNumRegionIterArgs() > 0)
@@ -955,8 +952,8 @@ struct ConvertPIMToUPMEMPass
   // 타일 시작은 축별 타일 번호에서 나온다:
   //   번호[d] = origin[d] / tile[d],  축별 타일 수[d] = capacity[d] / tile[d]
   //   시작 = ((번호[0] * 수[1] + 번호[1]) * 수[2] + ...) * 타일 원소 수
-  // 타일 축은 원본 버퍼의 rank라 WRAM 버퍼보다 클 수 있다 — 앞쪽 축의 크기가 1이면
-  // 그 축은 자리 계산에만 나타난다(split-K의 출력면이 그 경우다).
+  // 타일 축은 원본 버퍼의 rank이며 Common pim.access와 pim.place가 확정한 순서를
+  // 그대로 사용한다.
   template <typename PitchFn>
   void buildDMA(Operation *xfer, Value accessValue, Value wbuf,
                 const llvm::DenseMap<int64_t, Buffer> &byAccess, PitchFn pitchOf,
@@ -1056,14 +1053,13 @@ struct ConvertPIMToUPMEMPass
   }
 
   // 출력 하나: 전 device에서 회수 → 그룹마다 원본으로 되돌린다. 영역과 capacity는
-  // Common pim.place를 그대로 쓴다. Common pim.combine이 있으면 spatial/temporal
-  // partial 좌표가 모두 0인 첫 partial만 대입하고 나머지는 누산한다.
+  // Common pim.place를 그대로 쓴다. Common pim.combine이 있으면 reduction_k
+  // round와 device_k가 모두 0인 첫 partial만 대입하고 나머지는 누산한다.
   LogicalResult buildOutput(OpBuilder &b, pim::PlaceOp place, Value set,
                             int64_t numUnits, ArrayAttr axes,
                             DenseI64ArrayAttr counts, FlatSymbolRefAttr mram,
                             Operation *foreach, ArrayRef<int64_t> tile,
-                            Value partialRound, bool spatialPartial,
-                            int64_t combinedValueRank) {
+                            Value partialRound, bool combined) {
     Location loc = place.getLoc();
     unsigned rank = place.getAllocationShape().size();
     auto elem =
@@ -1107,9 +1103,9 @@ struct ConvertPIMToUPMEMPass
 
     OpBuilder gbuilder(gb, gb->end());
     Value accumulate = partialRound;
-    if (spatialPartial) {
-      // axisNames는 Common의 canonical [m,n,k] 순서다. 같은 launch 안의 p_k
-      // device partial도 temporal/spatial round와 같은 add combine source다.
+    if (combined) {
+      // axisNames는 Common의 canonical [m,n,k] 순서다. 같은 reduction_k round
+      // 안의 p_k device contribution도 동일한 add combine source다.
       unsigned k = 0;
       for (; k < axes.size(); ++k)
         if (cast<StringAttr>(axes[k]).getValue() == "k")
@@ -1121,24 +1117,10 @@ struct ConvertPIMToUPMEMPass
           loc, accumulate, gb->getArgument(k + 1));
     }
 
-    unsigned partialDims = 0;
-    if (spatialPartial) {
-      if (combinedValueRank < 0 ||
-          combinedValueRank > static_cast<int64_t>(rank))
-        return place->emitError(
-            "combined output value rank exceeds its placement rank");
-      // RecoverAccessOrigin이 spatial split-K의 partial plane을 buffer 앞축에
-      // 명시한다. host combine은 그 축의 시작만 0으로 두고 size/capacity는
-      // 보존한다. 따라서 inactive tail device(size=0)는 그대로 no-op이고,
-      // 모든 plane partial은 같은 최종 output 영역에 더해진다.
-      partialDims = rank - combinedValueRank;
-    }
     SmallVector<Value> start, size, strides;
     for (unsigned d = 0; d < rank; d++) {
       // 좌표 계산은 이미 foreach_unit 몸체로 옮겨졌으므로 그 범위를 기준으로 본다.
-      Value o = d < partialDims
-                    ? gbuilder.create<arith::ConstantIndexOp>(loc, 0).getResult()
-                    : cloneInto(gbuilder, place.getStart()[d], map, foreach);
+      Value o = cloneInto(gbuilder, place.getStart()[d], map, foreach);
       Value s = cloneInto(gbuilder, place.getSize()[d], map, foreach);
       Value t = cloneInto(gbuilder, place.getStrides()[d], map, foreach);
       if (!o || !s || !t)

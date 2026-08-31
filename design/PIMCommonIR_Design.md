@@ -197,8 +197,8 @@ GEMM의 A/B `allocation_shape[K]`는 항상 `block_k × group_k × tile_k`이며
 아니다. 각 `(round, device_k)`의 `start[K]`와 tail `size[K]`도 Common
 IR에 이미 계산되어 있다.
 
-여러 K window가 만드는 partial output은 `pim.store`의 `pim.combine`에 원래 reduction
-combiner를 기록한다. 현재 정규화되는 GEMM/GEMV는 `pim.combine = "add"`다. UPMEM은
+여러 K window가 만드는 partial output은 `pim.combine partial into destination`에
+원래 reduction combiner를 기록한다. 현재 정규화되는 GEMM/GEMV는 `kind "add"`다. UPMEM은
 이를 host accumulation으로, AiMX는 vACC로 구현할 수 있지만 window 경계나 combine
 종류를 다시 추론하거나 바꿀 수는 없다.
 
@@ -297,7 +297,7 @@ Triton Block이 `[32,32,16]`, Group이 `[2,2,2]` Block, Execution Tile이
    `dk`의 시작 Group은 `(r * 2 + dk) * 56`이며, K tile이 더 많으면 다음
    `reduction_k` round에서 같은 두 K device를 재사용한다. A/B placement의 K
    allocation은 항상 1792다.
-7. 각 `(round, device_k)`의 C partial에는 `pim.combine="add"`가 붙는다.
+7. 각 `(round, device_k)`의 C partial은 `pim.combine ... kind "add"`가 된다.
 8. A placement에는 `replicated_over=["n"]`, B에는 `replicated_over=["m"]`가 붙는다.
 
 UPMEM lowering은 이 구조를 DPU별 MRAM/WRAM과 tasklet 협력 실행으로 옮긴다. UPMEM에서

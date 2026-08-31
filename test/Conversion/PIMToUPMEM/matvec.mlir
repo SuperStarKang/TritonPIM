@@ -77,10 +77,10 @@ func.func @matvec(%A: memref<*xf32>, %x: memref<*xf32>, %y: memref<*xf32>)
             ins(%aTile, %xTile : tensor<8x16xf32>, tensor<16xf32>)
             outs(%acc : tensor<8xf32>) -> tensor<8xf32>
         scf.yield %partial : tensor<8xf32>
-      } {pim.temporal_reduction}
+      } {pim.reduction = "add", pim.temporal_reduction}
       %yAccess = pim.access %y offset %m sizes [8] strides[%c1]
           origin[%m] {id = 2 : i64} : memref<*xf32> -> !pim.access
-      pim.store %result, %yAccess {pim.combine = "add"}
+      pim.combine %result into %yAccess kind "add"
           : tensor<8xf32>, !pim.access
     } {pim.axis = #pim.axis<"m">}
   }

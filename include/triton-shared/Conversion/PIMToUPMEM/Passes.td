@@ -36,8 +36,8 @@ def ConvertPIMToUPMEM : Pass<"convert-pim-to-upmem", "mlir::ModuleOp"> {
     - 전역 좌표를 복원하던 자리(pim.device_origin)의 device 시작을 0 으로 바꾼다. 그러면
       pim.access 의 origin 이 device 안의 위치가 된다.
     - tile 은 WRAM 버퍼가 되고 계산은 그 위에서 memref 형태 linalg 로 돈다.
-    - `pim.load`/`pim.store` 는 타일 하나를 옮기는 DMA 가 된다. 타일이 2048 byte 를 넘으면
-      행 묶음으로 쪼갠다.
+    - `pim.load`와 `pim.store`/`pim.combine` partial write는 타일 하나를 옮기는
+      DMA가 된다. 타일이 2048 byte를 넘으면 행 묶음으로 쪼갠다.
     - tasklet 이 여럿이면 target option `nr-tasklets`에 따라 block group의 행을 연속
       구간으로 나눠 협력 실행한다. 이 값은 profile의 lanes_per_core 이하이어야 한다.
       어느 operand가 m을 따르는지는
@@ -61,13 +61,12 @@ def ConvertPIMToUPMEM : Pass<"convert-pim-to-upmem", "mlir::ModuleOp"> {
     launch는 DPU set 전체에서 device program을 한 번 시작하는 것이며 Block Group마다
     발생하지 않는다. device-local Block Group loop 전체가 그 launch 한 번 안에서 돈다.
     각 stage/unstage 영역과 MRAM capacity는 그 round 안의 `pim.place`를 그대로 쓴다.
-    Common `pim.store`가 `pim.combine = "add"`를 기록한 출력만 Common reduction round의
-    spatial K round, device_k 좌표, temporal reduction_k round를
-    `upmem.unstage accumulate`의 첫-partial 판정에 그대로 사용한다. spatial split-K의
-    leading partial plane origin은 최종 output의 0번 plane으로 모으되 size를 유지하여
-    inactive tail device는 no-op으로 남긴다. `upmem.acquire`는 모든 Common scheduling
-    loop 밖에 있어 같은 DPU set과 device binary를 round 사이에 재사용한다. 별도
-    temporal host window는 만들지 않는다.
+    Common `pim.combine ... kind "add"`가 명시된 출력만 `reduction_k` round와
+    `device_k` 좌표를 `upmem.unstage accumulate`의 첫-partial 판정에 그대로
+    사용한다. 최종 output의 rank와 `pim.place` 영역은 K에 의존하지 않으므로 target이
+    partial plane을 제거하거나 destination을 다시 만들지 않는다. `upmem.acquire`는
+    모든 Common scheduling loop 밖에 있어 같은 DPU set과 device binary를 round
+    사이에 재사용한다. 별도 temporal host window는 만들지 않는다.
   }];
   let constructor = "mlir::triton::createConvertPIMToUPMEMPass()";
   let options = [

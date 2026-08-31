@@ -74,7 +74,7 @@ func.func @k_only_sum(%A: memref<*xi32>, %C: memref<*xi32>)
       } {pim.reduction = "add", pim.temporal_reduction}
       %cAccess = pim.access %C offset %c0 sizes [2] strides[%c1]
           origin[%c0] {id = 1 : i64} : memref<*xi32> -> !pim.access
-      pim.store %result, %cAccess {pim.combine = "add"}
+      pim.combine %result into %cAccess kind "add"
           : tensor<2xi32>, !pim.access
     }
   } {pim.scheduling_axis = "reduction_k"}

@@ -221,9 +221,9 @@ def UPMEM_ForeachGroupOp : UPMEM_Op<"foreach_group", [NoTerminator]> {
 //                sizes로 간격을 재면 엉뚱한 자리를 읽는다.
 //   tile       = upmem.stage와 같은 뜻. 유닛 버퍼가 타일 단위로 쓰여 있으므로 되돌릴 때도
 //                같은 순서로 읽어야 한다.
-//   accumulate = PIM Common IR의 explicit partial 좌표. 없으면 언제나 대입이고,
-//                있으면 spatial K round, device_k, temporal reduction_k가 모두 0인
-//                첫 partial만 대입하며 나머지는 누산(+=)한다. UPMEM lowering은
+//   accumulate = PIM Common IR에서 내린 first-partial 판정값. 없으면 언제나 대입이고,
+//                있으면 reduction_k round와 device_k가 모두 0인 첫 partial만
+//                대입하며 나머지는 누산(+=)한다. UPMEM lowering은
 //                pim.combine과 Common scheduling/device 좌표를 그대로 사용한다.
 def UPMEM_UnstageOp : UPMEM_Op<"unstage", [AttrSizedOperandSegments]> {
   let summary = "Scatter a tile-major buffer back into a strided region";

@@ -36,7 +36,7 @@ UPMEM 하드웨어가 답을 요구하는 것이 네 가지 더 있다.
 ### 2.1 컴파일
 
 ```
-PIM Common IR (pim.units + pim.unit_data)
+PIM Common IR (pim.device + pim.place + pim.combine)
    │
    ├ --convert-pim-to-upmem                     결정: 메모리 계층, 전송 단위,
    │     unit-memory-bytes / local-lanes              tasklet 분배, 레이아웃
@@ -163,7 +163,7 @@ upmem.stage %A origin[%r, %c] sizes[%m, %n] strides[%lda, %c1]
 
 ## 4. `--convert-pim-to-upmem`
 
-`lib/Conversion/PIMToUPMEM/PIMToUPMEMPass.cpp`. `pim.units` 하나를 module 수준 선언 +
+`lib/Conversion/PIMToUPMEM/PIMToUPMEMPass.cpp`. `pim.device` 하나를 module 수준 선언 +
 host 몸체 + `upmem.device_func`로 나눈다.
 
 ### 4.1 결정 1 — MRAM 버퍼는 유닛 메모리를 버퍼 수로 나눈다
@@ -262,6 +262,14 @@ for (scf::ForOp l : loops) if (...) dropIterArgs(l);  // yield와 init을 놓아
 for (Operation *op : llvm::reverse(oldCompute)) op->erase();  // 쓰는 쪽이 먼저
 for (Operation *op : oldLoads) op->erase();           // pim.access를 놓아 준다
 ```
+
+### 4.6 semantic K partial 회수
+
+Common IR은 하나의 `pim.reduction` domain을 `reduction_k` round와 `device_k`로
+이미 나눈다. UPMEM lowering은 별도 spatial K plane이나 K window를 만들지 않는다.
+각 `pim.combine ... kind "add"`는 device에서 해당 partial을 MRAM에 쓰고, host의
+`upmem.unstage accumulate`는 `reduction_k round + device_k`가 0인 첫 partial만
+대입하고 나머지를 더한다. 최종 `pim.place`의 start/size/rank는 그대로 사용한다.
 
 ---
 

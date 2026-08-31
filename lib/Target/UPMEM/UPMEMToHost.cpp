@@ -514,7 +514,7 @@ struct HostEmitter {
   // 타일 단위 버퍼를 원본의 strided 영역으로 되돌린다. 읽는 범위는 실제로 쓴 영역(sizes)
   // 이고, 축별 타일 수는 버퍼 자체의 크기(capacity)에서 나온다. 유닛이 배정량보다 적게
   // 맡으면 둘이 달라지므로 나누어 써야 한다.
-  // accumulate(partial 좌표)가 있으면 spatial/temporal/device-k가 모두 0인 첫
+  // accumulate(first-partial 판정값)가 있으면 reduction-k round와 device-k가 모두 0인 첫
   // partial만 대입하고 그 뒤는 누산한다. launch마다 나온 부분합을 host가 합쳐
   // 최종 output을 만든다.
   LogicalResult emitUnstage(upmem::UnstageOp un, unsigned depth) {
