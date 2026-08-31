@@ -1,4 +1,4 @@
-// pim.access / pim.device / pim.place / pim.store verifier가 말이 안 되는 조합을
+// pim.access / pim.device / pim.place / pim.combine verifier가 말이 안 되는 조합을
 // 거부하는지 확인.
 // RUN: triton-shared-opt --split-input-file -verify-diagnostics %s
 
@@ -77,8 +77,45 @@ func.func @unsupported_combine(%C: memref<*xi32>) {
   %empty = tensor.empty() : tensor<1xi32>
   %access = pim.access %C offset %c0 sizes [1] strides[%c1] origin[%c0]
       {id = 0 : i64} : memref<*xi32> -> !pim.access
-  // expected-error @+1 {{pim.combine currently supports only the normalized add combiner}}
-  pim.store %empty, %access {pim.combine = "max"}
-      : tensor<1xi32>, !pim.access
+  // expected-error @+1 {{currently supports only the normalized add combiner}}
+  pim.combine %empty into %access kind "max" : tensor<1xi32>, !pim.access
+  return
+}
+
+// -----
+
+// split-K partial과 final output tile은 같은 M/N 논리 shape를 가져야 한다.
+func.func @combine_rank(%C: memref<*xi32>) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %empty = tensor.empty() : tensor<2x2xi32>
+  %access = pim.access %C offset %c0 sizes [4] strides[%c1] origin[%c0]
+      {id = 0 : i64} : memref<*xi32> -> !pim.access
+  // expected-error @+1 {{partial rank must equal the final destination access rank}}
+  pim.combine %empty into %access kind "add" : tensor<2x2xi32>, !pim.access
+  return
+}
+
+// -----
+
+// 같은 rank라도 partial과 final destination의 tile shape가 다르면 안 된다.
+func.func @combine_shape(%C: memref<*xi32>) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %empty = tensor.empty() : tensor<2xi32>
+  %access = pim.access %C offset %c0 sizes [4] strides[%c1] origin[%c0]
+      {id = 0 : i64} : memref<*xi32> -> !pim.access
+  // expected-error @+1 {{partial shape must equal the final destination access shape}}
+  pim.combine %empty into %access kind "add" : tensor<2xi32>, !pim.access
+  return
+}
+
+// -----
+
+// destination은 Target이 추측하는 handle이 아니라 명시적인 최종 pim.access다.
+func.func @combine_destination(%destination: !pim.access) {
+  %empty = tensor.empty() : tensor<1xi32>
+  // expected-error @+1 {{destination must be defined by pim.access}}
+  pim.combine %empty into %destination kind "add" : tensor<1xi32>, !pim.access
   return
 }

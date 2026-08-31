@@ -688,8 +688,7 @@ struct PIMVerifyPass
         semanticReductions.push_back(loop);
       if (auto axis = loop->getAttrOfType<pim::AxisAttr>("pim.axis")) {
         int64_t number = canonicalAxis(axis.getName().getValue());
-        if (number >= 0)
-          spatialAxes[number].push_back(loop);
+        spatialAxes[number].push_back(loop);
       }
     }
     if (temporalReductions.size() > 1)
@@ -716,9 +715,10 @@ struct PIMVerifyPass
                << " greater than one requires an explicit spatial pim.axis=\""
                << axisNames[axis] << "\"";
 
-    bool hasStore = false;
-    device.walk([&](pim::StoreOp) { hasStore = true; });
-    if (!spatialAxes[2].empty() && hasStore && semanticReductions.empty())
+    bool hasOutput = false;
+    device.walk([&](pim::StoreOp) { hasOutput = true; });
+    device.walk([&](pim::CombineOp) { hasOutput = true; });
+    if (!spatialAxes[2].empty() && hasOutput && semanticReductions.empty())
       return device->emitError(
           "pim-verify: a spatial K output needs one semantic pim.reduction");
 
@@ -795,7 +795,7 @@ struct PIMVerifyPass
              << profile.getNumUnits();
 
     llvm::DenseMap<int64_t, pim::AccessOp> accessIds;
-    llvm::DenseSet<int64_t> placeIds;
+    llvm::DenseMap<int64_t, pim::PlaceOp> placements;
     WalkResult res = device.walk([&](pim::AccessOp a) {
       if (a.getOrigin().size() != a.getSizes().size()) {
         a->emitError("pim-verify: origin rank does not match sizes rank");
@@ -838,7 +838,7 @@ struct PIMVerifyPass
       auto place = dyn_cast<pim::PlaceOp>(&op);
       if (!place)
         continue;
-      if (!placeIds.insert(place.getAccess()).second)
+      if (!placements.insert({place.getAccess(), place}).second)
         return place->emitError("pim-verify: two placements for one pim.access");
       auto it = accessIds.find((int64_t)place.getAccess());
       if (it == accessIds.end())
@@ -884,9 +884,6 @@ struct PIMVerifyPass
           if (auto axis = driver->getAttrOfType<pim::AxisAttr>("pim.axis")) {
             StringRef name = axis.getName().getValue();
             int64_t axisNumber = canonicalAxis(name);
-            if (axisNumber < 0)
-              return place->emitError("pim-verify: unsupported spatial axis ")
-                     << name;
             if (spatialFirst[axisNumber] &&
                 !dependsOn(place.getStart()[d], spatialFirst[axisNumber]))
               return place->emitError("pim-verify: resident buffer axis ")
@@ -901,12 +898,8 @@ struct PIMVerifyPass
                      << " but size does not use the current local Tile "
                         "length";
             ArrayRef<int64_t> groups = execution.getGroups().asArrayRef();
-            int64_t factor = name == "m"   ? groups[0]
-                             : name == "n" ? groups[1]
-                             : name == "k" ? 1
-                                           : 0;
-            if (factor < 1 ||
-                expected > std::numeric_limits<int64_t>::max() / factor)
+            int64_t factor = axisNumber == 2 ? 1 : groups[axisNumber];
+            if (expected > std::numeric_limits<int64_t>::max() / factor)
               return place->emitError(
                   "pim-verify: resident allocation extent overflows i64");
             expected *= factor;
@@ -935,11 +928,11 @@ struct PIMVerifyPass
         if (size && *size < 0)
           return place->emitError("pim-verify: negative size on buffer axis ")
                  << d;
-        if (allocation && *allocation < 0)
+        if (*allocation < 0)
           return place->emitError(
                      "pim-verify: negative allocation_shape on buffer axis ")
                  << d;
-        if (size && allocation && *size > *allocation)
+        if (size && *size > *allocation)
           return place->emitError("pim-verify: buffer axis ")
                  << d << " needs " << *size << " elements but only " << *allocation
                  << " are allocated per device";
@@ -966,9 +959,9 @@ struct PIMVerifyPass
             "pim-verify: total allocation byte count overflows i64");
       staticAllocationBytes += bytes;
     }
-    if (accessIds.size() != placeIds.size())
+    if (accessIds.size() != placements.size())
       return device->emitError("pim-verify: ")
-             << accessIds.size() << " accesses but " << placeIds.size()
+             << accessIds.size() << " accesses but " << placements.size()
              << " placements";
 
     for (int64_t axis = 0; axis < 3; ++axis) {
@@ -983,56 +976,145 @@ struct PIMVerifyPass
                << " axis requires exactly one matching scheduling round";
     }
 
-    // pim.combine is the original semantic combiner for every partial source.
+    // K is an execution/reduction coordinate, not an output dimension.  A
+    // final store/combine destination may depend on M/N scheduling, but its
+    // address must not select a temporal window, spatial plane, or K device.
+    // Otherwise Common would still expose a hidden [p_k,...] partial ABI and a
+    // target would have to reinterpret it.
+    SmallVector<Value> kSchedulingRoots;
+    kSchedulingRoots.push_back(device.getBody().front().getArgument(2));
+    for (scf::ForOp loop : temporalReductions)
+      kSchedulingRoots.push_back(loop.getInductionVar());
+    for (scf::ForOp loop : spatialAxes[2])
+      kSchedulingRoots.push_back(loop.getInductionVar());
+    for (scf::ForOp loop : temporalRounds)
+      kSchedulingRoots.push_back(loop.getInductionVar());
+    for (scf::ForOp loop : spatialRounds[2])
+      kSchedulingRoots.push_back(loop.getInductionVar());
+
+    auto accessDependsOnK = [&](pim::AccessOp access) {
+      if (dependsOn(access.getOffset(), kSchedulingRoots))
+        return true;
+      for (Value value : access.getOrigin())
+        if (dependsOn(value, kSchedulingRoots))
+          return true;
+      for (Value value : access.getStrides())
+        if (dependsOn(value, kSchedulingRoots))
+          return true;
+      for (Value value : access.getValid())
+        if (dependsOn(value, kSchedulingRoots))
+          return true;
+      return access.getPad() &&
+             dependsOn(access.getPad(), kSchedulingRoots);
+    };
+
+    auto verifyFinalAccess = [&](pim::AccessOp access,
+                                 Operation *write) -> LogicalResult {
+      auto placement = placements.find(access.getId());
+      if (placement == placements.end())
+        return write->emitError(
+            "pim-verify: final output access has no pim.place in this device");
+      if (placement->second.getDirection() != "out")
+        return write->emitError(
+            "pim-verify: final output access must have an out placement");
+      if (accessDependsOnK(access))
+        return write->emitError(
+            "pim-verify: final output access must not depend on temporal, "
+            "spatial, or device K scheduling");
+      return success();
+    };
+
+    WalkResult finalResult = device.walk([&](pim::StoreOp store) {
+      auto access = store.getAccess().getDefiningOp<pim::AccessOp>();
+      if (!access) {
+        store->emitError(
+            "pim-verify: final store destination must be defined by pim.access");
+        return WalkResult::interrupt();
+      }
+      if (failed(verifyFinalAccess(access, store)))
+        return WalkResult::interrupt();
+      return WalkResult::advance();
+    });
+    if (finalResult.wasInterrupted())
+      return failure();
+    finalResult = device.walk([&](pim::CombineOp combine) {
+      auto access =
+          combine.getDestination().getDefiningOp<pim::AccessOp>();
+      if (failed(verifyFinalAccess(access, combine)))
+        return WalkResult::interrupt();
+      return WalkResult::advance();
+    });
+    if (finalResult.wasInterrupted())
+      return failure();
+
+    // pim.combine is the original semantic combiner and final destination for
+    // every partial source.
     // The sources are explicit in Common IR: reduction_k ancestors are temporal
     // windows and pim.axis="k" plus mapping.partitions[k] are spatial planes and
     // devices.  A target may choose where to perform the combine, but it must
     // not rediscover either the operation or its scope from access arithmetic.
     if (!semanticReductions.empty() &&
         semanticReductions.front().getNumResults() != 0) {
-      bool sawPartialStore = false;
-      bool missingCombine = false;
+      scf::ForOp reduction = semanticReductions.front();
+      int64_t combineCount = 0;
       bool mismatchedCombine = false;
       bool hasPreCombineEpilogue = false;
-      StringAttr reductionCombiner = semanticReductions.front()
-                                         ->getAttrOfType<StringAttr>(
-                                             "pim.reduction");
+      pim::StoreOp directPartialStore;
+      pim::CombineOp unrelatedCombine;
+      StringAttr reductionCombiner =
+          reduction->getAttrOfType<StringAttr>("pim.reduction");
       device.walk([&](pim::StoreOp store) {
-        if (!dependsOn(store.getValue(), semanticReductions.front().getResults()))
+        if (!dependsOn(store.getValue(), reduction.getResults()))
           return;
-        sawPartialStore = true;
-        hasPreCombineEpilogue |= !llvm::is_contained(
-            semanticReductions.front().getResults(), store.getValue());
-        StringAttr combine =
-            store->getAttrOfType<StringAttr>("pim.combine");
-        missingCombine |= !combine;
-        mismatchedCombine |=
-            combine && combine.getValue() != reductionCombiner.getValue();
+        if (!directPartialStore)
+          directPartialStore = store;
       });
-      if (!sawPartialStore)
+      device.walk([&](pim::CombineOp combine) {
+        if (!dependsOn(combine.getPartial(), reduction.getResults())) {
+          if (!unrelatedCombine)
+            unrelatedCombine = combine;
+          return;
+        }
+        ++combineCount;
+        hasPreCombineEpilogue |= !llvm::is_contained(
+            reduction.getResults(), combine.getPartial());
+        mismatchedCombine |=
+            combine.getKind() != reductionCombiner.getValue();
+      });
+      if (directPartialStore)
+        return directPartialStore->emitError(
+            "pim-verify: a semantic K reduction result must use pim.combine, "
+            "not a direct pim.store");
+      if (unrelatedCombine)
+        return unrelatedCombine->emitError(
+            "pim-verify: pim.combine partial must be the semantic K "
+            "reduction result");
+      if (reduction.getRegionIterArgs().size() != 1 ||
+          reduction.getNumResults() != 1)
+        return reduction->emitError(
+            "pim-verify: a normalized PIM reduction loop must carry exactly "
+            "one accumulator result");
+      if (combineCount != 1)
         return device->emitError(
-            "pim-verify: semantic K reduction has no partial output store");
+            "pim-verify: one semantic K reduction result needs exactly one "
+            "partial-to-final pim.combine");
       if (hasPreCombineEpilogue)
         return device->emitError(
             "pim-verify: an epilogue consumes a K partial result "
             "before it is combined");
-      if (missingCombine)
-        return device->emitError(
-            "pim-verify: every K partial store needs an explicit "
-            "pim.combine");
       if (mismatchedCombine)
         return device->emitError(
-            "pim-verify: K partial store combiner does not match the "
+            "pim-verify: K partial combiner does not match the "
             "semantic pim.reduction combiner");
     }
 
     // A combine marker without a semantic reduction would force the target to
     // guess what value is partial.  Reject it in Common IR.
     if (semanticReductions.empty()) {
-      pim::StoreOp unexplainedCombine;
-      device.walk([&](pim::StoreOp store) {
-        if (!unexplainedCombine && store->hasAttr("pim.combine"))
-          unexplainedCombine = store;
+      pim::CombineOp unexplainedCombine;
+      device.walk([&](pim::CombineOp combine) {
+        if (!unexplainedCombine)
+          unexplainedCombine = combine;
       });
       if (unexplainedCombine)
         return unexplainedCombine->emitError(

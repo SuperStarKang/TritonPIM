@@ -141,10 +141,24 @@ LogicalResult PlaceOp::verify() {
   return success();
 }
 
-LogicalResult StoreOp::verify() {
-  auto combine = (*this)->getAttrOfType<StringAttr>("pim.combine");
-  if (combine && combine.getValue() != "add")
+LogicalResult CombineOp::verify() {
+  if (getKind() != "add")
     return emitOpError(
-        "pim.combine currently supports only the normalized add combiner");
+        "currently supports only the normalized add combiner");
+
+  auto destination = getDestination().getDefiningOp<AccessOp>();
+  if (!destination)
+    return emitOpError("destination must be defined by pim.access");
+
+  auto partialType = cast<RankedTensorType>(getPartial().getType());
+  ArrayRef<int64_t> destinationShape = destination.getSizes();
+  if (partialType.getRank() != static_cast<int64_t>(destinationShape.size()))
+    return emitOpError(
+        "partial rank must equal the final destination access rank");
+  for (auto [partialDim, destinationDim] :
+       llvm::zip_equal(partialType.getShape(), destinationShape))
+    if (!ShapedType::isDynamic(partialDim) && partialDim != destinationDim)
+      return emitOpError(
+          "partial shape must equal the final destination access shape");
   return success();
 }

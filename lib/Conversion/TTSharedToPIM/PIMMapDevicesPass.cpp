@@ -25,7 +25,7 @@ namespace triton {
 namespace {
 
 static int64_t canonicalAxis(StringRef axis) {
-  return axis == "m" ? 0 : axis == "n" ? 1 : axis == "k" ? 2 : -1;
+  return axis == "m" ? 0 : axis == "n" ? 1 : 2;
 }
 
 static bool dependsOn(Value value, ValueRange roots) {
@@ -172,22 +172,22 @@ struct PIMMapDevicesPass
 
     SmallVector<scf::ForOp> loops;
     SmallVector<StringAttr> names;
-    bool invalidAxis = false;
+    bool duplicateAxis = false;
     bool seen[3] = {false, false, false};
     for (scf::ForOp loop : allLoops) {
       auto axis = loop->getAttrOfType<pim::AxisAttr>("pim.axis");
       if (!axis)
         continue;
       int64_t number = canonicalAxis(axis.getName().getValue());
-      if (number < 0 || seen[number]) {
-        invalidAxis = true;
+      if (seen[number]) {
+        duplicateAxis = true;
         continue;
       }
       seen[number] = true;
       loops.push_back(loop);
       names.push_back(axis.getName());
     }
-    if (invalidAxis)
+    if (duplicateAxis)
       return func->emitError(
           "pim-map-devices: each canonical axis m, n, and k may occur at most once");
 
@@ -254,10 +254,6 @@ struct PIMMapDevicesPass
     for (StringAttr name : names) {
       int64_t axis = canonicalAxis(name.getValue());
       int64_t groups = name.getValue() == "k" ? 1 : tileGroups[axis];
-      if (groups <= 0)
-        return func->emitError("pim-map-devices: execution_tile.groups[")
-               << name.getValue()
-               << "] must be positive for an existing axis";
       granularity.push_back(groups);
     }
 
@@ -274,7 +270,7 @@ struct PIMMapDevicesPass
 
     // M/N이 없는 K-only reduction에서는 init과 최종 store가 reduction loop의
     // 형제다. loop만 pim.device로 옮기면 init은 scheduling round 밖에서 한 번만
-    // 만들어지고 partial store는 host에 남는다. 이 경우에만 loop의 single-use
+    // 만들어지고 output write는 host에 남는다. 이 경우에만 loop의 single-use
     // tensor init chain과 direct result store를 함께 옮길 envelope로 모은다.
     SmallVector<Operation *> kOnlyInitOps;
     SmallVector<std::pair<pim::AccessOp, pim::StoreOp>> kOnlyOutputs;
@@ -319,10 +315,10 @@ struct PIMMapDevicesPass
       });
       if (invalidStore)
         return invalidStore->emitError("pim-map-devices: ") << invalidReason;
-      if (reductionLoop.getNumResults() != 0 && kOnlyOutputs.empty())
+      if (reductionLoop.getNumResults() != 0 && kOnlyOutputs.size() != 1)
         return reductionLoop->emitError(
-            "pim-map-devices: a K-only reduction result must be written by "
-            "a direct pim.store");
+            "pim-map-devices: a K-only reduction result must have exactly "
+            "one direct final output pim.store");
     }
 
     MLIRContext *ctx = func.getContext();
@@ -403,8 +399,8 @@ struct PIMMapDevicesPass
     // 옮겨 zero-init이 Execution Tile마다 한 번 실행되게 한다.
     for (Operation *init : llvm::reverse(kOnlyInitOps))
       init->moveBefore(rootLoop);
-    // output access/store는 reduction 뒤에 두어 local result를 같은 pim.device
-    // instance의 partial output으로 만든다.
+    // output access/store는 reduction 뒤에 두고, 아래에서 같은 pim.device instance의
+    // partial-to-final combine으로 바꾼다.
     Operation *afterReduction = rootLoop;
     for (auto [access, store] : kOnlyOutputs) {
       access->moveAfter(afterReduction);
@@ -426,13 +422,13 @@ struct PIMMapDevicesPass
                    reductionRange);
       reductionLoop->setAttr("pim.temporal_reduction", b.getUnitAttr());
 
-      // Window마다 accumulator가 identity에서 다시 시작하므로 최종 store는
-      // partial 결과다. spatial pim.axis="k"가 있으면 서로 다른 plane/device도
-      // 같은 reduction의 partial이다. 어느 경우든 combiner는 linalg 의미에서 이미
-      // 기록된 pim.reduction을 그대로 복사한다. target은 pim.device의 p_k, spatial
-      // K scheduling loop, reduction_k round와 이 attribute를 소비할 뿐 결합 범위나
-      // 연산을 다시 추론하지 않는다. store 전에 epilogue가 끼면 partial 결합 뒤에
-      // 실행해야 의미가 같으므로 조용히 잘못된 위치에 combine을 붙이지 않는다.
+      // Window마다 accumulator가 identity에서 다시 시작하므로 reduction 결과는
+      // 하나의 partial contribution이다. spatial pim.axis="k"가 있으면 서로 다른
+      // plane/device도 같은 final M/N destination의 contribution이다. 원래 store의
+      // access가 operation의 최종 논리 destination이므로 pim.combine이 value와 그
+      // access를 직접 연결한다. target은 destination이나 reduction 여부를 access
+      // rank에서 다시 추론하지 않는다. combine 전에 epilogue가 끼면 partial들을
+      // 먼저 결합한 뒤 epilogue를 실행하는 원래 의미와 달라지므로 거부한다.
       if (reductionLoop.getNumResults() != 0) {
         SmallVector<pim::StoreOp> partialStores;
         pim::StoreOp epilogueStore;
@@ -450,10 +446,17 @@ struct PIMMapDevicesPass
               "pim-map-devices: an epilogue consumes a K partial "
               "result before it is combined; combine the reduction result "
               "before lowering the epilogue");
+        if (partialStores.size() != 1)
+          return reductionLoop->emitError(
+              "pim-map-devices: one normalized K reduction result must have "
+              "exactly one final output store");
         StringAttr combiner =
             reductionLoop->getAttrOfType<StringAttr>("pim.reduction");
-        for (pim::StoreOp store : partialStores)
-          store->setAttr("pim.combine", combiner);
+        pim::StoreOp store = partialStores.front();
+        OpBuilder combineBuilder(store);
+        combineBuilder.create<pim::CombineOp>(
+            store.getLoc(), store.getValue(), store.getAccess(), combiner);
+        store.erase();
       }
     }
     return success();

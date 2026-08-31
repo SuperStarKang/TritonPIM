@@ -44,7 +44,7 @@ SmallVector<int64_t, 3> mlir::pim::blockShape(Operation *op) {
 SmallVector<int64_t, 3> mlir::pim::groupShape(Operation *op) {
   SmallVector<int64_t, 3> shape = blockShape(op);
   auto group = lookupPlanAttr<BlockGroupAttr>(op, "pim.block_group");
-  if (shape.size() != 3 || !group || group.getBlocks().size() != 3)
+  if (shape.size() != 3 || !group)
     return {};
   for (unsigned i = 0; i < 3; ++i)
     shape[i] *= group.getBlocks().asArrayRef()[i];
@@ -54,7 +54,7 @@ SmallVector<int64_t, 3> mlir::pim::groupShape(Operation *op) {
 SmallVector<int64_t, 3> mlir::pim::executionTileShape(Operation *op) {
   SmallVector<int64_t, 3> shape = groupShape(op);
   auto tile = lookupPlanAttr<ExecutionTileAttr>(op, "pim.execution_tile");
-  if (shape.size() != 3 || !tile || tile.getGroups().size() != 3)
+  if (shape.size() != 3 || !tile)
     return {};
   for (unsigned i = 0; i < 3; ++i)
     shape[i] *= tile.getGroups().asArrayRef()[i];
@@ -67,8 +67,7 @@ mlir::pim::unitCapacityLimitBytes(TargetProfileAttr profile) {
     return std::nullopt;
   int64_t banks = profile.getBanksPerUnit();
   int64_t bytes = profile.getBankCapacityLimitBytes();
-  if (banks < 1 || bytes < 0 ||
-      (bytes != 0 && banks > std::numeric_limits<int64_t>::max() / bytes))
+  if (bytes != 0 && banks > std::numeric_limits<int64_t>::max() / bytes)
     return std::nullopt;
   return banks * bytes;
 }

@@ -106,6 +106,46 @@ struct PIMFormBlockGroupsPass
       grouped.push_back({reductions.front(), gK});
     }
 
+    // Group loop의 상한이 group 크기로 나누어지지 않거나 runtime 값이면 마지막
+    // Group에 존재하지 않는 Block이 포함될 수 있다. 그런 축을 실제로 사용하는
+    // access는 원본 extent를 복원할 dynamic valid를 가져야 한다. valid가 없거나
+    // 항상 full Block이라고만 말하는 상수 valid라면 확대된 access가 phantom Block을
+    // 읽고 쓰게 되므로 IR을 변경하기 전에 거부한다.
+    SmallVector<pim::AccessOp> accesses;
+    func.walk([&](pim::AccessOp access) { accesses.push_back(access); });
+    for (auto [loop, group] : grouped) {
+      std::optional<int64_t> tiles =
+          getConstantIntValue(loop.getUpperBound());
+      bool mayHaveIncompleteGroup =
+          !tiles || *tiles < 0 || *tiles % group != 0;
+      if (!mayHaveIncompleteGroup)
+        continue;
+
+      SmallVector<scf::ForOp, 1> groupedLoop{loop};
+      for (pim::AccessOp access : accesses) {
+        for (unsigned d = 0, e = access.getSizes().size(); d < e; ++d) {
+          llvm::SmallPtrSet<Operation *, 1> drivers;
+          pim::collectDrivers(access.getOrigin()[d], groupedLoop, drivers);
+          if (drivers.empty())
+            continue;
+          if (access.getValid().empty())
+            return access->emitError(
+                       "pim-form-block-groups: an unmasked buffer axis may "
+                       "have an incomplete Block Group; its Block count must "
+                       "be statically divisible by the Group size ")
+                   << group;
+          if (std::optional<int64_t> valid =
+                  getConstantIntValue(access.getValid()[d]);
+              valid && *valid != 0)
+            return access->emitError(
+                       "pim-form-block-groups: a constant full valid extent "
+                       "cannot describe an incomplete Block Group tail on "
+                       "buffer axis ")
+                   << d;
+        }
+      }
+    }
+
     // m/n의 새 상한은 가장 바깥 축 loop 앞에 만든다. reduction 상한은 원래 runtime K
     // 식과 같은 위치인 reduction loop 앞에 둔다. 뒤의 pim-map-devices는 Common
     // scheduling boundary를 만들 때 이 불변 bound 식을 그 경계 앞으로 다시 만든다.
@@ -157,8 +197,6 @@ struct PIMFormBlockGroupsPass
     SmallVector<scf::ForOp> allLoops;
     func.walk<WalkOrder::PreOrder>(
         [&](scf::ForOp loop) { allLoops.push_back(loop); });
-    SmallVector<pim::AccessOp> accesses;
-    func.walk([&](pim::AccessOp access) { accesses.push_back(access); });
     for (pim::AccessOp a : accesses) {
       SmallVector<int64_t> sizes(a.getSizes());
       SmallVector<Value> valid(a.getValid());

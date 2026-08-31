@@ -1,8 +1,8 @@
 // PIM dialect op의 parse/print roundtrip 확인.
 // RUN: triton-shared-opt %s | triton-shared-opt | FileCheck %s
 
-// CHECK-LABEL: func.func @access_load_store
-func.func @access_load_store(%A: memref<*xf32>, %C: memref<*xf32>) {
+// CHECK-LABEL: func.func @access_load_store_combine
+func.func @access_load_store_combine(%A: memref<*xf32>, %C: memref<*xf32>) {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
 
@@ -16,6 +16,9 @@ func.func @access_load_store(%A: memref<*xf32>, %C: memref<*xf32>) {
       : memref<*xf32> -> !pim.access
   // CHECK: pim.store %{{.*}}, %{{.*}} : tensor<32xf32>, !pim.access
   pim.store %v, %dc : tensor<32xf32>, !pim.access
+  // A split-K contribution is internal; Common names its final logical output.
+  // CHECK: pim.combine %{{.*}} into %{{.*}} kind "add" : tensor<32xf32>, !pim.access
+  pim.combine %v into %dc kind "add" : tensor<32xf32>, !pim.access
   return
 }
 

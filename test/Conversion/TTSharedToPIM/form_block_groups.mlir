@@ -58,19 +58,20 @@
 // CHECK:          pim.store %{{.*}} : tensor<16x64xi32>, !pim.access
 
 func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
-                  %tr: index, %tc: index, %tk: index, %lda: index, %ldb: index) {
+                  %lda: index, %ldb: index) {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
+  %c4 = arith.constant 4 : index
   %c8 = arith.constant 8 : index
   %c32 = arith.constant 32 : index
   %c0_i32 = arith.constant 0 : i32
-  scf.for %x = %c0 to %tr step %c1 {
+  scf.for %x = %c0 to %c4 step %c1 {
     %m = arith.muli %x, %c8 : index
-    scf.for %y = %c0 to %tc step %c1 {
+    scf.for %y = %c0 to %c4 step %c1 {
       %n = arith.muli %y, %c32 : index
       %e = tensor.empty() : tensor<8x32xi32>
       %init = linalg.fill ins(%c0_i32 : i32) outs(%e : tensor<8x32xi32>) -> tensor<8x32xi32>
-      %r = scf.for %z = %c0 to %tk step %c1 iter_args(%acc = %init) -> (tensor<8x32xi32>) {
+      %r = scf.for %z = %c0 to %c4 step %c1 iter_args(%acc = %init) -> (tensor<8x32xi32>) {
         %k = arith.muli %z, %c32 : index
         %da = pim.access %A offset %m sizes [8, 32] strides[%lda, %c1] origin[%m, %k]
               {id = 0 : i64} : memref<*xi8> -> !pim.access

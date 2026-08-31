@@ -14,12 +14,13 @@
 // CHECK-SAME: allocation_shape[{{.*}}, {{.*}}]
 // CHECK: pim.place %arg1
 // CHECK-SAME: allocation_shape[{{.*}}, {{.*}}]
+// 최종 output은 split-K plane을 외부 차원으로 노출하지 않는다.
 // CHECK: pim.place %arg2
-// CHECK-SAME: allocation_shape[{{.*}}, {{.*}}, {{.*}}]
+// CHECK-SAME: allocation_shape[{{.*}}, {{.*}}]
 // CHECK: scf.for {{.*}} iter_args
 // CHECK: } {pim.reduction = "add", pim.temporal_reduction}
 // 같은 add가 temporal window, spatial plane, p_k device partial 모두의 combiner다.
-// CHECK: pim.store {{.*}} {pim.combine = "add"}
+// CHECK: pim.combine {{.*}} into {{.*}} kind "add"
 // CHECK: } {pim.axis = #pim.axis<"k">}
 // CHECK: } {pim.scheduling_axis = "reduction_k"}
 // CHECK: } {pim.scheduling_axis = "k"}
@@ -31,10 +32,9 @@ module attributes {pim.target_profile = #pim.target_profile<
     local_capacity_limit_bytes = 0>} {
 
 func.func @spatial_split_k(
-    %A: memref<*xi8>, %B: memref<*xi8>, %Partial: memref<*xi32>,
+    %A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
     %mTiles: index, %nTiles: index, %planes: index, %kGroups: index,
-    %kPerPlane: index, %lda: index, %ldb: index, %ldc: index,
-    %planeStride: index)
+    %kPerPlane: index, %lda: index, %ldb: index, %ldc: index)
     attributes {
       pim.block = #pim.block<shape = [8, 8, 4]>,
       pim.block_group = #pim.block_group<blocks = [1, 1, 1]>,
@@ -79,13 +79,11 @@ func.func @spatial_split_k(
           scf.yield %next : tensor<8x8xi32>
         } {pim.reduction = "add"}
 
-        %planeOffset = arith.muli %plane, %planeStride : index
         %cRow = arith.muli %m, %ldc : index
         %cMN = arith.addi %cRow, %n : index
-        %cOffset = arith.addi %planeOffset, %cMN : index
-        %cAccess = pim.access %Partial offset %cOffset sizes [1, 8, 8]
-            strides[%planeStride, %ldc, %c1] origin[%plane, %m, %n]
-            {id = 2 : i64} : memref<*xi32> -> !pim.access
+        %cAccess = pim.access %C offset %cMN sizes [8, 8]
+            strides[%ldc, %c1] origin[%m, %n] {id = 2 : i64}
+            : memref<*xi32> -> !pim.access
         pim.store %result, %cAccess : tensor<8x8xi32>, !pim.access
       } {pim.axis = #pim.axis<"k">}
     } {pim.axis = #pim.axis<"n">}

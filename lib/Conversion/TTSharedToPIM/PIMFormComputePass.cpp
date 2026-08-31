@@ -6,6 +6,7 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 
@@ -137,26 +138,55 @@ static bool isZeroFill(Value v) {
 // body에서 읽는다. op 이름을 열거하지 않으므로 matmul/matvec/reduce뿐 아니라 같은
 // add-accumulator 계약의 convolution/generic도 동일하게 처리한다. access 주소를
 // 모는 loop인지 여부는 데이터 이동 정보일 뿐 연산 의미가 아니므로 사용하지 않는다.
-static bool isAddCompute(linalg::LinalgOp compute) {
+static bool dependsOn(Value value, Value root) {
+  SmallVector<Value> work{value};
+  llvm::DenseSet<Value> seen;
+  while (!work.empty()) {
+    Value current = work.pop_back_val();
+    if (!seen.insert(current).second)
+      continue;
+    if (current == root)
+      return true;
+    if (Operation *def = current.getDefiningOp())
+      work.append(def->getOperands().begin(), def->getOperands().end());
+  }
+  return false;
+}
+
+enum class AddComputeKind {
+  NotAddAccumulator,
+  IndependentPartial,
+  AccumulatorDependentPartial,
+};
+
+static AddComputeKind classifyAddCompute(linalg::LinalgOp compute) {
   if (compute.getNumDpsInits() != 1 || compute->getNumRegions() != 1 ||
       compute->getNumResults() != 1)
-    return false;
+    return AddComputeKind::NotAddAccumulator;
   Region &region = compute->getRegion(0);
   if (region.empty())
-    return false;
+    return AddComputeKind::NotAddAccumulator;
   Block &body = region.front();
   unsigned accumulatorIndex = compute.getDpsInputs().size();
   if (body.getNumArguments() <= accumulatorIndex)
-    return false;
+    return AddComputeKind::NotAddAccumulator;
   auto yield = dyn_cast<linalg::YieldOp>(body.getTerminator());
   if (!yield || yield.getValues().size() != 1)
-    return false;
+    return AddComputeKind::NotAddAccumulator;
   Operation *add = yield.getValues()[0].getDefiningOp();
   if (!add || !isa<arith::AddFOp, arith::AddIOp>(add))
-    return false;
+    return AddComputeKind::NotAddAccumulator;
   Value accumulator = body.getArgument(accumulatorIndex);
-  return add->getOperand(0) == accumulator ||
-         add->getOperand(1) == accumulator;
+  Value partial;
+  if (add->getOperand(0) == accumulator)
+    partial = add->getOperand(1);
+  else if (add->getOperand(1) == accumulator)
+    partial = add->getOperand(0);
+  else
+    return AddComputeKind::NotAddAccumulator;
+  return dependsOn(partial, accumulator)
+             ? AddComputeKind::AccumulatorDependentPartial
+             : AddComputeKind::IndependentPartial;
 }
 
 // 누산기 초기값을 만드는 op을 그 loop 바로 앞으로 내린다. 값 의미로는 밖에
@@ -218,21 +248,29 @@ struct PIMFormComputePass
       Operation *def = yield.getOperand(i).getDefiningOp();
       auto compute = dyn_cast_or_null<linalg::LinalgOp>(def);
       if (!compute || compute.getNumDpsInits() != 1 ||
-          compute.getDpsInits()[0] != acc || !isAddCompute(compute))
+          compute.getDpsInits()[0] != acc)
+        continue;
+      AddComputeKind kind = classifyAddCompute(compute);
+      if (kind == AddComputeKind::AccumulatorDependentPartial)
+        return compute->emitError(
+            "pim-form-compute: the add contribution must not depend on the "
+            "previous accumulator before it is split into Execution Tiles");
+      if (kind != AddComputeKind::IndependentPartial)
         continue;
       if (!isZeroFill(loop.getInitArgs()[i]))
         return loop->emitError(
             "pim-form-compute: an add reduction must start from a zero "
             "identity before it can be split into Execution Tiles");
-      if (found)
-        return loop->emitError(
-            "pim-form-compute: one loop may carry only one normalized PIM "
-            "reduction result");
       found = true;
     }
-    if (found)
+    if (found) {
+      if (loop.getRegionIterArgs().size() != 1 || loop.getNumResults() != 1)
+        return loop->emitError(
+            "pim-form-compute: a normalized PIM reduction loop must carry "
+            "exactly one accumulator result");
       loop->setAttr("pim.reduction",
                     StringAttr::get(loop.getContext(), "add"));
+    }
     return success();
   }
 

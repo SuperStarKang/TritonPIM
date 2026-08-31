@@ -1,5 +1,5 @@
 // M/N 축이 없는 linalg.reduce도 zero-init, temporal K window, resident
-// placement, partial store가 모두 같은 pim.device Execution Tile에 들어가야 한다.
+// placement, partial-to-final combine이 같은 pim.device Execution Tile에 들어간다.
 // RUN: triton-shared-opt --pim-form-compute "--pim-map-devices=p-m=1 p-n=1 p-k=1" --pim-place-data --pim-verify %s | FileCheck %s
 
 // CHECK-LABEL: func.func @k_only_sum
@@ -19,8 +19,8 @@
 // CHECK: scf.for {{.*}} iter_args(%{{.*}} = %[[INIT]]) -> (tensor<1xi32>)
 // CHECK: linalg.reduce
 // CHECK: } {pim.reduction = "add", pim.temporal_reduction}
-// direct partial store도 같은 device 안에 있고 semantic combiner를 가진다.
-// CHECK: pim.store {{.*}} {pim.combine = "add"}
+// partial과 최종 logical output access가 명시적으로 연결된다.
+// CHECK: pim.combine {{.*}} into {{.*}} kind "add"
 // CHECK: } {pim.scheduling_axis = "reduction_k"}
 
 module attributes {pim.target_profile = #pim.target_profile<

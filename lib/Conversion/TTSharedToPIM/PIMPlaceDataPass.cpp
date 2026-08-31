@@ -237,15 +237,9 @@ struct PIMPlaceDataPass
         // spatial k loop 한 회전은 split-K plane 하나다. 그 plane 내부 temporal
         // reduction loop에는 위 pim.temporal_reduction 표시가 있고, 그 loop가
         // execution_tile.groups[k]를 placement capacity에 반영한다.
-        int axisNumber = axis == "m" ? 0 : axis == "n" ? 1
-                                                     : axis == "k" ? 2 : -1;
-        if (axisNumber < 0)
-          return l->emitError("pim-place-data: unsupported PIM axis ") << axis;
+        int axisNumber = axis == "m" ? 0 : axis == "n" ? 1 : 2;
         r.partitions = partitions[axisNumber];
         int64_t capacityTiles = axis == "k" ? 1 : tileGroups[axisNumber];
-        if (capacityTiles <= 0)
-          return l->emitError("pim-place-data: execution_tile.groups[")
-                 << axis << "] must be positive for an existing axis";
         r.capacityTiles =
             b.create<arith::ConstantIndexOp>(loc, capacityTiles);
       }
@@ -268,8 +262,9 @@ struct PIMPlaceDataPass
     MLIRContext *ctx = b.getContext();
     Location loc = access.getLoc();
     unsigned rank = access.getSizes().size();
-    bool isOutput = llvm::any_of(access.getResult().getUsers(),
-                                 [](Operation *u) { return isa<pim::StoreOp>(u); });
+    bool isOutput = llvm::any_of(access.getResult().getUsers(), [](Operation *u) {
+      return isa<pim::StoreOp, pim::CombineOp>(u);
+    });
 
     // 치환표는 access마다 새로 시작한다. 앞 access가 만든 클론을 물려받으면 그 값이
     // 이 access의 삽입 지점보다 뒤에 있을 수 있다.

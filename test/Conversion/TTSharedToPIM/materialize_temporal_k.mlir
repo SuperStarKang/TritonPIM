@@ -12,7 +12,7 @@
 // 실제 Triton runtime K와 같은 i32 reduction loop의 control type을 유지한다.
 // CHECK: scf.for {{.*}} iter_args{{.*}} : i32 {
 // CHECK: } {pim.reduction = "add", pim.temporal_reduction}
-// CHECK: pim.store {{.*}} {pim.combine = "add"}
+// CHECK: pim.combine {{.*}} into {{.*}} kind "add"
 // CHECK: } {pim.scheduling_axis = "reduction_k"}
 
 module attributes {pim.target_profile = #pim.target_profile<

@@ -69,7 +69,8 @@ def PIM_TargetProfileAttr : PIM_Attr<"TargetProfile", "target_profile"> {
 }
 
 // PIM Common IR의 좌표 이름은 [m, n, k]로 고정한다. m/n은 병렬 출력 축이고
-// pim.axis<"k">는 서로 다른 partial output을 만드는 spatial split-K plane이다.
+// pim.axis<"k">는 최종 output에 합쳐질 contribution을 만드는 spatial split-K
+// plane이다.
 // plane 내부의 temporal reduction loop는 pim.temporal_reduction으로 명시한다.
 // 축의 이름 자체가 의미를 가지므로 별도의 scope/kind 문자열은 두지 않는다.
 def PIM_AxisAttr : PIM_Attr<"Axis", "axis"> {
@@ -170,16 +171,29 @@ def PIM_LoadOp : PIM_Op<"load", [MemoryEffects<[MemRead]>]> {
   let assemblyFormat = "$access attr-dict `:` type($access) `->` type($result)";
 }
 
-// local→host 전송. semantic reduction loop는 `pim.reduction = "add"`를 가지며,
-// temporal reduction 또는 spatial split-K의 partial store는 그 값을
-// `pim.combine = "add"`처럼 최종 buffer에 옮긴다. 결합 source는 Common IR에 이미
-// 있는 `reduction_k` scheduling round와 spatial `pim.axis="k"`/p_k의 곱이며, 별도
-// policy attribute가 아니다. 이 값은 원래 reduction의 combiner이고 target은 이를
-// 재추론하지 않는다.
+// local→host 직접 전송. 서로 독립적인 K contribution을 최종 output에 합치는 write는
+// 아래 pim.combine으로 표현한다. 따라서 이 op 자체에는 partial/final 의미가 없다.
 def PIM_StoreOp : PIM_Op<"store", [MemoryEffects<[MemWrite]>]> {
   let summary = "Store a tile through a PIM access";
   let arguments = (ins AnyRankedTensor:$value, PIM_AccessType:$access);
   let assemblyFormat = "$value `,` $access attr-dict `:` type($value) `,` type($access)";
+}
+
+// 서로 독립적으로 계산된 K contribution을 원래 operation의 최종 output에
+// 결합한다. partial은 Execution Tile/device가 계산한 내부 값이고 destination은
+// reduction 축이 제거된 최종 논리 pim.access다. spatial/temporal/device K의 범위는
+// Common scheduling에 이미 있으므로 이 op에는 별도 partition/policy를 저장하지
+// 않는다. Target은 결합 여부나 목적지를 재해석하지 않고, 이 연산을 host reduction,
+// device accumulator 등 target에 맞는 동일 의미의 구현으로 내린다.
+def PIM_CombineOp : PIM_Op<"combine", [MemoryEffects<[MemWrite]>]> {
+  let summary = "Combine one internal partial into the final logical output";
+  let arguments = (ins AnyRankedTensor:$partial,
+                       PIM_AccessType:$destination,
+                       StrAttr:$kind);
+  let assemblyFormat = [{
+    $partial `into` $destination `kind` $kind attr-dict
+    `:` type($partial) `,` type($destination)
+  }];
   let hasVerifier = 1;
 }
 

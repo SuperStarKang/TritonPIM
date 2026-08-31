@@ -74,6 +74,8 @@ def PIMFormCompute : Pass<"pim-form-compute", "mlir::ModuleOp"> {
     상주량이 실제와 맞게 된다.
     이어서 linalg scalar body의 add가 loop-carried accumulator를 직접 갱신하고 같은
     iter_arg 위치로 yield되는지를 읽어 해당 loop에 `pim.reduction = "add"`를 기록한다.
+    add의 반대 operand는 이전 accumulator에 의존하지 않는 독립 contribution이어야
+    하며, 정규화된 reduction loop는 정확히 하나의 accumulator/result만 가진다.
     op 이름을 열거하지 않으므로 같은 계약의 matmul, matvec, reduce, convolution,
     generic에 공통으로 적용된다. access origin은 주소 정보이므로 reduction 판정에
     사용하지 않는다.
@@ -129,6 +131,9 @@ def PIMFormBlockGroups : Pass<"pim-form-block-groups", "mlir::ModuleOp"> {
     pim.access의 sizes, valid, tensor shape가 모두 같은 Group을 표현하며 pad 값은
     확대된 invalid tail에도 그대로 적용된다. pim-place-data도 같은 extent 복원
     함수를 사용해 resident transfer 범위를 자른다.
+    valid가 없는 access는 해당 loop의 Block 수가 Group 크기로 정적으로 나누어질 때만
+    확대할 수 있다. runtime Block 수 또는 나머지가 있는 정적 Block 수에는 원본 extent를
+    복원할 dynamic valid가 필요하며, 그렇지 않으면 phantom Block 접근을 진단한다.
 
     group-m/n/k는 각 축에서 묶을 Block 개수다. 양수면 그대로 쓰고, 0이면
     기본값인 Block 하나를 쓴다. 이 pass는 비용식이나 profile 탐색을 수행하지 않는다.
@@ -175,16 +180,17 @@ def PIMMapDevices : Pass<"pim-map-devices", "mlir::ModuleOp"> {
     `pim.reduction`으로 명시된 loop도 execution_tile.groups[k] 범위로 좁히고
     `pim.scheduling_axis = "reduction_k"` round를 device 바깥에 만든다. 따라서
     `pim.device` 한 번은 정확히 한 resident Execution Tile만 실행한다. 여러 temporal
-    window가 만드는 partial output의 결합 연산은 `pim.store`의 `pim.combine`에
+    window가 만드는 partial contribution은 `pim.combine partial into final_access`로
     명시한다. spatial `pim.axis="k"`가 있으면 그 scheduling round와 `p_k` device가
-    만드는 결과도 같은 combiner의 partial이다. 따라서 target은 명시된 spatial K,
-    temporal `reduction_k`, device mapping과 combiner를 소비하며 결합 범위나 연산을
-    access 식에서 다시 추론하지 않는다.
+    만드는 결과도 같은 최종 access의 contribution이다. 따라서 target은 명시된
+    spatial K, temporal `reduction_k`, device mapping, combiner와 destination을
+    소비하며 결합 범위나 연산을 access rank에서 다시 추론하지 않는다.
 
     M/N 축이 없는 K-only reduction에서는 zero-init tensor chain과 direct output
     access/store가 reduction loop의 형제다. 이 pass가 single-use init chain을
-    reduction 앞으로, direct partial store를 reduction 뒤로 같은 `pim.device`에 함께
-    옮긴다. 따라서 init은 Execution Tile마다 다시 실행되고 output도 host에 남지 않는다.
+    reduction 앞으로, output access를 reduction 뒤로 같은 `pim.device`에 함께 옮긴
+    다음 store를 partial-to-final `pim.combine`으로 바꾼다. 따라서 init은 Execution
+    Tile마다 다시 실행되고 output도 host에 남지 않는다.
   }];
   let options = [
     Option<"pM", "p-m", "int64_t", "1", "m축 device partition 수.">,
@@ -263,11 +269,16 @@ def PIMVerify : Pass<"pim-verify", "mlir::ModuleOp"> {
       `0 .. ceildiv(total_groups, groups[k])`의 unit-step loop이고, device-local
       reduction은 같은 total_groups에서 `first = round * groups[k]`,
       `trips = min(groups[k], total_groups-first)`로 만든 window다. marked global K
-      origin과 K placement start도 같은 first를 쓰며 partial store는 combiner를
-      명시한다.
+      origin과 K placement start도 같은 first를 쓰며 partial contribution은
+      `pim.combine`으로 final destination과 combiner를 명시한다.
     - spatial `pim.axis="k"` output은 semantic `pim.reduction`을 가지며, `p_k`가
-      1보다 크면 그 축이 명시적으로 존재한다. temporal/spatial K partial store의
-      `pim.combine`은 semantic combiner와 같고 의미 없는 독립 combine은 거부한다.
+      1보다 크면 그 축이 명시적으로 존재한다. temporal/spatial K의 `pim.combine`은
+      semantic combiner와 같고 의미 없는 독립 combine은 거부한다.
+    - `pim.store`와 `pim.combine`의 최종 output access는 `direction = "out"` placement를
+      가지며 temporal K window, spatial K plane, device K 좌표에 의존하지 않는다.
+      K는 scheduling/reduction 좌표이지 operation output 차원이 아니다.
+    - output이 있는 semantic reduction은 정확히 하나의 tensor accumulator/result와
+      정확히 하나의 direct `pim.combine partial into final_access`를 가진다.
     - spatial m/n/k도 각각 정확히 하나의 matching scheduling round를 가진다.
       `execution_tiles=ceildiv(total_groups,groups_per_tile)`,
       `rounds=ceildiv(execution_tiles,p_axis)`,
