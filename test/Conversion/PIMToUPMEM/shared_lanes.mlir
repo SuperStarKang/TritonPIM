@@ -82,22 +82,20 @@ func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
 
     %ar = arith.muli %startx, %c8 : index
     %arn = arith.muli %tripsx, %c8 : index
-    %arc = arith.muli %capx, %c8 : index
     %akn = arith.muli %tripsk, %c32 : index
-    pim.place %A start[%ar, %startk] size[%arn, %akn] allocation_shape[%arc, %c32]
+    pim.place %A start[%ar, %startk] size[%arn, %akn] allocation_shape[%c8, %c32]
         strides[%lda, %c1]
         {direction = "in", access = 0 : i64,
          replicated_over = ["n"]} : memref<*xi8>
 
     %bc = arith.muli %starty, %c32 : index
     %bcn = arith.muli %tripsy, %c32 : index
-    %bcc = arith.muli %capy, %c32 : index
-    pim.place %B start[%startk, %bc] size[%akn, %bcn] allocation_shape[%c32, %bcc]
+    pim.place %B start[%startk, %bc] size[%akn, %bcn] allocation_shape[%c32, %c32]
         strides[%ldb, %c1]
         {direction = "in", access = 1 : i64,
          replicated_over = ["m"]} : memref<*xi8>
 
-    pim.place %C start[%ar, %bc] size[%arn, %bcn] allocation_shape[%arc, %bcc]
+    pim.place %C start[%ar, %bc] size[%arn, %bcn] allocation_shape[%c8, %c32]
         strides[%ldb, %c1]
         {direction = "out", access = 2 : i64} : memref<*xi32>
 

@@ -1,9 +1,13 @@
 #include "triton-shared/Dialect/PIMTarget/UPMEM/IR/UPMEMDialect.h"
 
 // 생성된 op builder / type-attr printer-parser가 사용하는 헤더들.
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/DialectImplementation.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
+
+#include <optional>
 
 using namespace mlir;
 using namespace mlir::upmem;
@@ -107,6 +111,23 @@ static LogicalResult verifyRegionShape(Operation *op, size_t origin,
   return success();
 }
 
+// fixed slot operand가 정적 memref shape에 그대로 materialize되었는지 확인한다.
+static LogicalResult verifyFixedShape(Operation *op, ValueRange extents,
+                                      MemRefType type, unsigned leading) {
+  if (type.getRank() != static_cast<int64_t>(leading + extents.size()))
+    return op->emitOpError("result rank does not match its fixed-slot rank");
+  if (!type.hasStaticShape())
+    return op->emitOpError("fixed-slot result must have a static shape");
+  for (auto [d, extent] : llvm::enumerate(extents)) {
+    std::optional<int64_t> value = getConstantIntValue(extent);
+    if (!value)
+      return op->emitOpError("fixed-slot extent must be a constant");
+    if (type.getShape()[leading + d] != *value)
+      return op->emitOpError("fixed-slot extent does not match result shape");
+  }
+  return success();
+}
+
 //===----------------------------------------------------------------------===//
 // Verifiers
 //===----------------------------------------------------------------------===//
@@ -146,8 +167,17 @@ LogicalResult StageOp::verify() {
   if (getTile().size() != getOrigin().size())
     return emitOpError("tile must have the same rank as origin");
   auto result = cast<MemRefType>(getResult().getType());
-  if (result.getRank() != static_cast<int64_t>(getPadTo().size()))
-    return emitOpError("result rank must equal pad_to rank");
+  return verifyFixedShape(*this, getPadTo(), result, /*leading=*/0);
+}
+
+LogicalResult GatherOp::verify() {
+  auto result = cast<MemRefType>(getResult().getType());
+  if (failed(verifyFixedShape(*this, getCapacity(), result, /*leading=*/1)))
+    return failure();
+  if (auto acquire = getSet().getDefiningOp<AcquireOp>())
+    if (result.getShape()[0] != acquire.getNumUnits())
+      return emitOpError(
+          "leading result extent must equal the acquired DPU count");
   return success();
 }
 

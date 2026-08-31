@@ -1,5 +1,5 @@
 // PIM Common IR이 UPMEM host/device 구조로 바뀌는지 확인한다.
-// bank 예산을 3072 바이트로 주어 MRAM 크기를 눈으로 확인한다 → 버퍼 3개에 1024씩.
+// 각 MRAM은 Common allocation_shape의 정확한 fixed-slot 크기다.
 // RUN: triton-shared-opt --convert-pim-to-upmem %s | FileCheck %s
 // RUN: triton-shared-opt --convert-pim-to-upmem %s | FileCheck %s --check-prefix=PIM-CLEAN
 // RUN: triton-shared-opt --convert-pim-to-upmem %s | triton-shared-translate --upmem-to-host > /dev/null
@@ -16,8 +16,8 @@
 // PIM-CLEAN-NOT: pim.scheduling_axis
 // PIM-CLEAN-NOT: pim.combine
 
-// 버퍼마다 MRAM 심볼 하나. i8은 1024개, i32는 256개다.
-// CHECK-DAG: upmem.mram @matmul_mram_0 : memref<1024xi8, #upmem<space mram>>
+// 버퍼마다 MRAM 심볼 하나. A=8x32, B=32x32, C=8x32이다.
+// CHECK-DAG: upmem.mram @matmul_mram_0 : memref<256xi8, #upmem<space mram>>
 // CHECK-DAG: upmem.mram @matmul_mram_1 : memref<1024xi8, #upmem<space mram>>
 // CHECK-DAG: upmem.mram @matmul_mram_2 : memref<256xi32, #upmem<space mram>>
 
@@ -62,13 +62,14 @@
 // device마다 같은 바이트 수를 보내야 하므로.
 // CHECK:           %[[SA:.*]] = upmem.stage %{{.*}} origin[%{{.*}}, %{{.*}}] sizes[%{{.*}}, %{{.*}}] strides[%{{.*}}, %{{.*}}] pad_to[%{{.*}}, %{{.*}}] tile [8, 32]
 // CHECK-SAME:        dedup_over = ["n"]
+// CHECK-SAME:        -> memref<8x32xi8>
 // CHECK:           upmem.to_mram %{{.*}}, %[[SA]], @matmul_mram_0
 // CHECK:           upmem.stage
 // CHECK-SAME:        dedup_over = ["m"]
 // CHECK:           upmem.to_mram %{{.*}}, %{{.*}}, @matmul_mram_1
 // CHECK:         upmem.launch %[[SET]]
 // 출력은 집합 전체에서 한 번에 회수한 뒤 device마다 되돌린다.
-// CHECK:         %[[P:.*]] = upmem.gather %[[SET]], @matmul_mram_2
+// CHECK:         %[[P:.*]] = upmem.gather %[[SET]], @matmul_mram_2 {{.*}} -> memref<8x8x32xi32>
 // CHECK:         upmem.foreach_group %[[P]] : {{.*}} axes ["m", "n", "k"] counts [2, 4, 1]
 // 되돌릴 때 읽는 범위는 실제 크기(size)지만 축 사이 간격은 배정량(capacity)이다.
 // Common pim.combine과 reduction_k round가 명시한 partial 결합을 그대로 전달한다.
@@ -120,22 +121,20 @@ func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
 
     %ar = arith.muli %startx, %c8 : index
     %arn = arith.muli %tripsx, %c8 : index
-    %arc = arith.muli %capx, %c8 : index
     %akn = arith.muli %tripsk, %c32 : index
-    pim.place %A start[%ar, %startk] size[%arn, %akn] allocation_shape[%arc, %c32]
+    pim.place %A start[%ar, %startk] size[%arn, %akn] allocation_shape[%c8, %c32]
         strides[%lda, %c1]
         {direction = "in", access = 0 : i64,
          replicated_over = ["n"]} : memref<*xi8>
 
     %bc = arith.muli %starty, %c32 : index
     %bcn = arith.muli %tripsy, %c32 : index
-    %bcc = arith.muli %capy, %c32 : index
-    pim.place %B start[%startk, %bc] size[%akn, %bcn] allocation_shape[%c32, %bcc]
+    pim.place %B start[%startk, %bc] size[%akn, %bcn] allocation_shape[%c32, %c32]
         strides[%ldb, %c1]
         {direction = "in", access = 1 : i64,
          replicated_over = ["m"]} : memref<*xi8>
 
-    pim.place %C start[%ar, %bc] size[%arn, %bcn] allocation_shape[%arc, %bcc]
+    pim.place %C start[%ar, %bc] size[%arn, %bcn] allocation_shape[%c8, %c32]
         strides[%ldb, %c1]
         {direction = "out", access = 2 : i64} : memref<*xi32>
 

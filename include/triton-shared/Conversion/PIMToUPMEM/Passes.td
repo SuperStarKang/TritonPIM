@@ -15,10 +15,9 @@ def ConvertPIMToUPMEM : Pass<"convert-pim-to-upmem", "mlir::ModuleOp"> {
 
     모듈 수준:
     - `upmem.mram` = device 의 MRAM 버퍼. `pim.place.allocation_shape`를 그대로
-      사용해 place마다 하나를 만든다. 모든 차원이 상수면 그 곱이 정확한 크기이고
-      합이 예산에 드는지 확인한다. 런타임 차원이 남으면 bank 예산을 버퍼 수로 나눈
-      물리 상한을 쓰고 host 코드가 전송 직전에 검사한다 — device 의 __mram_noinit 은
-      상수 크기를 요구한다.
+      사용해 place마다 하나를 만든다. 모든 차원은 Common IR에서 확정된 정적 fixed
+      slot이어야 하며, 그 곱으로 정확한 크기를 만들고 합이 예산에 드는지 확인한다.
+      runtime trip count나 bank 예산 균등 분할 fallback은 사용하지 않는다.
     - `upmem.host_var` = device 가 실제로 도는 횟수와 MRAM 안의 축 간격.
 
     host:
@@ -26,11 +25,11 @@ def ConvertPIMToUPMEM : Pass<"convert-pim-to-upmem", "mlir::ModuleOp"> {
       다시 주므로 짝이 되는 반납이 없다.
     - `upmem.foreach_unit`: device 마다 하는 일. `direction = "in"` place 는
       `upmem.stage` + `upmem.to_mram` 이 되고, replicated_over 는 stage 의 dedup_over 가
-      된다. stage 의 pad_to 는 place 의 capacity 다 — push_xfer 가 모든 DPU 에 같은 바이트
-      수를 요구하므로 실제 크기로는 보낼 수 없다.
+      된다. stage 의 pad_to와 result shape는 place의 정적 allocation_shape다 —
+      push_xfer가 모든 DPU에 같은 바이트 수를 요구하므로 실제 tail size로는 보낼 수 없다.
     - `upmem.launch`
-    - `direction = "out"` place 는 `upmem.gather` + `upmem.foreach_group` +
-      `upmem.unstage` 가 된다.
+    - `direction = "out"` place 는 fixed allocation_shape의 `upmem.gather` +
+      `upmem.foreach_group` + `upmem.unstage` 가 된다.
 
     device(`upmem.device_func`):
     - 축 loop nest 를 그대로 옮기고 상한만 `upmem.get_host_var` 로 바꾼다.
@@ -45,9 +44,12 @@ def ConvertPIMToUPMEM : Pass<"convert-pim-to-upmem", "mlir::ModuleOp"> {
       연산 이름이 아니라 linalg indexing map으로 판정한다. 따라서 matmul의 A/C,
       matvec의 A/y, identity pointwise의 모든 operand가 같은 규칙으로 잘리고 B/x처럼
       m을 쓰지 않는 operand는 전체 tile을 공유한다.
-    - compute leaf는 fill, matmul, matvec와 identity indexing map + all-parallel
-      iterator를 가진 `linalg.generic`을 지원한다. generic의 scalar `arith` body는 하나의
-      C loop로 내려가므로 elementwise fusion이 보존된다.
+    - compute leaf는 fill, matmul, matvec, reduce와 identity indexing map + all-parallel
+      iterator를 가진 `linalg.generic`을 지원한다. generic과 reduce의 명시적인 scalar
+      `arith` body를 그대로 C loop로 내리므로 elementwise fusion과 reduction 의미가
+      보존된다. M축이 없는 K-only reduce는 tasklet-local partial combine이 IR에 표현되기
+      전까지 `nr-tasklets=1`이어야 한다. M축이 있는 연산은 기존처럼 output 행을 tasklet에
+      나눈다.
 
     모든 execution-tile 반복은 PIM Common IR의 `pim.scheduling_axis` loop를 그대로
     소비한다. 특히 temporal K도 Common의 `reduction_k` scheduling loop와
@@ -56,12 +58,16 @@ def ConvertPIMToUPMEM : Pass<"convert-pim-to-upmem", "mlir::ModuleOp"> {
     `#pim.execution_tile`로 window를 다시 계산하지 않는다.
 
     scheduling loop의 `pim.device` 한 번은 UPMEM의 stage → launch → gather 한 번이 된다.
+    launch는 DPU set 전체에서 device program을 한 번 시작하는 것이며 Block Group마다
+    발생하지 않는다. device-local Block Group loop 전체가 그 launch 한 번 안에서 돈다.
     각 stage/unstage 영역과 MRAM capacity는 그 round 안의 `pim.place`를 그대로 쓴다.
     Common `pim.store`가 `pim.combine = "add"`를 기록한 출력만 Common reduction round의
-    induction variable를 `upmem.unstage accumulate`로 전달한다. `upmem.acquire`는 모든
-    Common scheduling loop 밖에 있어 같은 DPU set과 device binary를 round 사이에
-    재사용한다. spatial `pim.axis = "k"`가 함께 있어도 별도 temporal host window를
-    만들지 않는다.
+    spatial K round, device_k 좌표, temporal reduction_k round를
+    `upmem.unstage accumulate`의 첫-partial 판정에 그대로 사용한다. spatial split-K의
+    leading partial plane origin은 최종 output의 0번 plane으로 모으되 size를 유지하여
+    inactive tail device는 no-op으로 남긴다. `upmem.acquire`는 모든 Common scheduling
+    loop 밖에 있어 같은 DPU set과 device binary를 round 사이에 재사용한다. 별도
+    temporal host window는 만들지 않는다.
   }];
   let constructor = "mlir::triton::createConvertPIMToUPMEMPass()";
   let options = [

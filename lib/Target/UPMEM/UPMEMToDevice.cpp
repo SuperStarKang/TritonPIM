@@ -11,6 +11,7 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Tools/mlir-translate/Translation.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace mlir;
@@ -192,6 +193,8 @@ struct DeviceEmitter {
       return emitMatmul(mm, depth);
     if (auto mv = dyn_cast<linalg::MatvecOp>(op))
       return emitMatvec(mv, depth);
+    if (auto reduce = dyn_cast<linalg::ReduceOp>(op))
+      return emitReduce(reduce, depth);
     if (auto generic = dyn_cast<linalg::GenericOp>(op))
       return emitPointwise(generic, depth);
 
@@ -269,6 +272,94 @@ struct DeviceEmitter {
          << e.name(yield.getValues()[0]) << ";\n";
     e.indent(depth);
     os() << "}\n";
+    return success();
+  }
+
+  // linalg.reduce가 명시한 dimensions와 scalar region을 그대로 WRAM loop로 낸다.
+  // reduction 종류를 이름이나 access 패턴으로 다시 판정하지 않는다. Common IR의
+  // region 안 arith가 accumulator 갱신식을 이미 완전히 표현한다.
+  LogicalResult emitReduce(linalg::ReduceOp reduce, unsigned depth) {
+    if (reduce.getInputs().size() != 1 || reduce.getInits().size() != 1)
+      return reduce->emitError(
+          "UPMEM reduce requires one input and one accumulator");
+    auto input = dyn_cast<MemRefType>(reduce.getInputs()[0].getType());
+    auto output = dyn_cast<MemRefType>(reduce.getInits()[0].getType());
+    if (!input || !output || !input.hasStaticShape() ||
+        !output.hasStaticShape())
+      return reduce->emitError(
+          "UPMEM reduce operands must be static WRAM memrefs");
+
+    SmallVector<int64_t> dimensions(reduce.getDimensions());
+    for (auto [i, dim] : llvm::enumerate(dimensions)) {
+      if (dim < 0 || dim >= input.getRank() ||
+          (i && dimensions[i - 1] >= dim))
+        return reduce->emitError(
+            "UPMEM reduce dimensions must be sorted, unique, and in range");
+    }
+
+    SmallVector<int64_t> expectedOutput;
+    for (int64_t dim = 0; dim < input.getRank(); ++dim)
+      if (!llvm::is_contained(dimensions, dim))
+        expectedOutput.push_back(input.getShape()[dim]);
+    if (output.getShape() != ArrayRef<int64_t>(expectedOutput))
+      return reduce->emitError(
+          "UPMEM reduce output shape does not match its non-reduction axes");
+
+    Block *body = reduce.getBody();
+    if (body->getNumArguments() != 2)
+      return reduce->emitError(
+          "UPMEM reduce region must take one input and one accumulator");
+    auto yield = dyn_cast<linalg::YieldOp>(body->getTerminator());
+    if (!yield || yield.getValues().size() != 1)
+      return reduce->emitError("UPMEM reduce region must yield one scalar");
+
+    SmallVector<std::string> indices;
+    indices.reserve(input.getRank());
+    for (int64_t dim = 0; dim < input.getRank(); ++dim)
+      indices.push_back("_r" + std::to_string(dim));
+
+    auto linearIndex = [&](bool omitReductionAxes) {
+      std::string expression;
+      for (int64_t dim = 0; dim < input.getRank(); ++dim) {
+        if (omitReductionAxes && llvm::is_contained(dimensions, dim))
+          continue;
+        int64_t extent = input.getShape()[dim];
+        if (expression.empty())
+          expression = indices[dim];
+        else
+          expression = "(" + expression + " * " + std::to_string(extent) +
+                       " + " + indices[dim] + ")";
+      }
+      return expression.empty() ? std::string("0") : expression;
+    };
+
+    for (int64_t dim = 0; dim < input.getRank(); ++dim) {
+      e.indent(depth + dim);
+      os() << "for (int32_t " << indices[dim] << " = 0; " << indices[dim]
+           << " < " << input.getShape()[dim] << "; ++" << indices[dim]
+           << ") {\n";
+    }
+    unsigned innerDepth = depth + input.getRank();
+    std::string inputIndex = linearIndex(/*omitReductionAxes=*/false);
+    std::string outputIndex = linearIndex(/*omitReductionAxes=*/true);
+    e.bind(body->getArgument(0),
+           e.name(reduce.getInputs()[0]) + "[" + inputIndex + "]");
+    e.bind(body->getArgument(1),
+           e.name(reduce.getInits()[0]) + "[" + outputIndex + "]");
+    for (Operation &nested : body->without_terminator()) {
+      if (!isa<arith::ArithDialect>(nested.getDialect()))
+        return nested.emitError(
+            "upmem-to-device: reduce body supports scalar arith only");
+      if (failed(e.emitArith(&nested, innerDepth, /*hostSide=*/false)))
+        return failure();
+    }
+    e.indent(innerDepth);
+    os() << e.name(reduce.getInits()[0]) << "[" << outputIndex
+         << "] = " << e.name(yield.getValues()[0]) << ";\n";
+    for (int64_t dim = input.getRank() - 1; dim >= 0; --dim) {
+      e.indent(depth + dim);
+      os() << "}\n";
+    }
     return success();
   }
 

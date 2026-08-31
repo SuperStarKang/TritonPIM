@@ -8,20 +8,25 @@
 // Spatial pim.axis="k"의 host variable만 존재한다.
 // IR-DAG: upmem.host_var @matmul_split_k_tiles_k : index
 // IR-NOT: tiles_reduction_k
-// acquire는 두 Common scheduling loop 밖에 있고, 두 번째 loop의 IV가 Common
-// pim.combine="add"를 위한 accumulate switch로 그대로 전달된다.
+// acquire는 두 Common scheduling loop 밖에 있다. accumulate는 spatial round,
+// temporal round, foreach_group의 device_k를 모두 사용한다.
 // IR: %[[SET:.*]] = upmem.acquire 2, @matmul_split_k_device
-// IR: scf.for %{{.*}} =
+// IR: scf.for %[[SPATIAL:.*]] =
 // IR:   scf.for %[[RED:.*]] =
 // IR:     upmem.foreach_unit %[[SET]]
 // IR:       upmem.stage
-// IR:     upmem.launch %[[SET]]
-// IR:     upmem.gather %[[SET]], @matmul_split_k_mram_2
-// IR:       upmem.unstage {{.*}} accumulate %[[RED]] tile [1, 8, 8]
+// IR-COUNT-1: upmem.launch %[[SET]]
+// IR:     %[[ROUND_PARTIAL:.*]] = arith.addi %[[RED]], %[[SPATIAL]] : index
+// IR:     upmem.gather %[[SET]], @matmul_split_k_mram_2 {{.*}} -> memref<2x1x8x8xi32>
+// IR:       %[[PARTIAL:.*]] = arith.addi %[[ROUND_PARTIAL]], %{{.*}} : index
+// IR:       %[[PLANE_ZERO:.*]] = arith.constant 0 : index
+// IR:       upmem.unstage {{.*}} origin[%[[PLANE_ZERO]], {{.*}}] {{.*}} accumulate %[[PARTIAL]] tile [1, 8, 8]
 // IR-NOT: pim.
 
 // HOST: dpu_push_xfer({{.*}}, "matmul_split_k_tiles_k"
 // HOST-NOT: tiles_reduction_k
+// HOST: if ({{.*}} == 0) {
+// HOST: +=
 
 // DEVICE-DAG: __host int32_t matmul_split_k_tiles_k;
 // DEVICE-NOT: tiles_reduction_k

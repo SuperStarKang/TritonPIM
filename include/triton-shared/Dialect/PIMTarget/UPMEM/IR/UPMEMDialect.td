@@ -135,6 +135,8 @@ def UPMEM_ForeachUnitOp : UPMEM_Op<"foreach_unit", [NoTerminator]> {
 //   origin/sizes/strides = 원본 안의 영역 (pim.place에서 그대로 온다)
 //   pad_to               = 결과 버퍼 shape. sizes보다 크면 남는 자리를 0으로 채운다.
 //                          덜 맡는 마지막 유닛이 여기서 균일 크기로 맞춰진다.
+//                          PIM Common allocation_shape에서 온 정적 fixed slot이며
+//                          result memref shape와 정확히 같아야 한다.
 //   tile                 = 유닛 버퍼를 타일 단위로 쓴다. 타일 하나가 연속이 되므로
 //                          device가 타일을 DMA 한 번으로 옮긴다. 행 단위로 두면 타일의
 //                          행 수만큼 DMA가 필요하고, 한 행이 몇십 바이트라 준비 비용이
@@ -184,8 +186,8 @@ def UPMEM_LaunchOp : UPMEM_Op<"launch"> {
 
 // dpu_push_xfer(FROM_DPU). 집합 전체에서 한 번에 회수하므로 foreach가 필요 없다.
 // 결과는 유닛 하나 몫의 shape 앞에 유닛 축이 하나 더 붙은 memref다.
-// capacity는 유닛 하나 몫의 축별 크기다. 모든 DPU에서 같은 바이트 수를 읽어야 하므로
-// 실제 크기가 아니라 배정량이며, MRAM 심볼의 선언 크기(넉넉히 잡은 상한)와도 다르다.
+// capacity는 유닛 하나의 Common fixed allocation_shape다. 모든 DPU에서 같은 바이트
+// 수를 읽으며, result의 trailing static shape와 정확히 같아야 한다.
 def UPMEM_GatherOp : UPMEM_Op<"gather"> {
   let summary = "Read one MRAM buffer back from every DPU at once";
   let arguments = (ins UPMEM_SetType:$set, FlatSymbolRefAttr:$src,
@@ -195,6 +197,7 @@ def UPMEM_GatherOp : UPMEM_Op<"gather"> {
     $set `,` $src `capacity` `[` $capacity `]` attr-dict
     `:` type($set) `->` type($result)
   }];
+  let hasVerifier = 1;
 }
 
 // 출력 device 위를 돈다. 몸체가 device 하나의 버퍼를 원본으로 되돌리는 일이다.
@@ -218,10 +221,10 @@ def UPMEM_ForeachGroupOp : UPMEM_Op<"foreach_group", [NoTerminator]> {
 //                sizes로 간격을 재면 엉뚱한 자리를 읽는다.
 //   tile       = upmem.stage와 같은 뜻. 유닛 버퍼가 타일 단위로 쓰여 있으므로 되돌릴 때도
 //                같은 순서로 읽어야 한다.
-//   accumulate = PIM Common IR이 정한 reduction_k scheduling round. 없으면 언제나
-//                대입이고, 있으면 0(첫 partial)은 대입, 그 뒤는 누산(+=)이다.
-//                UPMEM lowering은 이 값을 새로 계산하지 않고 pim.combine과 Common
-//                scheduling loop에서 그대로 받는다.
+//   accumulate = PIM Common IR의 explicit partial 좌표. 없으면 언제나 대입이고,
+//                있으면 spatial K round, device_k, temporal reduction_k가 모두 0인
+//                첫 partial만 대입하며 나머지는 누산(+=)한다. UPMEM lowering은
+//                pim.combine과 Common scheduling/device 좌표를 그대로 사용한다.
 def UPMEM_UnstageOp : UPMEM_Op<"unstage", [AttrSizedOperandSegments]> {
   let summary = "Scatter a tile-major buffer back into a strided region";
   let arguments = (ins AnyMemRef:$buffer, AnyRankedOrUnrankedMemRef:$dst,

@@ -14,7 +14,7 @@
 // CHECK-DAG: upmem.stage
 // CHECK-DAG: upmem.to_mram %{{.*}}, %{{.*}}, @matmul_mram_1
 // CHECK-DAG: upmem.to_host_var %{{.*}}, %{{.*}}, @matmul_tiles_n
-// CHECK:   upmem.launch
+// CHECK-COUNT-1: upmem.launch
 // CHECK:   upmem.gather %{{.*}}, @matmul_mram_2
 // CHECK:   upmem.foreach_group
 // CHECK:     upmem.unstage
@@ -24,7 +24,7 @@ module attributes {pim.target_profile = #pim.target_profile<
     banks_per_unit = 1,
     cores_per_bank = 1,
     lanes_per_core = 1,
-    bank_capacity_limit_bytes = 3072, local_capacity_limit_bytes = 49152>} {
+    bank_capacity_limit_bytes = 8192, local_capacity_limit_bytes = 49152>} {
 
 func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
                   %K: i32, %N: i32, %ex: index, %ey: index)
@@ -37,6 +37,7 @@ func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
   %c4 = arith.constant 4 : index
   %c8 = arith.constant 8 : index
   %c32 = arith.constant 32 : index
+  %c64 = arith.constant 64 : index
   %c0_i32 = arith.constant 0 : i32
   %lda = arith.index_cast %K : i32 to index
   %ldb = arith.index_cast %N : i32 to index
@@ -67,22 +68,20 @@ func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
 
     %ar = arith.muli %startx, %c8 : index
     %arn = arith.muli %tripsx, %c8 : index
-    %arc = arith.muli %capx, %c8 : index
     %akn = arith.muli %tripsk, %c32 : index
-    pim.place %A start[%ar, %startk] size[%arn, %akn] allocation_shape[%arc, %c32]
+    pim.place %A start[%ar, %startk] size[%arn, %akn] allocation_shape[%c8, %c32]
         strides[%lda, %c1]
         {direction = "in", access = 0 : i64,
          replicated_over = ["n"]} : memref<*xi8>
 
     %bc = arith.muli %starty, %c32 : index
     %bcn = arith.muli %tripsy, %c32 : index
-    %bcc = arith.muli %c2, %c32 : index
-    pim.place %B start[%startk, %bc] size[%akn, %bcn] allocation_shape[%c32, %bcc]
+    pim.place %B start[%startk, %bc] size[%akn, %bcn] allocation_shape[%c32, %c64]
         strides[%ldb, %c1]
         {direction = "in", access = 1 : i64,
          replicated_over = ["m"]} : memref<*xi8>
 
-    pim.place %C start[%ar, %bc] size[%arn, %bcn] allocation_shape[%arc, %bcc]
+    pim.place %C start[%ar, %bc] size[%arn, %bcn] allocation_shape[%c8, %c64]
         strides[%ldb, %c1]
         {direction = "out", access = 2 : i64} : memref<*xi32>
 
