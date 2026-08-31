@@ -37,7 +37,12 @@ static bool isClamped(Value v) {
 // pim-map-devices가 만드는 local window의 upper bound는
 // min(execution_tile.groups[k], remaining)이다. operand 순서가 바뀌어도 같은
 // 계약으로 보고, 다른 임의의 clamp는 temporal K window로 인정하지 않는다.
+// scheduling 산술은 index지만 원래 Triton K loop가 i32이면 scf.for
+// 경계에서만 index_cast가 생긴다. 이 cast는 window 의미를 바꾸지 않으므로
+// 벗긴 뒤 map pass가 만든 min 형태를 검증한다.
 static bool isClampedTo(Value value, int64_t limit) {
+  if (auto cast = value.getDefiningOp<arith::IndexCastOp>())
+    value = cast.getIn();
   auto min = value.getDefiningOp<arith::MinSIOp>();
   if (!min)
     return false;

@@ -105,9 +105,9 @@ struct PIMFormBlockGroupsPass
       grouped.push_back({cast<scf::ForOp>(*reductions.begin()), gK});
     }
 
-    // 새 상한은 전부 가장 바깥 축 loop 앞에 만든다. 안쪽 loop 앞에 두면 그 값이 바깥
-    // loop 몸체 안에 갇혀서, 뒤의 pim-map-devices 가 nest 밖에서 상한을 읽을 때 지배가
-    // 깨진다 — build-logical-grid 가 상한을 전부 entry 에 만드는 것과 같은 이유다.
+    // m/n의 새 상한은 가장 바깥 축 loop 앞에 만든다. reduction 상한은 원래 runtime K
+    // 식과 같은 위치인 reduction loop 앞에 둔다. 뒤의 pim-map-devices는 Common
+    // scheduling boundary를 만들 때 이 불변 bound 식을 그 경계 앞으로 다시 만든다.
     scf::ForOp outermost;
     func.walk<WalkOrder::PreOrder>([&](scf::ForOp l) {
       if (!l->getAttrOfType<pim::AxisAttr>("pim.axis"))

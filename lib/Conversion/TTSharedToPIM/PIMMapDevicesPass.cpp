@@ -6,6 +6,8 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/IRMapping.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -41,32 +43,101 @@ static bool dependsOn(Value value, ValueRange roots) {
   return false;
 }
 
+// Device scheduling 산술은 index로 통일한다. Triton의 runtime reduction loop는
+// i32일 수 있으므로 원래 scf.for 경계에서만 그 loop의 control type으로 되돌린다.
+static Value castTo(OpBuilder &b, Location loc, Value value, Type type) {
+  return value.getType() == type
+             ? value
+             : b.create<arith::IndexCastOp>(loc, type, value).getResult();
+}
+
+static Value toIndex(OpBuilder &b, Location loc, Value value) {
+  return castTo(b, loc, value, b.getIndexType());
+}
+
+static Value constantOfType(OpBuilder &b, Location loc, Type type,
+                            int64_t value) {
+  return b.create<arith::ConstantOp>(loc, b.getIntegerAttr(type, value))
+      .getResult();
+}
+
+// scope 안에서 만들어진 loop-bound 식을 scope 앞에 다시 만든다. 함수 인자나 이미
+// scope 밖에 있는 값은 그대로 쓰고, scope 안의 block argument나 side effect가 있는
+// 식에 닿으면 scheduling 위치로 옮길 수 없으므로 실패한다.
+static Value rebuildBefore(OpBuilder &b, Value value, IRMapping &made,
+                           Operation *scope) {
+  if (Value rebuilt = made.lookupOrNull(value))
+    return rebuilt;
+  Operation *def = value.getDefiningOp();
+  if (!def) {
+    Operation *owner = value.getParentBlock()->getParentOp();
+    return owner == scope || scope->isAncestor(owner) ? Value() : value;
+  }
+  if (!scope->isAncestor(def))
+    return value;
+  if (def->getNumRegions() != 0 || !isMemoryEffectFree(def))
+    return Value();
+
+  IRMapping operands;
+  for (Value operand : def->getOperands()) {
+    Value rebuilt = rebuildBefore(b, operand, made, scope);
+    if (!rebuilt)
+      return Value();
+    operands.map(operand, rebuilt);
+  }
+  Value rebuilt =
+      b.clone(*def, operands)->getResult(cast<OpResult>(value).getResultNumber());
+  made.map(value, rebuilt);
+  return rebuilt;
+}
+
+struct SchedulingRange {
+  Value lower;
+  Value step;
+  Value extent;
+};
+
+static LogicalResult buildSchedulingRange(OpBuilder &b, Location loc,
+                                          scf::ForOp loop, Operation *scope,
+                                          IRMapping &made,
+                                          SchedulingRange &range) {
+  range.lower = rebuildBefore(b, loop.getLowerBound(), made, scope);
+  Value upper = rebuildBefore(b, loop.getUpperBound(), made, scope);
+  range.step = rebuildBefore(b, loop.getStep(), made, scope);
+  if (!range.lower || !upper || !range.step)
+    return failure();
+  Value count = b.create<arith::CeilDivSIOp>(
+      loc, b.create<arith::SubIOp>(loc, upper, range.lower), range.step);
+  range.extent = toIndex(b, loc, count);
+  return success();
+}
+
 static void scheduleLoop(OpBuilder &b, scf::ForOp loop, Value round,
                          Value device, int64_t partitions,
-                         int64_t unitGroups, Value extent) {
+                         int64_t unitGroups, const SchedulingRange &range) {
   Location loc = loop.getLoc();
-  Value lb = loop.getLowerBound(), step = loop.getStep();
+  Type loopType = loop.getInductionVar().getType();
   Value c0 = b.create<arith::ConstantIndexOp>(loc, 0);
-  Value c1 = b.create<arith::ConstantIndexOp>(loc, 1);
   Value parts = b.create<arith::ConstantIndexOp>(loc, partitions);
   Value unit = b.create<arith::ConstantIndexOp>(loc, unitGroups);
   Value executionTile = b.create<arith::AddIOp>(
       loc, b.create<arith::MulIOp>(loc, round, parts), device);
   Value first = b.create<arith::MulIOp>(loc, executionTile, unit);
   Value left = b.create<arith::MaxSIOp>(
-      loc, b.create<arith::SubIOp>(loc, extent, first), c0);
+      loc, b.create<arith::SubIOp>(loc, range.extent, first), c0);
   Value trips = b.create<arith::MinSIOp>(loc, unit, left);
-  Value start =
-      b.create<arith::AddIOp>(loc, lb,
-                              b.create<arith::MulIOp>(loc, first, step));
+  Value firstInLoopType = castTo(b, loc, first, loopType);
+  Value start = b.create<arith::AddIOp>(
+      loc, range.lower,
+      b.create<arith::MulIOp>(loc, firstInLoopType, range.step));
 
-  loop.getLowerBoundMutable().assign(c0);
-  loop.getUpperBoundMutable().assign(trips);
-  loop.getStepMutable().assign(c1);
+  loop.getLowerBoundMutable().assign(constantOfType(b, loc, loopType, 0));
+  loop.getUpperBoundMutable().assign(castTo(b, loc, trips, loopType));
+  loop.getStepMutable().assign(constantOfType(b, loc, loopType, 1));
 
   OpBuilder bb(loop.getBody(), loop.getBody()->begin());
   Value local = loop.getInductionVar();
-  auto scaled = bb.create<arith::MulIOp>(loc, local, step);
+  auto scaled = bb.create<arith::MulIOp>(loc, local, range.step);
   auto global = bb.create<arith::AddIOp>(loc, start, scaled);
   global->setAttr("pim.device_origin", bb.getUnitAttr());
   local.replaceUsesWithIf(global, [&](OpOperand &use) {
@@ -194,21 +265,24 @@ struct PIMMapDevicesPass
     Location loc = rootLoop.getLoc();
     OpBuilder b(rootLoop);
 
-    SmallVector<Value> extents;
-    for (scf::ForOp loop : loops)
-      extents.push_back(b.create<arith::CeilDivSIOp>(
-          loc,
-          b.create<arith::SubIOp>(loc, loop.getUpperBound(),
-                                  loop.getLowerBound()),
-          loop.getStep()));
+    // 안쪽 reduction bound는 원래 M/N loop 몸체 안에서 계산될 수 있다. 새 scheduling
+    // loop는 rootLoop 밖에 생기므로 bound 식을 그 위치에 다시 만들어야 한다.
+    IRMapping rebuiltBounds;
+    SmallVector<SchedulingRange> ranges(loops.size());
+    for (auto [i, loop] : llvm::enumerate(loops))
+      if (failed(buildSchedulingRange(b, loc, loop, rootLoop, rebuiltBounds,
+                                      ranges[i])))
+        return loop->emitError(
+            "pim-map-devices: loop bounds cannot be rebuilt at the Common "
+            "scheduling boundary");
 
-    Value reductionExtent;
-    if (reductionLoop)
-      reductionExtent = b.create<arith::CeilDivSIOp>(
-          loc,
-          b.create<arith::SubIOp>(loc, reductionLoop.getUpperBound(),
-                                  reductionLoop.getLowerBound()),
-          reductionLoop.getStep());
+    SchedulingRange reductionRange;
+    if (reductionLoop &&
+        failed(buildSchedulingRange(b, loc, reductionLoop, rootLoop,
+                                    rebuiltBounds, reductionRange)))
+      return reductionLoop->emitError(
+          "pim-map-devices: reduction bounds cannot be rebuilt at the Common "
+          "scheduling boundary");
 
     SmallVector<unsigned> order;
     StringRef preferred[] = {"n", "k", "m"};
@@ -226,7 +300,7 @@ struct PIMMapDevicesPass
       Value unit =
           scheduled.create<arith::ConstantIndexOp>(loc, granularity[i]);
       Value executionTiles =
-          scheduled.create<arith::CeilDivSIOp>(loc, extents[i], unit);
+          scheduled.create<arith::CeilDivSIOp>(loc, ranges[i].extent, unit);
       Value active =
           scheduled.create<arith::ConstantIndexOp>(loc, partitions[axis]);
       Value rounds =
@@ -243,8 +317,8 @@ struct PIMMapDevicesPass
     scf::ForOp reductionRound;
     if (reductionLoop) {
       Value unit = scheduled.create<arith::ConstantIndexOp>(loc, tileGroups[2]);
-      Value rounds = scheduled.create<arith::CeilDivSIOp>(loc, reductionExtent,
-                                                          unit);
+      Value rounds = scheduled.create<arith::CeilDivSIOp>(
+          loc, reductionRange.extent, unit);
       reductionRound = scheduled.create<scf::ForOp>(loc, c0, rounds, c1);
       reductionRound->setAttr("pim.scheduling_axis",
                               scheduled.getStringAttr("reduction_k"));
@@ -266,14 +340,14 @@ struct PIMMapDevicesPass
     for (auto [i, loop] : llvm::enumerate(loops)) {
       int64_t axis = canonicalAxis(names[i].getValue());
       scheduleLoop(b, loop, roundIVs[i], body->getArgument(axis),
-                   partitions[axis], granularity[i], extents[i]);
+                   partitions[axis], granularity[i], ranges[i]);
     }
 
     if (reductionLoop) {
       Value noDevicePartition = b.create<arith::ConstantIndexOp>(loc, 0);
       scheduleLoop(b, reductionLoop, reductionRound.getInductionVar(),
                    noDevicePartition, /*partitions=*/1, tileGroups[2],
-                   reductionExtent);
+                   reductionRange);
       reductionLoop->setAttr("pim.temporal_reduction", b.getUnitAttr());
 
       // Window마다 accumulator가 identity에서 다시 시작하므로 최종 store는
