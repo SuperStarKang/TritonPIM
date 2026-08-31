@@ -26,6 +26,10 @@ namespace triton {
 
 namespace {
 
+static int64_t canonicalAxis(StringRef axis) {
+  return axis == "m" ? 0 : axis == "n" ? 1 : axis == "k" ? 2 : -1;
+}
+
 // 배치 pass가 만드는 clamp 식인가. 런타임 값이면 부등식을 증명할 수 없으므로 clamp가
 // 있었는지를 구조로 확인한다.
 static bool isClamped(Value v) {
@@ -84,6 +88,439 @@ static bool dependsOn(Value value, ValueRange roots) {
   return false;
 }
 
+static bool dependsOn(Value value, Value root) {
+  SmallVector<Value, 1> roots{root};
+  return dependsOn(value, roots);
+}
+
+// Scheduling arithmetic is built with index values and may be cast only at the
+// original Triton loop boundary. Casts do not change which Execution Tile is
+// selected, so structural scheduling checks look through them.
+static Value stripIndexCasts(Value value) {
+  while (auto cast = value.getDefiningOp<arith::IndexCastOp>())
+    value = cast.getIn();
+  return value;
+}
+
+struct LinearForm {
+  int64_t coefficient;
+  int64_t constant;
+};
+
+struct SpatialLinearForm {
+  int64_t roundCoefficient;
+  int64_t deviceCoefficient;
+  int64_t constant;
+};
+
+static std::optional<int64_t> checkedLinearValue(__int128 value) {
+  if (value < std::numeric_limits<int64_t>::min() ||
+      value > std::numeric_limits<int64_t>::max())
+    return std::nullopt;
+  return static_cast<int64_t>(value);
+}
+
+// Read the small affine expression produced for an Execution Tile start. The
+// accepted grammar is intentionally limited to casts, add/sub, and a multiply
+// by a constant; arbitrary arithmetic that merely depends on the round IV is
+// not sufficient to establish the Common scheduling contract.
+static std::optional<LinearForm> linearForm(Value value, Value variable) {
+  value = stripIndexCasts(value);
+  variable = stripIndexCasts(variable);
+  if (value == variable)
+    return LinearForm{1, 0};
+  if (std::optional<int64_t> constant = getConstantIntValue(value))
+    return LinearForm{0, *constant};
+  if (auto add = value.getDefiningOp<arith::AddIOp>()) {
+    std::optional<LinearForm> lhs = linearForm(add.getLhs(), variable);
+    std::optional<LinearForm> rhs = linearForm(add.getRhs(), variable);
+    if (!lhs || !rhs)
+      return std::nullopt;
+    std::optional<int64_t> coefficient = checkedLinearValue(
+        static_cast<__int128>(lhs->coefficient) + rhs->coefficient);
+    std::optional<int64_t> constant = checkedLinearValue(
+        static_cast<__int128>(lhs->constant) + rhs->constant);
+    if (!coefficient || !constant)
+      return std::nullopt;
+    return LinearForm{*coefficient, *constant};
+  }
+  if (auto sub = value.getDefiningOp<arith::SubIOp>()) {
+    std::optional<LinearForm> lhs = linearForm(sub.getLhs(), variable);
+    std::optional<LinearForm> rhs = linearForm(sub.getRhs(), variable);
+    if (!lhs || !rhs)
+      return std::nullopt;
+    std::optional<int64_t> coefficient = checkedLinearValue(
+        static_cast<__int128>(lhs->coefficient) - rhs->coefficient);
+    std::optional<int64_t> constant = checkedLinearValue(
+        static_cast<__int128>(lhs->constant) - rhs->constant);
+    if (!coefficient || !constant)
+      return std::nullopt;
+    return LinearForm{*coefficient, *constant};
+  }
+  if (auto mul = value.getDefiningOp<arith::MulIOp>()) {
+    Value expression;
+    std::optional<int64_t> factor = getConstantIntValue(mul.getLhs());
+    if (factor)
+      expression = mul.getRhs();
+    else {
+      factor = getConstantIntValue(mul.getRhs());
+      expression = mul.getLhs();
+    }
+    if (!factor)
+      return std::nullopt;
+    std::optional<LinearForm> form = linearForm(expression, variable);
+    if (!form)
+      return std::nullopt;
+    std::optional<int64_t> coefficient = checkedLinearValue(
+        static_cast<__int128>(form->coefficient) * *factor);
+    std::optional<int64_t> constant = checkedLinearValue(
+        static_cast<__int128>(form->constant) * *factor);
+    if (!coefficient || !constant)
+      return std::nullopt;
+    return LinearForm{*coefficient, *constant};
+  }
+  return std::nullopt;
+}
+
+// Read the exact first-group expression emitted for a spatial axis.  Only the
+// scheduling round and the corresponding pim.device coordinate may vary:
+//   first = (round * partitions + device) * groupsPerTile
+static std::optional<SpatialLinearForm>
+spatialLinearForm(Value value, Value round, Value device) {
+  value = stripIndexCasts(value);
+  round = stripIndexCasts(round);
+  device = stripIndexCasts(device);
+  if (value == round)
+    return SpatialLinearForm{1, 0, 0};
+  if (value == device)
+    return SpatialLinearForm{0, 1, 0};
+  if (std::optional<int64_t> constant = getConstantIntValue(value))
+    return SpatialLinearForm{0, 0, *constant};
+  if (auto add = value.getDefiningOp<arith::AddIOp>()) {
+    std::optional<SpatialLinearForm> lhs =
+        spatialLinearForm(add.getLhs(), round, device);
+    std::optional<SpatialLinearForm> rhs =
+        spatialLinearForm(add.getRhs(), round, device);
+    if (!lhs || !rhs)
+      return std::nullopt;
+    std::optional<int64_t> roundCoefficient = checkedLinearValue(
+        static_cast<__int128>(lhs->roundCoefficient) +
+        rhs->roundCoefficient);
+    std::optional<int64_t> deviceCoefficient = checkedLinearValue(
+        static_cast<__int128>(lhs->deviceCoefficient) +
+        rhs->deviceCoefficient);
+    std::optional<int64_t> constant = checkedLinearValue(
+        static_cast<__int128>(lhs->constant) + rhs->constant);
+    if (!roundCoefficient || !deviceCoefficient || !constant)
+      return std::nullopt;
+    return SpatialLinearForm{*roundCoefficient, *deviceCoefficient,
+                             *constant};
+  }
+  if (auto sub = value.getDefiningOp<arith::SubIOp>()) {
+    std::optional<SpatialLinearForm> lhs =
+        spatialLinearForm(sub.getLhs(), round, device);
+    std::optional<SpatialLinearForm> rhs =
+        spatialLinearForm(sub.getRhs(), round, device);
+    if (!lhs || !rhs)
+      return std::nullopt;
+    std::optional<int64_t> roundCoefficient = checkedLinearValue(
+        static_cast<__int128>(lhs->roundCoefficient) -
+        rhs->roundCoefficient);
+    std::optional<int64_t> deviceCoefficient = checkedLinearValue(
+        static_cast<__int128>(lhs->deviceCoefficient) -
+        rhs->deviceCoefficient);
+    std::optional<int64_t> constant = checkedLinearValue(
+        static_cast<__int128>(lhs->constant) - rhs->constant);
+    if (!roundCoefficient || !deviceCoefficient || !constant)
+      return std::nullopt;
+    return SpatialLinearForm{*roundCoefficient, *deviceCoefficient,
+                             *constant};
+  }
+  if (auto mul = value.getDefiningOp<arith::MulIOp>()) {
+    Value expression;
+    std::optional<int64_t> factor = getConstantIntValue(mul.getLhs());
+    if (factor)
+      expression = mul.getRhs();
+    else {
+      factor = getConstantIntValue(mul.getRhs());
+      expression = mul.getLhs();
+    }
+    if (!factor)
+      return std::nullopt;
+    std::optional<SpatialLinearForm> form =
+        spatialLinearForm(expression, round, device);
+    if (!form)
+      return std::nullopt;
+    std::optional<int64_t> roundCoefficient = checkedLinearValue(
+        static_cast<__int128>(form->roundCoefficient) * *factor);
+    std::optional<int64_t> deviceCoefficient = checkedLinearValue(
+        static_cast<__int128>(form->deviceCoefficient) * *factor);
+    std::optional<int64_t> constant = checkedLinearValue(
+        static_cast<__int128>(form->constant) * *factor);
+    if (!roundCoefficient || !deviceCoefficient || !constant)
+      return std::nullopt;
+    return SpatialLinearForm{*roundCoefficient, *deviceCoefficient,
+                             *constant};
+  }
+  return std::nullopt;
+}
+
+static bool matchScaledCoordinate(Value value, Value coordinate,
+                                  Value &scale) {
+  value = stripIndexCasts(value);
+  coordinate = stripIndexCasts(coordinate);
+  if (value == coordinate) {
+    scale = Value();
+    return true;
+  }
+  auto mul = value.getDefiningOp<arith::MulIOp>();
+  if (!mul)
+    return false;
+  Value lhs = stripIndexCasts(mul.getLhs());
+  Value rhs = stripIndexCasts(mul.getRhs());
+  if (lhs == coordinate) {
+    scale = rhs;
+    return true;
+  }
+  if (rhs == coordinate) {
+    scale = lhs;
+    return true;
+  }
+  return false;
+}
+
+// The local logical coordinate must be the original loop coordinate at the
+// current Execution Tile start:
+//   start  = lower + first * step
+//   global = start + local * step
+static bool hasExactSpatialOrigin(scf::ForOp local, Value first) {
+  Operation *origin = nullptr;
+  for (Operation &op : *local.getBody()) {
+    if (!op.hasAttr("pim.device_origin"))
+      continue;
+    if (origin)
+      return false;
+    origin = &op;
+  }
+  if (!origin || origin->getNumResults() != 1)
+    return false;
+
+  auto global = stripIndexCasts(origin->getResult(0))
+                    .getDefiningOp<arith::AddIOp>();
+  if (!global)
+    return false;
+  Value globalOperands[2] = {global.getLhs(), global.getRhs()};
+  for (int localOperand = 0; localOperand < 2; ++localOperand) {
+    Value localScale;
+    if (!matchScaledCoordinate(globalOperands[localOperand],
+                               local.getInductionVar(), localScale))
+      continue;
+    Value start = stripIndexCasts(globalOperands[1 - localOperand]);
+    auto startAdd = start.getDefiningOp<arith::AddIOp>();
+    if (!startAdd)
+      continue;
+    Value startOperands[2] = {startAdd.getLhs(), startAdd.getRhs()};
+    for (int firstOperand = 0; firstOperand < 2; ++firstOperand) {
+      Value firstScale;
+      if (!matchScaledCoordinate(startOperands[firstOperand], first,
+                                 firstScale))
+        continue;
+      Value lower = startOperands[1 - firstOperand];
+      bool sameScale = (!localScale && !firstScale) ||
+                       (localScale && firstScale &&
+                        stripIndexCasts(localScale) ==
+                            stripIndexCasts(firstScale));
+      if (sameScale && !dependsOn(lower, first) &&
+          !dependsOn(lower, local.getInductionVar()))
+        return true;
+    }
+  }
+  return false;
+}
+
+// Verify the exact spatial scheduling contract emitted by PIMMapDevices:
+//   executionTiles = ceildiv(totalGroups, groupsPerTile)
+//   rounds          = ceildiv(executionTiles, partitions)
+//   first           = (round * partitions + device) * groupsPerTile
+//   localTrips      = min(groupsPerTile, max(totalGroups - first, 0))
+static LogicalResult verifySpatialSchedule(scf::ForOp round,
+                                           scf::ForOp local, Value device,
+                                           StringRef axis,
+                                           int64_t groupsPerTile,
+                                           int64_t partitions, Value &first) {
+  if (!matchPattern(round.getLowerBound(), m_Zero()) ||
+      getConstantIntValue(round.getStep()) != 1)
+    return round->emitError("pim-verify: the spatial ")
+           << axis << " scheduling round must be zero-based with unit step";
+
+  auto roundCount = stripIndexCasts(round.getUpperBound())
+                        .getDefiningOp<arith::CeilDivSIOp>();
+  if (!roundCount ||
+      getConstantIntValue(roundCount.getRhs()) != partitions)
+    return round->emitError("pim-verify: the spatial ")
+           << axis
+           << " scheduling round upper bound must divide the Execution Tile "
+              "count by p_"
+           << axis;
+  auto executionTiles = stripIndexCasts(roundCount.getLhs())
+                            .getDefiningOp<arith::CeilDivSIOp>();
+  if (!executionTiles ||
+      getConstantIntValue(executionTiles.getRhs()) != groupsPerTile)
+    return round->emitError("pim-verify: the spatial ")
+           << axis
+           << " Execution Tile count must be ceildiv(total groups, groups per "
+              "Execution Tile)";
+  Value totalGroups = stripIndexCasts(executionTiles.getLhs());
+
+  if (!matchPattern(local.getLowerBound(), m_Zero()) ||
+      getConstantIntValue(local.getStep()) != 1)
+    return local->emitError("pim-verify: the device-local spatial ")
+           << axis << " loop must be zero-based with unit step";
+  auto window = stripIndexCasts(local.getUpperBound())
+                    .getDefiningOp<arith::MinSIOp>();
+  if (!window)
+    return local->emitError("pim-verify: the device-local spatial ")
+           << axis << " loop is not clamped to the current Execution Tile";
+  Value remaining;
+  if (getConstantIntValue(window.getLhs()) == groupsPerTile)
+    remaining = window.getRhs();
+  else if (getConstantIntValue(window.getRhs()) == groupsPerTile)
+    remaining = window.getLhs();
+  else
+    return local->emitError("pim-verify: the device-local spatial ")
+           << axis << " loop does not use its Execution Tile group count";
+
+  auto nonnegative = stripIndexCasts(remaining).getDefiningOp<arith::MaxSIOp>();
+  if (!nonnegative)
+    return local->emitError("pim-verify: the remaining spatial ")
+           << axis << " group count is not clamped at zero";
+  Value difference;
+  if (getConstantIntValue(nonnegative.getLhs()) == 0)
+    difference = nonnegative.getRhs();
+  else if (getConstantIntValue(nonnegative.getRhs()) == 0)
+    difference = nonnegative.getLhs();
+  else
+    return local->emitError("pim-verify: the remaining spatial ")
+           << axis << " group count is not clamped at zero";
+
+  auto left = stripIndexCasts(difference).getDefiningOp<arith::SubIOp>();
+  if (!left || stripIndexCasts(left.getLhs()) != totalGroups)
+    return local->emitError("pim-verify: the spatial ")
+           << axis
+           << " host round and local loop do not use the same total group "
+              "count";
+  first = stripIndexCasts(left.getRhs());
+  std::optional<SpatialLinearForm> form = spatialLinearForm(
+      first, round.getInductionVar(), device);
+  std::optional<int64_t> roundCoefficient = checkedLinearValue(
+      static_cast<__int128>(partitions) * groupsPerTile);
+  if (!form || !roundCoefficient ||
+      form->roundCoefficient != *roundCoefficient ||
+      form->deviceCoefficient != groupsPerTile || form->constant != 0)
+    return local->emitError("pim-verify: the spatial ")
+           << axis
+           << " Execution Tile start must be "
+              "(round * partitions + device) * groups per tile";
+  if (!hasExactSpatialOrigin(local, first))
+    return local->emitError("pim-verify: the spatial ")
+           << axis
+           << " global origin must be lower + (first + local) * original "
+              "step";
+  return success();
+}
+
+// Verify that the host round and device-local temporal K loop are two views of
+// the same Execution Tile window:
+//   round       = 0 .. ceildiv(totalGroups, tileK)
+//   first       = round * tileK
+//   local trips = min(tileK, max(totalGroups - first, 0))
+// The marked global origin must use both first and the local induction value.
+static LogicalResult verifyTemporalSchedule(scf::ForOp round,
+                                            scf::ForOp reduction,
+                                            int64_t tileK,
+                                            Value &first) {
+  if (!matchPattern(round.getLowerBound(), m_Zero()) ||
+      getConstantIntValue(round.getStep()) != 1)
+    return round->emitError(
+        "pim-verify: the temporal K scheduling round must be zero-based "
+        "with unit step");
+
+  Value roundUpper = stripIndexCasts(round.getUpperBound());
+  auto roundCount = roundUpper.getDefiningOp<arith::CeilDivSIOp>();
+  if (!roundCount || getConstantIntValue(roundCount.getRhs()) != tileK)
+    return round->emitError(
+        "pim-verify: the temporal K scheduling round upper bound must be "
+        "ceildiv(total reduction groups, execution_tile.groups[k])");
+  Value totalGroups = stripIndexCasts(roundCount.getLhs());
+
+  Value localUpper = stripIndexCasts(reduction.getUpperBound());
+  auto window = localUpper.getDefiningOp<arith::MinSIOp>();
+  if (!window)
+    return reduction->emitError(
+        "pim-verify: the temporal K local window is not clamped to the "
+        "remaining reduction groups");
+  Value remaining;
+  if (getConstantIntValue(window.getLhs()) == tileK)
+    remaining = window.getRhs();
+  else if (getConstantIntValue(window.getRhs()) == tileK)
+    remaining = window.getLhs();
+  else
+    return reduction->emitError(
+        "pim-verify: the temporal K local window does not use "
+        "execution_tile.groups[k]");
+
+  auto nonnegative = stripIndexCasts(remaining).getDefiningOp<arith::MaxSIOp>();
+  if (!nonnegative)
+    return reduction->emitError(
+        "pim-verify: the temporal K remaining group count is not clamped "
+        "at zero");
+  Value difference;
+  if (getConstantIntValue(nonnegative.getLhs()) == 0)
+    difference = nonnegative.getRhs();
+  else if (getConstantIntValue(nonnegative.getRhs()) == 0)
+    difference = nonnegative.getLhs();
+  else
+    return reduction->emitError(
+        "pim-verify: the temporal K remaining group count is not clamped "
+        "at zero");
+
+  auto left = stripIndexCasts(difference).getDefiningOp<arith::SubIOp>();
+  if (!left || stripIndexCasts(left.getLhs()) != totalGroups)
+    return reduction->emitError(
+        "pim-verify: the temporal K host round and local window do not use "
+        "the same total reduction-group count");
+  first = stripIndexCasts(left.getRhs());
+  std::optional<LinearForm> form =
+      linearForm(first, round.getInductionVar());
+  if (!form || form->coefficient != tileK || form->constant != 0)
+    return reduction->emitError(
+        "pim-verify: the temporal K window start must be round * "
+        "execution_tile.groups[k]");
+
+  Operation *origin = nullptr;
+  for (Operation &op : *reduction.getBody()) {
+    if (!op.hasAttr("pim.device_origin"))
+      continue;
+    if (origin)
+      return reduction->emitError(
+          "pim-verify: the temporal K loop has more than one device origin");
+    origin = &op;
+  }
+  if (!origin || origin->getNumResults() != 1)
+    return reduction->emitError(
+        "pim-verify: the temporal K loop needs one marked device origin");
+  Value global = origin->getResult(0);
+  if (!dependsOn(global, first))
+    return origin->emitError(
+        "pim-verify: the temporal K global origin does not use the current "
+        "Execution Tile window start");
+  if (!dependsOn(global, reduction.getInductionVar()))
+    return origin->emitError(
+        "pim-verify: the temporal K global origin does not use the local "
+        "reduction-group coordinate");
+  return success();
+}
+
 struct PIMVerifyPass
     : public mlir::triton::impl::PIMVerifyBase<PIMVerifyPass> {
   using PIMVerifyBase::PIMVerifyBase;
@@ -122,9 +559,9 @@ struct PIMVerifyPass
       }
 
       // hierarchy metadata가 실제 local compute tile과 같은 크기를 말하는지 확인한다.
-      // m/n은 이름 붙은 logical axis, k는 access origin을 모는 유일한 reduction
-      // loop다. 이 검사가 없으면 block_group.blocks를 바꿔도 linalg/access shape는
-      // 예전 값인 모순된 Common IR이 target lowering까지 내려간다.
+      // m/n은 이름 붙은 logical axis, k는 linalg/accumulator 의미에서 명시된
+      // semantic reduction loop다. access 주소를 모는 loop로 reduction을 추측하지
+      // 않는다.
       SmallVector<scf::ForOp> loops;
       func.walk<WalkOrder::PreOrder>([&](scf::ForOp loop) {
         // pim.device 바깥의 scheduling round도 tag 없는 scf.for다. 그것을
@@ -142,18 +579,22 @@ struct PIMVerifyPass
         else if (axis.getName().getValue() == "n")
           hierarchyAxes[1] = loop;
       }
-      llvm::SmallPtrSet<Operation *, 4> reductions;
-      func.walk([&](pim::AccessOp access) {
-        for (Value origin : access.getOrigin()) {
-          llvm::SmallPtrSet<Operation *, 4> drivers;
-          pim::collectDrivers(origin, loops, drivers);
-          for (Operation *driver : drivers)
-            if (!driver->getAttrOfType<pim::AxisAttr>("pim.axis"))
-              reductions.insert(driver);
+      for (scf::ForOp loop : loops)
+        if (auto reduction =
+                loop->getAttrOfType<StringAttr>("pim.reduction")) {
+          if (reduction.getValue() != "add") {
+            loop->emitError("pim-verify: unsupported reduction '")
+                << reduction.getValue() << "'";
+            return WalkResult::interrupt();
+          }
+          if (hierarchyAxes[2]) {
+            func->emitError(
+                "pim-verify: more than one semantic reduction loop is "
+                "present");
+            return WalkResult::interrupt();
+          }
+          hierarchyAxes[2] = loop;
         }
-      });
-      if (reductions.size() == 1)
-        hierarchyAxes[2] = cast<scf::ForOp>(*reductions.begin());
 
       SmallVector<int64_t, 3> groupShape = pim::groupShape(func);
       pim::DeviceOp device;
@@ -238,16 +679,62 @@ struct PIMVerifyPass
     device.getBody().walk<WalkOrder::PreOrder>(
         [&](scf::ForOp loop) { deviceLoops.push_back(loop); });
     SmallVector<scf::ForOp> temporalReductions;
-    for (scf::ForOp loop : deviceLoops)
+    SmallVector<scf::ForOp> semanticReductions;
+    SmallVector<scf::ForOp> spatialAxes[3];
+    for (scf::ForOp loop : deviceLoops) {
       if (loop->hasAttr("pim.temporal_reduction"))
         temporalReductions.push_back(loop);
+      if (loop->getAttrOfType<StringAttr>("pim.reduction"))
+        semanticReductions.push_back(loop);
+      if (auto axis = loop->getAttrOfType<pim::AxisAttr>("pim.axis")) {
+        int64_t number = canonicalAxis(axis.getName().getValue());
+        if (number >= 0)
+          spatialAxes[number].push_back(loop);
+      }
+    }
     if (temporalReductions.size() > 1)
       return device->emitError(
           "pim-verify: one Execution Tile may have only one temporal K "
           "reduction loop");
+    if (semanticReductions.size() > 1)
+      return device->emitError(
+          "pim-verify: one Execution Tile may have only one semantic "
+          "reduction loop");
+    static const char *axisNames[3] = {"m", "n", "k"};
+    for (int64_t axis = 0; axis < 3; ++axis)
+      if (spatialAxes[axis].size() > 1)
+        return device->emitError("pim-verify: one Execution Tile may have "
+                                 "only one spatial ")
+               << axisNames[axis] << " axis";
 
+    ArrayRef<int64_t> partitions =
+        device.getMapping().getPartitions().asArrayRef();
+    for (int64_t axis = 0; axis < 3; ++axis)
+      if (partitions[axis] > 1 && spatialAxes[axis].empty())
+        return device->emitError("pim-verify: p_")
+               << axisNames[axis]
+               << " greater than one requires an explicit spatial pim.axis=\""
+               << axisNames[axis] << "\"";
+
+    bool hasStore = false;
+    device.walk([&](pim::StoreOp) { hasStore = true; });
+    if (!spatialAxes[2].empty() && hasStore && semanticReductions.empty())
+      return device->emitError(
+          "pim-verify: a spatial K output needs one semantic pim.reduction");
+
+    scf::ForOp temporalReduction;
+    Value temporalFirst;
     if (!temporalReductions.empty()) {
-      scf::ForOp reduction = temporalReductions.front();
+      temporalReduction = temporalReductions.front();
+      scf::ForOp reduction = temporalReduction;
+      auto combiner = reduction->getAttrOfType<StringAttr>("pim.reduction");
+      if (!combiner)
+        return reduction->emitError(
+            "pim-verify: a temporal K loop must also carry the semantic "
+            "pim.reduction attribute");
+      if (combiner.getValue() != "add")
+        return reduction->emitError("pim-verify: unsupported reduction '")
+               << combiner.getValue() << "'";
       int64_t tileK = execution.getGroups().asArrayRef()[2];
       if (!matchPattern(reduction.getLowerBound(), m_Zero()) ||
           getConstantIntValue(reduction.getStep()) != 1 ||
@@ -258,16 +745,46 @@ struct PIMVerifyPass
                << tileK;
     }
 
-    bool hasTemporalRound = false;
+    SmallVector<scf::ForOp> temporalRounds;
+    SmallVector<scf::ForOp> spatialRounds[3];
     for (Operation *parent = device->getParentOp(); parent;
          parent = parent->getParentOp())
       if (auto loop = dyn_cast<scf::ForOp>(parent))
-        if (auto axis = loop->getAttrOfType<StringAttr>("pim.scheduling_axis"))
-          hasTemporalRound |= axis.getValue() == "reduction_k";
-    if (hasTemporalRound != !temporalReductions.empty())
+        if (auto axis = loop->getAttrOfType<StringAttr>("pim.scheduling_axis")) {
+          if (axis.getValue() == "reduction_k")
+            temporalRounds.push_back(loop);
+          else {
+            int64_t number = canonicalAxis(axis.getValue());
+            if (number >= 0)
+              spatialRounds[number].push_back(loop);
+          }
+        }
+    if (temporalReductions.empty() && !temporalRounds.empty())
       return device->emitError(
-          "pim-verify: temporal K scheduling round and device-local "
-          "reduction window must occur together");
+          "pim-verify: a temporal K scheduling round has no device-local "
+          "reduction window");
+    if (!temporalReductions.empty() && temporalRounds.size() != 1)
+      return device->emitError(
+          "pim-verify: one temporal K reduction requires exactly one "
+          "reduction_k scheduling round");
+    if (temporalReduction &&
+        failed(verifyTemporalSchedule(temporalRounds.front(), temporalReduction,
+                                      execution.getGroups().asArrayRef()[2],
+                                      temporalFirst)))
+      return failure();
+
+    Value spatialFirst[3];
+    for (int64_t axis = 0; axis < 3; ++axis) {
+      if (spatialAxes[axis].size() != 1 || spatialRounds[axis].size() != 1)
+        continue;
+      int64_t groupsPerTile =
+          axis == 2 ? 1 : execution.getGroups().asArrayRef()[axis];
+      if (failed(verifySpatialSchedule(
+              spatialRounds[axis].front(), spatialAxes[axis].front(),
+              device.getBody().front().getArgument(axis), axisNames[axis],
+              groupsPerTile, partitions[axis], spatialFirst[axis])))
+        return failure();
+    }
 
     int64_t used = 1;
     for (int64_t p : device.getMapping().getPartitions().asArrayRef())
@@ -283,6 +800,22 @@ struct PIMVerifyPass
       if (a.getOrigin().size() != a.getSizes().size()) {
         a->emitError("pim-verify: origin rank does not match sizes rank");
         return WalkResult::interrupt();
+      }
+      for (auto [d, valid] : llvm::enumerate(a.getValid())) {
+        int64_t size = a.getSizes()[d];
+        if (std::optional<int64_t> constant = getConstantIntValue(valid)) {
+          if (*constant < 0 || *constant > size) {
+            a->emitError("pim-verify: constant valid extent on buffer axis ")
+                << d << " is outside [0, " << size << "]";
+            return WalkResult::interrupt();
+          }
+          continue;
+        }
+        if (!isClampedTo(valid, size)) {
+          a->emitError("pim-verify: dynamic valid extent on buffer axis ")
+              << d << " is not clamped to pim.access size " << size;
+          return WalkResult::interrupt();
+        }
       }
       // 단계 1은 pad = 0만 지원한다. 0이 아닌 pad는 calloc으로 나오지 않아 별도 채우기가
       // 필요하다.
@@ -301,7 +834,6 @@ struct PIMVerifyPass
       return failure();
 
     int64_t staticAllocationBytes = 0;
-    bool allAllocationsStatic = true;
     for (Operation &op : device.getBody().front()) {
       auto place = dyn_cast<pim::PlaceOp>(&op);
       if (!place)
@@ -314,7 +846,6 @@ struct PIMVerifyPass
                << place.getAccess() << " in this device";
       pim::AccessOp access = it->second;
       int64_t elements = 1;
-      bool allocationStatic = true;
       for (auto [d, s] : llvm::enumerate(place.getSize())) {
         // mask 가 있는 축만 잘라야 한다. 없으면 도는 범위가 그대로 영역이다.
         bool masked = !access.getValid().empty() &&
@@ -323,8 +854,6 @@ struct PIMVerifyPass
           return place->emitError("pim-verify: the size of buffer axis ")
                  << d << " is not clamped to the buffer extent";
         std::optional<int64_t> size = getConstantIntValue(s);
-        std::optional<int64_t> allocation =
-            getConstantIntValue(place.getAllocationShape()[d]);
 
         // placement가 실제 Execution Tile 하나의 resident buffer인지 hierarchy와
         // 독립적으로 맞춰 본다. access dimension을 모는 m/n loop는 해당 Tile의
@@ -332,11 +861,45 @@ struct PIMVerifyPass
         // tile_k Group 수만큼 상주해야 한다.
         llvm::SmallPtrSet<Operation *, 4> drivers;
         pim::collectDrivers(access.getOrigin()[d], deviceLoops, drivers);
+        // The resident K slice for this round must begin at the same window
+        // start that bounds the device-local temporal reduction. Merely using
+        // the round IV somewhere else in the address expression is not enough.
+        if (temporalReduction &&
+            drivers.contains(temporalReduction.getOperation()) &&
+            !dependsOn(place.getStart()[d], temporalFirst))
+          return place->emitError("pim-verify: resident buffer axis ")
+                 << d
+                 << " is driven by temporal K but start does not use the "
+                    "current Execution Tile window start";
+        if (temporalReduction &&
+            drivers.contains(temporalReduction.getOperation()) &&
+            !dependsOn(place.getSize()[d],
+                       temporalReduction.getUpperBound()))
+          return place->emitError("pim-verify: resident buffer axis ")
+                 << d
+                 << " is driven by temporal K but size does not use the "
+                    "current local window length";
         int64_t expected = access.getSizes()[d];
-        bool hierarchyOnly = true;
         for (Operation *driver : drivers) {
           if (auto axis = driver->getAttrOfType<pim::AxisAttr>("pim.axis")) {
             StringRef name = axis.getName().getValue();
+            int64_t axisNumber = canonicalAxis(name);
+            if (axisNumber < 0)
+              return place->emitError("pim-verify: unsupported spatial axis ")
+                     << name;
+            if (spatialFirst[axisNumber] &&
+                !dependsOn(place.getStart()[d], spatialFirst[axisNumber]))
+              return place->emitError("pim-verify: resident buffer axis ")
+                     << d << " is driven by spatial " << name
+                     << " but start does not use the current Execution Tile "
+                        "start";
+            if (spatialFirst[axisNumber] &&
+                !dependsOn(place.getSize()[d],
+                           spatialAxes[axisNumber].front().getUpperBound()))
+              return place->emitError("pim-verify: resident buffer axis ")
+                     << d << " is driven by spatial " << name
+                     << " but size does not use the current local Tile "
+                        "length";
             ArrayRef<int64_t> groups = execution.getGroups().asArrayRef();
             int64_t factor = name == "m"   ? groups[0]
                              : name == "n" ? groups[1]
@@ -354,19 +917,21 @@ struct PIMVerifyPass
                   "pim-verify: resident allocation extent overflows i64");
             expected *= factor;
           } else {
-            hierarchyOnly = false;
+            return place->emitError("pim-verify: resident buffer axis ")
+                   << d
+                   << " is driven by a loop outside the "
+                      "Block-Group-Execution Tile hierarchy";
           }
         }
-        if (hierarchyOnly) {
-          allocation = constantIndexExpr(place.getAllocationShape()[d]);
-          if (!allocation)
-            return place->emitError("pim-verify: resident allocation_shape[")
-                   << d << "] must be a static Execution Tile extent";
-          if (*allocation != expected)
-            return place->emitError("pim-verify: allocation_shape[")
-                   << d << "] is " << *allocation
-                   << " but the Execution Tile requires " << expected;
-        }
+        std::optional<int64_t> allocation =
+            constantIndexExpr(place.getAllocationShape()[d]);
+        if (!allocation)
+          return place->emitError("pim-verify: resident allocation_shape[")
+                 << d << "] must be a static Execution Tile extent";
+        if (*allocation != expected)
+          return place->emitError("pim-verify: allocation_shape[")
+                 << d << "] is " << *allocation
+                 << " but the Execution Tile requires " << expected;
         if (size && *size < 0)
           return place->emitError("pim-verify: negative size on buffer axis ")
                  << d;
@@ -378,63 +943,103 @@ struct PIMVerifyPass
           return place->emitError("pim-verify: buffer axis ")
                  << d << " needs " << *size << " elements but only " << *allocation
                  << " are allocated per device";
-        if (!allocation) {
-          allocationStatic = false;
-        } else if (*allocation != 0 &&
-                   elements > std::numeric_limits<int64_t>::max() /
-                                  *allocation) {
+        if (*allocation != 0 &&
+            elements > std::numeric_limits<int64_t>::max() / *allocation) {
           return place->emitError(
               "pim-verify: allocation_shape element count overflows i64");
         } else {
           elements *= *allocation;
         }
       }
-      if (!allocationStatic) {
-        allAllocationsStatic = false;
-      } else {
-        Type elementType =
-            cast<BaseMemRefType>(place.getBuffer().getType()).getElementType();
-        int64_t elementBytes = std::max<int64_t>(
-            1, elementType.getIntOrFloatBitWidth() / 8);
-        if (elements != 0 &&
-            elementBytes > std::numeric_limits<int64_t>::max() / elements)
-          return place->emitError(
-              "pim-verify: allocation byte count overflows i64");
-        int64_t bytes = elements * elementBytes;
-        if (staticAllocationBytes >
-            std::numeric_limits<int64_t>::max() - bytes)
-          return place->emitError(
-              "pim-verify: total allocation byte count overflows i64");
-        staticAllocationBytes += bytes;
-      }
+      Type elementType =
+          cast<BaseMemRefType>(place.getBuffer().getType()).getElementType();
+      int64_t elementBytes =
+          std::max<int64_t>(1, elementType.getIntOrFloatBitWidth() / 8);
+      if (elements != 0 &&
+          elementBytes > std::numeric_limits<int64_t>::max() / elements)
+        return place->emitError(
+            "pim-verify: allocation byte count overflows i64");
+      int64_t bytes = elements * elementBytes;
+      if (staticAllocationBytes >
+          std::numeric_limits<int64_t>::max() - bytes)
+        return place->emitError(
+            "pim-verify: total allocation byte count overflows i64");
+      staticAllocationBytes += bytes;
     }
     if (accessIds.size() != placeIds.size())
       return device->emitError("pim-verify: ")
              << accessIds.size() << " accesses but " << placeIds.size()
              << " placements";
 
-    if (!temporalReductions.empty() &&
-        temporalReductions.front().getNumResults() != 0) {
+    for (int64_t axis = 0; axis < 3; ++axis) {
+      if (spatialAxes[axis].empty() && !spatialRounds[axis].empty())
+        return spatialRounds[axis].front()->emitError(
+                   "pim-verify: spatial scheduling round has no device-local ")
+               << axisNames[axis] << " axis";
+      if (!spatialAxes[axis].empty() && spatialRounds[axis].size() != 1)
+        return spatialAxes[axis].front()->emitError(
+                   "pim-verify: one device-local spatial ")
+               << axisNames[axis]
+               << " axis requires exactly one matching scheduling round";
+    }
+
+    // pim.combine is the original semantic combiner for every partial source.
+    // The sources are explicit in Common IR: reduction_k ancestors are temporal
+    // windows and pim.axis="k" plus mapping.partitions[k] are spatial planes and
+    // devices.  A target may choose where to perform the combine, but it must
+    // not rediscover either the operation or its scope from access arithmetic.
+    if (!semanticReductions.empty() &&
+        semanticReductions.front().getNumResults() != 0) {
       bool sawPartialStore = false;
       bool missingCombine = false;
+      bool mismatchedCombine = false;
+      bool hasPreCombineEpilogue = false;
+      StringAttr reductionCombiner = semanticReductions.front()
+                                         ->getAttrOfType<StringAttr>(
+                                             "pim.reduction");
       device.walk([&](pim::StoreOp store) {
-        if (!dependsOn(store.getValue(), temporalReductions.front().getResults()))
+        if (!dependsOn(store.getValue(), semanticReductions.front().getResults()))
           return;
         sawPartialStore = true;
-        missingCombine |=
-            !store->getAttrOfType<StringAttr>("pim.combine");
+        hasPreCombineEpilogue |= !llvm::is_contained(
+            semanticReductions.front().getResults(), store.getValue());
+        StringAttr combine =
+            store->getAttrOfType<StringAttr>("pim.combine");
+        missingCombine |= !combine;
+        mismatchedCombine |=
+            combine && combine.getValue() != reductionCombiner.getValue();
       });
       if (!sawPartialStore)
         return device->emitError(
-            "pim-verify: temporal K reduction has no partial output store");
+            "pim-verify: semantic K reduction has no partial output store");
+      if (hasPreCombineEpilogue)
+        return device->emitError(
+            "pim-verify: an epilogue consumes a K partial result "
+            "before it is combined");
       if (missingCombine)
         return device->emitError(
-            "pim-verify: every temporal K partial store needs an explicit "
+            "pim-verify: every K partial store needs an explicit "
             "pim.combine");
+      if (mismatchedCombine)
+        return device->emitError(
+            "pim-verify: K partial store combiner does not match the "
+            "semantic pim.reduction combiner");
+    }
+
+    // A combine marker without a semantic reduction would force the target to
+    // guess what value is partial.  Reject it in Common IR.
+    if (semanticReductions.empty()) {
+      pim::StoreOp unexplainedCombine;
+      device.walk([&](pim::StoreOp store) {
+        if (!unexplainedCombine && store->hasAttr("pim.combine"))
+          unexplainedCombine = store;
+      });
+      if (unexplainedCombine)
+        return unexplainedCombine->emitError(
+            "pim-verify: pim.combine requires one semantic pim.reduction");
     }
     std::optional<int64_t> unitLimit = pim::unitCapacityLimitBytes(profile);
-    if (allAllocationsStatic && unitLimit && *unitLimit > 0 &&
-        staticAllocationBytes > *unitLimit)
+    if (unitLimit && *unitLimit > 0 && staticAllocationBytes > *unitLimit)
       return device->emitError("pim-verify: the execution tile needs ")
              << staticAllocationBytes << " byte but one PIM unit is limited to "
              << *unitLimit << " byte";

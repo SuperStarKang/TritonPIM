@@ -5,8 +5,7 @@
 // RUN: triton-shared-opt "--pim-map-devices=p-m=2 p-n=2 p-k=2" %s | FileCheck %s
 // RUN: triton-shared-opt "--pim-map-devices=p-m=64" -verify-diagnostics %s
 
-// CHECK: pim.device
-// CHECK: #pim.device_mapping<partitions = [2, 2, 2]>
+// CHECK: pim.device <partitions = [2, 2, 2]>
 
 module attributes {pim.target_profile = #pim.target_profile<
     target = "upmem", num_units = 8, banks_per_unit = 1,
@@ -14,7 +13,7 @@ module attributes {pim.target_profile = #pim.target_profile<
     bank_capacity_limit_bytes = 3072,
     local_capacity_limit_bytes = 49152>} {
 
-// expected-error @below {{[p_m,p_n,p_k] needs 64 PIM units but the profile has 8}}
+// expected-error @below {{needs 64 PIM units but the profile has 8}}
 func.func @three_axes(%tr: index, %tc: index, %tp: index)
     attributes {
       pim.block = #pim.block<shape = [1, 1, 1]>,

@@ -169,10 +169,10 @@ PIM_COMMON_PASSES = [
     "-cse",
     "-loop-invariant-code-motion",
     "-canonicalize",               # (iv - 0) / 1 같은 잉여 산술을 상수로 확정한다
+    "--pim-form-compute",          # ① linalg와 accumulator에서 compute/reduction 의미 확정
     "--convert-ttshared-to-pim",   # 메모리 접근을 pim.access/load/store 로
     "--pim-build-logical-grid",    # source grid 를 logical tile loop nest 로
     "--pim-recover-access-origin", # access 의 축별 origin 을 logical 좌표로 채운다
-    "--pim-form-compute",          # 누산기를 matmul 의 outs 로 통합
     "{profile}",                   # 기계 profile 부착. 여기부터 profile 을 읽는다
     "{form_block_groups}",         # 계층 2: 사용자 묶음(group-m/n/k) → #pim.block_group
     "{form_execution_tiles}",      # 계층 3: 주어진 Block Group 개수 → #pim.execution_tile

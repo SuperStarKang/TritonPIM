@@ -55,7 +55,7 @@ func.func @device_place(%A: memref<*xi8>, %C: memref<*xi32>, %ex: index, %ey: in
   %c1 = arith.constant 1 : index
   %c32 = arith.constant 32 : index
 
- // CHECK: pim.device #pim.device_mapping<partitions = [2, 4, 1]>
+ // CHECK: pim.device <partitions = [2, 4, 1]>
   pim.device #pim.device_mapping<partitions = [2, 4, 1]> {
   ^bb0(%px: index, %py: index, %device_k_unused: index):
     // CHECK: pim.place %{{.*}} start[%{{.*}}, %{{.*}}] size[%{{.*}}, %{{.*}}] allocation_shape[%{{.*}}, %{{.*}}] strides[%{{.*}}, %{{.*}}] {{.*}}replicated_over = ["n"]

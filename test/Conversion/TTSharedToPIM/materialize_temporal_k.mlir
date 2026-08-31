@@ -4,14 +4,14 @@
 
 // CHECK-LABEL: func.func @gemm
 // CHECK: scf.for
-// CHECK: pim.device #pim.device_mapping<partitions = [1, 1, 1]>
+// CHECK: pim.device <partitions = [1, 1, 1]>
 // CHECK-SAME: pim.execution_tile = #pim.execution_tile<groups = [2, 2, 2]>
 // A 한 window는 M=8*2, K=(block 4)*(group 2)*(tile 2)만 상주시킨다.
 // CHECK: pim.place %arg0
 // CHECK-SAME: allocation_shape[{{.*}}, {{.*}}]
 // 실제 Triton runtime K와 같은 i32 reduction loop의 control type을 유지한다.
 // CHECK: scf.for {{.*}} iter_args{{.*}} : i32 {
-// CHECK: } {pim.temporal_reduction}
+// CHECK: } {pim.reduction = "add", pim.temporal_reduction}
 // CHECK: pim.store {{.*}} {pim.combine = "add"}
 // CHECK: } {pim.scheduling_axis = "reduction_k"}
 
@@ -66,7 +66,7 @@ func.func @gemm(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
             ins(%a, %b : tensor<8x8xi8>, tensor<8x8xi8>)
             outs(%acc : tensor<8x8xi32>) -> tensor<8x8xi32>
         scf.yield %next : tensor<8x8xi32>
-      }
+      } {pim.reduction = "add"}
       %cAccess = pim.access %C offset %n sizes [8, 8]
           strides[%c32, %c1] origin[%m, %n] {id = 2 : i64}
           : memref<*xi32> -> !pim.access

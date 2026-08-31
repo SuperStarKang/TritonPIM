@@ -25,6 +25,36 @@ func.func @wrong_temporal_window(%A: memref<*xi8>) attributes {
       scf.for %k = %c0 to %c4 step %c1 {
         %access = pim.access %A offset %k sizes [4] strides[%c1] origin[%k]
             {id = 0 : i64} : memref<*xi8> -> !pim.access
+      } {pim.reduction = "add", pim.temporal_reduction}
+    }
+  } {pim.scheduling_axis = "reduction_k"}
+  return
+}
+}
+
+// -----
+
+module attributes {pim.target_profile = #pim.target_profile<
+    target = "test", num_units = 1,
+    banks_per_unit = 1, cores_per_bank = 1, lanes_per_core = 1,
+    bank_capacity_limit_bytes = 1024,
+    local_capacity_limit_bytes = 0>} {
+
+func.func @temporal_without_semantics(%A: memref<*xi8>) attributes {
+    pim.block = #pim.block<shape = [1, 1, 1]>,
+    pim.block_group = #pim.block_group<blocks = [1, 1, 1]>} {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  scf.for %round = %c0 to %c1 step %c1 {
+    pim.device #pim.device_mapping<partitions = [1, 1, 1]> attributes {
+        pim.execution_tile = #pim.execution_tile<groups = [1, 1, 1]>} {
+    ^bb0(%device_m: index, %device_n: index, %device_k: index):
+      pim.place %A start[%c0] size[%c1] allocation_shape[%c1]
+          strides[%c1] {direction = "in", access = 0 : i64} : memref<*xi8>
+      // expected-error @below {{a temporal K loop must also carry the semantic pim.reduction attribute}}
+      scf.for %k = %c0 to %c1 step %c1 {
+        %access = pim.access %A offset %k sizes [1] strides[%c1] origin[%k]
+            {id = 0 : i64} : memref<*xi8> -> !pim.access
       } {pim.temporal_reduction}
     }
   } {pim.scheduling_axis = "reduction_k"}

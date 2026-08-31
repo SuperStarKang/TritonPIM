@@ -1,7 +1,7 @@
 // Common IR은 비용식이나 자동 인수분해 없이 [p_m,p_n,p_k]를 그대로 materialize한다.
 // RUN: triton-shared-opt "--pim-map-devices=p-m=2 p-n=1 p-k=1" %s | FileCheck %s
 
-// CHECK: #pim.device_mapping<partitions = [2, 1, 1]>
+// CHECK: pim.device <partitions = [2, 1, 1]>
 // CHECK: pim.execution_tile = #pim.execution_tile<groups = [1, 256, 1]>
 // CHECK: ^bb0(%{{.*}}: index, %{{.*}}: index, %{{.*}}: index):
 // CHECK: arith.maxsi

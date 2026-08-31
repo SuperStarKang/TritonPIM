@@ -7,7 +7,6 @@
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/IRMapping.h"
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 
@@ -43,49 +42,6 @@ static Value rebuild(OpBuilder &b, Value v, IRMapping &map, Operation *nest) {
   Value r = b.clone(*def, local)->getResult(cast<OpResult>(v).getResultNumber());
   map.map(v, r);
   return r;
-}
-
-// v가 유도변수를 쓰는 loop들.
-// 좌표에 무관하고 상수도 아닌 값인가. mask 식에서 원본 버퍼의 크기만 이 성질을 갖는다.
-static bool isExtentCandidate(Value v, ArrayRef<scf::ForOp> loops) {
-  if (getConstantIntValue(v))
-    return false;
-  llvm::SmallPtrSet<Operation *, 4> drivers;
-  pim::collectDrivers(v, loops, drivers);
-  return drivers.empty();
-}
-
-// mask 식에서 축별 원본 크기를 되짚는다. triton-shared의 mask 생성이 내는 두 꼴이다.
-//   min(max(min(start + tile, extent), start) - start, tile)
-//   min(max(extent - start, 0), tile)
-// 좌표에 무관한 쪽이 크기이고 다른 쪽은 좌표에 의존한다. 크기를 모르는 채로 두면 경계
-// tile에서 원본 버퍼 밖을 읽으므로, 못 찾으면 진단을 낸다.
-static Value extentFromValid(Value valid, ArrayRef<scf::ForOp> loops) {
-  SmallVector<Value> order;
-  llvm::DenseSet<Value> seen;
-  SmallVector<Value> work{valid};
-  while (!work.empty()) {
-    Value v = work.pop_back_val();
-    if (!seen.insert(v).second)
-      continue;
-    order.push_back(v);
-    if (Operation *def = v.getDefiningOp())
-      work.append(def->getOperands().begin(), def->getOperands().end());
-  }
-  for (Value v : order)
-    if (auto mn = v.getDefiningOp<arith::MinSIOp>()) {
-      if (mn.getLhs().getDefiningOp<arith::AddIOp>() &&
-          isExtentCandidate(mn.getRhs(), loops))
-        return mn.getRhs();
-      if (mn.getRhs().getDefiningOp<arith::AddIOp>() &&
-          isExtentCandidate(mn.getLhs(), loops))
-        return mn.getLhs();
-    }
-  for (Value v : order)
-    if (auto sub = v.getDefiningOp<arith::SubIOp>())
-      if (isExtentCandidate(sub.getLhs(), loops))
-        return sub.getLhs();
-  return Value();
 }
 
 // loop 몸체에 직접 있는 전역 좌표 복원 op. 안쪽 loop에도 같은 표시가 있으므로 walk로
@@ -266,8 +222,10 @@ struct PIMPlaceDataPass
 
       // 모든 hierarchy loop의 capacity는 Execution Tile 하나의 고정 크기다.
       // 여러 scheduling round가 같은 buffer를 재사용하므로 마지막 round의 실제
-      // trips가 작더라도 allocation_shape는 변하지 않는다.
-      r.capacityTiles = r.trips;
+      // trips가 작더라도 allocation_shape는 변하지 않는다. 계층으로 분류되지 않은
+      // loop에는 runtime trip count를 capacity로 쓰지 않는다. 그런 loop가 resident
+      // origin을 움직이면 아래에서 fixed slot을 만들 수 없다고 진단한다.
+      r.capacityTiles = Value();
       r.axis = StringAttr();
       r.partitions = 1;
       if (l->hasAttr("pim.temporal_reduction"))
@@ -338,6 +296,12 @@ struct PIMPlaceDataPass
         if (!drivers.contains(l))
           continue;
         const LoopRange &r = ranges.find(l)->second;
+        if (!r.capacityTiles)
+          return access->emitError("pim-place-data: buffer axis ")
+                 << d
+                 << " is driven by a loop outside the Block-Group-Execution "
+                    "Tile hierarchy, so a fixed resident slot cannot be "
+                    "derived";
         // 나뉜 축이 다른 loop와 함께 한 버퍼 축을 움직이면, blocked 분할(함께 모는
         // loop가 정확히 tile씩 전진)일 때만 연속 구간 하나다. 아니면 진단이다.
         if (r.axis && drivers.size() > 1 && r.partitions != 1 &&
@@ -362,7 +326,8 @@ struct PIMPlaceDataPass
       Value length = span;
       if (!access.getValid().empty() &&
           !getConstantIntValue(access.getValid()[d])) {
-        Value extent = extentFromValid(access.getValid()[d], loops);
+        Value extent =
+            pim::recoverExtentFromValid(access.getValid()[d], loops);
         if (!extent)
           return access->emitError("pim-place-data: cannot recover the extent of "
                                    "buffer axis ")
@@ -387,9 +352,16 @@ struct PIMPlaceDataPass
     SmallVector<Attribute> replicated;
     if (!isOutput) {
       llvm::SmallPtrSet<Operation *, 4> used;
-      pim::collectDrivers(access.getOffset(), loops, used);
+      // origin은 각 buffer 축의 실제 시작 좌표이며 device별 slice dependency의
+      // 기준이다. offset은 origin·stride의 중복 선형화 값이므로 다시 해석하지
+      // 않는다.
+      for (Value v : access.getOrigin())
+        pim::collectDrivers(v, loops, used);
+      // stride 자체가 device 축에 따라 달라지는 access도 같은 slice가 아니다.
       for (Value v : access.getStrides())
         pim::collectDrivers(v, loops, used);
+      // mask가 origin 외의 축에 추가로 의존하면 그 device들은 서로 다른 유효
+      // 영역을 받으므로 replicated로 볼 수 없다.
       for (Value v : access.getValid())
         pim::collectDrivers(v, loops, used);
       if (Value pad = access.getPad())

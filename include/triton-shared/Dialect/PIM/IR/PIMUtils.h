@@ -45,6 +45,12 @@ int64_t localTileBytes(Operation *scope);
 void collectDrivers(Value v, ArrayRef<scf::ForOp> loops,
                     llvm::SmallPtrSetImpl<Operation *> &drivers);
 
+// valid(mask) 산술에서 이 buffer 축의 원본 element extent를 복원한다. Triton
+// lowering이 만드는 clamp 두 형태를 공통으로 해석하며, loop와 무관한 extent를
+// 찾을 수 없으면 null Value를 돌려준다. Block Group valid 재구성과 placement tail
+// clamp가 반드시 같은 원본 extent를 사용한다.
+Value recoverExtentFromValid(Value valid, ArrayRef<scf::ForOp> loops);
+
 // 이 축 loop 가 tile 하나에서 옮기는 원소 수. pim.access 의 sizes 가 그 값이고, 어느
 // 차원인지는 origin 을 이 loop 가 단독으로 모는가로 가른다. 축을 모는 차원이 여럿인데
 // 크기가 다르면 답이 하나가 아니므로 0 을 돌려준다. block-group 형성,

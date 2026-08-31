@@ -47,7 +47,7 @@ func.func @split_k(%A: memref<*xi8>, %C: memref<*xi8>,
           %k2 = arith.addi %kbase, %koff2 : index
           %db = pim.access %A offset %k2 sizes [8, 32] strides[%lda, %c1]
                 origin[%m, %k2] {id = 1 : i64} : memref<*xi8> -> !pim.access
-        }
+        } {pim.reduction = "add"}
       } {pim.axis = #pim.axis<"k">}
     } {pim.axis = #pim.axis<"n">}
   } {pim.axis = #pim.axis<"m">}

@@ -31,7 +31,7 @@ func.func @split_k_cyclic(%A: memref<*xi8>, %tr: index, %tp: index, %tk: index,
         // expected-error @below {{not a blocked split}}
         %da = pim.access %A offset %k sizes [8, 16] strides[%lda, %c1]
               origin[%m, %k] {id = 0 : i64} : memref<*xi8> -> !pim.access
-      }
+      } {pim.reduction = "add"}
     } {pim.axis = #pim.axis<"k">}
   } {pim.axis = #pim.axis<"m">}
   return

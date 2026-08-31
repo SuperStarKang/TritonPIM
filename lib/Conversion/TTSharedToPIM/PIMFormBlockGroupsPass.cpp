@@ -21,6 +21,13 @@ namespace triton {
 
 namespace {
 
+static Value toIndex(OpBuilder &b, Location loc, Value value) {
+  return isa<IndexType>(value.getType())
+             ? value
+             : b.create<arith::IndexCastOp>(loc, b.getIndexType(), value)
+                   .getResult();
+}
+
 struct PIMFormBlockGroupsPass
     : public mlir::triton::impl::PIMFormBlockGroupsBase<
           PIMFormBlockGroupsPass> {
@@ -83,26 +90,20 @@ struct PIMFormBlockGroupsPass
       grouped.push_back({colLoop, gN});
     }
     if (gK != 1) {
-      // reduction loop 를 찾는다: pim.axis 가 없으면서 access 의 origin 을 모는 loop.
-      // 정확히 하나여야 어느 loop 를 넓힐지 유일하다.
+      // reduction loop는 PIMFormCompute가 linalg accumulator 의미에서 명시한
+      // 표식으로만 찾는다. access origin은 연산 의미가 아니라 주소 정보다.
       SmallVector<scf::ForOp> all;
       func.walk<WalkOrder::PreOrder>([&](scf::ForOp l) { all.push_back(l); });
-      llvm::SmallPtrSet<Operation *, 4> reductions;
-      func.walk([&](pim::AccessOp a) {
-        for (Value o : a.getOrigin()) {
-          llvm::SmallPtrSet<Operation *, 4> ds;
-          pim::collectDrivers(o, all, ds);
-          for (Operation *op : ds)
-            if (!op->getAttrOfType<pim::AxisAttr>("pim.axis"))
-              reductions.insert(op);
-        }
-      });
+      SmallVector<scf::ForOp> reductions;
+      for (scf::ForOp loop : all)
+        if (loop->getAttrOfType<StringAttr>("pim.reduction"))
+          reductions.push_back(loop);
       if (reductions.size() != 1)
         return func->emitError("pim-form-block-groups: group-k is ")
                << gK << " but " << reductions.size()
-               << " reduction loops drive memory accesses; exactly one is "
+               << " semantic reduction loops are present; exactly one is "
                   "needed to know which loop to widen";
-      grouped.push_back({cast<scf::ForOp>(*reductions.begin()), gK});
+      grouped.push_back({reductions.front(), gK});
     }
 
     // m/n의 새 상한은 가장 바깥 축 loop 앞에 만든다. reduction 상한은 원래 runtime K
@@ -153,22 +154,66 @@ struct PIMFormBlockGroupsPass
       loops.push_back(l);
       factorOf[l.getOperation()] = g;
     }
-    func.walk([&](pim::AccessOp a) {
+    SmallVector<scf::ForOp> allLoops;
+    func.walk<WalkOrder::PreOrder>(
+        [&](scf::ForOp loop) { allLoops.push_back(loop); });
+    SmallVector<pim::AccessOp> accesses;
+    func.walk([&](pim::AccessOp access) { accesses.push_back(access); });
+    for (pim::AccessOp a : accesses) {
       SmallVector<int64_t> sizes(a.getSizes());
+      SmallVector<Value> valid(a.getValid());
       bool changed = false;
       for (unsigned d = 0, e = sizes.size(); d < e; d++) {
         llvm::SmallPtrSet<Operation *, 4> drivers;
         pim::collectDrivers(a.getOrigin()[d], loops, drivers);
-        for (Operation *l : drivers) {
+        int64_t oldSize = sizes[d];
+        for (Operation *l : drivers)
           sizes[d] *= factorOf[l];
+        if (sizes[d] != oldSize) {
           changed = true;
+
+          // valid는 원래 Block 시작과 Block 크기로 clamp되어 있다. Group 시작은
+          // 위의 IV 치환으로 이미 맞았으므로, 원본 extent만 복원해 확대된 sizes로
+          // 다시 clamp한다. pad 값은 같은 buffer 축의 invalid tail에 그대로 적용된다.
+          if (!valid.empty()) {
+            OpBuilder b(a);
+            Location loc = a.getLoc();
+            if (std::optional<int64_t> constant =
+                    getConstantIntValue(valid[d])) {
+              if (*constant != 0 && *constant != oldSize)
+                return a->emitError(
+                           "pim-form-block-groups: cannot extend a constant "
+                           "partial valid extent on buffer axis ")
+                       << d;
+              valid[d] = b.create<arith::ConstantIndexOp>(
+                  loc, *constant == 0 ? 0 : sizes[d]);
+            } else {
+              Value extent =
+                  pim::recoverExtentFromValid(valid[d], allLoops);
+              if (!extent)
+                return a->emitError(
+                           "pim-form-block-groups: cannot recover the original "
+                           "extent from valid on buffer axis ")
+                       << d;
+              Value zero = b.create<arith::ConstantIndexOp>(loc, 0);
+              Value capacity =
+                  b.create<arith::ConstantIndexOp>(loc, sizes[d]);
+              Value remaining = b.create<arith::SubIOp>(
+                  loc, toIndex(b, loc, extent), a.getOrigin()[d]);
+              Value nonnegative =
+                  b.create<arith::MaxSIOp>(loc, remaining, zero);
+              valid[d] =
+                  b.create<arith::MinSIOp>(loc, nonnegative, capacity);
+            }
+          }
         }
       }
-      if (changed)
+      if (changed) {
         a.setSizesAttr(DenseI64ArrayAttr::get(a.getContext(), sizes));
-    });
-    // valid(mask)는 건드리지 않는다 — 소비자는 pim-place-data 의 원본 크기 복원뿐이고
-    // 그 판정은 식의 구조만 보므로, 잘라내기는 새 sizes 로 다시 계산된다.
+        if (!valid.empty())
+          a.getValidMutable().assign(valid);
+      }
+    }
 
     // tile tensor 를 group 크기로 다시 적는다. collectLocalTiles 의 owner 사슬이 정확히
     // 다시 적어야 하는 값의 집합이다. load 사슬은 대응 access 의 sizes 가, 누산기 사슬은
@@ -222,18 +267,14 @@ struct PIMFormBlockGroupsPass
       else if (a.getName().getValue() == "n")
         axis[1] = l;
     }
-    llvm::SmallPtrSet<Operation *, 4> reds;
-    func.walk([&](pim::AccessOp a) {
-      for (Value o : a.getOrigin()) {
-        llvm::SmallPtrSet<Operation *, 4> ds;
-        pim::collectDrivers(o, loops, ds);
-        for (Operation *op : ds)
-          if (!op->getAttrOfType<pim::AxisAttr>("pim.axis"))
-            reds.insert(op);
+    for (scf::ForOp loop : loops)
+      if (loop->getAttrOfType<StringAttr>("pim.reduction")) {
+        if (axis[2])
+          return func->emitError(
+              "pim-form-block-groups: more than one semantic reduction "
+              "loop is present");
+        axis[2] = loop;
       }
-    });
-    if (reds.size() == 1)
-      axis[2] = cast<scf::ForOp>(*reds.begin());
     static const char *name[3] = {"m", "n", "k"};
     int64_t blocks[3] = {g[0], g[1], g[2]};
     // 고정 [m,n,k] 표현에서 실제 compute loop가 없는 축은 곱의 항등원 1이다.

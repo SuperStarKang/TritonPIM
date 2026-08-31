@@ -72,6 +72,11 @@ def PIMFormCompute : Pass<"pim-form-compute", "mlir::ModuleOp"> {
     `matmul(outs=0으로 채운 tile)` + `generic(add)(누산기, 그 결과)` 를
     `matmul(outs=누산기)` 로 접는다. 임시 tile 하나와 tile 크기만큼의 덧셈이 사라지고,
     상주량이 실제와 맞게 된다.
+    이어서 linalg scalar body의 add가 loop-carried accumulator를 직접 갱신하고 같은
+    iter_arg 위치로 yield되는지를 읽어 해당 loop에 `pim.reduction = "add"`를 기록한다.
+    op 이름을 열거하지 않으므로 같은 계약의 matmul, matvec, reduce, convolution,
+    generic에 공통으로 적용된다. access origin은 주소 정보이므로 reduction 판정에
+    사용하지 않는다.
     이어서 누산기 초기값을 만드는 op 을 그 loop 바로 앞으로 내린다. 값 의미로는 밖에
     있어도 맞지만 버퍼로 내리면 초기화가 한 번만 돌아 두 번째 instance 부터 앞 결과가 남는다.
   }];
@@ -119,10 +124,11 @@ def PIMFormBlockGroups : Pass<"pim-form-block-groups", "mlir::ModuleOp"> {
     (matmul 의 행 방향 이웃은 B 를, 열 방향 이웃은 A 를) 상주 중 재사용이 늘어난다.
     몇 개를 묶을지는 target 의 정책이라 옵션으로 받고, 기본 1 이면 항등이다.
 
-    마지막 group 이 부분이면 기존 부분 tile 과 같은 방식으로 처리된다 — 배치가
-    원본 크기로 잘리고(pim-place-data 의 clamp) host 가 남는 자리에 0 을 채운다.
-    valid(mask)는 건드리지 않는다 — 소비자는 pim-place-data 의 원본 크기 복원뿐이고
-    그 판정은 식의 구조만 본다.
+    마지막 group이 부분이면 기존 valid 산술에서 원본 extent를 복원하고
+    `min(max(extent - group_origin, 0), group_size)`로 다시 만든다. 따라서
+    pim.access의 sizes, valid, tensor shape가 모두 같은 Group을 표현하며 pad 값은
+    확대된 invalid tail에도 그대로 적용된다. pim-place-data도 같은 extent 복원
+    함수를 사용해 resident transfer 범위를 자른다.
 
     group-m/n/k는 각 축에서 묶을 Block 개수다. 양수면 그대로 쓰고, 0이면
     기본값인 Block 하나를 쓴다. 이 pass는 비용식이나 profile 탐색을 수행하지 않는다.
@@ -166,11 +172,19 @@ def PIMMapDevices : Pass<"pim-map-devices", "mlir::ModuleOp"> {
     여러 round에서 재사용한다. 마지막 round에 Tile이 없는 device는 0회 loop인 no-op이다.
     device 안에서 좌표를 0부터 세고, 전역 좌표는 몸체 첫머리에서 다시 만들어
     `pim.device_origin` 표시를 단다. round loop는 pim.device 바깥 host IR에 남는다.
-    이름 없는 reduction loop도 execution_tile.groups[k] 범위로 좁히고
+    `pim.reduction`으로 명시된 loop도 execution_tile.groups[k] 범위로 좁히고
     `pim.scheduling_axis = "reduction_k"` round를 device 바깥에 만든다. 따라서
     `pim.device` 한 번은 정확히 한 resident Execution Tile만 실행한다. 여러 temporal
     window가 만드는 partial output의 결합 연산은 `pim.store`의 `pim.combine`에
-    명시하며 target은 window나 combiner를 다시 추론하지 않는다.
+    명시한다. spatial `pim.axis="k"`가 있으면 그 scheduling round와 `p_k` device가
+    만드는 결과도 같은 combiner의 partial이다. 따라서 target은 명시된 spatial K,
+    temporal `reduction_k`, device mapping과 combiner를 소비하며 결합 범위나 연산을
+    access 식에서 다시 추론하지 않는다.
+
+    M/N 축이 없는 K-only reduction에서는 zero-init tensor chain과 direct output
+    access/store가 reduction loop의 형제다. 이 pass가 single-use init chain을
+    reduction 앞으로, direct partial store를 reduction 뒤로 같은 `pim.device`에 함께
+    옮긴다. 따라서 init은 Execution Tile마다 다시 실행되고 output도 host에 남지 않는다.
   }];
   let options = [
     Option<"pM", "p-m", "int64_t", "1", "m축 device partition 수.">,
@@ -222,8 +236,12 @@ def PIMPlaceData : Pass<"pim-place-data", "mlir::ModuleOp"> {
                넘지 않도록 실제 유효 범위까지 반영한 값이다.
     - capacity = execution tile 한 개의 고정 용량. scheduling round가 바뀌어도 같은
                  PIM Device buffer를 재사용하므로 전체 문제 크기와 무관하다.
-    입력이 어느 logical 축에 불변이면 그 축만 다른 device 들은 같은 데이터를 받으므로
-    `replicated_over` 로 적는다. 끊기면 host staging 이 device 수만큼 부풀어 오른다.
+      allocation_shape는 항상 Block, Block Group, Execution Tile에서 정적으로
+      파생한다. 계층 밖 loop가 resident origin을 움직이는 경우 runtime trip count로
+      대체하지 않고 진단한다.
+    입력의 `pim.access` origin이 어느 logical 축에 불변이면 그 축만 다른 device들은
+    같은 데이터를 받으므로 `replicated_over`로 적는다. 중복 선형화 값인 offset에서
+    축을 다시 추론하지 않는다. 끊기면 host staging이 device 수만큼 부풀어 오른다.
   }];
   let constructor = "mlir::triton::createPIMPlaceDataPass()";
   let dependentDialects = ["mlir::pim::PIMDialect", "mlir::arith::ArithDialect"];
@@ -234,15 +252,32 @@ def PIMVerify : Pass<"pim-verify", "mlir::ModuleOp"> {
   let description = [{
     - access 와 place 가 id 로 양방향 일대일이다.
     - origin 이 비어 있지 않고 rank 가 sizes 와 같다.
+    - dynamic valid는 같은 access의 sizes로 clamp되어 Block/Group shape와 일치한다.
     - pad 가 0 이 아니면 진단(단계 1 은 pad = 0 만 지원).
     - device partition 의 곱이 profile의 num_units를 넘지 않는다.
     - `pim.device`에 `#pim.execution_tile`이 존재하고 Block×Group에서 파생한
       shape 및 device mapping과 일치한다.
     - `pim.place.allocation_shape`가 hierarchy에서 파생한 Execution Tile 하나의
       고정 resident extent와 정확히 일치한다.
-    - temporal K scheduling round와 device-local reduction window가 함께 존재하고,
-      local window가 `execution_tile.groups[k]` 이하로 제한되며 partial store가
-      combiner를 명시한다.
+    - temporal K scheduling round가 정확히 하나 존재한다. round는
+      `0 .. ceildiv(total_groups, groups[k])`의 unit-step loop이고, device-local
+      reduction은 같은 total_groups에서 `first = round * groups[k]`,
+      `trips = min(groups[k], total_groups-first)`로 만든 window다. marked global K
+      origin과 K placement start도 같은 first를 쓰며 partial store는 combiner를
+      명시한다.
+    - spatial `pim.axis="k"` output은 semantic `pim.reduction`을 가지며, `p_k`가
+      1보다 크면 그 축이 명시적으로 존재한다. temporal/spatial K partial store의
+      `pim.combine`은 semantic combiner와 같고 의미 없는 독립 combine은 거부한다.
+    - spatial m/n/k도 각각 정확히 하나의 matching scheduling round를 가진다.
+      `execution_tiles=ceildiv(total_groups,groups_per_tile)`,
+      `rounds=ceildiv(execution_tiles,p_axis)`,
+      `first=(round*p_axis+device)*groups_per_tile`,
+      `trips=min(groups_per_tile,max(total_groups-first,0))`를 검증한다.
+      spatial k의 groups_per_tile은 plane 하나인 1이고 Execution Tile의 k Group 수는
+      별도 temporal reduction_k에서 검증한다.
+    - 모든 `pim.place.allocation_shape`는 Block-Group-Execution Tile hierarchy에서
+      파생된 정적 fixed-slot extent다. runtime start와 tail size는 허용하지만 runtime
+      trip count를 allocation capacity로 사용하는 fallback은 허용하지 않는다.
     - 한 Group의 local buffer 한 벌이 local_capacity_limit_bytes 안이다. lane들은
       같은 Group을 협력 실행하므로 buffer를 lane 수만큼 복제하지 않는다.
     - 정적으로 아는 값끼리는 start·size·allocation_shape 부등식을 직접 검사한다. 런타임 값이면

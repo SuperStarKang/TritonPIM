@@ -5,7 +5,6 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
-#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 
 using namespace mlir;
@@ -62,23 +61,20 @@ struct PIMFormExecutionTilesPass
     };
     // tile-k는 spatial split 여부와 무관하게 각 output plane 내부 reduction loop의
     // temporal 상주 window다. k은 별도의 spatial output 축이다.
-    // reduction loop는 pim.axis 없이 access origin을 모는 loop 하나로 찾는다.
-    auto reductionLoop = [&]() -> scf::ForOp {
-      llvm::SmallPtrSet<Operation *, 4> reds;
-      func.walk([&](pim::AccessOp a) {
-        for (Value o : a.getOrigin()) {
-          llvm::SmallPtrSet<Operation *, 4> ds;
-          pim::collectDrivers(o, loops, ds);
-          for (Operation *op : ds)
-            if (!op->getAttrOfType<pim::AxisAttr>("pim.axis"))
-              reds.insert(op);
-        }
-      });
-      return reds.size() == 1 ? cast<scf::ForOp>(*reds.begin()) : scf::ForOp();
-    };
+    // reduction loop는 PIMFormCompute가 linalg/accumulator 의미에서 붙인
+    // pim.reduction으로만 찾는다.
+    SmallVector<scf::ForOp> reductionLoops;
+    for (scf::ForOp loop : loops)
+      if (loop->getAttrOfType<StringAttr>("pim.reduction"))
+        reductionLoops.push_back(loop);
+    if (reductionLoops.size() > 1)
+      return func->emitError(
+          "pim-form-execution-tiles: more than one semantic reduction loop "
+          "is present");
     scf::ForOp mLoop = axisLoop("m");
     scf::ForOp nLoop = axisLoop("n");
-    scf::ForOp redLoop = reductionLoop();
+    scf::ForOp redLoop =
+        reductionLoops.empty() ? scf::ForOp() : reductionLoops.front();
     if (!func->getAttrOfType<pim::BlockAttr>("pim.block") ||
         !func->getAttrOfType<pim::BlockGroupAttr>("pim.block_group"))
       return func->emitError(

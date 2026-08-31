@@ -133,6 +133,32 @@ static bool isZeroFill(Value v) {
   return matchPattern(f, m_Zero()) || matchPattern(f, m_AnyZeroFloat());
 }
 
+// Common IR이 현재 표현할 수 있는 reduction combiner를 모든 linalg op의 scalar
+// body에서 읽는다. op 이름을 열거하지 않으므로 matmul/matvec/reduce뿐 아니라 같은
+// add-accumulator 계약의 convolution/generic도 동일하게 처리한다. access 주소를
+// 모는 loop인지 여부는 데이터 이동 정보일 뿐 연산 의미가 아니므로 사용하지 않는다.
+static bool isAddCompute(linalg::LinalgOp compute) {
+  if (compute.getNumDpsInits() != 1 || compute->getNumRegions() != 1 ||
+      compute->getNumResults() != 1)
+    return false;
+  Region &region = compute->getRegion(0);
+  if (region.empty())
+    return false;
+  Block &body = region.front();
+  unsigned accumulatorIndex = compute.getDpsInputs().size();
+  if (body.getNumArguments() <= accumulatorIndex)
+    return false;
+  auto yield = dyn_cast<linalg::YieldOp>(body.getTerminator());
+  if (!yield || yield.getValues().size() != 1)
+    return false;
+  Operation *add = yield.getValues()[0].getDefiningOp();
+  if (!add || !isa<arith::AddFOp, arith::AddIOp>(add))
+    return false;
+  Value accumulator = body.getArgument(accumulatorIndex);
+  return add->getOperand(0) == accumulator ||
+         add->getOperand(1) == accumulator;
+}
+
 // 누산기 초기값을 만드는 op을 그 loop 바로 앞으로 내린다. 값 의미로는 밖에
 // 있어도 맞지만 버퍼로 내리면 초기화가 한 번만 돌아 두 번째 instance부터 앞
 // 결과가 남는다. 쓰는 곳이 그 loop 하나여야 옮긴다.
@@ -171,9 +197,43 @@ struct PIMFormComputePass
         [&](linalg::ReduceOp reduce) { reductions.push_back(reduce); });
     for (linalg::ReduceOp reduce : reductions)
       formMatvec(reduce);
+    // linalg compute가 loop-carried accumulator를 직접 갱신하고 그 결과가 같은
+    // iter_arg 위치로 yield될 때만 이 scf.for를 의미상 reduction으로 기록한다.
+    // 뒤 패스는 이 표식을 소비하며 access-driving loop를 reduction으로 추측하지
+    // 않는다.
+    for (scf::ForOp l : loops)
+      if (failed(markReduction(l)))
+        return signalPassFailure();
     // 접은 뒤라야 초기값이 iter_args에서만 쓰여 내릴 수 있다.
     for (scf::ForOp l : loops)
       sinkInit(l);
+  }
+
+  LogicalResult markReduction(scf::ForOp loop) {
+    auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+    bool found = false;
+    for (auto [i, acc] : llvm::enumerate(loop.getRegionIterArgs())) {
+      if (!isa<RankedTensorType>(acc.getType()))
+        continue;
+      Operation *def = yield.getOperand(i).getDefiningOp();
+      auto compute = dyn_cast_or_null<linalg::LinalgOp>(def);
+      if (!compute || compute.getNumDpsInits() != 1 ||
+          compute.getDpsInits()[0] != acc || !isAddCompute(compute))
+        continue;
+      if (!isZeroFill(loop.getInitArgs()[i]))
+        return loop->emitError(
+            "pim-form-compute: an add reduction must start from a zero "
+            "identity before it can be split into Execution Tiles");
+      if (found)
+        return loop->emitError(
+            "pim-form-compute: one loop may carry only one normalized PIM "
+            "reduction result");
+      found = true;
+    }
+    if (found)
+      loop->setAttr("pim.reduction",
+                    StringAttr::get(loop.getContext(), "add"));
+    return success();
   }
 
   // TTShared가 GEMV를 내는 두 reduce 배치를 모두 받는다.

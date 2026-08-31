@@ -170,9 +170,12 @@ def PIM_LoadOp : PIM_Op<"load", [MemoryEffects<[MemRead]>]> {
   let assemblyFormat = "$access attr-dict `:` type($access) `->` type($result)";
 }
 
-// local→host 전송. temporal reduction 또는 spatial split-K의 partial이면
-// `pim.combine = "add"`처럼 최종 buffer에 결합할 연산 의미를 명시한다. 이 값은
-// target policy가 아니라 원래 reduction의 combiner이며 target은 이를 재추론하지 않는다.
+// local→host 전송. semantic reduction loop는 `pim.reduction = "add"`를 가지며,
+// temporal reduction 또는 spatial split-K의 partial store는 그 값을
+// `pim.combine = "add"`처럼 최종 buffer에 옮긴다. 결합 source는 Common IR에 이미
+// 있는 `reduction_k` scheduling round와 spatial `pim.axis="k"`/p_k의 곱이며, 별도
+// policy attribute가 아니다. 이 값은 원래 reduction의 combiner이고 target은 이를
+// 재추론하지 않는다.
 def PIM_StoreOp : PIM_Op<"store", [MemoryEffects<[MemWrite]>]> {
   let summary = "Store a tile through a PIM access";
   let arguments = (ins AnyRankedTensor:$value, PIM_AccessType:$access);
@@ -198,7 +201,8 @@ def PIM_DeviceOp : PIM_Op<"device", [NoTerminator]> {
 //   start    = 이 device 의 첫 원소 (balanced block 이 낸 값 그대로)
 //   size     = 실제로 맡는 원소 수. 경계 tile 의 유효 범위까지 반영된 값이라
 //              언제나 start + size 가 원본 버퍼 안이다.
-//   allocation_shape = device 에 배정된 고정 크기. 실제 target buffer 모양이 여기서 나온다.
+//   allocation_shape = Block×Group×Execution Tile에서 정적으로 파생된 device의
+//                      fixed-slot 크기. scheduling round가 바뀌어도 변하지 않는다.
 //   strides  = 원본 버퍼 안의 축별 간격
 // direction: "in"(host→device) | "out"(device→host).
 // access: 이 영역을 유도한 pim.access 의 id.

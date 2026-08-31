@@ -1,10 +1,13 @@
 #include "triton-shared/Dialect/PIM/IR/PIMUtils.h"
 #include "triton-shared/Dialect/PIM/IR/PIMDialect.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 
 #include <limits>
@@ -68,6 +71,45 @@ mlir::pim::unitCapacityLimitBytes(TargetProfileAttr profile) {
       (bytes != 0 && banks > std::numeric_limits<int64_t>::max() / bytes))
     return std::nullopt;
   return banks * bytes;
+}
+
+Value mlir::pim::recoverExtentFromValid(Value valid,
+                                        ArrayRef<scf::ForOp> loops) {
+  auto isExtent = [&](Value value) {
+    if (getConstantIntValue(value))
+      return false;
+    llvm::SmallPtrSet<Operation *, 4> drivers;
+    collectDrivers(value, loops, drivers);
+    return drivers.empty();
+  };
+
+  SmallVector<Value> order;
+  llvm::DenseSet<Value> seen;
+  SmallVector<Value> work{valid};
+  while (!work.empty()) {
+    Value value = work.pop_back_val();
+    if (!seen.insert(value).second)
+      continue;
+    order.push_back(value);
+    if (Operation *def = value.getDefiningOp())
+      work.append(def->getOperands().begin(), def->getOperands().end());
+  }
+  // min(start + block, extent)에서 loop-independent 피연산자가 extent다.
+  for (Value value : order)
+    if (auto min = value.getDefiningOp<arith::MinSIOp>()) {
+      if (min.getLhs().getDefiningOp<arith::AddIOp>() &&
+          isExtent(min.getRhs()))
+        return min.getRhs();
+      if (min.getRhs().getDefiningOp<arith::AddIOp>() &&
+          isExtent(min.getLhs()))
+        return min.getLhs();
+    }
+  // min(max(extent - start, 0), block)의 extent도 직접 복원한다.
+  for (Value value : order)
+    if (auto sub = value.getDefiningOp<arith::SubIOp>())
+      if (isExtent(sub.getLhs()))
+        return sub.getLhs();
+  return Value();
 }
 
 void mlir::pim::collectLocalTiles(Operation *scope,
