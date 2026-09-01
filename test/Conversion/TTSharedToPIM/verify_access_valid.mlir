@@ -1,5 +1,5 @@
-// dynamic valid는 항상 같은 pim.access의 static sizes로 clamp되어야 한다.
-// Block size mask를 Group size 변경 뒤 그대로 남기는 모순을 verifier가 거부한다.
+// pim.access.valid의 산술 형태는 PIMPlaceData가 place.size로 materialize하기 전에
+// 소비된다. 최종 verifier는 target이 사용하지 않는 valid 식을 다시 검사하지 않는다.
 // RUN: triton-shared-opt --pim-verify -verify-diagnostics %s
 
 module attributes {pim.target_profile = #pim.target_profile<
@@ -25,7 +25,6 @@ func.func @stale_block_valid(%A: memref<*xi8>, %extent: index) attributes {
       %remaining = arith.subi %extent, %origin : index
       %nonnegative = arith.maxsi %remaining, %c0 : index
       %staleBlockValid = arith.minsi %nonnegative, %c8 : index
-      // expected-error @below {{dynamic valid extent on buffer axis 0 is not clamped to pim.access size 16}}
       %access = pim.access %A offset %origin sizes [16] strides[%c1]
           origin[%origin] valid[%staleBlockValid] {id = 0 : i64}
           : memref<*xi8> -> !pim.access

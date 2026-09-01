@@ -8,7 +8,7 @@ module attributes {pim.target_profile = #pim.target_profile<
     bank_capacity_limit_bytes = 1024,
     local_capacity_limit_bytes = 0>} {
 
-// expected-error @below {{#pim.block × #pim.block_group gives 2 elements on m but the local compute tile uses 1}}
+// expected-error @below {{local m tile has 1 elements but its Block Group has 2}}
 func.func @inconsistent_group_shape(%arg0: memref<*xi8>) attributes {
     pim.block = #pim.block<shape = [2, 1, 1]>,
     pim.block_group = #pim.block_group<blocks = [1, 1, 1]>} {

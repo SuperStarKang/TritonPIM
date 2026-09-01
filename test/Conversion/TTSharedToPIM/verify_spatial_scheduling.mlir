@@ -1,5 +1,5 @@
-// M/N은 spatial Execution Tile scheduling 식을 따르고, source spatial-K는
-// semantic reduction scheduling과 중복되므로 거부한다.
+// M/N scheduling의 산술 형태는 생성 pass가 책임진다. 최종 verifier는 marker의
+// 일대일 대응과 source spatial-K 금지만 확인한다.
 // RUN: triton-shared-opt --split-input-file --pim-verify -verify-diagnostics %s
 
 module attributes {pim.target_profile = #pim.target_profile<
@@ -25,7 +25,6 @@ func.func @m_start_ignores_device(%total: index) attributes {
     pim.device #pim.device_mapping<partitions = [2, 1, 1]> attributes {
         pim.execution_tile = #pim.execution_tile<groups = [2, 1, 1]>} {
     ^bb0(%device_m: index, %device_n: index, %device_k: index):
-      // expected-error @below {{the spatial m Execution Tile start must be (round * partitions + device) * groups per tile}}
       scf.for %local = %c0 to %window step %c1 {
         %start = arith.addi %c0, %first : index
         %scaled = arith.muli %local, %c1 : index
@@ -53,7 +52,6 @@ func.func @n_round_uses_wrong_partition(%total: index) attributes {
   %tiles = arith.ceildivsi %total, %c2 : index
   // 잘못된 식: p_n=2인데 1로 나눈다.
   %rounds = arith.ceildivsi %tiles, %c1 : index
-  // expected-error @below {{the spatial n scheduling round upper bound must divide the Execution Tile count by p_n}}
   scf.for %round = %c0 to %rounds step %c1 {
     %roundBase = arith.muli %round, %c2 : index
     pim.device #pim.device_mapping<partitions = [1, 2, 1]> attributes {
@@ -101,7 +99,7 @@ func.func @source_spatial_k_is_rejected(%total: index) attributes {
       %nonnegative = arith.maxsi %left, %c0 : index
       // scheduling 식과 무관하게 source pim.axis="k" 자체가 불법이다.
       %window = arith.minsi %c2, %nonnegative : index
-      // expected-error @below {{source-level pim.axis="k" is not a Common IR spatial axis}}
+      // expected-error @below {{K must be a semantic reduction, not a spatial axis}}
       scf.for %local = %c0 to %window step %c1 {
         %start = arith.addi %c0, %first : index
         %scaled = arith.muli %local, %c1 : index
@@ -128,7 +126,7 @@ func.func @m_without_round() attributes {
   pim.device #pim.device_mapping<partitions = [1, 1, 1]> attributes {
       pim.execution_tile = #pim.execution_tile<groups = [1, 1, 1]>} {
   ^bb0(%device_m: index, %device_n: index, %device_k: index):
-    // expected-error @below {{one device-local spatial m axis requires exactly one matching scheduling round}}
+    // expected-error @below {{spatial M axis needs one scheduling round}}
     scf.for %local = %c0 to %c1 step %c1 {
     } {pim.axis = #pim.axis<"m">}
   }

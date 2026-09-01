@@ -17,7 +17,7 @@ func.func @dynamic_allocation_shape(%A: memref<*xi8>, %capacity: index)
   pim.device #pim.device_mapping<partitions = [1, 1, 1]> attributes {
       pim.execution_tile = #pim.execution_tile<groups = [1, 1, 1]>} {
   ^bb0(%device_m: index, %device_n: index, %device_k: index):
-    // expected-error @below {{resident allocation_shape[0] must be a static Execution Tile extent}}
+    // expected-error @below {{allocation_shape[0] must be a positive compile-time constant}}
     pim.place %A start[%c0] size[%c4] allocation_shape[%capacity]
         strides[%c1] {direction = "in", access = 0 : i64} : memref<*xi8>
     %access = pim.access %A offset %c0 sizes [4] strides[%c1] origin[%c0]

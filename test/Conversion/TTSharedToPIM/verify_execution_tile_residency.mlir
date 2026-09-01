@@ -1,5 +1,5 @@
-// verifier가 hierarchy metadata만 보지 않고 실제 local window와 resident
-// placement가 Execution Tile 하나를 정확히 표현하는지 확인한다.
+// 최종 verifier는 scheduling 산술의 정확한 형태 대신 marker 대응과 target이
+// 소비하는 고정 allocation 계약만 확인한다.
 // RUN: triton-shared-opt --split-input-file --pim-verify -verify-diagnostics %s
 
 module attributes {pim.target_profile = #pim.target_profile<
@@ -21,7 +21,6 @@ func.func @wrong_temporal_window(%A: memref<*xi8>) attributes {
     ^bb0(%device_m: index, %device_n: index, %device_k: index):
       pim.place %A start[%c0] size[%c8] allocation_shape[%c8]
           strides[%c1] {direction = "in", access = 0 : i64} : memref<*xi8>
-      // expected-error @below {{the temporal K loop must be a zero-based unit-step window clamped to execution_tile.groups[k] = 2}}
       scf.for %k = %c0 to %c4 step %c1 {
         %access = pim.access %A offset %k sizes [4] strides[%c1] origin[%k]
             {id = 0 : i64} : memref<*xi8> -> !pim.access
@@ -51,7 +50,7 @@ func.func @temporal_without_semantics(%A: memref<*xi8>) attributes {
     ^bb0(%device_m: index, %device_n: index, %device_k: index):
       pim.place %A start[%c0] size[%c1] allocation_shape[%c1]
           strides[%c1] {direction = "in", access = 0 : i64} : memref<*xi8>
-      // expected-error @below {{a temporal K loop must also carry the semantic pim.reduction attribute}}
+      // expected-error @below {{a temporal K loop needs a semantic reduction}}
       scf.for %k = %c0 to %c1 step %c1 {
         %access = pim.access %A offset %k sizes [1] strides[%c1] origin[%k]
             {id = 0 : i64} : memref<*xi8> -> !pim.access
@@ -80,7 +79,7 @@ func.func @wrong_resident_allocation(%A: memref<*xi8>) attributes {
   pim.device #pim.device_mapping<partitions = [1, 1, 1]> attributes {
       pim.execution_tile = #pim.execution_tile<groups = [2, 1, 1]>} {
   ^bb0(%device_m: index, %device_n: index, %device_k: index):
-    // expected-error @below {{allocation_shape[0] is 4 but the Execution Tile requires 8}}
+    // expected-error @below {{allocation_shape[0] = 4 but the Execution Tile requires 8}}
     pim.place %A start[%c0] size[%c4] allocation_shape[%c4]
         strides[%c1] {direction = "in", access = 0 : i64} : memref<*xi8>
     scf.for %m = %c0 to %c2 step %c1 {

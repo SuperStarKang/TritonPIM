@@ -260,46 +260,22 @@ def PIMPlaceData : Pass<"pim-place-data", "mlir::ModuleOp"> {
 }
 
 def PIMVerify : Pass<"pim-verify", "mlir::ModuleOp"> {
-  let summary = "Fail fast on the target-independent placement contract";
+  let summary = "Check the minimal target-independent PIM contract";
   let description = [{
-    - access 와 place 가 id 로 양방향 일대일이다.
-    - origin 이 비어 있지 않고 rank 가 sizes 와 같다.
-    - dynamic valid는 같은 access의 sizes로 clamp되어 Block/Group shape와 일치한다.
-    - pad 가 0 이 아니면 진단(단계 1 은 pad = 0 만 지원).
-    - device partition 의 곱이 profile의 num_units를 넘지 않는다.
-    - `pim.device`에 `#pim.execution_tile`이 존재하고 Block×Group에서 파생한
-      shape 및 device mapping과 일치한다.
-    - `pim.place.allocation_shape`가 hierarchy에서 파생한 Execution Tile 하나의
-      고정 resident extent와 정확히 일치한다.
-    - semantic K scheduling round가 정확히 하나 존재한다. round는
-      `0 .. ceildiv(ceildiv(total_groups, groups[k]), p_k)`의 unit-step loop이고,
-      device-local reduction은 같은 total_groups에서
-      `first = (round * p_k + device_k) * groups[k]`,
-      `trips = min(groups[k], total_groups-first)`로 만든 window다. marked global K
-      origin과 K placement start도 같은 first를 쓰며 partial contribution은
-      `pim.combine`으로 final destination과 combiner를 명시한다.
-    - source-level spatial `pim.axis="k"`는 거부한다. `p_k`가 1보다 크면 semantic
-      `pim.reduction`이 명시적으로 존재해야 한다. K의 `pim.combine`은 semantic
-      combiner와 같고 의미 없는 독립 combine은 거부한다.
-    - `pim.store`와 `pim.combine`의 최종 output access는 `direction = "out"` placement를
-      가지며 K round, local K coordinate, device K 좌표에 의존하지 않는다.
-      K는 scheduling/reduction 좌표이지 operation output 차원이 아니다.
-    - output이 있는 semantic reduction은 정확히 하나의 tensor accumulator/result와
-      정확히 하나의 direct `pim.combine partial into final_access`를 가진다.
-    - spatial m/n은 각각 정확히 하나의 matching scheduling round를 가진다.
-      `execution_tiles=ceildiv(total_groups,groups_per_tile)`,
-      `rounds=ceildiv(execution_tiles,p_axis)`,
-      `first=(round*p_axis+device)*groups_per_tile`,
-      `trips=min(groups_per_tile,max(total_groups-first,0))`를 검증한다.
-    - 모든 `pim.place.allocation_shape`는 Block-Group-Execution Tile hierarchy에서
-      파생된 정적 fixed-slot extent다. runtime start와 tail size는 허용하지만 runtime
-      trip count를 allocation capacity로 사용하는 fallback은 허용하지 않는다.
-    - 한 Group의 local buffer 한 벌이 local_capacity_limit_bytes 안이다. lane들은
-      같은 Group을 협력 실행하므로 buffer를 lane 수만큼 복제하지 않는다.
-    - 정적으로 아는 값끼리는 start·size·allocation_shape 부등식을 직접 검사한다. 런타임 값이면
-      배치 pass 가 clamp 식을 만들었는지 구조로 확인한다.
-    정적으로 계산 가능한 모든 resident allocation의 합은 한 PIM unit의 공통 capacity
-    limit도 넘지 않아야 한다. target은 이 placement를 더 작게 다시 자르지 않는다.
+    이 pass는 target lowering이 직접 소비하는 최소 계약만 검사한다.
+    - device partition의 곱이 profile의 num_units를 넘지 않는다.
+    - Block, Block Group, Execution Tile이 존재하고 실제 local tile 크기와 맞는다.
+    - access와 place가 id로 양방향 일대일이며 rank가 일치한다.
+    - allocation_shape는 정적인 Execution Tile slot이고 local/unit capacity를 넘지 않는다.
+    - 현재 지원하지 않는 0 이외의 padding을 거부한다.
+    - M/N/K scheduling marker의 개수와 round/loop 대응만 검사한다.
+      scheduling 산술의 정확한 표현은 각 생성 pass의 단위 테스트가 담당한다.
+    - 최종 output placement는 out이고 K scheduling에 의존하지 않는다.
+    - semantic K reduction과 pim.combine은 일대일이며 combiner가 일치한다.
+
+    pim.access.valid는 PIMPlaceData가 pim.place.size로 materialize한 뒤 target에서
+    소비하지 않으므로 이 pass에서 산술 형태를 다시 검사하지 않는다. 동적 start와
+    size 역시 생성 pass의 결과를 신뢰하며, 정적으로 아는 범위만 확인한다.
   }];
   let constructor = "mlir::triton::createPIMVerifyPass()";
   let dependentDialects = ["mlir::pim::PIMDialect"];

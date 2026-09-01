@@ -20,7 +20,7 @@ func.func @combine_without_reduction(%C: memref<*xi32>) attributes {
     %access = pim.access %C offset %c0 sizes [1] strides[%c1] origin[%c0]
         {id = 0 : i64} : memref<*xi32> -> !pim.access
     %partial = tensor.empty() : tensor<1xi32>
-    // expected-error @below {{pim.combine requires one semantic pim.reduction}}
+    // expected-error @below {{pim.combine requires a semantic K reduction}}
     pim.combine %partial into %access kind "add" : tensor<1xi32>, !pim.access
   }
   return
@@ -73,7 +73,7 @@ func.func @k_dependent_final_output(%A: memref<*xi32>, %C: memref<*xi32>)
       } {pim.reduction = "add", pim.temporal_reduction}
       %access = pim.access %C offset %first sizes [1] strides[%c1]
           origin[%first] {id = 0 : i64} : memref<*xi32> -> !pim.access
-      // expected-error @below {{final output access must not depend on K round, local K, or device K scheduling}}
+      // expected-error @below {{final output placement must not depend on K scheduling}}
       pim.combine %partial into %access kind "add"
           : tensor<1xi32>, !pim.access
     }
