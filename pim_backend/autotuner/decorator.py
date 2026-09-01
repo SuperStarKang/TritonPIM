@@ -6,6 +6,7 @@ import statistics
 import time
 
 import torch
+import triton.backends.pim.driver as pim_driver
 
 from .cache import PIMConfigCache
 from .constraints import ConstraintEngine
@@ -15,7 +16,10 @@ from .targets import AiMXRuntimeConfig, UPMEMRuntimeConfig, target_spec
 from .types import PIMBenchmarkResult, PIMProblem
 
 
-DEFAULT_CACHE_PATH = os.path.expanduser("~/.pim_autotune_cache.json")
+DEFAULT_CACHE_PATH = os.path.join(
+    os.environ.get("TRITON_CACHE_DIR", os.path.expanduser("~/.triton")),
+    "pim_autotune_cache.json",
+)
 
 TORCH_DTYPE_NAMES = {
     torch.int8: "int8",
@@ -99,9 +103,10 @@ def _env_flag(name, default):
 
 
 def pim_autotune(target=None, spec=None, cache_path=DEFAULT_CACHE_PATH,
-                 budget=None, space_overrides=None, ref_fn=None, reps=1,
+                 budget=None, space_overrides=None, ref_fn=None, reps=3,
                  seed=0, search=True, retune=False, verbose=True,
-                 rtol=0.0, atol=0.0):
+                 rtol=0.0, atol=0.0,
+                 template_version="pim-common-ir-semantic-schedule-v1"):
     """Autotune ``fn(a, b, *, config)`` with Common IR configurations."""
     selected_target = spec if spec is not None else target_spec(target)
     overrides = space_overrides if space_overrides is not None else {}
@@ -111,7 +116,7 @@ def pim_autotune(target=None, spec=None, cache_path=DEFAULT_CACHE_PATH,
         cache = PIMConfigCache(
             cache_path,
             template_version=(
-                f"pim-common-ir-v1;verify={verify_kind};"
+                f"{template_version};verify={verify_kind};"
                 f"rtol={rtol};atol={atol}"),
         )
 
@@ -124,12 +129,21 @@ def pim_autotune(target=None, spec=None, cache_path=DEFAULT_CACHE_PATH,
             if not do_retune:
                 hit = cache.lookup_result(problem, selected_target)
                 if hit is not None:
+                    if verbose:
+                        print(
+                            f"[autotuner] cache hit: "
+                            f"{hit[1].total_ms:.2f} ms "
+                            f"config={hit[0].key()}")
                     return fn(a, b, config=hit[0])
 
             space = build_config_space(
                 problem, selected_target, **overrides)
             if not (do_search or do_retune):
                 config = default_config(problem, selected_target, space)
+                if verbose:
+                    print(
+                        f"[autotuner] search disabled: "
+                        f"config={config.key()}")
                 return fn(a, b, config=config)
 
             out_dtype = getattr(torch, problem.output_dtype)
@@ -155,14 +169,22 @@ def pim_autotune(target=None, spec=None, cache_path=DEFAULT_CACHE_PATH,
             def benchmark_fn(problem, target, config):
                 out = fn(a, b, config=config)
                 samples = []
+                stage_samples = []
                 for _ in range(reps):
                     start = time.perf_counter_ns()
                     out = fn(a, b, config=config)
                     samples.append(
                         (time.perf_counter_ns() - start) / 1e6)
+                    stage_samples.append(tuple(pim_driver.timing))
+                timings = tuple(
+                    (name, statistics.median(
+                        sample[stage] for sample in stage_samples))
+                    for stage, name in enumerate(pim_driver.TIMING_STAGES)
+                )
                 return PIMBenchmarkResult(
                     total_ms=statistics.median(samples),
                     correctness=verify(out),
+                    timings=timings,
                 )
 
             result = tune(

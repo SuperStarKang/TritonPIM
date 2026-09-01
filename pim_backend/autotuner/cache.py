@@ -3,14 +3,15 @@
 import json
 import math
 import os
+import tempfile
 from dataclasses import asdict
 
 from .types import PIMBenchmarkResult, PIMConfig
 
 
-CACHE_SCHEMA = "pim-common-ir-search-v3"
+CACHE_SCHEMA = "pim-common-ir-semantic-schedule-v4"
 RESULT_FIELDS = (
-    "total_ms", "correctness",
+    "total_ms", "correctness", "timings",
 )
 
 
@@ -24,9 +25,14 @@ class PIMConfigCache:
         self.template_version = template_version
         self.compiler_version = compiler_version
         self.entries = {}
-        if os.path.exists(path):
-            with open(path) as handle:
-                self.entries = json.load(handle)
+        if os.path.exists(path) and os.path.getsize(path) != 0:
+            try:
+                with open(path) as handle:
+                    self.entries = json.load(handle)
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"PIM autotuner cache is not valid JSON: {path}"
+                ) from error
 
     def _context_key(self, problem, target):
         profile = target.common_profile
@@ -100,10 +106,10 @@ class PIMConfigCache:
             for _, entry in matches[:limit]
         ]
 
-    def store(self, problem, target, record, records=()):
+    def store(self, problem, target, record, records=(), replace=False):
         key = self._key(problem, target)
         merged = {}
-        previous = self.entries.get(key)
+        previous = None if replace else self.entries.get(key)
         if previous is not None:
             for old in previous.get("records", ()):
                 merged[_decode_config(old["config"]).key()] = old
@@ -123,5 +129,11 @@ class PIMConfigCache:
             "total_ms": record.result.total_ms,
             "records": list(merged.values()),
         }
-        with open(self.path, "w") as handle:
+        directory = os.path.dirname(os.path.abspath(self.path))
+        os.makedirs(directory, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+                mode="w", dir=directory, prefix=".pim-autotune-",
+                suffix=".json", delete=False) as handle:
             json.dump(self.entries, handle, indent=2)
+            temporary = handle.name
+        os.replace(temporary, self.path)

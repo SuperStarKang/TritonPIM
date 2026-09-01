@@ -146,34 +146,12 @@ class ConstraintEngine:
             return f"PIM unit memory overflow: {unit_bytes} > {unit_limit}"
 
         p_m, p_n, p_k = config.p_m, config.p_n, config.p_k
-        split_k_granularity = p_k * config.block_k
-        if (problem.has_reduction
-                and problem.K % split_k_granularity):
-            return (
-                f"K({problem.K}) must be divisible by "
-                f"p_k*block_k({split_k_granularity})")
         active_units = p_m * p_n * p_k
         if active_units > profile.num_units:
             return (
                 f"p_m*p_n*p_k({active_units})가 num_units"
                 f"({profile.num_units})를 넘는다")
 
-        t_m, t_n, t_k = config.execution_extent
-        e_m = ceil_div(problem.M, t_m)
-        e_n = ceil_div(problem.N, t_n)
-        e_k = ceil_div(problem.K, t_k)
-        if p_m > e_m:
-            return f"p_m({p_m})이 Execution Tile grid M({e_m})보다 크다"
-        if p_n > e_n:
-            return f"p_n({p_n})이 Execution Tile grid N({e_n})보다 크다"
-        if p_k > e_k:
-            return f"p_k({p_k})가 Execution Tile grid K({e_k})보다 크다"
-
-        k_plane = ceil_div(problem.K, p_k)
-        if problem.has_reduction and t_k > k_plane:
-            return (
-                f"Execution Tile K extent({t_k})가 K plane"
-                f"({k_plane})보다 크다")
         return None
 
     def valid(self, config):

@@ -16,7 +16,7 @@ from .features import (
 from .forest import RandomForestClassifier
 from .space import axis_values, build_config_space, heuristic_seeds, make_config
 from .space import random_valid_configs
-from .types import PIMBenchmarkResult, ceil_div
+from .types import PIMBenchmarkResult, pim_hierarchy
 
 
 @dataclass
@@ -50,24 +50,54 @@ class ScoredCandidate:
 
 
 FEATURE_INFLUENCE = {
+    "block_group_compute_per_byte": (
+        "block_m", "block_n", "block_k",
+        "group_m", "group_n", "group_k"),
+    "execution_tile_compute_per_byte": (
+        "block_m", "block_n", "block_k",
+        "group_m", "group_n", "group_k",
+        "tile_m", "tile_n", "tile_k"),
     "active_units": ("p_m", "p_n", "p_k"),
-    "effective_utilization": (
-        "p_m", "p_n", "p_k", "tile_m", "tile_n", "tile_k"),
-    "execution_tile_count": ("tile_m", "tile_n", "tile_k"),
-    "scheduling_rounds": ("p_m", "p_n", "tile_m", "tile_n"),
+    "useful_execution_tiles": (
+        "block_m", "block_n", "block_k",
+        "group_m", "group_n", "group_k",
+        "tile_m", "tile_n", "tile_k"),
+    "scheduled_execution_tiles": (
+        "block_m", "block_n", "block_k",
+        "group_m", "group_n", "group_k",
+        "tile_m", "tile_n", "tile_k", "p_m", "p_n", "p_k"),
+    "schedule_utilization": (
+        "block_m", "block_n", "block_k",
+        "group_m", "group_n", "group_k",
+        "tile_m", "tile_n", "tile_k", "p_m", "p_n", "p_k"),
+    "scheduling_rounds": (
+        "block_m", "block_n", "block_k",
+        "group_m", "group_n", "group_k",
+        "tile_m", "tile_n", "tile_k", "p_m", "p_n", "p_k"),
+    "stage_bytes": (
+        "block_m", "block_n", "block_k",
+        "group_m", "group_n", "group_k",
+        "tile_m", "tile_n", "tile_k", "p_m", "p_n", "p_k"),
     "h2d_bytes": (
-        "p_m", "p_n", "p_k", "tile_m", "tile_n", "tile_k"),
-    "d2h_bytes": ("p_k", "tile_m", "tile_n"),
-    "input_reuse_bytes": (
-        "p_m", "p_n", "p_k", "tile_m", "tile_n", "tile_k"),
-    "reduction_bytes": ("p_k", "tile_m", "tile_n"),
-    "padding_ratio": ("tile_m", "tile_n", "tile_k"),
-    "load_imbalance": (
-        "p_m", "p_n", "p_k", "tile_m", "tile_n"),
+        "block_m", "block_n", "block_k",
+        "group_m", "group_n", "group_k",
+        "tile_m", "tile_n", "tile_k", "p_m", "p_n", "p_k"),
+    "d2h_bytes": (
+        "block_m", "block_n", "block_k",
+        "group_m", "group_n", "group_k",
+        "tile_m", "tile_n", "tile_k", "p_m", "p_n", "p_k"),
+    "reduction_bytes": ("block_k", "group_k", "tile_k", "p_k"),
+    "padding_ratio": (
+        "block_m", "block_n", "block_k",
+        "group_m", "group_n", "group_k",
+        "tile_m", "tile_n", "tile_k", "p_m", "p_n", "p_k"),
     "local_memory_pressure": (
         "block_m", "block_n", "block_k",
         "group_m", "group_n", "group_k"),
-    "unit_memory_pressure": ("tile_m", "tile_n", "tile_k"),
+    "unit_memory_pressure": (
+        "block_m", "block_n", "block_k",
+        "group_m", "group_n", "group_k",
+        "tile_m", "tile_n", "tile_k"),
 }
 
 
@@ -133,18 +163,7 @@ def semantic_mutate(problem, config, fragment_kinds, spec):
                     partitions[axis]):
                 new = list(partitions)
                 new[axis] = value
-                # partition을 늘리면 한 device plane의 group 수가 줄어든다.
-                # 기존 tile을 그대로 두면 partition 변경 후보가 tile-grid
-                # constraint에서 즉시 탈락하므로 해당 축 tile만 줄인다.
-                dims = (problem.M, problem.N, problem.K)
-                base = blocks[axis] * groups[axis]
-                plane_groups = ceil_div(
-                    ceil_div(dims[axis], base), value)
-                new_tiles = list(tiles)
-                new_tiles[axis] = min(new_tiles[axis], plane_groups)
-                neighbors.append(rebuild(
-                    new_tiles=tuple(new_tiles),
-                    new_partitions=tuple(new)))
+                neighbors.append(rebuild(new_partitions=tuple(new)))
         else:
             raise ValueError(f"알 수 없는 fragment 종류: {kind}")
     return neighbors
@@ -205,11 +224,21 @@ def tune(problem, target, benchmark_fn, *, space=None, cache=None,
             config, result = hit
             features = extract_features(problem, target, config)
             record = TuningRecord(config, features, result)
+            if verbose:
+                print(
+                    f"[autotuner] cache hit: {result.total_ms:.2f} ms "
+                    f"config={config.key()}")
             return TuningResult(
                 best=record, records=[record], from_cache=True)
 
-    measured = (
-        cache.measured_results(problem, target) if cache is not None else {})
+    measured = (cache.measured_results(problem, target)
+                if cache is not None and not retune else {})
+    if verbose:
+        mode = "retune" if retune else "cache miss"
+        print(
+            f"[autotuner] {mode}: problem="
+            f"({problem.M},{problem.N},{problem.K}) "
+            f"target={target.common_profile.target}")
     records = []
     seen = set()
     benchmarks_run = 0
@@ -227,13 +256,23 @@ def tune(problem, target, benchmark_fn, *, space=None, cache=None,
         nonlocal benchmarks_run
         if verbose:
             extent = config.execution_extent
+            hierarchy = pim_hierarchy(problem, config)
             print(
                 f"[autotuner] "
                 f"B=({config.block_m},{config.block_n},{config.block_k}) "
                 f"G=({config.group_m},{config.group_n},{config.group_k}) "
                 f"tile=({config.tile_m},{config.tile_n},{config.tile_k}) "
                 f"extent={extent} "
-                f"P=({config.p_m},{config.p_n},{config.p_k})",
+                f"P=({config.p_m},{config.p_n},{config.p_k}) "
+                f"groups={hierarchy.total_groups} "
+                f"tiles={hierarchy.execution_tiles} "
+                f"rounds={hierarchy.rounds} "
+                f"compute/byte=({features.block_group_compute_per_byte:.3f},"
+                f"{features.execution_tile_compute_per_byte:.3f}) "
+                f"schedule_util={features.schedule_utilization:.3f} "
+                f"bytes(stage/h2d/d2h/combine)="
+                f"({features.stage_bytes},{features.h2d_bytes},"
+                f"{features.d2h_bytes},{features.reduction_bytes})",
                 end="", flush=True)
         stored = measured.get(config.key())
         if stored is None:
@@ -246,7 +285,12 @@ def tune(problem, target, benchmark_fn, *, space=None, cache=None,
         record = TuningRecord(config, features, result)
         records.append(record)
         if verbose:
-            print(f" -> {result.total_ms:.2f} ms (ok={result.ok}){source}")
+            stages = "".join(
+                f" {name}={milliseconds:.2f}"
+                for name, milliseconds in result.timings)
+            print(
+                f" -> {result.total_ms:.2f} ms (ok={result.ok})"
+                f"{stages}{source}")
         return record
 
     def best_ms():
@@ -343,5 +387,9 @@ def tune(problem, target, benchmark_fn, *, space=None, cache=None,
     assert ok_records, "성공적으로 측정된 configuration이 없습니다"
     best = min(ok_records, key=lambda record: record.result.total_ms)
     if cache is not None:
-        cache.store(problem, target, best, records)
+        cache.store(problem, target, best, records, replace=retune)
+    if verbose:
+        print(
+            f"[autotuner] selected: {best.result.total_ms:.2f} ms "
+            f"config={best.config.key()}")
     return TuningResult(best=best, records=records)

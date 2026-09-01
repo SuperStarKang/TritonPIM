@@ -1,6 +1,7 @@
 """Values shared by PIM Common IR analysis and autotuning."""
 
 from dataclasses import dataclass
+from math import prod
 
 
 DTYPE_BYTES = {
@@ -233,12 +234,56 @@ class PIMConfig:
             self.p_m, self.p_n, self.p_k,
         )
 
+
+@dataclass(frozen=True)
+class PIMHierarchy:
+    """The three Common IR hierarchy levels and their scheduled grid."""
+
+    block_group_extent: tuple
+    total_groups: tuple
+    execution_tiles: tuple
+    rounds: tuple
+
+    @property
+    def useful_execution_tiles(self):
+        return prod(self.execution_tiles)
+
+    @property
+    def scheduling_rounds(self):
+        return prod(self.rounds)
+
+
+def pim_hierarchy(problem, config):
+    """Materialize the same group/tile/partition arithmetic as Common IR."""
+    blocks = (config.block_m, config.block_n, config.block_k)
+    groups = (config.group_m, config.group_n, config.group_k)
+    tiles = (config.tile_m, config.tile_n, config.tile_k)
+    partitions = (config.p_m, config.p_n, config.p_k)
+    block_group_extent = tuple(
+        blocks[axis] * groups[axis] for axis in range(3))
+    total_groups = tuple(
+        ceil_div(problem.axis_extents[axis], block_group_extent[axis])
+        for axis in range(3))
+    execution_tiles = tuple(
+        ceil_div(total_groups[axis], tiles[axis]) for axis in range(3))
+    rounds = tuple(
+        ceil_div(execution_tiles[axis], partitions[axis])
+        for axis in range(3))
+    return PIMHierarchy(
+        block_group_extent=block_group_extent,
+        total_groups=total_groups,
+        execution_tiles=execution_tiles,
+        rounds=rounds,
+    )
+
+
 @dataclass
 class PIMBenchmarkResult:
     """Measured end-to-end result for one Common IR configuration."""
 
     total_ms: float
     correctness: bool = True
+    timings: tuple = ()
 
     @property
     def ok(self):

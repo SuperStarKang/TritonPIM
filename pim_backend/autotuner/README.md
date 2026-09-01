@@ -13,6 +13,19 @@ Device mapping     [p_m, p_n, p_k]
 `group_*`, `tile_*`, `p_*`는 compiler option으로 전달되어 각각
 `#pim.block_group`, `#pim.execution_tile`, `#pim.device_mapping`이 된다.
 
+모든 후보는 Common IR과 같은 식으로 해석한다.
+
+```text
+block_group_extent[d] = block[d] * group[d]
+total_groups[d]       = ceildiv(problem[d], block_group_extent[d])
+execution_tiles[d]    = ceildiv(total_groups[d], tile[d])
+rounds[d]             = ceildiv(execution_tiles[d], p[d])
+```
+
+K도 예외가 아니다. `p_k`는 같은 round에서 semantic K Block Group을 나눌
+device 수이고, `tile_k`는 device 하나가 round 한 번에 처리할 K Block Group
+수다. Source K plane이나 `ceildiv(K, p_k)` domain은 만들지 않는다.
+
 ## Target 정보
 
 compiler와 autotuner는 `backend/target.py`의 동일한 타입과 builder를 사용한다.
@@ -34,12 +47,11 @@ random/LFBO 후보를 측정하므로 최대 device 사용이 최종
 `(1,1,1)`은 강제하지 않고 problem grid가 unit 하나만 허용할 때만 첫
 seed로 나온다.
 
-UPMEM은 split-K를 충분히 비교할 수 있도록 유효한 각 `p_k` 단계마다
+Reduction 연산은 semantic K 병렬성을 충분히 비교하도록 유효한 각 `p_k` 단계마다
 `p_m*p_n*p_k`가 최대가 되는 `p_m/p_n` 조합을 초기 seed에 포함한다. 따라서
 적은 DPU를 쓰는 K-only 후보가 아니라, 비슷한 전체 device parallelism을
-유지한 상태에서 `p_k` 변화의 실제 실행 시간을 비교한다. LFBO가 partition을
-변경할 때는 같은 축의 Execution Tile만 새 device plane 안에 들어오도록
-줄인 뒤 constraint를 검사한다.
+유지한 상태에서 `p_k` 변화의 실제 실행 시간을 비교한다. LFBO는 `p_k`와
+`tile_k`를 독립적으로 변경하며, 변경된 조합의 round 수를 위 식으로 다시 계산한다.
 
 ## 탐색 흐름
 
@@ -55,9 +67,21 @@ PIMProblem
   -> cache
 ```
 
-최종 objective는 실제 end-to-end 실행시간이다. utilization, transfer,
-input reuse, reduction, padding, memory pressure는 후보를 설명하기 위해 Common IR
-값에서 계산하는 내부 feature일 뿐 compiler option이나 IR attribute로 저장하지 않는다.
+최종 objective는 실제 end-to-end 실행시간이다. 내부 feature의 역할은 계층별
+trade-off를 Random Forest에 설명하는 것이다.
+
+- Block Group: compute-domain 크기 대비 local buffer byte와 local-memory pressure
+- Execution Tile: compute-domain 크기 대비 resident byte와 stage/H2D/D2H byte
+- Multi-device scheduling: active unit 수, useful/scheduled tile 비율,
+  M/N/K round 수, K contribution 결합 byte
+
+이 값들은 후보 선택에만 쓰며 compiler option이나 IR attribute를 새로 만들지 않는다.
+실행 시간은 세 번 측정한 median이 기본이고 UPMEM에서는
+`stage/h2d/kernel/d2h/combine` median도 후보 로그와 cache에 기록한다.
+기본 cache는 `TRITON_CACHE_DIR/pim_autotune_cache.json`에 저장한다. 저장할 때
+같은 디렉터리의 임시 파일을 완성한 뒤 교체하므로 `/tmp`를 사용하지 않으며,
+중단되더라도 기존 cache를 먼저 비우지 않는다. 0-byte 파일은 빈 cache로 취급하고
+내용이 있는 잘못된 JSON은 해당 경로를 포함한 오류로 보고한다.
 
 `PIMProblem`은 연산별 policy를 갖지 않는다. `compute_kind`는 PIM compute op의
 종류를 식별하는 의미 값이고, 각 `PIMAccess`는 unique buffer의 direction, dtype,
