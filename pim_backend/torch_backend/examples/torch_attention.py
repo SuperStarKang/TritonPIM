@@ -1,5 +1,5 @@
 # 두 번째 검증: 한 그래프 안의 _int_mm 두 개(QK, PV)를 PIM에서 돌린다.
-# 나머지(transpose, scale, mask, softmax, quantization, partial 합)는 CPU Cpp다.
+# 나머지(transpose, scale, mask, softmax, quantization)는 CPU Cpp다.
 #
 # 실행:
 #   conda activate pim_triton
@@ -8,12 +8,10 @@
 # 예상 배치:
 #   transpose        CPU Cpp
 #   QK _int_mm       PIM
-#   QK partial sum   CPU Cpp
 #   scale/mask       CPU Cpp
 #   softmax          CPU Cpp
 #   quantization     CPU Cpp
 #   PV _int_mm       PIM
-#   PV partial sum   CPU Cpp
 #
 # KV group loop는 아직 torch.compile 밖에 둔다.
 

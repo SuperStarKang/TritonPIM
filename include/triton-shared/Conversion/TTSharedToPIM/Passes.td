@@ -107,7 +107,7 @@ def PIMSetTargetProfile : Pass<"pim-set-target-profile", "mlir::ModuleOp"> {
     Option<"lanesPerCore", "lanes-per-core", "int64_t", "16",
            "PIM Core 하나의 병렬 실행 lane 능력값.">,
     Option<"bankCapacityLimitBytes", "bank-capacity-limit-bytes", "int64_t",
-           "33554432", "bank 하나가 담을 수 있는 최대 byte 수.">,
+           "62914560", "bank 하나가 담을 수 있는 최대 byte 수.">,
     Option<"localCapacityLimitBytes", "local-capacity-limit-bytes", "int64_t",
            "49152", "PIM Core local storage의 최대 byte 수.">,
   ];

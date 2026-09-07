@@ -24,9 +24,9 @@ from autotuner import (  # noqa: E402
     PIMTargetSpec,
     build_config_space,
     heuristic_seeds,
+    pim_hierarchy,
     target_spec,
 )
-from autotuner.types import ceil_div  # noqa: E402
 from autotuner.decorator import (  # noqa: E402
     DEFAULT_CACHE_PATH,
     pim_launch_options,
@@ -36,7 +36,6 @@ __all__ = [
     "ConstraintEngine", "PIMAccess", "PIMConfig", "PIMConfigCache",
     "PIMProblem",
     "PIMTargetSpec", "build_config_space",
-    "heuristic_seeds", "target_spec",
+    "heuristic_seeds", "pim_hierarchy", "target_spec",
     "DEFAULT_CACHE_PATH", "pim_launch_options",
-    "ceil_div",
 ]

@@ -1,6 +1,6 @@
 # PIMCombinedScheduling — 한 CPU 그래프 안에서 두 codegen backend를 섞는다.
 #
-#     PIM split-K template  → TritonScheduling  (Triton 소스 → PIMBackend)
+#     PIM semantic template → TritonScheduling  (Triton 소스 → PIMBackend)
 #     그 밖의 모든 노드      → CppScheduling     (C++/OpenMP, stock 그대로)
 #
 # CUDACombinedScheduling(torch/_inductor/codegen/cuda_combined_scheduling.py)이
@@ -58,10 +58,9 @@ class PIMCombinedScheduling(BaseScheduling):
         return self._cpp_scheduling.group_fn(sizes)
 
     # ── fusion: PIM template 주변은 전부 막는다 ───────────────────────────
-    # epilogue/prologue가 붙으면 생성되는 Triton 소스가 split-K kernel과 달라져
-    # PIM 파이프라인이 실패했을 때 원인이 갈라지지 않는다. lowering에서
-    # allow_epilogue_fusion / allow_prologue_fusion을 False로 두었고, 여기서
-    # 한 번 더 막는다 (수평 fusion까지 포함).
+    # Fused compute/access 의미는 아직 이 Torch lowering의 지원 범위가 아니다.
+    # lowering에서 allow_epilogue_fusion / allow_prologue_fusion을 False로
+    # 두었고, 여기서 수평 fusion까지 함께 막는다.
     def can_fuse_vertical(self, node1, node2) -> bool:
         if self.is_pim_template(node1) or self.is_pim_template(node2):
             return False

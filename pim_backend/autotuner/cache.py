@@ -9,7 +9,7 @@ from dataclasses import asdict
 from .types import PIMBenchmarkResult, PIMConfig
 
 
-CACHE_SCHEMA = "pim-common-ir-semantic-schedule-v4"
+CACHE_SCHEMA = "pim-common-ir-semantic-schedule-v5"
 RESULT_FIELDS = (
     "total_ms", "correctness", "timings",
 )

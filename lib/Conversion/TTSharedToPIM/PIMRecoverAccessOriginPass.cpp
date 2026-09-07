@@ -178,8 +178,8 @@ struct PIMRecoverAccessOriginPass
     return promote(b, access, extraStride, extraOrigin, origin);
   }
 
-  // 새 축을 앞에 붙인 access로 바꾼다. split-K의 출력면처럼 원본 버퍼에는 있는데
-  // tile에는 없는 축이 이 경우다.
+  // 새 축을 앞에 붙인 access로 바꾼다. 원본 버퍼에는 있는데 tile에는 없는 축이
+  // 이 경우다.
   LogicalResult promote(OpBuilder &b, pim::AccessOp access,
                         ArrayRef<Value> extraStride, ArrayRef<Value> extraOrigin,
                         ArrayRef<Value> origin) {

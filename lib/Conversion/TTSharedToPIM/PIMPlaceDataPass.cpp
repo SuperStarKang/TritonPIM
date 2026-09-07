@@ -53,47 +53,6 @@ static Operation *deviceOrigin(scf::ForOp loop) {
   return nullptr;
 }
 
-// origin 식을 덧셈 항으로 가른다.
-static void collectAddends(Value v, SmallVectorImpl<Value> &terms) {
-  if (auto add = v.getDefiningOp<arith::AddIOp>()) {
-    collectAddends(add.getLhs(), terms);
-    collectAddends(add.getRhs(), terms);
-    return;
-  }
-  terms.push_back(v);
-}
-
-// 항이 유도변수에 곱하는 정적 계수. index_cast 를 벗기고 muli 사슬의 상수들을 곱해
-// 내려간다 — group-k 가 끼면 유도변수 사용처가 muli(muli(iv, g), tile) 꼴이 된다.
-// 유도변수까지 상수 곱으로만 이어지지 않으면 알 수 없다.
-static std::optional<int64_t> stepOfTerm(Value term) {
-  while (auto c = term.getDefiningOp<arith::IndexCastOp>())
-    term = c.getIn();
-  if (isa<BlockArgument>(term))
-    return 1;
-  if (Operation *origin = term.getDefiningOp();
-      origin && origin->hasAttr("pim.device_origin")) {
-    auto add = dyn_cast<arith::AddIOp>(origin);
-    if (!add)
-      return std::nullopt;
-    // start + local*step에서 scheduling round에 의존하는 start는 loop 한
-    // 회전의 전진 폭과 무관하다. local 쪽 scaled 항만 따라간다.
-    return stepOfTerm(add.getRhs());
-  }
-  auto mul = term.getDefiningOp<arith::MulIOp>();
-  if (!mul)
-    return std::nullopt;
-  if (std::optional<int64_t> c = getConstantIntValue(mul.getRhs())) {
-    std::optional<int64_t> rest = stepOfTerm(mul.getLhs());
-    return rest ? std::optional<int64_t>(*c * *rest) : std::nullopt;
-  }
-  if (std::optional<int64_t> c = getConstantIntValue(mul.getLhs())) {
-    std::optional<int64_t> rest = stepOfTerm(mul.getRhs());
-    return rest ? std::optional<int64_t>(*c * *rest) : std::nullopt;
-  }
-  return std::nullopt;
-}
-
 // 좌표는 loop 고유 타입으로 두고 배치 산술은 index로 한다. 축 loop는 index이고 reduction
 // loop는 커널이 쓰던 정수 타입이라 섞으면 타입이 어긋난다.
 static Value toIndex(OpBuilder &b, Location loc, Value v) {
@@ -112,54 +71,6 @@ struct LoopRange {
   StringAttr axis;     // canonical device axis. semantic reduction은 k.
   int64_t partitions;  // 이 축의 device partition 수
 };
-
-// 나뉜 축 P 가 다른 loop 와 함께 버퍼 축을 움직여도 연속인 경우가 하나 있다: 함께 모는
-// loop 가 정확히 tile 씩 전진하는 안쪽 loop 이고(blocked 분할), P 가 그 전체 구간을
-// 단위로 전진할 때다. 그때 device 영역은 시작 하나에 trips 곱 × tile 길이의 연속
-// 구간이라 기존 span/capacity 식이 그대로 맞는다. 함께 모는 loop 가 tile 보다 크게
-// 전진하면(cyclic 분할) 영역이 띄엄띄엄이므로 진단한다.
-// P 의 전진 폭(= 안쪽 loop 의 전체 구간)은 런타임 값이라 여기서 증명하지 못한다 —
-// partitioned logical coordinate가 연속 구간을 만들도록 정규화됐다는 것이 계약이다.
-static LogicalResult
-checkBlockedComposite(pim::AccessOp access, unsigned d, Operation *partitioned,
-                      StringAttr axisName, ArrayRef<scf::ForOp> loops,
-                      const llvm::DenseMap<Operation *, LoopRange> &ranges,
-                      const llvm::SmallPtrSetImpl<Operation *> &drivers) {
-  auto fail = [&]() {
-    return access->emitError("pim-place-data: buffer axis ")
-           << d << " is driven by the partitioned axis " << axisName.getValue()
-           << " together with another loop, and the composite is not a blocked "
-              "split (the co-driving loop must advance by exactly one tile), "
-              "so the device region is not a single contiguous range";
-  };
-  if (drivers.size() != 2)
-    return fail();
-  Operation *other = nullptr;
-  for (Operation *o : drivers)
-    if (o != partitioned)
-      other = o;
-  // 나뉜 축 둘이 한 버퍼 축을 몰면 어느 쪽 구간도 연속일 수 없다.
-  if (ranges.find(other)->second.partitions != 1)
-    return fail();
-  SmallVector<Value> terms;
-  collectAddends(access.getOrigin()[d], terms);
-  bool sawInner = false;
-  for (Value t : terms) {
-    llvm::SmallPtrSet<Operation *, 4> termDrivers;
-    pim::collectDrivers(t, loops, termDrivers);
-    if (termDrivers.empty())
-      continue; // 좌표 무관 base
-    if (termDrivers.size() != 1)
-      return fail(); // 한 항에 두 loop 가 섞이면 분해할 수 없다
-    if (termDrivers.contains(partitioned))
-      continue; // P 의 시작 항 — 전진 폭은 런타임이라 위의 계약에 맡긴다
-    std::optional<int64_t> step = stepOfTerm(t);
-    if (!step || *step != access.getSizes()[d])
-      return fail();
-    sawInner = true;
-  }
-  return sawInner ? success() : fail();
-}
 
 struct PIMPlaceDataPass
     : public mlir::triton::impl::PIMPlaceDataBase<PIMPlaceDataPass> {
@@ -300,12 +211,15 @@ struct PIMPlaceDataPass
                  << " is driven by a loop outside the Block-Group-Execution "
                     "Tile hierarchy, so a fixed resident slot cannot be "
                     "derived";
-        // 나뉜 축이 다른 loop와 함께 한 버퍼 축을 움직이면, blocked 분할(함께 모는
-        // loop가 정확히 tile씩 전진)일 때만 연속 구간 하나다. 아니면 진단이다.
-        if (r.axis && drivers.size() > 1 && r.partitions != 1 &&
-            failed(checkBlockedComposite(access, d, l, r.axis, loops, ranges,
-                                         drivers)))
-          return failure();
+        // 나뉜 축이 다른 loop와 함께 한 버퍼 축을 움직이면 device 영역이 연속
+        // 구간 하나가 아니다. Common hierarchy는 buffer 축 하나를 loop 하나가
+        // 모는 형태만 만들므로 그 밖의 모양은 진단한다.
+        if (r.axis && drivers.size() > 1 && r.partitions != 1)
+          return access->emitError("pim-place-data: buffer axis ")
+                 << d << " is driven by the partitioned axis "
+                 << r.axis.getValue()
+                 << " together with another loop, so the device region is "
+                    "not a single contiguous range";
         trips = first ? r.trips
                       : b.create<arith::MulIOp>(loc, trips, r.trips).getResult();
         capacityTiles = first ? r.capacityTiles

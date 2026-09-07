@@ -4,7 +4,6 @@ import logging
 from dataclasses import dataclass
 
 from ._autotuner import (
-    ceil_div,
     ConstraintEngine,
     PIMConfig,
     PIMConfigCache,
@@ -12,10 +11,12 @@ from ._autotuner import (
     PIMTargetSpec,
     build_config_space,
     heuristic_seeds,
+    pim_hierarchy,
     pim_launch_options,
     target_spec,
 )
 from .config import PIMTorchConfig, UnsupportedPIMIntMM, validate_pim_options
+from .template import TORCH_INT_MM_TEMPLATE_VERSION
 
 
 log = logging.getLogger(__name__)
@@ -35,8 +36,6 @@ class PIMExecution:
             "BLOCK_M": self.config.block_m,
             "BLOCK_N": self.config.block_n,
             "BLOCK_K": self.config.block_k,
-            "SPLIT_K": self.config.p_k,
-            "EVEN_TILES": even_tiles(self.problem, self.config),
         }
 
     def backend_options(self):
@@ -46,10 +45,7 @@ class PIMExecution:
     def describe(self):
         config = self.config
         profile = self.target.common_profile
-        t_m, t_n, _ = config.execution_extent
-        e_m = ceil_div(self.problem.M, t_m)
-        e_n = ceil_div(self.problem.N, t_n)
-        rounds = ceil_div(e_m, config.p_m) * ceil_div(e_n, config.p_n)
+        hierarchy = pim_hierarchy(self.problem, config)
         active = config.p_m * config.p_n * config.p_k
         return (
             f"block=({config.block_m},{config.block_n},{config.block_k}) "
@@ -57,26 +53,10 @@ class PIMExecution:
             f"tile=({config.tile_m},{config.tile_n},{config.tile_k}) "
             f"extent={config.execution_extent} "
             f"devices=({config.p_m},{config.p_n},{config.p_k})="
-            f"{active}/{profile.num_units} rounds={rounds}")
-
-
-def even_tiles(problem, config):
-    return (
-        problem.M % config.block_m == 0
-        and problem.N % config.block_n == 0
-    )
-
-
-def check_template_support(problem, config, torch_config):
-    divisor = config.p_k * config.block_k
-    if problem.K % divisor:
-        raise UnsupportedPIMIntMM(
-            f"K={problem.K} must be divisible by "
-            f"p_k*BLOCK_K={config.p_k}*{config.block_k}={divisor}")
-    if not even_tiles(problem, config) and not torch_config.allow_masked_tiles:
-        raise UnsupportedPIMIntMM(
-            f"M={problem.M} must be divisible by BLOCK_M={config.block_m} "
-            f"and N={problem.N} by BLOCK_N={config.block_n}")
+            f"{active}/{profile.num_units} "
+            f"groups={hierarchy.total_groups} "
+            f"tiles={hierarchy.execution_tiles} "
+            f"rounds={hierarchy.rounds}")
 
 
 def _seed_config(problem, target):
@@ -89,7 +69,10 @@ def _seed_config(problem, target):
 
 
 def _cached_config(problem, target, torch_config):
-    cache = PIMConfigCache(torch_config.autotune_cache_path)
+    cache = PIMConfigCache(
+        torch_config.autotune_cache_path,
+        template_version=TORCH_INT_MM_TEMPLATE_VERSION,
+    )
     found = cache.lookup_result(problem, target)
     if found is None:
         raise UnsupportedPIMIntMM(
@@ -120,7 +103,6 @@ def resolve_execution(torch_config, problem):
         raise UnsupportedPIMIntMM(
             f"config rejected for (M,N,K)=({problem.M},{problem.N},"
             f"{problem.K}): {reason}")
-    check_template_support(problem, config, torch_config)
     return PIMExecution(
         problem=problem, target=target, config=config,
         torch_config=torch_config)

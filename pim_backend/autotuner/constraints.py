@@ -114,6 +114,26 @@ class ConstraintEngine:
                     f"extent가 1인 {AXES[axis]} axis의 "
                     "Block/Group/Tile/partition은 모두 1이어야 한다")
 
+        block_group_extent = tuple(
+            blocks[axis] * groups[axis] for axis in range(3))
+        total_groups = tuple(
+            ceil_div(problem.axis_extents[axis], block_group_extent[axis])
+            for axis in range(3))
+        for axis in range(3):
+            if tiles[axis] > total_groups[axis]:
+                return (
+                    f"{AXES[axis]} tile({tiles[axis]})이 total groups"
+                    f"({total_groups[axis]})보다 크다")
+
+        execution_tiles = tuple(
+            ceil_div(total_groups[axis], tiles[axis])
+            for axis in range(3))
+        for axis in range(3):
+            if partitions[axis] > execution_tiles[axis]:
+                return (
+                    f"{AXES[axis]} partition({partitions[axis]})이 "
+                    f"execution tiles({execution_tiles[axis]})보다 크다")
+
         local_bytes = local_memory_footprint(problem, config)
         if (profile.local_capacity_limit_bytes > 0
                 and local_bytes > profile.local_capacity_limit_bytes):

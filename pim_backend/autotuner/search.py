@@ -15,7 +15,7 @@ from .features import (
 )
 from .forest import RandomForestClassifier
 from .space import axis_values, build_config_space, heuristic_seeds, make_config
-from .space import random_valid_configs
+from .space import structured_valid_configs
 from .types import PIMBenchmarkResult, pim_hierarchy
 
 
@@ -300,10 +300,10 @@ def tune(problem, target, benchmark_fn, *, space=None, cache=None,
         return min(record.result.total_ms for record in ok)
 
     seeds = heuristic_seeds(problem, target, spec)
-    random_configs = random_valid_configs(
+    structured_configs = structured_valid_configs(
         problem, target, spec, initial_random, rng, engine)
     warm = cache.lookup_similar(problem, target) if cache is not None else []
-    population = seeds[:1] + warm + seeds[1:] + random_configs
+    population = seeds[:1] + warm + seeds[1:] + structured_configs
 
     for config in population:
         if config.key() in seen or not engine.valid(config):

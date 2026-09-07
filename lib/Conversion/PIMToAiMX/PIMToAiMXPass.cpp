@@ -215,8 +215,8 @@ struct ConvertPIMToAiMXPass
     if (cPlace.getDirection() != "out")
       return cPlace->emitError(
           "convert-pim-to-aimx: the matmul result must be an \"out\" place");
-    // 마지막 두 축이 PIM의 2-D C tile이다. 앞축이 있으면 split-K 같은 독립 partial
-    // output 축이며 host buffer의 origin/stride로 보존한다.
+    // 마지막 두 축이 PIM의 2-D C tile이다. 앞축이 있으면 host buffer의
+    // origin/stride로 보존한다.
     if (cPlace.getStart().size() < 2)
       return cPlace->emitError(
           "convert-pim-to-aimx: the output needs at least row and column axes");

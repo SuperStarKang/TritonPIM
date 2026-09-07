@@ -1,13 +1,10 @@
-# aten._int_mm → PIM split-K template + CPU partial reduction.
+# aten._int_mm → one semantic GEMM template.
 #
 # 그래프 모양:
 #
-#     zeros[SPLIT_K,M,N] (CPU Cpp)
-#              │ (mutated input)
-#     PIM split-K template  ── PIMBackend compile → PIM 실행
-#              │
-#     sum(partial, dim=0)  (CPU Cpp)
-#              │
+#     PIM semantic GEMM template ── PIMBackend compile → PIM Common IR
+#              │                    → semantic K scheduling/combine
+#              ▼
 #          C[M,N] int32
 #
 # [stock tuned_int_mm을 전역 수정하지 않는 이유]
@@ -31,12 +28,12 @@ import torch
 
 from torch._inductor import ir
 from torch._inductor.kernel.mm_common import mm_args
-from torch._inductor.lowering import _full, _register_lowering, lowerings
+from torch._inductor.lowering import _register_lowering, lowerings
 
 from ._autotuner import PIMProblem
 from .config import PIMTorchConfig, UnsupportedPIMIntMM
 from .execution import resolve_execution
-from .template import pim_split_k_template
+from .template import pim_gemm_template
 
 aten = torch.ops.aten
 log = logging.getLogger(__name__)
@@ -78,27 +75,6 @@ def validate_pim_int_mm(mat1, mat2, m, n, k) -> PIMProblem:
         input_dtype="int8", output_dtype="int32")
 
 
-def _zeroed_partial(device, split_k, m, n):
-    """zero로 채운 partial[SPLIT_K,M,N] int32 buffer를 만든다.
-
-    lowering.empty_strided를 쓰지 않는 이유: 그쪽은 _full로 만든 뒤 ranges를
-    0으로 덮어 NopKernel(할당만)로 만든다. 여기서는 실제로 0을 채우는 CPU
-    커널이 필요하다 — examples/split_k.py의 torch.zeros와 같은 의미다."""
-    size = [sympy.Integer(split_k), sympy.expand(m), sympy.expand(n)]
-    partial = _full(0, device, torch.int32, size)
-    partial.realize()
-    buffer = partial.data.data
-    assert isinstance(buffer, ir.ComputedBuffer), type(buffer)
-    # template이 {{stride("PARTIAL", i)}}로 읽을 stride를 여기서 못박는다.
-    buffer.layout = ir.FixedLayout(
-        device=device,
-        dtype=torch.int32,
-        size=size,
-        stride=ir.FlexibleLayout.contiguous_strides(size),
-    )
-    return partial
-
-
 def _unwrap_template_buffer(node):
     """TensorBox.create(...)가 감싼 TritonTemplateBuffer를 꺼낸다."""
     current = node
@@ -114,26 +90,14 @@ def is_pim_template_buffer(node) -> bool:
     return getattr(node, "_pim_template", False) is True
 
 
-def generate_pim_split_k_template(mat1, mat2, partial, execution):
+def generate_pim_gemm_template(mat1, mat2, layout, execution):
     problem = execution.problem
-    caller = pim_split_k_template.generate(
-        input_nodes=(mat1, mat2, partial),
-        # 선언상 출력은 쓰이지 않는다. 실제 출력은 mutated input인 partial이다
-        # (template.py의 [PARTIAL을 mutated input으로 두는 이유] 참고).
-        layout=ir.FixedLayout(
-            device=mat1.get_device(),
-            dtype=torch.int32,
-            size=[sympy.Integer(1)],
-            stride=[sympy.Integer(1)],
-        ),
+    caller = pim_gemm_template.generate(
+        input_nodes=(mat1, mat2),
+        layout=layout,
         num_stages=execution.torch_config.num_stages,
         num_warps=execution.torch_config.num_warps,
-        mutated_inputs=[partial],
-        # grid_fn(m, n, meta)가 쓰는 값. 선언상 출력([1])이 아니라 실제 문제
-        # 크기를 넘겨야 grid가 맞는다.
         call_sizes=[sympy.Integer(problem.M), sympy.Integer(problem.N)],
-        # 이 커널만 PIM으로 컴파일하라는 표식과 그때 쓸 PIM option.
-        # triton_heuristics의 patch(_precompile_config)가 이것을 읽는다.
         triton_meta={
             "compile_backend": "pim",
             "backend_options": execution.backend_options(),
@@ -142,14 +106,12 @@ def generate_pim_split_k_template(mat1, mat2, partial, execution):
     )
     if caller is None:
         raise UnsupportedPIMIntMM(
-            f"PIM split-K template failed to generate for {problem}")
+            f"PIM semantic GEMM template failed to generate for {problem}")
 
     node = caller.output_node()
     buffer = _unwrap_template_buffer(node)
     buffer._pim_template = True
-    # 초기에는 template 주변 fusion을 전부 막는다. epilogue/prologue가 붙으면
-    # 생성되는 Triton 소스가 split-K kernel과 달라져서, PIM 파이프라인이
-    # 실패했을 때 원인이 갈라지지 않는다.
+    # Fusion은 Common IR이 fused compute/access 의미를 받는 별도 단계에서 연다.
     buffer.allow_epilogue_fusion = False
     buffer.allow_prologue_fusion = False
     return node
@@ -157,7 +119,7 @@ def generate_pim_split_k_template(mat1, mat2, partial, execution):
 
 def make_pim_int_mm_lowering(config: PIMTorchConfig):
     def pim_int_mm(mat1, mat2, *, layout=None):
-        m, n, k, _out_layout, mat1_r, mat2_r = mm_args(
+        m, n, k, out_layout, mat1_r, mat2_r = mm_args(
             mat1, mat2, layout=layout, out_dtype=torch.int32)
         problem = validate_pim_int_mm(mat1_r, mat2_r, m, n, k)
         execution = resolve_execution(config, problem)
@@ -170,17 +132,8 @@ def make_pim_int_mm_lowering(config: PIMTorchConfig):
         mat1_r = ir.ExternKernel.require_contiguous(mat1_r)
         mat2_r = ir.ExternKernel.require_contiguous(mat2_r)
 
-        partial = _zeroed_partial(
-            mat1_r.get_device(), execution.config.p_k, problem.M, problem.N)
-
-        generate_pim_split_k_template(mat1_r, mat2_r, partial, execution)
-
-        # partial을 읽는 쪽은 mutation 이후의 이름을 보게 된다 (MutationOutput).
-        # dtype을 명시하지 않으면 torch.sum 규약대로 int64로 승격된다.
-        #
-        # 각 p_k plane 안의 reduction은 target lowering이 수행한다. 서로 다른
-        # PIM Device가 만든 p_k partial만 이 그래프의 host sum으로 합친다.
-        return lowerings[aten.sum](partial, axis=0, dtype=torch.int32)
+        return generate_pim_gemm_template(
+            mat1_r, mat2_r, out_layout, execution)
 
     return pim_int_mm
 

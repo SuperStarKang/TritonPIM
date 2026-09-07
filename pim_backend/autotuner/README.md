@@ -41,14 +41,24 @@ PIMTargetSpec
 변수가 아니다.
 
 초기 후보의 첫 `P`는 problem grid가 허용하는 범위에서
-`p_m*p_n*p_k`가 `num_units`에 가장 가까운 값이다. 이후에는 축별 seed와
-random/LFBO 후보를 측정하므로 최대 device 사용이 최종
+`p_m*p_n*p_k`가 `num_units`에 가장 가까운 값이다. 이후에는 structured/LFBO
+후보를 측정하므로 최대 device 사용이 최종
 선택으로 고정되지 않는다.
 `(1,1,1)`은 강제하지 않고 problem grid가 unit 하나만 허용할 때만 첫
-seed로 나온다.
+seed로 나온다. 축 하나만 사용하는 seed도 전체 grid와 같은 수의 unit을 실제로
+채울 수 있을 때만 포함한다.
 
-Reduction 연산은 semantic K 병렬성을 충분히 비교하도록 유효한 각 `p_k` 단계마다
-`p_m*p_n*p_k`가 최대가 되는 `p_m/p_n` 조합을 초기 seed에 포함한다. 따라서
+초기 exploration 후보는 Block/Group/Tile/P를 서로 독립적으로 random sampling하지
+않는다. Block과 Group을 고른 뒤 유효한 `P`와 목표 scheduling round를 먼저 정하고,
+그에 맞는 Tile을 역산한다. Tile은 해당 축의 total Block Group 수를 넘을 수 없고,
+`p_m/p_n/p_k`도 각 축의 execution tile 수를 넘을 수 없다. 초기 후보는
+schedule utilization 50% 이상, padding 50% 이하, 전체 scheduling round 4 이하인
+경우만 실제 측정한다. Reduction 초기 후보는 output contribution이 64개를 넘지
+않도록 제한하며, 이 경계 밖은 LFBO가 측정 결과를 바탕으로 확장한다. 이 초기 안전
+경계들은 `PIMConfigSpace` 또는 `space_overrides`로 바꿀 수 있다.
+
+Reduction 연산은 semantic K 병렬성을 비교하도록 초기 안전 경계 안의 각 `p_k`
+단계마다 `p_m*p_n*p_k`가 최대가 되는 `p_m/p_n` 조합을 seed에 포함한다. 따라서
 적은 DPU를 쓰는 K-only 후보가 아니라, 비슷한 전체 device parallelism을
 유지한 상태에서 `p_k` 변화의 실제 실행 시간을 비교한다. LFBO는 `p_k`와
 `tile_k`를 독립적으로 변경하며, 변경된 조합의 round 수를 위 식으로 다시 계산한다.
@@ -58,7 +68,7 @@ Reduction 연산은 semantic K 병렬성을 충분히 비교하도록 유효한 
 ```text
 PIMProblem
   -> compute op와 pim.place access dependency 분석
-  -> Common IR config seed/random candidate
+  -> Common IR config seed/structured candidate
   -> static constraint
   -> Common IR 값에서 feature 파생
   -> Random Forest LFBO scoring

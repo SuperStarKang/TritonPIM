@@ -233,22 +233,6 @@ struct ConvertPIMToUPMEMPass
     bool hasReduce = false;
     device.walk([&](linalg::ReduceOp) { hasReduce = true; });
 
-    // UPMEM의 tasklet 협력은 Common의 m축 Block Group을 행 단위로 나누는
-    // 구현이다. 실제 m축이 있을 때만 그 크기에 lane divisibility를 적용한다.
-    if (hasM && func->getAttrOfType<pim::BlockGroupAttr>("pim.block_group")) {
-      SmallVector<int64_t, 3> shape = pim::groupShape(func);
-      if (shape.size() != 3) {
-        func->emitError("convert-pim-to-upmem: cannot derive block-group "
-                        "shape from #pim.block and #pim.block_group");
-        return signalPassFailure();
-      }
-      int64_t rows = shape[0];
-      if (rows % lanes != 0) {
-        func->emitError("convert-pim-to-upmem: block-group m extent ")
-            << rows << " is not divisible by " << lanes << " tasklets";
-        return signalPassFailure();
-      }
-    }
     // M축이 없는 K-only reduction은 모든 tasklet이 같은 accumulator를 쓰게 된다.
     // tasklet-local partial과 DPU 내부 combine이 IR에 없는 동안에는 한 tasklet만이
     // Common이 정한 reduction 순서를 그대로 실행할 수 있다.
@@ -1039,8 +1023,6 @@ struct ConvertPIMToUPMEMPass
     OpBuilder b(loop);
     auto fresh = b.create<scf::ForOp>(loop.getLoc(), loop.getLowerBound(),
                                       loop.getUpperBound(), loop.getStep());
-    if (Attribute axis = loop->getAttr("pim.axis"))
-      fresh->setAttr("pim.axis", axis);
     Block *from = loop.getBody(), *to = fresh.getBody();
     loop.getInductionVar().replaceAllUsesWith(fresh.getInductionVar());
     to->getOperations().splice(to->begin(), from->getOperations(), from->begin(),

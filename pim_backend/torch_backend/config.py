@@ -56,11 +56,6 @@ class PIMTorchConfig:
     num_warps: int = 1
     num_stages: int = 1
 
-    # tile이 나누어떨어지지 않는 shape를 허용할까. mask의 extent가 상수면
-    # PIMPlaceDataPass의 isExtentCandidate가 extent 복원에 실패한다. template이
-    # M/N/K를 런타임 인자로 넘기게 된 뒤로는 풀렸을 수 있지만 확인 전이다.
-    allow_masked_tiles: bool = False
-
     # ── Inductor 쪽 안전장치 ──────────────────────────────────────────────
     # 컴파일을 in-process로 묶는다. worker subprocess는 우리 monkeypatch가 없어
     # PIM 분기를 모른다 (runtime_compat 참고).

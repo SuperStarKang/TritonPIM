@@ -238,7 +238,7 @@ def AiMX_AllocOp : AiMX_Op<"alloc"> {
 }
 
 // 원본 버퍼의 strided 영역 마지막 두 축을 PIM DRAM의 2차원 배열로 모은다. 앞축은
-// split-K output plane처럼 독립된 2-D slice를 선택하며 PIM layout에는 들어가지 않는다.
+// 독립된 2-D slice를 선택하며 PIM layout에는 들어가지 않는다.
 // upmem.stage 와 세 가지가 다르다.
 //   1. pitch 를 받는다. descriptor 의 stride 필드가 행 간격을 읽으므로 PIM DRAM 안의
 //      layout 이 pitch 로 규정된 2차원 배열이다 (UPMEM 은 tile-major 연속 배열).

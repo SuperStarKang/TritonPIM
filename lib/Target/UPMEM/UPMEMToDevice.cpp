@@ -130,11 +130,6 @@ struct DeviceEmitter {
       os() << "int32_t " << e.name(op->getResult(0)) << " = me();\n";
       return success();
     }
-    if (isa<upmem::NumTaskletsOp>(op)) {
-      e.indent(depth);
-      os() << "int32_t " << e.name(op->getResult(0)) << " = NR_TASKLETS;\n";
-      return success();
-    }
     if (isa<upmem::BarrierOp>(op)) {
       e.indent(depth);
       os() << "barrier_wait(&pim_barrier);\n";

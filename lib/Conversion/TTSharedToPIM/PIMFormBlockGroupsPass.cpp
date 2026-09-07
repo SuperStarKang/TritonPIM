@@ -256,7 +256,7 @@ struct PIMFormBlockGroupsPass
     // tile tensor 를 group 크기로 다시 적는다. collectLocalTiles 의 owner 사슬이 정확히
     // 다시 적어야 하는 값의 집합이다. load 사슬은 대응 access 의 sizes 가, 누산기 사슬은
     // 그것을 저장하는 access 의 sizes 가 새 shape 이다. 저장 access 의 rank 가 tensor 보다
-    // 크면(split-K 의 출력면 축) 뒤쪽 축만 쓴다.
+    // 크면(pim-recover-access-origin 이 앞에 붙인 크기 1 축) 뒤쪽 축만 쓴다.
     SmallVector<Value> roots;
     llvm::DenseMap<Value, Value> owner;
     pim::collectLocalTiles(func, roots, owner);

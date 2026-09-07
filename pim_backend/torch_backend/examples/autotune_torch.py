@@ -6,21 +6,17 @@
 # 하나마다 torch.compile을 새로 만들어 재고, 그 측정을 autotuner의
 # benchmark_fn으로 넘기면 된다.
 #
-# [왜 examples/autotune_gemm.py로는 부족한가]
-# 그쪽이 재는 것은 examples/split_k.py의 커널을 직접 launch한 것이다. torch
-# 경로가 도는 것은 Inductor template이라 mask가 없고, shape/stride를 런타임
-# 인자로 받고, partial 합이 별도 cpp 커널이다. 재는 대상이 다르므로 그 측정을
-# 그대로 쓸 수 없다. 이 스크립트는 torch 경로 자체를 잰다 — 측정에 PIM launch와
-# CPU partial 합이 모두 들어간다.
+# 이 스크립트는 Inductor wrapper와 layout 처리까지 포함한 Torch 경로 자체를 잰다.
+# 직접 Triton launch의 측정과 objective가 다르므로 같은 cache 파일 안에서도
+# Torch template version으로 별도 context를 사용한다.
 #
 # 실행:
 #   conda activate pim_triton
 #   python autotune_torch.py --m 8192 --n 8192 --k 128      # attention QK
 #   python autotune_torch.py --m 8192 --n 128  --k 8192     # attention P.V
 #
-# cache는 examples/autotune_gemm.py와 같은 파일을 쓴다. 같은 (M,N,K)를 두
-# 경로에서 튜닝하면 나중 것이 이긴다 — 지금은 template을 cache key에 넣지
-# 않기 때문이다.
+# 직접 예제와 cache 파일은 공유할 수 있지만 template version이 context key에
+# 포함되므로 각 경로의 측정과 best는 서로 덮어쓰지 않는다.
 
 import argparse
 import statistics
@@ -32,8 +28,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import torch  # noqa: E402
+import triton.backends.pim.driver as pim_driver  # noqa: E402
 
 from torch_backend import PIMInductorBackend, PIMTorchConfig  # noqa: E402
+from torch_backend.template import TORCH_INT_MM_TEMPLATE_VERSION  # noqa: E402
 from torch_backend._autotuner import (  # noqa: E402
     DEFAULT_CACHE_PATH,
     PIMConfigCache,
@@ -105,18 +103,30 @@ def main():
         # 첫 호출은 compile(TTIR→PIM artifact 빌드 포함)이라 측정에서 뺀다.
         out = compiled(a, b)
         samples = []
+        stage_samples = []
         for _ in range(args.reps):
             start = time.perf_counter_ns()
             out = compiled(a, b)
             samples.append((time.perf_counter_ns() - start) / 1e6)
+            stage_samples.append(tuple(pim_driver.timing))
 
         got = out.index_select(0, rows).index_select(1, cols)
+        timings = tuple(
+            (name, statistics.median(
+                sample[stage] for sample in stage_samples))
+            for stage, name in enumerate(pim_driver.TIMING_STAGES)
+        )
         return PIMBenchmarkResult(
             total_ms=statistics.median(samples),
-            correctness=bool(torch.equal(got, ref_block)))
+            correctness=bool(torch.equal(got, ref_block)),
+            timings=timings,
+        )
 
     space = build_config_space(problem, target)
-    cache = PIMConfigCache(args.cache)
+    cache = PIMConfigCache(
+        args.cache,
+        template_version=TORCH_INT_MM_TEMPLATE_VERSION,
+    )
     budget = SearchBudget(max_generations=args.max_generations,
                           max_benchmarks=args.max_benchmarks,
                           max_autotune_seconds=args.max_seconds)

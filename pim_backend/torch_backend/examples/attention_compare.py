@@ -10,15 +10,21 @@
 # 섞이므로 그대로 비교하면 다른 것을 비교하게 된다.
 #
 # [무엇이 측정에 들어가는가]
-# 우리 쪽 e2e는 compiled(a,b) 한 번이고, 그 안에 partial zero 채우기(CPU),
-# PIM launch, partial 합(CPU)이 모두 들어간다. PIM launch의 단계별 시간은
+# 우리 쪽 e2e는 compiled(a,b) 한 번이고, 그 안에 Inductor wrapper와
+# PIM launch가 들어간다. PIM launch의 단계별 시간은
 # pim_driver.timing이 준다 — 마지막 launch의 것이므로 GEMM 하나짜리 그래프에서만
 # 의미가 있다(그래서 attention 전체가 아니라 GEMM 단위로 잰다).
 #
 # 실행:
 #   python attention_compare.py                       # llama3-70b, seq=8192
 #   python attention_compare.py --seq 2048 --op qk
-#   python attention_compare.py --cache ~/.pim_autotune_cache.json
+#   python attention_compare.py --cache $TRITON_CACHE_DIR/pim_autotune_cache.json
+#   python attention_compare.py --gqa --seq 1024       # 실험 B의 GEMM 모양 (M = G·seq)
+#
+# [--gqa]
+# torch_attention_gqa.py가 KV group 하나의 query head G개를 M축에 쌓으므로
+# 그 GEMM은 m=G·seq다. --gqa는 같은 모양으로 재고, app2 명령의 -m도 함께 바뀐다.
+# 그쪽 run_attention_kernel.py는 head 하나 단위라 이 모양의 직접 대응은 없다.
 
 import argparse
 import sys
@@ -35,6 +41,7 @@ from torch_backend import PIMInductorBackend, PIMTorchConfig  # noqa: E402
 from torch_backend._autotuner import (  # noqa: E402
     PIMConfigCache, PIMProblem, target_spec)
 from torch_backend.execution import resolve_execution  # noqa: E402
+from torch_backend.template import TORCH_INT_MM_TEMPLATE_VERSION  # noqa: E402
 
 # name: (q_heads, kv_heads, head_dim) — run_attention_kernel.py의 표와 같다
 MODELS = {
@@ -106,6 +113,9 @@ def main():
                         help="전체 참조와 대조한다. seq=8192에서는 느리다")
     parser.add_argument("--dry-run", action="store_true",
                         help="실행 계획과 app2 명령만 낸다")
+    parser.add_argument("--gqa", action="store_true",
+                        help="KV group 하나의 query head G개를 M축에 쌓은 모양"
+                             "(M = G·seq)으로 잰다. torch_attention_gqa.py와 같다")
     args = parser.parse_args()
 
     if args.model not in MODELS:
@@ -113,7 +123,10 @@ def main():
     q_heads, kv_heads, head_dim = MODELS[args.model]
     seq = args.seq_len
 
-    cases = [("QK^T", seq, head_dim, seq), ("P.V", seq, seq, head_dim)]
+    # --gqa: KV group 하나의 query head G개를 M축에 쌓는다 (torch_attention_gqa.py).
+    group = q_heads // kv_heads if args.gqa else 1
+    rows = group * seq
+    cases = [("QK^T", rows, head_dim, seq), ("P.V", rows, seq, head_dim)]
     cases = {"qk": cases[:1], "pv": cases[1:], "both": cases}[args.op]
 
     target = target_spec("upmem")
@@ -121,7 +134,11 @@ def main():
                             autotune_cache_path=args.cache)
     print(f"model={args.model} seq={seq} head_dim={head_dim} "
           f"q_heads={q_heads} kv_heads={kv_heads}")
-    print(f"benchmark scope: query head 하나. attention layer 전체 = {q_heads}배")
+    if args.gqa:
+        print(f"benchmark scope: KV group 하나 (query head {group}개를 M축에 쌓음, "
+              f"M={rows}). attention layer 전체 = {kv_heads}배")
+    else:
+        print(f"benchmark scope: query head 하나. attention layer 전체 = {q_heads}배")
     print(f"config source: "
           f"{'autotune cache ' + args.cache if args.cache else 'heuristic seed (성능 숫자 아님)'}")
 
@@ -132,16 +149,18 @@ def main():
         if args.cache:
             # record가 1~2개면 튜닝이 아니라 smoke test 결과다. tune()은 끝까지
             # 돌아야 저장하므로 중단된 탐색은 아무것도 남기지 않는다.
-            measured = len(PIMConfigCache(args.cache).measured_results(
-                problem, target))
+            measured = len(PIMConfigCache(
+                args.cache,
+                template_version=TORCH_INT_MM_TEMPLATE_VERSION,
+            ).measured_results(problem, target))
             note = "  ← 측정이 너무 적다. 튜닝이 끝까지 돌지 않았다" if measured <= 2 else ""
             print(f"  cache: 측정된 config {measured}개{note}")
         p_m = execution.config.p_m
         p_n = execution.config.p_n
         p_k = execution.config.p_k
         print(f"  plan: {execution.describe()}")
-        partial_gib = p_k * m * n * 4 / 2**30
-        print(f"  partial[{p_k},{m},{n}] int32 = {partial_gib:.2f} GiB")
+        output_gib = m * n * 4 / 2**30
+        print(f"  output[{m},{n}] int32 = {output_gib:.2f} GiB")
         print(f"  PIM-LLM 같은 분할:\n    {app2_command(m, k, n, p_m, p_n, p_k, args.reps)}")
 
         if args.dry_run:
@@ -158,7 +177,7 @@ def main():
         print(f"    {'--':9s} {'':>9}")
         print(f"    {'PIM 합':9s} {launch:9.3f} ms")
         print(f"    {'CPU+기타':9s} {e2e - launch:9.3f} ms   "
-              f"(partial zero 채우기 + partial 합 + wrapper)")
+              f"(Inductor wrapper/layout 처리)")
         print(f"    {'e2e':9s} {e2e:9.3f} ms   {gops:8.2f} GOPS")
 
 

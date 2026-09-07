@@ -91,8 +91,6 @@ upmem.device_func @matmul_kernel_i8_device {
 
   // CHECK: %[[T:.*]] = upmem.tasklet_id : index
   %t = upmem.tasklet_id : index
-  // CHECK: %[[NT:.*]] = upmem.num_tasklets : index
-  %nt = upmem.num_tasklets : index
 
   // WRAM 타일 버퍼. 합계 128 + 512 + 1024 = 1664 B.
   // CHECK: memref.alloc() : memref<8x16xi8, #upmem<space wram>>

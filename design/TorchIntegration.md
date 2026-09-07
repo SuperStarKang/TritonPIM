@@ -5,25 +5,28 @@
 ```text
 torch.compile
   -> aten._int_mm lowering
-  -> PIMProblem(M,N,K,compute op,pim.place accesses)
+  -> PIMProblem(M,N,K, compute op, pim.access dependencies)
   -> PIMConfig 선택
-       직접 지정 | offline autotune cache | heuristic seed
-  -> Triton split-K template
+       직접 지정 | Torch offline autotune cache | heuristic seed
+  -> semantic GEMM TritonTemplate
+       source grid = M/N
+       source reduction = complete K
   -> TTShared IR
   -> PIM Common IR
+       Block -> Block Group -> Execution Tile
+       temporal/spatial scheduling
+       pim.place -> pim.combine
   -> UPMEM IR | AiMX IR
   -> target runtime
-  -> p_k partial host sum
+  -> C[M,N]
 ```
 
-Inductor lowering은 fake tensor를 다루므로 실제 측정은 lowering 밖의
-`torch_backend/examples/autotune_torch.py`가 수행한다. 후보마다 `PIMConfig`를
-주입해 새로 compile하고, PIM launch와 partial 합을 포함한 end-to-end 시간을
-autotuner에 돌려준다.
+Torch source에는 `SPLIT_K`, `pid_k`, `partial[p_k,M,N]`가 없다. `p_k`는
+`#pim.device_mapping`에 들어가는 Common scheduling 값이며, `tile_k`와 함께 하나의
+semantic reduction Block Group domain을 분할한다. Target은 Common `pim.combine`이
+명시한 contribution과 최종 destination을 그대로 lowering한다.
 
 ## 공유 값
-
-Torch integration은 별도 실행 plan을 만들지 않는다.
 
 | 값 | 소유자 |
 |---|---|
@@ -31,22 +34,23 @@ Torch integration은 별도 실행 plan을 만들지 않는다.
 | 일곱 common hardware 필드 | `PIMTargetSpec.common_profile` |
 | `nr_tasklets`, `host_threads`, `batch`, `base_fpga` | target runtime config |
 | Block–Group–Execution Tile, `[p_m,p_n,p_k]` | `PIMConfig` |
+| total groups, Execution Tiles, scheduling rounds | `pim_hierarchy()` |
 
-`PIMConfig`는 그대로 backend option으로 이동한다. Execution Tile 원소 extent와
-scheduling round는 `Block × Group × Tile`과 problem shape에서 파생하며 별도 Plan이나
-compiler option으로 저장하지 않는다.
+`PIMConfig`는 보정 없이 backend option으로 이동한다. `block_*`는 template constexpr,
+나머지 계층과 mapping 값은 PIM compiler option이다.
 
-## Config 선택 우선순위
+## Config 선택과 cache
 
 ```text
-PIMTorchConfig(spec=PIMTargetSpec(...))    공유 target profile/runtime
 PIMTorchConfig(config=...)                 직접 지정
 PIMTorchConfig(autotune_cache_path=...)    측정된 best
-PIMTorchConfig()                           기본 Common IR seed
+PIMTorchConfig()                           Common IR heuristic seed
 ```
 
-세 경로 모두 동일한 `ConstraintEngine`과 template support 검사를 통과해야 한다.
-직접 지정하거나 cache에서 읽은 config를 lowering이 보정하지 않는다.
+Torch offline tuner와 production lookup은 같은
+`torch-int-mm-semantic-k-v1` template version을 사용한다. 직접 Triton 예제와 cache
+파일은 공유할 수 있지만 context entry는 분리한다. 같은 `PIMConfig`라도 Torch
+wrapper/layout을 포함한 end-to-end objective와 직접 launch objective가 다르기 때문이다.
 
 ## Backend option
 
@@ -72,16 +76,13 @@ UPMEM: nr_tasklets, host_threads
 AiMX:  batch, base_fpga
 ```
 
-`local_lanes`, `device_axis_partitions`, `capacity_limit_*`, policy 문자열은 사용하지
-않는다.
-
 ## 현재 template 조건
 
 - 2-D CPU `int8` 입력 두 개와 `int32` 출력
 - static M/N/K
-- `K % (p_k * BLOCK_K) == 0`
-- masked tile을 사용하지 않으면 M/N이 BLOCK_M/N으로 나누어떨어짐
-- A/B는 row-major 연속. 아니면 lowering이 contiguous copy를 삽입
+- A/B row-major contiguous; 아니면 lowering이 copy를 삽입
+- M/N/K tail은 masked access와 Common local trip count로 처리
+- template 주변 fusion은 아직 지원하지 않음
 
-각 `p_k` plane 안의 reduction은 target lowering이 수행한다. 서로 다른 PIM Device의
-partial은 torch 그래프가 host에서 합친다.
+`K % (p_k * BLOCK_K) == 0` 조건은 없다. K partition과 round는 source가 아니라
+Common scheduling이 정한다.

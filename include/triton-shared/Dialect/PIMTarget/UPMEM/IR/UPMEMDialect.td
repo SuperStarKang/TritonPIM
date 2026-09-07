@@ -261,13 +261,6 @@ def UPMEM_TaskletIdOp : UPMEM_Op<"tasklet_id", [Pure]> {
   let assemblyFormat = "attr-dict `:` type($result)";
 }
 
-// NR_TASKLETS. 빌드 시점에 -D로 주입되므로 device 코드에서는 상수다.
-def UPMEM_NumTaskletsOp : UPMEM_Op<"num_tasklets", [Pure]> {
-  let summary = "Number of tasklets on this DPU";
-  let results = (outs Index:$result);
-  let assemblyFormat = "attr-dict `:` type($result)";
-}
-
 // barrier_wait. 모든 tasklet이 이 지점에 도달할 때까지 기다린다.
 // 협력 lane plan(lane_axis = "m")에서 공유 WRAM 버퍼의 적재와 소비를
 // 가른다 — 적재 뒤의 barrier는 "전부 실렸다"를, 계산 뒤의 barrier는 "전부 읽었다"를

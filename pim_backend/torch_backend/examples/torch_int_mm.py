@@ -8,8 +8,8 @@
 #   TORCH_LOGS=output_code python torch_int_mm.py
 #     - PIM 커널은 @triton_heuristics.template(...)로 정의되고, 그 triton_meta에
 #       "compile_backend": "pim"과 "backend_options"가 들어 있어야 한다.
-#     - 커널 본문이 split-K 커널(pid_k, K_PER, tl.dot 누산)이어야 한다.
-#     - 그 앞뒤로 cpp_fused_* 커널 두 개(zeros 채우기 / partial 합)가 있어야 한다.
+#     - 커널 본문에 pid_m/pid_n과 전체 semantic K loop가 있어야 한다.
+#     - SPLIT_K, pid_k, K_PER, partial zero/sum CPU kernel이 없어야 한다.
 #
 # FX 그래프를 보려면:
 #   TORCH_LOGS=graph_code python torch_int_mm.py

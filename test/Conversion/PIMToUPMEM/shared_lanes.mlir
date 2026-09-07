@@ -35,8 +35,6 @@
 // CHECK:         upmem.mram_write
 // CHECK:         upmem.barrier
 
-// whole_tile 의 tile 분배(loop 평탄화)는 없다 — 전원이 같은 tile 순서를 돈다.
-// CHECK-NOT:     upmem.num_tasklets
 // lane 복제 버퍼(4x…)도 없다.
 // CHECK-NOT:     memref.alloc() : memref<4x
 

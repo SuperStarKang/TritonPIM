@@ -50,7 +50,7 @@ def _inductor_overrides(config: PIMTorchConfig) -> dict:
 
 
 class PIMInductorBackend:
-    """aten._int_mm만 PIM split-K template로 보내는 Inductor backend."""
+    """Send aten._int_mm to the PIM semantic GEMM template."""
 
     def __init__(self, config: PIMTorchConfig = None):
         self.config = config if config is not None else PIMTorchConfig()

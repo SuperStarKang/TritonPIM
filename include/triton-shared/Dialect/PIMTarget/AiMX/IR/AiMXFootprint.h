@@ -9,9 +9,8 @@ namespace mlir {
 namespace aimx {
 
 // execution tile 하나가 PIM DRAM 에 요구하는 바이트. 설계 문서 §6.2 의 표 그대로다.
-// --convert-pim-to-aimx(예산 재검증)와 공통 --pim-form-execution-tiles(k 상한 탐색)가
-// 같은 식을 써야 하므로 여기 둔다. mT/kT/nT 는 target 실행 눈금에 맞춰 padding한
-// 물리 원소수다.
+// --convert-pim-to-aimx 가 예산을 검증할 때 쓴다. mT/kT/nT 는 target 실행 눈금에
+// 맞춰 padding한 물리 원소수다.
 struct Footprint {
   int64_t paddedK, paddedN;
   int64_t a, arel, b, c, chain;
@@ -30,11 +29,6 @@ struct Footprint {
     };
     return oneAllocation(kPMMSize) + oneAllocation(a) + oneAllocation(arel) +
            oneAllocation(b) + oneAllocation(c) + oneAllocation(chain);
-  }
-
-  // 공통 execution-tile 탐색도 target verifier와 같은 보수적 경계를 쓰기 위한 값.
-  int64_t bankAccountedDeviceBytes() const {
-    return maxBankBytes() * kNumBanks * kNumChannels;
   }
 };
 

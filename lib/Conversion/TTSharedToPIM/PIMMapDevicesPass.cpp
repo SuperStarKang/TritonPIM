@@ -347,7 +347,7 @@ struct PIMMapDevicesPass
           "scheduling boundary");
 
     SmallVector<unsigned> order;
-    StringRef preferred[] = {"n", "k", "m"};
+    StringRef preferred[] = {"n", "m"};
     for (StringRef wanted : preferred)
       for (auto [i, name] : llvm::enumerate(names))
         if (name.getValue() == wanted)
