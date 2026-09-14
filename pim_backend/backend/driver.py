@@ -38,12 +38,15 @@ import triton.backends.triton_shared.driver as cpu_driver
 
 # ── PIM_TIMING (임시): 마지막 launch의 단계별 시간(ms)과 그 단계 이름.
 # 지울 때 이 표시를 찾으면 된다. 두 target의 단계 이름이 다르므로 launch마다 다시 놓는다.
+UPMEM_TIMING_VERSION = 2
 _STAGE_NAMES = {
-    "upmem": ("stage", "h2d", "kernel", "d2h", "combine"),
+    # H2D/D2H: prepare+push. kernel: synchronous dpu_launch only.
+    # host_alloc: receive buffers; input staging allocations remain in stage.
+    "upmem": ("stage", "h2d", "kernel", "d2h", "combine", "host_alloc", "host_free"),
     "aimx": ("alloc", "build", "stage", "invoke", "unstage"),
 }
 TIMING_STAGES = _STAGE_NAMES["upmem"]
-timing = [0.0] * 5
+timing = [0.0] * len(TIMING_STAGES)
 # 마지막 launch의 pim_exec 호출 수. aimx만 낸다(upmem은 0으로 둔다). execution tile 하나의
 # throughput은 invoke 시간을 이 값으로 나눠야 나오는데, host에서 tile 산술을 다시 하면
 # device 분할 규칙이 바뀔 때마다 어긋난다.
@@ -237,6 +240,18 @@ class PIMLauncher(object):
         # host 진입 함수 이름 = metadata.name (compiler가 host.cpp에서 파싱해 채운 값). index 6.
         entry = kernel_metadata[6]
         lib = ctypes.CDLL(so_path)
+        if self.pim_target == "upmem":
+            # Old cached hosts export five timings with different boundaries.
+            # Reject them before launching or reading the expanded timing array.
+            try:
+                timing_version = ctypes.c_uint32.in_dll(lib, "pim_timing_version").value
+            except ValueError:
+                timing_version = None
+            if timing_version != UPMEM_TIMING_VERSION:
+                raise RuntimeError(
+                    f"UPMEM timing version {timing_version!r}; expected {UPMEM_TIMING_VERSION}. "
+                    "Rebuild triton-shared-translate, then regenerate the Triton artifacts "
+                    "(use a fresh TRITON_CACHE_DIR and TORCHINDUCTOR_CACHE_DIR).")
         fn = getattr(lib, entry)
         # 커널 인자를 원래 순서대로, 그 뒤에 grid 크기 셋.
         # grid는 컴파일 캐시 키에 없으므로(jit.py가 캐시를 조회한 뒤 정규화한다) 반드시
@@ -257,7 +272,7 @@ class PIMLauncher(object):
         # 같은 표시를 지운다. 단계 이름은 target마다 다르므로 같이 놓는다.
         global TIMING_STAGES, invokes
         TIMING_STAGES = _STAGE_NAMES[self.pim_target]
-        timing[:] = list((ctypes.c_double * 5).in_dll(lib, "pim_timing_ms"))
+        timing[:] = list((ctypes.c_double * len(TIMING_STAGES)).in_dll(lib, "pim_timing_ms"))
         # 이 전역은 AiMXToRuntimeStub.cpp만 낸다. upmem .so에서 in_dll을 부르면
         # ValueError로 launch 자체가 실패하므로 target을 보고 부른다.
         invokes = (ctypes.c_uint64.in_dll(lib, "pim_invoke_count").value

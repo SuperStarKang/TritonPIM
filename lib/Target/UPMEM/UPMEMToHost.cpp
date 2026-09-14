@@ -37,27 +37,41 @@ struct HostEmitter {
 
   // ── PIM_TIMING (임시) ────────────────────────────────────────────────────────
   // 어느 단계가 오래 걸리는지 보려고 넣은 계측이다. 성능 판단이 끝나면 지운다.
-  // 지우려면 PIM_TIMING 표시가 붙은 곳(이 블록, emitTimingPreamble, mark 호출 5곳)과
+  // 지우려면 PIM_TIMING 표시가 붙은 곳(이 블록과 start/stop 호출들)과
   // driver.py의 같은 표시를 지우면 된다. 생성되는 계산 코드에는 영향이 없다.
   void emitTimingPreamble() {
     os() << "// PIM_TIMING: 단계별 시간(ms). launcher가 이름으로 읽어 간다.\n"
+         << "// v2: stage, h2d, kernel, d2h, combine, host_alloc, host_free.\n"
+         << "// Match PGEMM: transfers include prepare+push; kernel is synchronous launch.\n"
          << "#include <time.h>\n"
-         << "extern \"C\" double pim_timing_ms[5];\n"
-         << "double pim_timing_ms[5];\n"
-         << "static double _pim_now() {\n"
+         << "extern \"C\" uint32_t pim_timing_version;\n"
+         << "uint32_t pim_timing_version = 2;\n"
+         << "extern \"C\" double pim_timing_ms[7];\n"
+         << "double pim_timing_ms[7];\n"
+         << "static uint64_t _pim_now_ns() {\n"
          << "  struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);\n"
-         << "  return ts.tv_sec * 1e3 + ts.tv_nsec * 1e-6;\n"
+         << "  return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;\n"
          << "}\n"
-         << "static double _pim_last;\n"
-         // round 가 있으면 단계가 반복되므로 덮어쓰지 않고 누적한다. 진입 시 0 이다.
-         << "static void _pim_mark(int slot) {\n"
-         << "  double t = _pim_now(); pim_timing_ms[slot] += t - _pim_last; _pim_last = t;\n"
+         << "static uint64_t _pim_started_ns[7];\n"
+         // 독립된 구간만 잰다. 단계 사이의 malloc/free가 전송이나 kernel로 넘어가지 않는다.
+         // scheduling round마다 시작 시각만 바꾸고, 시간은 host 진입 때 한 번만 초기화한다.
+         << "static void _pim_start(int slot) {\n"
+         << "  _pim_started_ns[slot] = _pim_now_ns();\n"
+         << "}\n"
+         << "static void _pim_stop(int slot) {\n"
+         << "  uint64_t elapsed_ns = _pim_now_ns() - _pim_started_ns[slot];\n"
+         << "  pim_timing_ms[slot] += (double)elapsed_ns / 1e6;\n"
          << "}\n\n";
   }
 
-  void mark(int slot, unsigned depth) {
+  void startTimer(int slot, unsigned depth) {
     e.indent(depth);
-    os() << "_pim_mark(" << slot << ");  // PIM_TIMING\n";
+    os() << "_pim_start(" << slot << ");  // PIM_TIMING\n";
+  }
+
+  void stopTimer(int slot, unsigned depth) {
+    e.indent(depth);
+    os() << "_pim_stop(" << slot << ");  // PIM_TIMING\n";
   }
   // ── PIM_TIMING 끝 ───────────────────────────────────────────────────────────
 
@@ -118,7 +132,6 @@ struct HostEmitter {
     os() << ") {\n";
     os() << "  struct dpu_set_t _set, _dpu;\n  uint32_t _idx;\n";
     os() << "  memset(pim_timing_ms, 0, sizeof pim_timing_ms);  // PIM_TIMING\n";
-    os() << "  _pim_last = _pim_now();  // PIM_TIMING\n";
     if (failed(emitBlock(host.getBody().front(), 1)))
       return failure();
     os() << "}\n";
@@ -138,14 +151,17 @@ struct HostEmitter {
 
     if (auto acq = dyn_cast<upmem::AcquireOp>(op)) {
       e.bind(acq.getResult(), "_set");
+      startTimer(0, depth);  // PIM_TIMING: runtime 확보/적재는 host 준비 비용
       e.indent(depth);
       os() << "_set = upmem_acquire(" << acq.getNumUnits() << ", DPU_BINARY);\n";
+      stopTimer(0, depth);
       return success();
     }
     if (isa<upmem::LaunchOp>(op)) {
+      startTimer(2, depth);  // PIM_TIMING: PGEMM timer[2]와 같은 동기식 launch 구간
       e.indent(depth);
       os() << "DPU_ASSERT(dpu_launch(_set, DPU_SYNCHRONOUS));\n";
-      mark(2, depth);  // PIM_TIMING: 유닛 실행
+      stopTimer(2, depth);
       return success();
     }
     // round(시간 창) loop. 값을 나르지 않는 단순 반복만 다룬다.
@@ -199,6 +215,7 @@ struct HostEmitter {
     for (int64_t c : counts)
       units *= c;
     Block &body = fe.getBody().front();
+    startTimer(0, depth);  // PIM_TIMING: 입력 버퍼 할당/패킹과 유닛별 인자 준비
 
     // staging 버퍼 목록. 서로 다른 조합의 개수만큼 잡는다(dedup_over 축은 뺀다).
     // 준비 loop 앞에서 잡아야 한다 — 같은 .so가 다른 크기로 다시 불릴 수 있으므로
@@ -281,9 +298,11 @@ struct HostEmitter {
     }
     e.indent(depth);
     os() << "}\n";
-    mark(0, depth);  // PIM_TIMING: 여기까지가 영역 모으기
+    stopTimer(0, depth);
 
     // 전송: 버퍼마다 DPU_FOREACH로 준비하고 집합 단위로 민다.
+    // PGEMM timer[1]처럼 행렬과 메타데이터의 prepare+push 전체를 잰다.
+    startTimer(1, depth);
     for (const Xfer &x : xfers) {
       e.indent(depth);
       os() << "_idx = 0;\n";
@@ -294,7 +313,9 @@ struct HostEmitter {
       os() << "DPU_ASSERT(dpu_push_xfer(_set, DPU_XFER_TO_DPU, \"" << x.symbol
            << "\", 0, " << x.bytes << ", DPU_XFER_DEFAULT));\n";
     }
+    stopTimer(1, depth);  // PIM_TIMING: 버퍼 해제 전에 H2D 종료
     // 전송이 끝났으므로 staging 버퍼를 놓는다(dpu_push_xfer는 동기다).
+    startTimer(6, depth);
     for (auto &[id, distinct] : stageBuffers) {
       e.indent(depth);
       os() << "for (int64_t _i = 0; _i < " << distinct << "; ++_i) free(" << id
@@ -307,7 +328,7 @@ struct HostEmitter {
         e.indent(depth);
         os() << "free(" << x.array << ");\n";
       }
-    mark(1, depth);  // PIM_TIMING: 여기까지가 유닛으로 보내기
+    stopTimer(6, depth);  // PIM_TIMING: 해제 비용은 H2D/kernel에 포함하지 않는다
     return success();
   }
 
@@ -447,6 +468,7 @@ struct HostEmitter {
     int64_t units = rt.getShape()[0];
     std::string ct = CEmitter::scalarType(rt.getElementType(), true);
     std::string arr = e.name(g.getResult());
+    startTimer(5, depth);  // PIM_TIMING: 수신 버퍼 할당을 D2H와 분리
     e.indent(depth);
     os() << "int64_t " << arr << "_bytes = (";
     for (auto [d, c] : llvm::enumerate(g.getCapacity()))
@@ -458,6 +480,8 @@ struct HostEmitter {
     e.indent(depth);
     os() << "for (int64_t _u = 0; _u < " << units << "; ++_u) " << arr
          << "[_u] = (" << ct << "*)malloc(" << arr << "_bytes);\n";
+    stopTimer(5, depth);
+    startTimer(3, depth);  // PIM_TIMING: PGEMM timer[3]와 같은 prepare+push 구간
     e.indent(depth);
     os() << "_idx = 0;\n";
     e.indent(depth);
@@ -467,7 +491,7 @@ struct HostEmitter {
     os() << "DPU_ASSERT(dpu_push_xfer(_set, DPU_XFER_FROM_DPU, \""
          << g.getSrc() << "\", 0, " << arr
          << "_bytes, DPU_XFER_DEFAULT));\n";
-    mark(3, depth);  // PIM_TIMING: 유닛에서 회수
+    stopTimer(3, depth);
     return success();
   }
 
@@ -483,6 +507,7 @@ struct HostEmitter {
     std::string ct = CEmitter::scalarType(rt.getElementType(), true);
     std::string part = e.name(body.getArgument(0));
 
+    startTimer(4, depth);  // PIM_TIMING: 부분합 결합과 출력 배치 복원
     e.indent(depth);
     os() << "for (int64_t _g = 0; _g < " << groups << "; ++_g) {\n";
     emitCoords(counts, body, 1, depth + 1, "_g");
@@ -501,13 +526,15 @@ struct HostEmitter {
     }
     e.indent(depth);
     os() << "}\n";
+    stopTimer(4, depth);
     // 되돌리기가 끝났으므로 회수 버퍼를 놓는다.
+    startTimer(6, depth);
     e.indent(depth);
     os() << "for (int64_t _u = 0; _u < " << rt.getShape()[0] << "; ++_u) free("
          << parts << "[_u]);\n";
     e.indent(depth);
     os() << "free(" << parts << ");\n";
-    mark(4, depth);  // PIM_TIMING: 부분합 결합과 되돌리기
+    stopTimer(6, depth);
     return success();
   }
 

@@ -11,9 +11,15 @@ upmem.host_var @pitch_a : index
 // ── host ────────────────────────────────────────────────────────────────────
 // 런타임 헤더는 UPMEM target의 것이고, driver가 -I로 잡아 주는 이름과 같아야 한다.
 // HOST: #include "upmem_runtime.h"
+// HOST: uint32_t pim_timing_version = 2;
+// HOST: double pim_timing_ms[7];
 // HOST: extern "C" void kernel(int8_t* a0, int32_t* a1, int64_t a2, int64_t a3)
+// HOST: memset(pim_timing_ms, 0, sizeof pim_timing_ms);
 // 확보와 적재는 런타임이 한 번만 한다.
+// HOST: _pim_start(0);
 // HOST: _set = upmem_acquire(4, DPU_BINARY);
+// HOST-NEXT: _pim_stop(0);
+// HOST-NEXT: _pim_start(0);
 // staging: dedup 축을 뺀 조합마다 한 번씩만 만들고, 남는 자리는 0이다.
 // HOST: calloc(2, sizeof(int8_t*))
 // 유닛 좌표는 선형 번호에서 자리값으로 푼다.
@@ -24,13 +30,39 @@ upmem.host_var @pitch_a : index
 // HOST: if (_t0 * 8 + _e0 < {{.*}} && _t1 * 16 + _e1 < {{.*}})
 // MRAM 심볼과 host staging은 같은 fixed-slot 크기이며 전송 직전에도 상한을 확인한다.
 // HOST: if ({{.*}}_bytes > 4096) {
+// H2D는 PGEMM과 같이 행렬+메타데이터의 prepare/push만 잰다.
+// HOST: _pim_stop(0);
+// HOST-NEXT: _pim_start(1);
 // HOST: dpu_prepare_xfer
 // HOST: dpu_push_xfer(_set, DPU_XFER_TO_DPU, "A_mram"
 // HOST: dpu_push_xfer(_set, DPU_XFER_TO_DPU, "tiles_x"
-// HOST: dpu_launch(_set, DPU_SYNCHRONOUS)
+// HOST-NEXT: _pim_stop(1);
+// HOST-NEXT: _pim_start(6);
+// HOST: for (int64_t _i = 0; _i < 2; ++_i) free(_s0[_i]);
+// HOST-NEXT: free(_s0);
+// HOST-NEXT: free(_p0);
+// HOST-NEXT: _pim_stop(6);
+// 해제 비용이 kernel 타이머로 넘어가면 안 된다.
+// HOST-NEXT: _pim_start(2);
+// HOST-NEXT: DPU_ASSERT(dpu_launch(_set, DPU_SYNCHRONOUS));
+// HOST-NEXT: _pim_stop(2);
+// 수신 버퍼 할당은 D2H 시작 전에 끝낸다.
+// HOST-NEXT: _pim_start(5);
+// HOST: malloc(4 * sizeof(int32_t*));
+// HOST: for (int64_t _u = 0; _u < 4; ++_u) {{.*}}malloc(
+// HOST-NEXT: _pim_stop(5);
+// HOST-NEXT: _pim_start(3);
+// HOST: dpu_prepare_xfer
 // HOST: dpu_push_xfer(_set, DPU_XFER_FROM_DPU, "C_mram"
+// HOST-NEXT: _pim_stop(3);
+// HOST-NEXT: _pim_start(4);
 // device마다 자기 버퍼를 원본으로 되돌린다.
 // HOST: for (int64_t _g = 0; _g < 4; ++_g)
+// HOST: _pim_stop(4);
+// HOST-NEXT: _pim_start(6);
+// HOST-NEXT: for (int64_t _u = 0; _u < 4; ++_u) free(
+// HOST-NEXT: free(
+// HOST-NEXT: _pim_stop(6);
 func.func @kernel(%A: memref<*xi8>, %C: memref<*xi32>, %lda: index, %ldc: index) {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index

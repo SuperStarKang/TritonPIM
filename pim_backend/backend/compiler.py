@@ -424,7 +424,8 @@ class PIMBackend(BaseBackend):
 
     @functools.lru_cache()
     def hash(self):
-        return f"{self.target}-pim-common-ir-v1"
+        # Regenerate cached hosts after the UPMEM timing ABI/boundary change.
+        return f"{self.target}-pim-common-ir-v1-upmem-timing-v2"
 
     def get_module_map(self) -> Dict[str, ModuleType]:
         return {}
