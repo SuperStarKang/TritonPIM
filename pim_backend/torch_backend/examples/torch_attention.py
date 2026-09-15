@@ -51,6 +51,53 @@ def attention_group_inductor(q, k, v, causal_mask, head_dim):
     return output, scores, pq, row_scale
 
 
+def print_attention_report(q, k, v, results):
+    """Print logical operations after the four returned outputs pass validation."""
+    output, scores, pq, row_scale = results
+
+    def shape(dims):
+        return "[" + ",".join(map(str, dims)) + "]"
+
+    def dtype(tensor):
+        return str(tensor.dtype).removeprefix("torch.")
+
+    q_shape, k_shape, v_shape = (shape(t.shape) for t in (q, k, v))
+    kt_shape = shape((k.shape[1], k.shape[0]))
+    scores_shape = shape(scores.shape)
+    float_dtype = dtype(row_scale)
+    rows = [
+        ["Transpose + contiguous", f"{k_shape} -> {kt_shape}",
+         "CPU", dtype(k), "-"],
+        ["QK^T (_int_mm)", f"{q_shape} @ {kt_shape} -> {scores_shape}",
+         "PIM", f"{dtype(q)} @ {dtype(k)} -> {dtype(scores)}", "PASS (scores)"],
+        ["Scale + cast", scores_shape,
+         "CPU", f"{dtype(scores)} -> {float_dtype}", "-"],
+        ["Mask", scores_shape, "CPU", float_dtype, "-"],
+        ["Softmax", scores_shape, "CPU", float_dtype, "-"],
+        ["Row max (amax)", f"{scores_shape} -> {shape(row_scale.shape)}",
+         "CPU", float_dtype, "PASS (row_scale)"],
+        ["Quantize", f"{scores_shape} -> {shape(pq.shape)}",
+         "CPU", f"{float_dtype} -> {dtype(pq)}", "PASS (pq)"],
+        ["PV (_int_mm)", f"{shape(pq.shape)} @ {v_shape} -> {shape(output.shape)}",
+         "PIM", f"{dtype(pq)} @ {dtype(v)} -> {dtype(output)}", "PASS (output)"],
+    ]
+    headers = ["operator", "shape", "where", "dtype", "check"]
+    widths = [max(len(header), *(len(row[i]) for row in rows))
+              for i, header in enumerate(headers)]
+
+    def line(cells):
+        return " | ".join(cell.ljust(width) for cell, width in zip(cells, widths))
+
+    print(f"\nAttention: seq={q.shape[0]}, kv={k.shape[0]}, head_dim={q.shape[1]}")
+    print(line(headers))
+    print("-+-".join("-" * width for width in widths))
+    for row in rows:
+        print(line(row))
+    print("\nChecks: 4/4 returned tensors PASS; '-' = intermediate not checked separately.")
+    print("Rows show logical operations; CPU operations may be fused into shared kernels.")
+    print("OK")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seq", type=int, default=256)       # M
@@ -82,13 +129,12 @@ def main():
     got = compiled(q, k, v, causal_mask, args.head_dim)
     ref = attention_group_inductor(q, k, v, causal_mask, args.head_dim)
 
-    for name, a, b in zip(("output", "scores", "pq", "row_scale"), got, ref):
+    for a, b in zip(got, ref):
         if a.dtype.is_floating_point:
             torch.testing.assert_close(a, b)
         else:
             torch.testing.assert_close(a, b, rtol=0, atol=0)
-        print(f"{name:9s} ok  {tuple(a.shape)} {a.dtype}")
-    print("OK")
+    print_attention_report(q, k, v, got)
 
 
 if __name__ == "__main__":
