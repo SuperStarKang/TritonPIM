@@ -14,6 +14,7 @@
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Twine.h"
@@ -160,6 +161,7 @@ struct ConvertPIMToUPMEMPass
       op->removeAttr("pim.device_origin");
       op->removeAttr("pim.temporal_reduction");
       op->removeAttr("pim.scheduling_axis");
+      op->removeAttr("pim.min_trip_count");
     });
   }
 
@@ -193,6 +195,8 @@ struct ConvertPIMToUPMEMPass
     MLIRContext *ctx = &getContext();
     Location loc = device.getLoc();
     Block *deviceBody = &device.getBody().front();
+    if (reuseStaging)
+      module->setAttr("upmem.reuse_staging", UnitAttr::get(ctx));
 
     int64_t lanes = nrTasklets == 0 ? profile.getLanesPerCore() : nrTasklets;
     // ── 입력 모으기 ────────────────────────────────────────────────────────
@@ -302,9 +306,22 @@ struct ConvertPIMToUPMEMPass
     if (temporalLoop) {
       temporalOrigin = deviceOrigin(temporalLoop);
       if (!temporalOrigin) {
-        temporalLoop->emitError("convert-pim-to-upmem: Common temporal "
-                                "reduction has no pim.device_origin");
-        return signalPassFailure();
+        // Singleton input reuse can leave the K origin dead. A remaining
+        // K-dependent access still requires the original in-loop marker.
+        bool needsOrigin = false;
+        SmallVector<scf::ForOp> kLoop{temporalLoop};
+        device.walk([&](pim::AccessOp access) {
+          for (Value origin : access.getOrigin()) {
+            llvm::SmallPtrSet<Operation *, 4> drivers;
+            pim::collectDrivers(origin, kLoop, drivers);
+            needsOrigin |= !drivers.empty();
+          }
+        });
+        if (needsOrigin) {
+          temporalLoop->emitError("convert-pim-to-upmem: Common temporal "
+                                  "reduction has no pim.device_origin");
+          return signalPassFailure();
+        }
       }
     }
 
@@ -422,6 +439,58 @@ struct ConvertPIMToUPMEMPass
     }
 
     // ── device: loop nest를 옮기고 device 로컬로 만든다 ────────────────────
+    // A reused input may no longer depend on a local loop IV. In particular,
+    // canonicalization folds (global K start + singleton IV 0) to global K
+    // start, erasing device_origin. Localize it explicitly using the placement
+    // that was staged at MRAM offset zero, before rebasing the remaining loops.
+    device.walk([&](pim::AccessOp access) {
+      if (!access->hasAttr("pim.reused_input"))
+        return;
+      pim::PlaceOp placement;
+      for (pim::PlaceOp input : inputs)
+        if (input.getAccess() == access.getId())
+          placement = input;
+      if (!placement)
+        return;
+      OpBuilder b(access);
+      llvm::DenseMap<Value, Value> copied;
+      std::function<Value(Value)> copyGlobal = [&](Value value) -> Value {
+        if (Value found = copied.lookup(value))
+          return found;
+        Operation *def = value.getDefiningOp();
+        if (!def || !device->isAncestor(def) || def->getNumRegions() ||
+            !isMemoryEffectFree(def))
+          return value;
+        IRMapping map;
+        for (Value operand : def->getOperands())
+          map.map(operand, copyGlobal(operand));
+        Operation *copy = b.clone(*def, map);
+        // Preserve the global expression until placement.start is subtracted.
+        copy->removeAttr("pim.device_origin");
+        for (auto [oldValue, newValue] :
+             llvm::zip(def->getResults(), copy->getResults()))
+          copied[oldValue] = newValue;
+        return copied.lookup(value);
+      };
+      SmallVector<Value> origins;
+      Value offset = b.create<arith::ConstantIndexOp>(loc, 0);
+      for (auto [d, origin] : llvm::enumerate(access.getOrigin())) {
+        Value global = copyGlobal(origin);
+        Value start = copyGlobal(placement.getStart()[d]);
+        Value local;
+        if (global == start)
+          local = b.create<arith::ConstantIndexOp>(loc, 0);
+        else
+          local = b.create<arith::SubIOp>(loc, global, start);
+        origins.push_back(local);
+        Value term = b.create<arith::MulIOp>(loc, local, access.getStrides()[d]);
+        offset = b.create<arith::AddIOp>(loc, offset, term);
+      }
+      access.getOriginMutable().assign(origins);
+      access.getOffsetMutable().assign(offset);
+      access->removeAttr("pim.reused_input");
+    });
+
     auto devName = StringAttr::get(ctx, (base + "_device").str());
     auto dev = mb.create<upmem::DeviceFuncOp>(loc, devName);
     // 실제로 쓰는 tasklet 수. launcher가 이 값을 -DNR_TASKLETS로 쓴다.
@@ -442,6 +511,14 @@ struct ConvertPIMToUPMEMPass
         return;
       for (Value operand : op->getOperands())
         requireValue(operand);
+      // Common input reuse may put access/load definitions before the outer
+      // loop. Region captures are not operands of scf.for itself, but these
+      // tensor/access producers still belong to the device compute slice.
+      for (Region &region : op->getRegions())
+        region.walk([&](Operation *nested) {
+          for (Value operand : nested->getOperands())
+            requireValue(operand);
+        });
     };
     // index/integer 값은 device 분배와 host staging도 함께 사용한다. 이 정의를
     // 이동하면 host IR에 dangling SSA use가 생긴다. scalar control 값은 제자리에
@@ -497,7 +574,6 @@ struct ConvertPIMToUPMEMPass
       temporalOrigin.getLhsMutable().assign(
           db.create<arith::ConstantOp>(loc, db.getIntegerAttr(t, 0)).getResult());
     }
-
     // ── host: func 몸체를 UPMEM 호출로 바꾼다 ──────────────────────────────
     func->setAttr("upmem.host_threads", mb.getI64IntegerAttr(hostThreads));
     // 같은 PIM Device set은 모든 scheduling round에서 재사용한다. acquire를 공통

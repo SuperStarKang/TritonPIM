@@ -18,7 +18,7 @@
 // CHECK-SAME: allocation_shape[%{{.*}}]
 // CHECK: scf.for {{.*}} iter_args(%{{.*}} = %[[INIT]]) -> (tensor<1xi32>)
 // CHECK: linalg.reduce
-// CHECK: } {pim.reduction = "add", pim.temporal_reduction}
+// CHECK: } {pim.min_trip_count = 1 : i64, pim.reduction = "add", pim.temporal_reduction}
 // partial과 최종 logical output access가 명시적으로 연결된다.
 // CHECK: pim.combine {{.*}} into {{.*}} kind "add"
 // CHECK: } {pim.scheduling_axis = "reduction_k"}

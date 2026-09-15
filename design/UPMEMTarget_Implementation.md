@@ -44,8 +44,8 @@ PIM Common IR (pim.device + pim.place + pim.combine)
    ▼
 UPMEM IR (upmem.* + scf/memref/linalg)
    │
-   ├ triton-shared-translate --upmem-to-host    결정: 없음 (IR → C++)
-   ├ triton-shared-translate --upmem-to-device  결정: 없음 (IR → C)
+   ├ triton-shared-translate --upmem-to-host    IR → C++, 메타데이터 통합 전송
+   ├ triton-shared-translate --upmem-to-device  IR → C, 동일 메타데이터 ABI
    ▼
 {"host": host.cpp, "device": device.c}          JSON 번들 (binary_ext = pimobj)
    │
@@ -54,9 +54,10 @@ UPMEM IR (upmem.* + scf/memref/linalg)
 device.elf + host.so
 ```
 
-변환은 `--convert-pim-to-upmem` 하나가 다 한다. codegen 두 단계는 IR을 그대로 옮기며
-아무것도 정하지 않는다 — op의 파라미터가 나올 코드를 유일하게 정해야 하고, codegen이
-스스로 정하는 것이 있으면 그 결정은 IR에 없는 것이다.
+연산 배치와 메모리 접근의 변환은 `--convert-pim-to-upmem`이 담당한다. codegen은
+이 결정을 유지하면서 C/C++로 옮긴다. 메타데이터의 물리적인 구조체 배치와 전송
+묶음은 두 번역기가 공유하는 고정 ABI 규칙으로 정한다. 이는 Common의 scheduling이나
+데이터 재사용 판단을 변경하지 않는 Target 전송 구현이다.
 
 ### 2.2 실행
 
@@ -96,7 +97,7 @@ dpu_push_xfer(FROM_DPU)          출력 버퍼를 집합 전체에서 회수    
 | op | device C | host C++ |
 | --- | --- | --- |
 | `upmem.mram` | `__mram_noinit T sym[N];` | `dpu_push_xfer`의 심볼 이름 |
-| `upmem.host_var` | `__host T sym;` | `dpu_broadcast_to` / `dpu_push_xfer`의 심볼 이름 |
+| `upmem.host_var` | `__host struct _pim_metadata_t`의 필드 | DPU별 메타데이터 구조체의 필드 |
 
 `upmem.mram`의 크기는 유닛이 받는 최대 영역이다. 실제 배정량(capacity)이 런타임
 값이고 `__mram_noinit`은 상수 크기를 요구하므로, **유닛 메모리를 버퍼 수로 나눈
@@ -110,12 +111,60 @@ dpu_push_xfer(FROM_DPU)          출력 버퍼를 집합 전체에서 회수    
 | `upmem.foreach_unit` | 유닛 좌표 loop (준비) + `DPU_FOREACH` (전송) |
 | `upmem.stage` | 원본의 strided 영역 → 타일 단위 연속 버퍼 |
 | `upmem.to_mram` | `dpu_prepare_xfer` + `dpu_push_xfer(TO_DPU)` |
-| `upmem.to_host_var` | 유닛마다 다른 스칼라를 그 DPU에 |
+| `upmem.to_host_var` | 유닛별 구조체 필드 대입 후 메타데이터 통합 전송 |
 | `upmem.broadcast` | `dpu_broadcast_to` — 모든 DPU에 같은 값 |
 | `upmem.launch` | `dpu_launch(SYNCHRONOUS)` |
 | `upmem.gather` | `dpu_push_xfer(FROM_DPU)` — 집합 전체에서 한 번에 |
 | `upmem.foreach_group` | 결합 축만 다른 유닛들을 묶어 먼저 합친다 |
 | `upmem.unstage` | `stage`의 반대 |
+
+**메타데이터 통합 전송.** Common IR과 UPMEM IR의 개별 스칼라 표현은 유지한다.
+`MetadataLayout.h`가 모듈의 `upmem.host_var` 선언 순서로 공통 구조체 배치를 정하고,
+host/device 번역기가 같은 정의를 생성한다. `index`의 전송 타입은 기존처럼
+`int32_t`이고, 나머지 스칼라도 기존 device 타입을 유지한다. 명시적인 padding과
+8바이트 구조체 정렬을 사용하며, 생성 소스에 필드 offset/크기와 전체 크기에 대한
+컴파일 시점 확인을 넣는다.
+
+host는 기존의 스칼라별 스택 배열 대신 DPU별 구조체 배열을 준비하고, 각
+`to_host_var`를 해당 필드에 대입한다. 일반적인 PIM lowering처럼 모든 필드를
+채우면 `foreach_unit`당 메타데이터용 `DPU_FOREACH`와 `dpu_push_xfer`를 한 번만
+생성한다. DPU별 값은 달라도 된다. 일부 필드만 갱신하는 IR에서는 갱신되는 연속
+필드 구간만 묶어 전송하여 나머지 필드를 덮어쓰지 않는다. 메타데이터가 없는
+`foreach_unit`에는 메타데이터 배열이나 전송을 만들지 않는다.
+
+구조체 준비는 `stage`, prepare/push는 `h2d`에 집계한다. 입력 행렬의 staging과
+전송량에는 변화가 없다. 이 변경은 단일 round의 전송 호출 비용을 줄이는 UPMEM
+Target 최적화이며, round 사이의 데이터 유지나 전송 생략은 포함하지 않는다.
+
+**선택적인 입력 버퍼 재사용.** 커널 launch 옵션 `upmem_reuse_staging`으로
+설정한다. 기본값은 `False`이며 기존 경로와 비교할 수 있다.
+
+| Python 옵션 | UPMEM pass 옵션 | 효과 |
+| --- | --- | --- |
+| `upmem_reuse_staging` | `reuse-staging` | 입력 staging 버퍼, dedup 포인터 표, 전송 포인터 배열의 할당 용량을 보관 |
+
+재사용 모드의 workspace는 생성 host artifact와 host thread별로 존재한다. 고유한
+staging slot마다 포인터와 확보 용량을 보관하고 부족할 때만 확장한다. 다음 round나
+호출에서 원본 포인터 또는 유효 크기가 달라져도 입력은 다시 패킹한다. dedup 목록은
+매번 비우며 데이터 slot도 0으로 채워, 유효 영역이 줄었을 때 이전 데이터가 padding에
+남지 않게 한다. D2H 수신 버퍼는 이 캐시의 대상이 아니다. 캐시 메모리는 workspace의
+수명이 끝날 때 해제되며, 서로 다른 artifact의 캐시는 별개로 유지된다. 이는 입력
+데이터의 불변성을 가정하는 캐시가 아니라 할당 공간의 재사용이다.
+
+slot 번호는 host 코드 생성 시 staging 연산과 dedup 좌표에 대해 정한다. 원본
+포인터를 캐시 키로 사용하지 않는다. 동일 artifact/thread에서 필요한 용량이 같으면
+첫 할당 이후 같은 공간을 계속 사용하며, 더 작은 요청에도 용량을 줄이지 않는다.
+최초 사용이나 용량 증가 시에만 `realloc`을 호출한다.
+
+재사용 모드도 매 round마다 전체 staging 영역을 `memset`한 뒤 유효 영역을
+패킹한다. padding만 초기화하는 구현은 아니다. 동일 입력을 공유하는 DPU에는
+그 round에 한 번 패킹한 버퍼 포인터를 배정하며, 이 dedup은 기존 경로에도 있다.
+A, B, 메타데이터를 모두 보내는 일반적인 GEMM에서는 H2D push가 각각 한 번씩
+발생한다. 원본에서 staging으로의 복사와 H2D 전송량은 재사용 옵션으로 줄지 않는다.
+
+입력 공간 확보·초기화·패킹은 `stage`, prepare/push는 `h2d`에 포함된다. 재사용
+모드에서는 입력 버퍼의 매번 해제만 없어지며, 출력 수신 버퍼 해제는 `host_free`에
+남는다. 메타데이터 구조체 배열은 매 round 스택에서 준비하며 workspace에 넣지 않는다.
 
 **`acquire`가 확보와 적재를 함께 하는 이유.** 둘 다 커널을 부를 때마다 다시 할 일이
 아니다. `dpu_alloc`은 수백 ms, `dpu_load`는 수십 ms가 드는데 둘 다 데이터와 무관하다.
@@ -151,7 +200,7 @@ upmem.stage %A origin[%r, %c] sizes[%m, %n] strides[%lda, %c1]
 | `upmem.device_func` | `int main()` |
 | `upmem.tasklet_id` | `me()` |
 | `upmem.num_tasklets` | `NR_TASKLETS` |
-| `upmem.get_host_var` | 전역 변수 참조 |
+| `upmem.get_host_var` | 전역 메타데이터 구조체 필드 참조 |
 | `upmem.barrier` | `barrier_wait(&_barrier)` |
 | `upmem.mram_read` | `mram_read(...)` |
 | `upmem.mram_write` | `mram_write(...)` |

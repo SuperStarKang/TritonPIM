@@ -15,7 +15,7 @@ _PIM_BACKEND_DIR = str(Path(__file__).resolve().parent.parent)
 if _PIM_BACKEND_DIR not in sys.path:
     sys.path.insert(0, _PIM_BACKEND_DIR)
 
-from autotuner import (  # noqa: E402
+from autotuner import (
     ConstraintEngine,
     PIMConfig,
     PIMConfigCache,
@@ -27,7 +27,7 @@ from autotuner import (  # noqa: E402
     pim_hierarchy,
     target_spec,
 )
-from autotuner.decorator import (  # noqa: E402
+from autotuner.decorator import (
     DEFAULT_CACHE_PATH,
     pim_launch_options,
 )

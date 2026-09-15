@@ -86,7 +86,7 @@ def UPMEM_MRAMOp : UPMEM_Op<"mram", [Symbol]> {
   let hasVerifier = 1;
 }
 
-// host가 값을 넣어 주는 device 스칼라(__host). device가 실제로 도는 횟수, MRAM 안의 축
+// host가 값을 넣어 주는 device 스칼라(__host 구조체 필드). device가 실제로 도는 횟수, MRAM 안의 축
 // 간격, 커널 인자에서 나오는 loop 상한 등 device가 알아야 하는 수가 여기로 온다.
 def UPMEM_HostVarOp : UPMEM_Op<"host_var", [Symbol]> {
   let summary = "Device scalar the host writes before launch";
@@ -167,9 +167,8 @@ def UPMEM_ToMRAMOp : UPMEM_Op<"to_mram"> {
   let assemblyFormat = "$unit `,` $buffer `,` $dst attr-dict `:` type($buffer)";
 }
 
-// 유닛마다 다른 스칼라를 그 DPU의 host 변수에 넣는다. foreach_unit 몸체에서만 쓴다.
-// 유닛이 실제로 도는 횟수는 맡은 타일 수만큼이라 유닛마다 다르므로 집합 단위 전송으로는
-// 보낼 수 없다.
+// 유닛마다 다른 스칼라를 그 DPU의 metadata 필드에 넣는다. foreach_unit 몸체에서만
+// 쓴다. C 번역기는 DPU별 구조체를 준비하고 여러 필드를 한 집합 전송으로 묶는다.
 def UPMEM_ToHostVarOp : UPMEM_Op<"to_host_var"> {
   let summary = "Write a per-DPU scalar into that DPU's host variable";
   let arguments = (ins UPMEM_UnitType:$unit, AnyType:$value,
@@ -270,7 +269,7 @@ def UPMEM_BarrierOp : UPMEM_Op<"barrier"> {
   let assemblyFormat = "attr-dict";
 }
 
-// upmem.host_var 읽기. device 코드에서는 전역 변수 참조 하나다.
+// upmem.host_var 읽기. device 코드에서는 전역 metadata 구조체 필드 참조 하나다.
 // 유닛이 실제로 도는 횟수가 이 통로로 온다 — 그래서 device는 자기 좌표를 몰라도
 // [0, tiles)만 돌면 되고, 마지막 유닛이 덜 맡는 것도 값 하나로 표현된다.
 def UPMEM_GetHostVarOp : UPMEM_Op<"get_host_var", [Pure]> {

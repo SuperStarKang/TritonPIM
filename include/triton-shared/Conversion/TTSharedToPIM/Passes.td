@@ -259,6 +259,28 @@ def PIMPlaceData : Pass<"pim-place-data", "mlir::ModuleOp"> {
   let dependentDialects = ["mlir::pim::PIMDialect", "mlir::arith::ArithDialect"];
 }
 
+def PIMReuseExecutionTileInputs : Pass<"pim-reuse-execution-tile-inputs", "mlir::ModuleOp"> {
+  let summary = "Reuse invariant input tiles across Block Groups in one Execution Tile";
+  let description = [{
+    Run after pim-place-data and pim-verify. Move an input pim.access/load out of
+    an M/N Group loop when its complete access is invariant. Only read-only
+    tensor consumers and input placements are eligible. Output placements are
+    separate resident bindings; unknown effects and writes to an input binding
+    prevent reuse. No loop interchange, Group resizing, or round-crossing reuse.
+
+    An intervening loop may be crossed only when it executes exactly once.
+    pim-map-devices records pim.min_trip_count = 1 for a local axis with one
+    partition: its enclosing scheduling round already excludes empty tiles.
+    Together with an Execution Tile extent of one this proves a singleton.
+    Otherwise static loop bounds must prove it. Potentially empty M/N loops get
+    a zero-or-one-trip guard around both the hoisted loads and the original loop.
+    No new input tile or larger local buffer is introduced.
+  }];
+  let constructor = "mlir::triton::createPIMReuseExecutionTileInputsPass()";
+  let dependentDialects = ["mlir::pim::PIMDialect", "mlir::arith::ArithDialect",
+                           "mlir::scf::SCFDialect", "mlir::linalg::LinalgDialect"];
+}
+
 def PIMVerify : Pass<"pim-verify", "mlir::ModuleOp"> {
   let summary = "Check the minimal target-independent PIM contract";
   let description = [{

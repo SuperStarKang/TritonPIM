@@ -9,6 +9,7 @@ add_triton_library(TTSharedToPIM
   PIMMapDevicesPass.cpp
   PIMFormExecutionTilesPass.cpp
   PIMPlaceDataPass.cpp
+  PIMReuseExecutionTileInputsPass.cpp
   PIMVerifyPass.cpp
 
   DEPENDS

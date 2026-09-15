@@ -35,7 +35,8 @@ upmem.host_var @pitch_a : index
 // HOST-NEXT: _pim_start(1);
 // HOST: dpu_prepare_xfer
 // HOST: dpu_push_xfer(_set, DPU_XFER_TO_DPU, "A_mram"
-// HOST: dpu_push_xfer(_set, DPU_XFER_TO_DPU, "tiles_x"
+// Only tiles_x is written in this hand-authored IR: preserve pitch_a.
+// HOST: dpu_push_xfer(_set, DPU_XFER_TO_DPU, "_pim_metadata", 0, 4,
 // HOST-NEXT: _pim_stop(1);
 // HOST-NEXT: _pim_start(6);
 // HOST: for (int64_t _i = 0; _i < 2; ++_i) free(_s0[_i]);
@@ -95,12 +96,12 @@ func.func @kernel(%A: memref<*xi8>, %C: memref<*xi32>, %lda: index, %ldc: index)
 // ── device ──────────────────────────────────────────────────────────────────
 // DEVICE: __mram_noinit int8_t A_mram[4096];
 // DEVICE: __mram_noinit int32_t C_mram[1024];
-// DEVICE: __host int32_t tiles_x;
+// DEVICE: __host struct _pim_metadata_t _pim_metadata;
 // WRAM 버퍼는 전역이다.
 // DEVICE: __dma_aligned int8_t w0[128];
 // DEVICE: __dma_aligned int32_t w1[256];
 // DEVICE: int main()
-// DEVICE: int32_t {{.*}} = tiles_x;
+// DEVICE: int32_t {{.*}} = _pim_metadata.f0;
 // 행마다 DMA 하나. 크기는 버퍼 타입에서 나온다(8x16 i8 의 한 행 = 16 바이트).
 // DEVICE: mram_read((__mram_ptr void*)(A_mram + {{.*}}), (void*){{.*}}, 16);
 // DEVICE: mram_write((void*){{.*}}, (__mram_ptr void*)(C_mram + {{.*}}), 64);

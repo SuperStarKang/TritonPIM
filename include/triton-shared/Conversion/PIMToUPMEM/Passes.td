@@ -67,6 +67,10 @@ def ConvertPIMToUPMEM : Pass<"convert-pim-to-upmem", "mlir::ModuleOp"> {
     partial plane을 제거하거나 destination을 다시 만들지 않는다. `upmem.acquire`는
     모든 Common scheduling loop 밖에 있어 같은 DPU set과 device binary를 round
     사이에 재사용한다. 별도 temporal host window는 만들지 않는다.
+
+    `reuse-staging`은 host의 입력 저장 공간을 round/호출 사이에 재사용한다. 내용은
+    매번 다시 채우며 input residency를 가정하지 않는다. 기본값은 false이며
+    Common scheduling이나 Group 크기는 바꾸지 않는다.
   }];
   let constructor = "mlir::triton::createConvertPIMToUPMEMPass()";
   let options = [
@@ -74,6 +78,8 @@ def ConvertPIMToUPMEM : Pass<"convert-pim-to-upmem", "mlir::ModuleOp"> {
            "host가 영역을 모으고 되돌릴 때 쓰는 스레드 수. 1이면 순차.">,
     Option<"nrTasklets", "nr-tasklets", "int64_t", "0",
            "DPU마다 활성화할 tasklet 수. 0이면 profile의 lanes_per_core.">,
+    Option<"reuseStaging", "reuse-staging", "bool", "false",
+           "Reuse host input staging allocations across rounds and calls.">,
   ];
   let dependentDialects = ["mlir::upmem::UPMEMDialect", "mlir::pim::PIMDialect",
                            "mlir::arith::ArithDialect", "mlir::scf::SCFDialect",

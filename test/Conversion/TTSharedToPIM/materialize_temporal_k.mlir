@@ -1,6 +1,18 @@
 // Common IR이 temporal K를 target에 맡기지 않고 scheduling round, device-local
 // reduction window, 정확한 resident placement, partial combine으로 모두 명시한다.
 // RUN: triton-shared-opt "--pim-map-devices=p-m=1 p-n=1 p-k=1" --pim-place-data --pim-verify -canonicalize %s | FileCheck %s
+// RUN: triton-shared-opt "--pim-form-execution-tiles=tile-m=2 tile-n=2 tile-k=1" "--pim-map-devices=p-m=1 p-n=1 p-k=1" --pim-place-data --pim-verify --pim-reuse-execution-tile-inputs --pim-verify -cse -canonicalize %s | FileCheck %s --check-prefix=REUSE
+// RUN: triton-shared-opt "--pim-form-execution-tiles=tile-m=2 tile-n=2 tile-k=1" "--pim-map-devices=p-m=1 p-n=1 p-k=1" --pim-place-data --pim-verify --pim-reuse-execution-tile-inputs --pim-verify -cse -canonicalize --convert-pim-to-upmem %s | triton-shared-translate --upmem-to-device > /dev/null
+// RUN: triton-shared-opt "--pim-form-execution-tiles=tile-m=2 tile-n=2 tile-k=1" "--pim-map-devices=p-m=1 p-n=1 p-k=1" --pim-place-data --pim-verify --pim-reuse-execution-tile-inputs --pim-verify -cse -canonicalize --convert-pim-to-upmem %s | triton-shared-translate --upmem-to-host > /dev/null
+
+// Dynamic K is singleton for each entered round with tile_k=p_k=1. Reuse
+// survives folding of its zero local IV, while global placement stays intact.
+// REUSE-LABEL: func.func @gemm
+// REUSE: %[[AA:.*]] = pim.access {{.*}}id = 0{{.*}}pim.reused_input
+// REUSE: %[[A:.*]] = pim.load %[[AA]]
+// REUSE: scf.for
+// REUSE: scf.for {{.*}}iter_args
+// REUSE: linalg.matmul ins(%[[A]],
 
 // CHECK-LABEL: func.func @gemm
 // CHECK: scf.for
@@ -11,7 +23,7 @@
 // CHECK-SAME: allocation_shape[{{.*}}, {{.*}}]
 // 실제 Triton runtime K와 같은 i32 reduction loop의 control type을 유지한다.
 // CHECK: scf.for {{.*}} iter_args{{.*}} : i32 {
-// CHECK: } {pim.reduction = "add", pim.temporal_reduction}
+// CHECK: } {pim.min_trip_count = 1 : i64, pim.reduction = "add", pim.temporal_reduction}
 // CHECK: pim.combine {{.*}} into {{.*}} kind "add"
 // CHECK: } {pim.scheduling_axis = "reduction_k"}
 

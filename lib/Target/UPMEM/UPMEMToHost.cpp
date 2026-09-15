@@ -2,6 +2,7 @@
 #include "triton-shared/Dialect/PIMTarget/UPMEM/IR/UPMEMDialect.h"
 
 #include "CEmitter.h"
+#include "MetadataLayout.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -26,14 +27,45 @@ namespace {
 // 데이터 모으기를 먼저 한 번에 하고 결과를 배열에 담은 뒤, 버퍼마다 FOREACH+push를 낸다.
 struct HostEmitter {
   CEmitter e;
+  MetadataLayout metadata;
+  bool reuseStaging = false;
+  uint64_t workspaceSlots = 0;
   HostEmitter(raw_ostream &os) : e(os) {}
   raw_ostream &os() { return e.os; }
 
   unsigned stageId = 0;
   // 전송 배열 이름. round loop 안에 foreach 가 또 나오므로 함수 전체에서 유일해야 한다.
   unsigned xferId = 0;
+  unsigned metadataId = 0;
   // 영역을 모으고 되돌리는 일을 몇 갈래로 나눌지. --convert-pim-to-upmem이 정해 준다.
   int64_t threads = 1;
+
+  // Cache allocation capacity, never input contents. Each generated buffer has
+  // its own slot; different calls may supply different pointers and valid sizes.
+  // A cache belongs to one host artifact and thread and is released on teardown.
+  void emitWorkspacePreamble() {
+    os() << R"cpp(#include <vector>
+struct _pim_workspace_t {
+  struct slot { void* ptr = nullptr; size_t capacity = 0; };
+  std::vector<slot> slots;
+  void* get(size_t index, size_t bytes) {
+    if (slots.size() <= index) slots.resize(index + 1);
+    auto& item = slots[index];
+    size_t wanted = bytes ? bytes : 1;
+    if (item.capacity < wanted) {
+      void* next = realloc(item.ptr, wanted);
+      if (!next) { fprintf(stderr, "UPMEM staging allocation failed\n"); abort(); }
+      item.ptr = next;
+      item.capacity = wanted;
+    }
+    return item.ptr;
+  }
+  ~_pim_workspace_t() { for (auto& item : slots) free(item.ptr); }
+};
+static thread_local _pim_workspace_t _pim_workspace;
+
+)cpp";
+  }
 
   // ── PIM_TIMING (임시) ────────────────────────────────────────────────────────
   // 어느 단계가 오래 걸리는지 보려고 넣은 계측이다. 성능 판단이 끝나면 지운다.
@@ -77,10 +109,9 @@ struct HostEmitter {
 
   // foreach_unit 몸체를 훑으며 모은 것들. 준비 loop 뒤에 전송으로 낸다.
   struct Xfer {
-    std::string array;  // 유닛별 포인터/값을 담은 배열 이름
-    std::string symbol; // MRAM 심볼 또는 host 변수 이름
+    std::string array;  // 유닛별 포인터를 담은 배열 이름
+    std::string symbol; // MRAM 심볼
     std::string bytes;  // 유닛 하나가 받는 바이트 (배열의 0번을 쓴다)
-    bool scalar;        // host 변수면 true
   };
 
   // MRAM 심볼마다 선언된 바이트 수. 전송 직전에 실제 크기와 대조한다.
@@ -94,6 +125,9 @@ struct HostEmitter {
     });
     if (!host)
       return module.emitError("upmem-to-host: no host function");
+    if (failed(metadata.init(module)))
+      return failure();
+    reuseStaging = module->hasAttr("upmem.reuse_staging");
     if (auto n = host->getAttrOfType<IntegerAttr>("upmem.host_threads"))
       threads = n.getInt();
     for (auto mram : module.getOps<upmem::MRAMOp>()) {
@@ -109,6 +143,9 @@ struct HostEmitter {
     // 같은 유닛 수·같은 프로그램이면 다시 확보하지 않는다.
     os() << "#include \"upmem_runtime.h\"\n\n";
     os() << "#ifndef DPU_BINARY\n#define DPU_BINARY \"kernel.dpu\"\n#endif\n\n";
+    metadata.emit(os());
+    if (reuseStaging)
+      emitWorkspacePreamble();
     emitTimingPreamble();
 
     os() << "extern \"C\" void " << host.getName() << "(";
@@ -218,9 +255,10 @@ struct HostEmitter {
     startTimer(0, depth);  // PIM_TIMING: 입력 버퍼 할당/패킹과 유닛별 인자 준비
 
     // staging 버퍼 목록. 서로 다른 조합의 개수만큼 잡는다(dedup_over 축은 뺀다).
-    // 준비 loop 앞에서 잡아야 한다 — 같은 .so가 다른 크기로 다시 불릴 수 있으므로
-    // 함수를 넘어 살아남는 자리에 두면 안 된다.
+    // 매 round의 dedup 목록은 비우되, reuse 모드에서는 실제 저장 공간의 용량만
+    // 보관한다. 같은 .so를 다른 입력/크기로 호출해도 내용은 항상 다시 채운다.
     llvm::DenseMap<Operation *, std::string> stageName;
+    llvm::DenseMap<Operation *, uint64_t> stageSlot;
     SmallVector<std::pair<std::string, int64_t>> stageBuffers;
     for (Operation &op : body) {
       auto st = dyn_cast<upmem::StageOp>(&op);
@@ -235,11 +273,37 @@ struct HostEmitter {
       int64_t distinct = distinctCount(st, counts, fe.getAxes());
       stageBuffers.push_back({id, distinct});
       e.indent(depth);
-      os() << ct << "** " << id << " = (" << ct << "**)calloc(" << distinct
-           << ", sizeof(" << ct << "*));\n";
+      os() << ct << "** " << id << " = (" << ct << "**)";
+      if (reuseStaging) {
+        os() << "_pim_workspace.get(" << workspaceSlots++ << ", " << distinct
+             << " * sizeof(" << ct << "*));\n";
+        e.indent(depth);
+        os() << "memset(" << id << ", 0, " << distinct << " * sizeof(" << ct
+             << "*));\n";
+        stageSlot[&op] = workspaceSlots;
+        workspaceSlots += distinct;
+      } else {
+        os() << "calloc(" << distinct << ", sizeof(" << ct << "*));\n";
+      }
     }
 
     SmallVector<Xfer> xfers;
+    // Keep logical scalar ops in the IR, but fill one wire struct per DPU.
+    // Zero initialization also makes the transmitted ABI padding deterministic.
+    SmallVector<bool> metadataWritten(metadata.fields.size(), false);
+    bool hasMetadata = false;
+    for (auto tv : body.getOps<upmem::ToHostVarOp>()) {
+      const auto *field = metadata.find(tv.getDst());
+      if (!field || field->type != tv.getValue().getType())
+        return tv.emitError("unknown or mismatched metadata field");
+      metadataWritten[field - metadata.fields.data()] = true;
+      hasMetadata = true;
+    }
+    std::string args = "_args" + std::to_string(metadataId++);
+    if (hasMetadata) {
+      e.indent(depth);
+      os() << "struct _pim_metadata_t " << args << "[" << units << "] = {};\n";
+    }
     // 유닛별 결과를 담을 배열.
     for (Operation &op : body) {
       if (auto to = dyn_cast<upmem::ToMRAMOp>(&op)) {
@@ -247,17 +311,15 @@ struct HostEmitter {
         std::string arr = "_p" + std::to_string(xferId++);
         std::string ct = CEmitter::scalarType(t.getElementType(), true);
         e.indent(depth);
-        os() << ct << "** " << arr << " = (" << ct << "**)malloc(" << units
-             << " * sizeof(" << ct << "*));\n";
+        os() << ct << "** " << arr << " = (" << ct << "**)";
+        if (reuseStaging)
+          os() << "_pim_workspace.get(" << workspaceSlots++ << ", ";
+        else
+          os() << "malloc(";
+        os() << units << " * sizeof(" << ct << "*));\n";
         e.indent(depth);
         os() << "int64_t " << arr << "_n[" << units << "];\n";
-        xfers.push_back({arr, to.getDst().str(), arr + "_n[0]", false});
-      } else if (auto tv = dyn_cast<upmem::ToHostVarOp>(&op)) {
-        std::string arr = "_p" + std::to_string(xferId++);
-        std::string ct = CEmitter::scalarType(tv.getValue().getType(), false);
-        e.indent(depth);
-        os() << ct << " " << arr << "[" << units << "];\n";
-        xfers.push_back({arr, tv.getDst().str(), "sizeof(" + ct + ")", true});
+        xfers.push_back({arr, to.getDst().str(), arr + "_n[0]"});
       }
     }
 
@@ -268,7 +330,8 @@ struct HostEmitter {
     unsigned slot = 0;
     for (Operation &op : body) {
       if (auto st = dyn_cast<upmem::StageOp>(&op)) {
-        if (failed(emitStage(st, stageName[&op], depth + 1, counts, body)))
+        if (failed(emitStage(st, stageName[&op], stageSlot.lookup(&op),
+                             depth + 1, counts, body)))
           return failure();
       } else if (auto to = dyn_cast<upmem::ToMRAMOp>(&op)) {
         // MRAM 심볼 크기는 컴파일 시점 상수인데 배정량은 런타임 값이라, 넘치는지는
@@ -286,9 +349,10 @@ struct HostEmitter {
         os() << xfers[slot].array << "_n[_u] = " << buf << "_bytes;\n";
         slot++;
       } else if (auto tv = dyn_cast<upmem::ToHostVarOp>(&op)) {
+        const auto *field = metadata.find(tv.getDst());
         e.indent(depth + 1);
-        os() << xfers[slot].array << "[_u] = " << e.name(tv.getValue()) << ";\n";
-        slot++;
+        os() << args << "[_u]." << field->name << " = "
+             << e.name(tv.getValue()) << ";\n";
       } else if (isa<arith::ArithDialect>(op.getDialect())) {
         if (failed(e.emitArith(&op, depth + 1, /*hostSide=*/true)))
           return failure();
@@ -308,26 +372,53 @@ struct HostEmitter {
       os() << "_idx = 0;\n";
       e.indent(depth);
       os() << "DPU_FOREACH(_set, _dpu, _idx) DPU_ASSERT(dpu_prepare_xfer(_dpu, "
-           << (x.scalar ? "&" : "") << x.array << "[_idx]));\n";
+           << x.array << "[_idx]));\n";
       e.indent(depth);
       os() << "DPU_ASSERT(dpu_push_xfer(_set, DPU_XFER_TO_DPU, \"" << x.symbol
            << "\", 0, " << x.bytes << ", DPU_XFER_DEFAULT));\n";
     }
-    stopTimer(1, depth);  // PIM_TIMING: 버퍼 해제 전에 H2D 종료
-    // 전송이 끝났으므로 staging 버퍼를 놓는다(dpu_push_xfer는 동기다).
-    startTimer(6, depth);
-    for (auto &[id, distinct] : stageBuffers) {
+    // Normal PIM lowering writes every field: one prepare loop and one push.
+    // For partial updates, merge only consecutive written fields so an absent
+    // field retains its device value instead of being overwritten with zero.
+    for (unsigned first = 0; first < metadata.fields.size();) {
+      if (!metadataWritten[first]) {
+        ++first;
+        continue;
+      }
+      unsigned end = first + 1;
+      while (end < metadata.fields.size() && metadataWritten[end])
+        ++end;
+      int64_t offset = metadata.fields[first].offset;
+      int64_t limit = end == metadata.fields.size()
+                          ? metadata.bytes
+                          : metadata.fields[end].offset;
       e.indent(depth);
-      os() << "for (int64_t _i = 0; _i < " << distinct << "; ++_i) free(" << id
-           << "[_i]);\n";
+      os() << "_idx = 0;\n";
       e.indent(depth);
-      os() << "free(" << id << ");\n";
+      os() << "DPU_FOREACH(_set, _dpu, _idx) DPU_ASSERT(dpu_prepare_xfer(_dpu, "
+           << "(uint8_t*)&" << args << "[_idx] + " << offset << "));\n";
+      e.indent(depth);
+      os() << "DPU_ASSERT(dpu_push_xfer(_set, DPU_XFER_TO_DPU, \""
+           << metadata.symbol << "\", " << offset << ", " << limit - offset
+           << ", DPU_XFER_DEFAULT));\n";
+      first = end;
     }
-    for (const Xfer &x : xfers)
-      if (!x.scalar) {
+    stopTimer(1, depth);  // PIM_TIMING: 버퍼 해제 전에 H2D 종료
+    // 동기 전송이 끝난 뒤, reuse 모드에서는 다음 round/호출을 위해 공간을 보관한다.
+    startTimer(6, depth);
+    if (!reuseStaging) {
+      for (auto &[id, distinct] : stageBuffers) {
+        e.indent(depth);
+        os() << "for (int64_t _i = 0; _i < " << distinct << "; ++_i) free(" << id
+             << "[_i]);\n";
+        e.indent(depth);
+        os() << "free(" << id << ");\n";
+      }
+      for (const Xfer &x : xfers) {
         e.indent(depth);
         os() << "free(" << x.array << ");\n";
       }
+    }
     stopTimer(6, depth);  // PIM_TIMING: 해제 비용은 H2D/kernel에 포함하지 않는다
     return success();
   }
@@ -415,7 +506,8 @@ struct HostEmitter {
   // 원본의 strided 영역을 타일 단위 연속 버퍼로 모은다. 남는 자리는 0이다(유닛마다 같은
   // 바이트 수를 보내야 하므로). dedup_over 축만 다른 유닛은 같은 결과를 받으므로, 그 축을
   // 뺀 조합마다 한 번씩만 만든다.
-  LogicalResult emitStage(upmem::StageOp st, StringRef id, unsigned depth,
+  LogicalResult emitStage(upmem::StageOp st, StringRef id, uint64_t slotBase,
+                          unsigned depth,
                           ArrayRef<int64_t> counts, Block &body) {
     unsigned rank = st.getOrigin().size();
     auto rt = cast<MemRefType>(st.getResult().getType());
@@ -442,7 +534,15 @@ struct HostEmitter {
     e.indent(depth);
     os() << "if (!" << id << "[" << id << "_key]) {\n";
     e.indent(depth + 1);
-    os() << ct << "* _b = (" << ct << "*)calloc(" << buf << "_bytes, 1);\n";
+    os() << ct << "* _b = (" << ct << "*)";
+    if (reuseStaging) {
+      os() << "_pim_workspace.get(" << slotBase << " + " << id << "_key, "
+           << buf << "_bytes);\n";
+      e.indent(depth + 1);
+      os() << "memset(_b, 0, " << buf << "_bytes);\n";
+    } else {
+      os() << "calloc(" << buf << "_bytes, 1);\n";
+    }
     ArrayRef<int64_t> tile = st.getTile();
     emitTileLoops(rank, tile, st.getSizes(), depth + 1);
     e.indent(depth + 2 + 2 * rank);

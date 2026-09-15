@@ -2,8 +2,34 @@
 // 각 MRAM은 Common allocation_shape의 정확한 fixed-slot 크기다.
 // RUN: triton-shared-opt --convert-pim-to-upmem %s | FileCheck %s
 // RUN: triton-shared-opt --convert-pim-to-upmem %s | FileCheck %s --check-prefix=PIM-CLEAN
-// RUN: triton-shared-opt --convert-pim-to-upmem %s | triton-shared-translate --upmem-to-host > /dev/null
+// RUN: triton-shared-opt --convert-pim-to-upmem %s | triton-shared-translate --upmem-to-host | FileCheck %s --check-prefix=HOST
 // RUN: triton-shared-opt --convert-pim-to-upmem %s | triton-shared-translate --upmem-to-device > /dev/null
+// RUN: triton-shared-opt --convert-pim-to-upmem="reuse-staging=true" %s | triton-shared-translate --upmem-to-host | FileCheck %s --check-prefix=REUSE
+
+// REUSE: static thread_local _pim_workspace_t _pim_workspace;
+// REUSE: extern "C" void matmul(
+// REUSE: memset(_s0, 0,
+// REUSE: memset(_b, 0,
+// REUSE: _pim_start(1);
+// REUSE: dpu_push_xfer(_set, DPU_XFER_TO_DPU, "matmul_mram_0",
+// REUSE: dpu_push_xfer(_set, DPU_XFER_TO_DPU, "matmul_mram_1",
+// REUSE: dpu_push_xfer(_set, DPU_XFER_TO_DPU, "_pim_metadata",
+// REUSE-NEXT: _pim_stop(1);
+// REUSE-NEXT: _pim_start(6);
+// REUSE-NEXT: _pim_stop(6);
+
+// Each round has exactly three H2D pushes: A, B, and all metadata together.
+// HOST: _pim_start(1);
+// HOST-NEXT: _idx = 0;
+// HOST-NEXT: DPU_FOREACH{{.*}}dpu_prepare_xfer
+// HOST-NEXT: DPU_ASSERT(dpu_push_xfer(_set, DPU_XFER_TO_DPU, "matmul_mram_0",
+// HOST-NEXT: _idx = 0;
+// HOST-NEXT: DPU_FOREACH{{.*}}dpu_prepare_xfer
+// HOST-NEXT: DPU_ASSERT(dpu_push_xfer(_set, DPU_XFER_TO_DPU, "matmul_mram_1",
+// HOST-NEXT: _idx = 0;
+// HOST-NEXT: DPU_FOREACH{{.*}}dpu_prepare_xfer
+// HOST-NEXT: DPU_ASSERT(dpu_push_xfer(_set, DPU_XFER_TO_DPU, "_pim_metadata", 0,
+// HOST-NEXT: _pim_stop(1);
 
 // PIM-CLEAN-LABEL: module
 // PIM-CLEAN-NOT: #pim.target_profile

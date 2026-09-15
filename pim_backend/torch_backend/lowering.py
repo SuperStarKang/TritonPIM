@@ -163,7 +163,7 @@ class PIMIntMMLowering:
 
     def __enter__(self):
         # stock lowering이 아직 등록 전이면 import로 강제한다.
-        import torch._inductor.kernel.mm  # noqa: F401
+        import torch._inductor.kernel.mm
 
         keys = _int_mm_lowering_keys()
         self._saved = {key: lowerings.get(key) for key in keys}

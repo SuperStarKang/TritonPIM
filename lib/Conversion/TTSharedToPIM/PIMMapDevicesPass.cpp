@@ -135,6 +135,13 @@ static void scheduleLoop(OpBuilder &b, scf::ForOp loop, Value round,
   loop.getUpperBoundMutable().assign(castTo(b, loc, trips, loopType));
   loop.getStepMutable().assign(constantOfType(b, loc, loopType, 1));
 
+  // With one partition, every entered scheduling round owns at least one
+  // Group, including a partial final tile. Empty domains execute no rounds.
+  // With multiple partitions the final round may contain inactive devices.
+  loop->removeAttr("pim.min_trip_count");
+  if (partitions == 1)
+    loop->setAttr("pim.min_trip_count", b.getI64IntegerAttr(1));
+
   OpBuilder bb(loop.getBody(), loop.getBody()->begin());
   Value local = loop.getInductionVar();
   auto scaled = bb.create<arith::MulIOp>(loc, local, range.step);

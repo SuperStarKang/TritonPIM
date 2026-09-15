@@ -27,12 +27,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-import torch  # noqa: E402
-import triton.backends.pim.driver as pim_driver  # noqa: E402
+import torch
+import triton.backends.pim.driver as pim_driver
 
-from torch_backend import PIMInductorBackend, PIMTorchConfig  # noqa: E402
-from torch_backend.template import TORCH_INT_MM_TEMPLATE_VERSION  # noqa: E402
-from torch_backend._autotuner import (  # noqa: E402
+from torch_backend import PIMInductorBackend, PIMTorchConfig
+from torch_backend.template import TORCH_INT_MM_TEMPLATE_VERSION
+from torch_backend._autotuner import (
     DEFAULT_CACHE_PATH,
     PIMConfigCache,
     PIMProblem,
@@ -40,7 +40,7 @@ from torch_backend._autotuner import (  # noqa: E402
     target_spec,
 )
 
-from autotuner import PIMBenchmarkResult, SearchBudget, tune  # noqa: E402
+from autotuner import PIMBenchmarkResult, SearchBudget, tune
 
 
 def pim_mm(a, b):

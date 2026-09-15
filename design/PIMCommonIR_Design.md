@@ -5,8 +5,8 @@
 PIM Common IR은 Triton 연산을 target과 무관한 세 계층 실행 구조로 표현한다.
 
 1. Block: Triton kernel 한 instance가 계산하는 원소 눈금
-2. Block Group: 한 PIM unit 안의 compute 단위
-3. Execution Tile: 한 PIM unit의 compute + transfer + residency 단위
+2. Block Group: 한 PIM unit의 연산 능력과 utilization에 맞춘 compute 단위
+3. Execution Tile: Group 간 데이터 재사용을 계획하는 transfer + residency 단위
 
 Execution Tile 하나는 항상 PIM unit 하나가 담당한다. 완성된 per-unit Execution
 Tile들을 `[p_m,p_n,p_k]` device grid에 배치하고, Tile 수가 active unit 수보다 많으면
@@ -25,9 +25,38 @@ Common lowering의 판단 순서는 다음과 같이 고정한다.
 3. **얼마나 묶는가:** Block과 Block Group을 materialize한다.
 4. **시간/공간 실행:** Execution Tile, scheduling round, device mapping을 만든다.
 5. **무엇을 resident시키는가:** Execution Tile 하나의 `pim.place`를 만든다.
-6. **실제 어디에 놓는가:** Common IR을 변경하지 않고 target memory와 primitive로 옮긴다.
+6. **어떤 입력을 재사용하는가:** Group 크기와 순서를 유지하면서 Execution Tile
+   내부의 불변 입력 load를 Group 반복 밖으로 옮긴다.
+7. **실제 어디에 놓는가:** Common IR을 변경하지 않고 target memory와 primitive로 옮긴다.
 
 앞 단계의 의미를 뒤 단계가 access 모양이나 target 특성에서 다시 추론하지 않는다.
+
+`--pim-reuse-execution-tile-inputs`는 placement와 최초 Common 검증 뒤에 실행한다.
+대상은 `direction = "in"`으로 배치된 입력의 `pim.access/load`이며, access의 모든
+operand(원본, offset, origin, stride, valid, pad)가 재사용 범위에서 불변이어야 한다.
+배치된 device invocation의 입력은 진입 시 준비되고 출력은 종료 시 회수된다.
+따라서 서로 다른 input/output resident binding의 구분은 host 포인터의 no-alias
+가정이 아니다. 입력 binding에 대한 write와 알 수 없는 memory effect가 있으면
+최적화하지 않는다. Load 결과도 linalg의 읽기 전용 tensor input으로만 사용해야 하며,
+누산기 초기값 등 Target bufferization이 덮어쓸 수 있는 사용은 제외한다.
+
+현재는 M/N Group loop 밖으로의 이동만 지원한다. 중간에 있는 loop는 정확히 한 번
+실행됨이 알려진 경우에만 통과한다. `pim-map-devices`는 partition이 하나인 축에
+`pim.min_trip_count = 1`을 기록한다. 해당 축의 scheduling round에 진입했다면 마지막
+부분 tile도 최소 한 Group을 가지기 때문이다. Execution Tile의 해당 축 Group 수가
+1이면 이 정보로 singleton을 증명한다. 여러 partition에서 비활성 device가 가능한
+경우에는 이 보장을 기록하지 않는다.
+
+M/N 반복의 nonempty 여부가 알려지지 않으면 `lb < ub`로 0/1회 실행되는 SCF 보호
+loop 안에 hoisted load와 원래 반복을 함께 둔다. 조건부 load, 여러 번 도는 K loop를
+넘는 이동, loop interchange, round 사이의 재사용은 지원하지 않는다. Access/load는
+복제하지 않으므로 access ID, Group shape, resident allocation, local buffer 수는
+유지된다. UPMEM은 이동된 load를 같은 위치의 MRAM→WRAM DMA로 내리고 기존 compute
+barrier를 유지한다. 이동한 access에는 `pim.reused_input`을 기록하되 Common origin은
+전역 좌표로 유지한다. UPMEM은 이 입력을 `origin - place.start`로 로컬화한다.
+Singleton IV가 0으로 접혀 기존 `pim.device_origin` 산술이 사라져도 이후 round의
+전역 시작 주소를 MRAM offset으로 잘못 사용하지 않도록 하기 위한 것이다.
+Host 전송량 감소를 목적으로 하는 pass는 아니다.
 
 ## 2. 공통 hardware profile
 
