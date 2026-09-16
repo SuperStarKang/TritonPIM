@@ -73,7 +73,7 @@ class KernelProxy:
         return getattr(self._kernel, name)
 
 
-def timed_kernel(fn, name, module, records, pim_kernel=None):
+def timed_kernel(fn, name, module, records, pim_kernel=None, pim_labeler=None):
     options = (dict(pim_kernel.triton_meta["backend_options"])
                if pim_kernel is not None else None)
     blocks = (dict(pim_kernel.inductor_meta.get("config_args", {}))
@@ -87,7 +87,7 @@ def timed_kernel(fn, name, module, records, pim_kernel=None):
         # stages now: the next PIM launch overwrites the driver's global array.
         stages = (dict(zip(pim_driver.TIMING_STAGES, pim_driver.timing))
                   if pim_kernel is not None else None)
-        records.append({
+        record = {
             "kernel": name,
             "module": module.__file__,
             "where": "CPU+UPMEM" if pim_kernel is not None else "CPU",
@@ -96,14 +96,17 @@ def timed_kernel(fn, name, module, records, pim_kernel=None):
             "pim_stages_ms": stages,
             "pim_config": ({"blocks": blocks, "backend_options": options}
                            if pim_kernel is not None else None),
-        })
+        }
+        if pim_kernel is not None and pim_labeler is not None:
+            record["operator"] = pim_labeler(args)
+        records.append(record)
         return result
 
     return measured
 
 
 @contextmanager
-def trace_kernels(modules):
+def trace_kernels(modules, pim_labeler=None):
     records = []
     pim_count = 0
     with ExitStack() as stack:
@@ -111,7 +114,8 @@ def trace_kernels(modules):
             for name, value in list(vars(module).items()):
                 if is_pim_kernel(name, value):
                     replacement = KernelProxy(value, timed_kernel(
-                        value.run, name, module, records, pim_kernel=value))
+                        value.run, name, module, records, pim_kernel=value,
+                        pim_labeler=pim_labeler))
                     pim_count += 1
                 elif name.startswith("cpp_") and callable(value):
                     replacement = timed_kernel(value, name, module, records)
@@ -154,7 +158,7 @@ def cpu_operator(name):
     return label + (" (fused)" if fused else "")
 
 
-def describe_records(records, total_ms):
+def describe_records(records, total_ms, pim_labels=("QK^T", "PV")):
     pim_index = 0
     for record in records:
         tensors = record["tensor_arguments"]
@@ -163,7 +167,10 @@ def describe_records(records, total_ms):
         if record["pim_stages_ms"] is not None:
             if len(tensors) != 3:
                 raise RuntimeError("Expected PIM GEMM tensor arguments A, B, C")
-            record["operator"] = ("QK^T", "PV")[pim_index]
+            if "operator" not in record:
+                if pim_labels is None:
+                    raise RuntimeError("No semantic label supplied for PIM GEMM")
+                record["operator"] = pim_labels[pim_index]
             pim_index += 1
             record["shape"] = f"{shapes[0]} @ {shapes[1]} -> {shapes[2]}"
             record["dtype"] = f"{dtypes[0]} @ {dtypes[1]} -> {dtypes[2]}"
