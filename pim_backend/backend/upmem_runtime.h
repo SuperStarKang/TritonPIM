@@ -23,8 +23,19 @@ extern "C" {
 //   - 프로세스 종료 시 atexit으로 일괄 free (per-call free 대신 1회).
 struct dpu_set_t upmem_acquire(uint32_t num_units, const char *binary_path);
 
+struct dpu_set_t upmem_runtime_reserve(uint32_t num_units);
+int upmem_runtime_load(const char *binary_path);
+
+#include "upmem_resident.h"
+
 #ifdef __cplusplus
 }
+#endif
+
+#ifdef UPMEM_RESIDENT_HOST
+#define dpu_prepare_xfer upmem_resident_prepare_xfer
+#define dpu_push_xfer upmem_resident_push_xfer
+#define dpu_launch upmem_resident_launch
 #endif
 
 #endif  // UPMEM_RUNTIME_H

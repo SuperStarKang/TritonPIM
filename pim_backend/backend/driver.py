@@ -34,6 +34,7 @@ from triton.backends.driver import DriverBase
 from triton.backends.compiler import GPUTarget
 
 import triton.backends.triton_shared.driver as cpu_driver
+from .resident import current_invocation, resident_lock
 
 
 # ── PIM_TIMING (임시): 마지막 launch의 단계별 시간(ms)과 그 단계 이름.
@@ -70,7 +71,11 @@ def _build_upmem_runtime() -> str:
     #   둘이 되어 DPU 예약이 두 벌 잡히므로, 위의 "1개만 적재"가 성립하지 않는다.
     backend_dir = os.path.dirname(os.path.abspath(__file__))
     rt_c = os.path.join(backend_dir, "upmem_runtime.c")
-    key = hashlib.sha256(("upmem_runtime|" + Path(rt_c).read_text()).encode("utf-8")).hexdigest()
+    runtime_sources = ("upmem_runtime.c", "upmem_runtime.h",
+                       "upmem_resident.c", "upmem_resident.h")
+    key = hashlib.sha256(("upmem_runtime|" + "".join(
+        Path(backend_dir, name).read_text() for name in runtime_sources
+    )).encode("utf-8")).hexdigest()
     cache = get_cache_manager(key)
     so_name = "libupmem_runtime.so"
     so_path = cache.get_file(so_name)
@@ -79,7 +84,8 @@ def _build_upmem_runtime() -> str:
             so_tmp = os.path.join(tmp, so_name)
             subprocess.check_call(
                 ["gcc", "-O2", "-fPIC", "-shared", f"-Wl,-soname,{so_name}",
-                 rt_c, *_upmem_host_flags(), "-o", so_tmp])
+                 rt_c, os.path.join(backend_dir, "upmem_resident.c"),
+                 *_upmem_host_flags(), "-o", so_tmp])
             so_path = cache.put(Path(so_tmp).read_bytes(), so_name, binary=True)
     return so_path
 
@@ -222,8 +228,27 @@ class PIMLauncher(object):
     def __call__(self, gridX, gridY, gridZ, stream, cu_function,
                  kernel_metadata, launch_metadata,
                  launch_enter_hook, launch_exit_hook, *args):
+        with resident_lock:
+            return self._launch(gridX, gridY, gridZ, stream, cu_function,
+                                kernel_metadata, launch_metadata,
+                                launch_enter_hook, launch_exit_hook, *args)
+
+    def _launch(self, gridX, gridY, gridZ, stream, cu_function,
+                kernel_metadata, launch_metadata,
+                launch_enter_hook, launch_exit_hook, *args):
         # cu_function = load_binary가 돌려준 소스 번들 bytes (PIMUtils.load_binary 참고).
         bundle = json.loads(bytes(cu_function).decode("utf-8"))
+        invocation = current_invocation.get()
+        if invocation is not None:
+            if self.pim_target != "upmem":
+                raise ValueError("ResidentBlock requires the UPMEM backend")
+            if launch_enter_hook is not None:
+                launch_enter_hook(launch_metadata)
+            invocation.launch(self, bundle, kernel_metadata[6],
+                              (gridX, gridY, gridZ), args)
+            if launch_exit_hook is not None:
+                launch_exit_hook(launch_metadata)
+            return
         # target마다 빌드 툴체인이 다르다(upmem=dpu-clang+libdpu, aimx=descriptor runtime).
         # 빌드 단계만 분기하고, 아래 dlopen→ctypes 호출은 stub이 같은 (A,B,C,M,N,K) C ABI를
         # 노출한다는 전제로 공유한다(AiMX가 다른 인자를 요구하면 그때 호출부도 분기).

@@ -242,6 +242,7 @@ def _upmem_to_artifact(upmem_ir: str, metadata) -> bytes:
     if not nr_tasklets:
         raise RuntimeError("generated device.c에서 tasklet 수를 찾지 못함")
     return json.dumps({"host": host_src, "device": device_src,
+                       "target_ir": upmem_ir,
                        "nr_tasklets": int(nr_tasklets.group(1))}).encode("utf-8")
 
 

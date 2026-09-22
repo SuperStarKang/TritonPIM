@@ -20,6 +20,7 @@ from .execution import PIMExecution, resolve_execution
 from .runtime_compat import set_driver_to_backend
 from .scheduling import PIMCombinedScheduling
 from .template import pim_gemm_template
+from .resident import ResidentBlock, ResidentGemmConfig, benchmark_resident_plans, prepare_block
 
 __all__ = [
     "PIMInductorBackend",
@@ -33,4 +34,8 @@ __all__ = [
     "set_driver_to_backend",
     "target_spec",
     "validate_pim_options",
+    "ResidentBlock",
+    "ResidentGemmConfig",
+    "benchmark_resident_plans",
+    "prepare_block",
 ]

@@ -37,6 +37,10 @@ CPU int32 C[M,N]
 Tensor device는 계속 CPU다. PIM은 tensor device가 아니라 이 template의 compile 및
 execution backend다.
 
+FX graph 전체의 weight를 UPMEM에 유지하는 별도 실행 경로는
+[ResidentBlock 사용법](RESIDENT.md)을 참고한다. 기존 lowering을 유지하며,
+모든 weight가 같은 전체 DPU 집합과 공용 입력·출력 scratch를 사용한다.
+
 ## Common IR configuration
 
 Torch integration은 별도 실행 plan을 만들지 않는다.

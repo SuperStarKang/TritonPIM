@@ -232,17 +232,36 @@ static thread_local _pim_workspace_t _pim_workspace;
     return op->emitError("upmem-to-host: no C form for this op");
   }
 
-  // 유닛 좌표를 선형 번호에서 푼다. 자리값은 뒤 축들의 곱이다.
+  // ------------------ original emitCoords (ORDER 없이) ------------------
+  // // 유닛 좌표를 선형 번호에서 푼다. 자리값은 뒤 축들의 곱이다.
+  // void emitCoords(ArrayRef<int64_t> counts, Block &body, unsigned first,
+  //                 unsigned depth, StringRef linear) {
+  //   int64_t place = 1;
+  //   for (int64_t c : counts)
+  //     place *= c;
+  //   for (auto [d, c] : llvm::enumerate(counts)) {
+  //     place /= c;
+  //     e.indent(depth);
+  //     os() << "int64_t " << e.name(body.getArgument(first + d)) << " = ("
+  //          << linear << " / " << place << ") % " << c << ";\n";
+  //   }
+  // }
+
+  // ------------------ revised emitCoords (ORDER with outermost first) ------------------
+  // 유닛 좌표를 선형 번호에서 푼다. ORDER[0]이 가장 바깥 자리(자리값이 가장 큼)다.
+  // 축 번호는 counts/block argument 순서 [m, n, k] = [0, 1, 2]다.
+  //   {0, 1, 2} = mnk (기존)   {2, 1, 0} = knm   {2, 0, 1} = kmn
+  static constexpr unsigned ORDER[3] = {2, 0 , 1};
   void emitCoords(ArrayRef<int64_t> counts, Block &body, unsigned first,
                   unsigned depth, StringRef linear) {
     int64_t place = 1;
     for (int64_t c : counts)
       place *= c;
-    for (auto [d, c] : llvm::enumerate(counts)) {
-      place /= c;
+    for (unsigned d : ORDER) {
+      place /= counts[d];
       e.indent(depth);
       os() << "int64_t " << e.name(body.getArgument(first + d)) << " = ("
-           << linear << " / " << place << ") % " << c << ";\n";
+            << linear << " / " << place << ") % " << counts[d] << ";\n";
     }
   }
 
