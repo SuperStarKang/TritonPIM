@@ -1,6 +1,6 @@
 // 협력 lane 모드(lane_axis = m): tasklet 들이 tile 하나를 출력 행으로
 // 나눠 함께 계산한다. 버퍼는 한 벌, 적재는 chunk 분담, 경계는 barrier 다.
-// 입력은 convert.mlir 과 같은 GEMM 이고 lanes = 4 만 다르다. 8행 tile 을 4 lane 이
+// square RHS를 사용하는 GEMM에 lanes = 4를 적용한다. 8행 tile 을 4 lane 이
 // 2행씩 맡는다.
 // RUN: triton-shared-opt --convert-pim-to-upmem %s | FileCheck %s
 

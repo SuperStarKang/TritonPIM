@@ -38,11 +38,13 @@ import triton.backends.triton_shared.driver as cpu_driver
 
 # ── PIM_TIMING (임시): 마지막 launch의 단계별 시간(ms)과 그 단계 이름.
 # 지울 때 이 표시를 찾으면 된다. 두 target의 단계 이름이 다르므로 launch마다 다시 놓는다.
-UPMEM_TIMING_VERSION = 2
+UPMEM_TIMING_VERSION = 3
 _STAGE_NAMES = {
     # H2D/D2H: prepare+push. kernel: synchronous dpu_launch only.
-    # host_alloc: receive buffers; input staging allocations remain in stage.
-    "upmem": ("stage", "h2d", "kernel", "d2h", "combine", "host_alloc", "host_free"),
+    # Exclusive action timings; summing them never counts layout twice.
+    "upmem": ("prepare", "h2d", "kernel", "d2h", "reduction",
+              "buffer_alloc", "buffer_free", "acquire", "buffer_init",
+              "layout_a", "layout_b", "layout_other", "layout_c"),
     "aimx": ("alloc", "build", "stage", "invoke", "unstage"),
 }
 TIMING_STAGES = _STAGE_NAMES["upmem"]
@@ -241,17 +243,12 @@ class PIMLauncher(object):
         entry = kernel_metadata[6]
         lib = ctypes.CDLL(so_path)
         if self.pim_target == "upmem":
-            # Old cached hosts export five timings with different boundaries.
-            # Reject them before launching or reading the expanded timing array.
-            try:
-                timing_version = ctypes.c_uint32.in_dll(lib, "pim_timing_version").value
-            except ValueError:
-                timing_version = None
+            timing_version = ctypes.c_uint32.in_dll(lib, "pim_timing_version").value
             if timing_version != UPMEM_TIMING_VERSION:
                 raise RuntimeError(
                     f"UPMEM timing version {timing_version!r}; expected {UPMEM_TIMING_VERSION}. "
-                    "Rebuild triton-shared-translate, then regenerate the Triton artifacts "
-                    "(use a fresh TRITON_CACHE_DIR and TORCHINDUCTOR_CACHE_DIR).")
+                    "Rebuild triton-shared-opt and triton-shared-translate, then regenerate the Triton artifacts "
+                    "with the current backend compiler version.")
         fn = getattr(lib, entry)
         # 커널 인자를 원래 순서대로, 그 뒤에 grid 크기 셋.
         # grid는 컴파일 캐시 키에 없으므로(jit.py가 캐시를 조회한 뒤 정규화한다) 반드시
@@ -321,7 +318,7 @@ def _pim_do_bench(fn, warmup=1, rep=3, quantiles=None, return_mode="mean", **kwa
     # warmup은 선택이 아니다. config마다 첫 호출에 device.elf 컴파일과 (num_units가 바뀌었으면)
     # DPU set 재예약이 섞여 들어온다.
     #
-    # 재는 것은 launch 전체(staging + h2d + kernel + d2h + combine)다. tile 크기를 바꾸면 전송량도
+    # 재는 것은 host 준비와 layout, h2d, kernel, d2h, reduction 전체다. tile 크기를 바꾸면 전송량도
     # 함께 변하므로 pim_timing_ms의 kernel 단계만 떼어 재면 최소화 대상이 어긋난다.
     from triton.testing import _summarize_statistics
 

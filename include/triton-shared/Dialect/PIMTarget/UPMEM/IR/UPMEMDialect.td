@@ -143,13 +143,15 @@ def UPMEM_ForeachUnitOp : UPMEM_Op<"foreach_unit", [NoTerminator]> {
 //                          옮기는 양보다 커진다.
 //   dedup_over           = 이 축만 다른 유닛은 같은 결과를 받는다. 그 축을 뺀 조합
 //                          개수만큼만 실제로 모으면 된다(pim.place replicated_over).
+//   operand_role         = GEMM 입력의 lhs/rhs 역할. Host layout 계측에 사용한다.
 def UPMEM_StageOp : UPMEM_Op<"stage", [AttrSizedOperandSegments]> {
   let summary = "Gather a strided region of a host buffer into a padded tile-major buffer";
   let arguments = (ins AnyRankedOrUnrankedMemRef:$src,
                        Variadic<Index>:$origin, Variadic<Index>:$sizes,
                        Variadic<Index>:$strides, Variadic<Index>:$pad_to,
                        DenseI64ArrayAttr:$tile,
-                       OptionalAttr<StrArrayAttr>:$dedup_over);
+                       OptionalAttr<StrArrayAttr>:$dedup_over,
+                       OptionalAttr<StrAttr>:$operand_role);
   let results = (outs AnyMemRef:$result);
   let assemblyFormat = [{
     $src `origin` `[` $origin `]` `sizes` `[` $sizes `]`

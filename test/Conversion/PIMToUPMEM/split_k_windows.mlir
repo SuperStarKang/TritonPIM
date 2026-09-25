@@ -23,7 +23,16 @@
 // HOST-NOT: matmul_split_k_tiles_k
 // HOST-NOT: tiles_reduction_k
 // HOST: if ({{.*}} == 0) {
-// HOST: +=
+// HOST-NEXT: _pim_stop(0);
+// HOST-NEXT: _pim_start(12);
+// HOST: _pim_stop(12);
+// HOST-NEXT: _pim_start(0);
+// HOST-NEXT: } else {
+// HOST-NEXT: _pim_stop(0);
+// HOST-NEXT: _pim_start(4);
+// HOST: {{.*}}] += {{.*}}[
+// HOST-NEXT: _pim_stop(4);
+// HOST-NEXT: _pim_start(0);
 
 // DEVICE-NOT: matmul_split_k_tiles_k
 // DEVICE-NOT: tiles_reduction_k

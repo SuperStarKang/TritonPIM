@@ -11,23 +11,40 @@ upmem.host_var @pitch_a : index
 // ── host ────────────────────────────────────────────────────────────────────
 // 런타임 헤더는 UPMEM target의 것이고, driver가 -I로 잡아 주는 이름과 같아야 한다.
 // HOST: #include "upmem_runtime.h"
-// HOST: uint32_t pim_timing_version = 2;
-// HOST: double pim_timing_ms[7];
+// HOST: uint32_t pim_timing_version = 3;
+// HOST: double pim_timing_ms[13];
 // HOST: extern "C" void kernel(int8_t* a0, int32_t* a1, int64_t a2, int64_t a3)
 // HOST: memset(pim_timing_ms, 0, sizeof pim_timing_ms);
 // 확보와 적재는 런타임이 한 번만 한다.
-// HOST: _pim_start(0);
+// HOST: _pim_start(7);
 // HOST: _set = upmem_acquire(4, DPU_BINARY);
-// HOST-NEXT: _pim_stop(0);
+// HOST-NEXT: _pim_stop(7);
 // HOST-NEXT: _pim_start(0);
 // staging: dedup 축을 뺀 조합마다 한 번씩만 만들고, 남는 자리는 0이다.
-// HOST: calloc(2, sizeof(int8_t*))
+// HOST: _pim_stop(0);
+// HOST-NEXT: _pim_start(5);
+// HOST-NEXT: int8_t** _s0 = (int8_t**)malloc(2 * sizeof(int8_t*));
+// HOST-NEXT: _pim_stop(5);
+// HOST-NEXT: _pim_start(8);
+// HOST-NEXT: memset(_s0, 0, 2 * sizeof(int8_t*));
+// HOST-NEXT: _pim_stop(8);
+// HOST-NEXT: _pim_start(0);
 // 유닛 좌표는 선형 번호에서 자리값으로 푼다.
 // HOST: for (int64_t _u = 0; _u < 4; ++_u)
-// HOST: calloc(
+// HOST: _pim_stop(0);
+// HOST-NEXT: _pim_start(5);
+// HOST-NEXT: int8_t* _b = (int8_t*)malloc(
+// HOST-NEXT: _pim_stop(5);
+// HOST-NEXT: _pim_start(8);
+// HOST-NEXT: memset(_b, 0,
+// HOST-NEXT: _pim_stop(8);
+// HOST-NEXT: _pim_start(11);
 // 부분 타일도 돌되 원본 범위를 넘는 원소는 건너뛴다.
 // HOST: for (int64_t _t0 = 0; _t0 < (({{.*}} + 7) / 8); ++_t0)
 // HOST: if (_t0 * 8 + _e0 < {{.*}} && _t1 * 16 + _e1 < {{.*}})
+// HOST: _b[{{.*}} * 128 + (_e0 * 16 + _e1)] =
+// HOST-NEXT: _pim_stop(11);
+// HOST-NEXT: _pim_start(0);
 // MRAM 심볼과 host staging은 같은 fixed-slot 크기이며 전송 직전에도 상한을 확인한다.
 // HOST: if ({{.*}}_bytes > 4096) {
 // H2D는 PGEMM과 같이 행렬+메타데이터의 prepare/push만 잰다.
@@ -56,10 +73,14 @@ upmem.host_var @pitch_a : index
 // HOST: dpu_prepare_xfer
 // HOST: dpu_push_xfer(_set, DPU_XFER_FROM_DPU, "C_mram"
 // HOST-NEXT: _pim_stop(3);
-// HOST-NEXT: _pim_start(4);
+// HOST-NEXT: _pim_start(0);
 // device마다 자기 버퍼를 원본으로 되돌린다.
 // HOST: for (int64_t _g = 0; _g < 4; ++_g)
-// HOST: _pim_stop(4);
+// HOST: _pim_stop(0);
+// HOST-NEXT: _pim_start(12);
+// HOST: _pim_stop(12);
+// HOST-NEXT: _pim_start(0);
+// HOST: _pim_stop(0);
 // HOST-NEXT: _pim_start(6);
 // HOST-NEXT: for (int64_t _u = 0; _u < 4; ++_u) free(
 // HOST-NEXT: free(

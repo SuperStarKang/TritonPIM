@@ -40,6 +40,11 @@ struct HostEmitter {
   // 영역을 모으고 되돌리는 일을 몇 갈래로 나눌지. --convert-pim-to-upmem이 정해 준다.
   int64_t threads = 1;
 
+  enum TimingSlot {
+    Prepare = 0, H2D, Kernel, D2H, Reduction, BufferAlloc, BufferFree,
+    Acquire, BufferInit, LayoutA, LayoutB, LayoutOther, LayoutC, TimingCount
+  };
+
   // Cache allocation capacity, never input contents. Each generated buffer has
   // its own slot; different calls may supply different pointers and valid sizes.
   // A cache belongs to one host artifact and thread and is released on teardown.
@@ -73,18 +78,19 @@ static thread_local _pim_workspace_t _pim_workspace;
   // driver.py의 같은 표시를 지우면 된다. 생성되는 계산 코드에는 영향이 없다.
   void emitTimingPreamble() {
     os() << "// PIM_TIMING: 단계별 시간(ms). launcher가 이름으로 읽어 간다.\n"
-         << "// v2: stage, h2d, kernel, d2h, combine, host_alloc, host_free.\n"
+         << "// v3: prepare, h2d, kernel, d2h, reduction, buffer_alloc, buffer_free,\n"
+         << "// acquire, buffer_init, layout_a, layout_b, layout_other, layout_c.\n"
          << "// Match PGEMM: transfers include prepare+push; kernel is synchronous launch.\n"
          << "#include <time.h>\n"
          << "extern \"C\" uint32_t pim_timing_version;\n"
-         << "uint32_t pim_timing_version = 2;\n"
-         << "extern \"C\" double pim_timing_ms[7];\n"
-         << "double pim_timing_ms[7];\n"
+         << "uint32_t pim_timing_version = 3;\n"
+         << "extern \"C\" double pim_timing_ms[" << TimingCount << "];\n"
+         << "double pim_timing_ms[" << TimingCount << "];\n"
          << "static uint64_t _pim_now_ns() {\n"
          << "  struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);\n"
          << "  return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;\n"
          << "}\n"
-         << "static uint64_t _pim_started_ns[7];\n"
+         << "static uint64_t _pim_started_ns[" << TimingCount << "];\n"
          // 독립된 구간만 잰다. 단계 사이의 malloc/free가 전송이나 kernel로 넘어가지 않는다.
          // scheduling round마다 시작 시각만 바꾸고, 시간은 host 진입 때 한 번만 초기화한다.
          << "static void _pim_start(int slot) {\n"
@@ -188,17 +194,17 @@ static thread_local _pim_workspace_t _pim_workspace;
 
     if (auto acq = dyn_cast<upmem::AcquireOp>(op)) {
       e.bind(acq.getResult(), "_set");
-      startTimer(0, depth);  // PIM_TIMING: runtime 확보/적재는 host 준비 비용
+      startTimer(Acquire, depth);
       e.indent(depth);
       os() << "_set = upmem_acquire(" << acq.getNumUnits() << ", DPU_BINARY);\n";
-      stopTimer(0, depth);
+      stopTimer(Acquire, depth);
       return success();
     }
     if (isa<upmem::LaunchOp>(op)) {
-      startTimer(2, depth);  // PIM_TIMING: PGEMM timer[2]와 같은 동기식 launch 구간
+      startTimer(Kernel, depth);  // PIM_TIMING: PGEMM timer[2]와 같은 동기식 launch 구간
       e.indent(depth);
       os() << "DPU_ASSERT(dpu_launch(_set, DPU_SYNCHRONOUS));\n";
-      stopTimer(2, depth);
+      stopTimer(Kernel, depth);
       return success();
     }
     // round(시간 창) loop. 값을 나르지 않는 단순 반복만 다룬다.
@@ -252,7 +258,7 @@ static thread_local _pim_workspace_t _pim_workspace;
     for (int64_t c : counts)
       units *= c;
     Block &body = fe.getBody().front();
-    startTimer(0, depth);  // PIM_TIMING: 입력 버퍼 할당/패킹과 유닛별 인자 준비
+    startTimer(Prepare, depth);
 
     // staging 버퍼 목록. 서로 다른 조합의 개수만큼 잡는다(dedup_over 축은 뺀다).
     // 매 round의 dedup 목록은 비우되, reuse 모드에서는 실제 저장 공간의 용량만
@@ -272,19 +278,25 @@ static thread_local _pim_workspace_t _pim_workspace;
       stageName[&op] = id;
       int64_t distinct = distinctCount(st, counts, fe.getAxes());
       stageBuffers.push_back({id, distinct});
+      stopTimer(Prepare, depth);
+      startTimer(BufferAlloc, depth);
       e.indent(depth);
       os() << ct << "** " << id << " = (" << ct << "**)";
       if (reuseStaging) {
         os() << "_pim_workspace.get(" << workspaceSlots++ << ", " << distinct
              << " * sizeof(" << ct << "*));\n";
-        e.indent(depth);
-        os() << "memset(" << id << ", 0, " << distinct << " * sizeof(" << ct
-             << "*));\n";
         stageSlot[&op] = workspaceSlots;
         workspaceSlots += distinct;
       } else {
-        os() << "calloc(" << distinct << ", sizeof(" << ct << "*));\n";
+        os() << "malloc(" << distinct << " * sizeof(" << ct << "*));\n";
       }
+      stopTimer(BufferAlloc, depth);
+      startTimer(BufferInit, depth);
+      e.indent(depth);
+      os() << "memset(" << id << ", 0, " << distinct << " * sizeof(" << ct
+           << "*));\n";
+      stopTimer(BufferInit, depth);
+      startTimer(Prepare, depth);
     }
 
     SmallVector<Xfer> xfers;
@@ -301,8 +313,12 @@ static thread_local _pim_workspace_t _pim_workspace;
     }
     std::string args = "_args" + std::to_string(metadataId++);
     if (hasMetadata) {
+      stopTimer(Prepare, depth);
+      startTimer(BufferInit, depth);
       e.indent(depth);
       os() << "struct _pim_metadata_t " << args << "[" << units << "] = {};\n";
+      stopTimer(BufferInit, depth);
+      startTimer(Prepare, depth);
     }
     // 유닛별 결과를 담을 배열.
     for (Operation &op : body) {
@@ -310,6 +326,8 @@ static thread_local _pim_workspace_t _pim_workspace;
         auto t = cast<MemRefType>(to.getBuffer().getType());
         std::string arr = "_p" + std::to_string(xferId++);
         std::string ct = CEmitter::scalarType(t.getElementType(), true);
+        stopTimer(Prepare, depth);
+        startTimer(BufferAlloc, depth);
         e.indent(depth);
         os() << ct << "** " << arr << " = (" << ct << "**)";
         if (reuseStaging)
@@ -317,6 +335,8 @@ static thread_local _pim_workspace_t _pim_workspace;
         else
           os() << "malloc(";
         os() << units << " * sizeof(" << ct << "*));\n";
+        stopTimer(BufferAlloc, depth);
+        startTimer(Prepare, depth);
         e.indent(depth);
         os() << "int64_t " << arr << "_n[" << units << "];\n";
         xfers.push_back({arr, to.getDst().str(), arr + "_n[0]"});
@@ -362,11 +382,11 @@ static thread_local _pim_workspace_t _pim_workspace;
     }
     e.indent(depth);
     os() << "}\n";
-    stopTimer(0, depth);
+    stopTimer(Prepare, depth);
 
     // 전송: 버퍼마다 DPU_FOREACH로 준비하고 집합 단위로 민다.
     // PGEMM timer[1]처럼 행렬과 메타데이터의 prepare+push 전체를 잰다.
-    startTimer(1, depth);
+    startTimer(H2D, depth);
     for (const Xfer &x : xfers) {
       e.indent(depth);
       os() << "_idx = 0;\n";
@@ -403,9 +423,9 @@ static thread_local _pim_workspace_t _pim_workspace;
            << ", DPU_XFER_DEFAULT));\n";
       first = end;
     }
-    stopTimer(1, depth);  // PIM_TIMING: 버퍼 해제 전에 H2D 종료
+    stopTimer(H2D, depth);  // PIM_TIMING: 버퍼 해제 전에 H2D 종료
     // 동기 전송이 끝난 뒤, reuse 모드에서는 다음 round/호출을 위해 공간을 보관한다.
-    startTimer(6, depth);
+    startTimer(BufferFree, depth);
     if (!reuseStaging) {
       for (auto &[id, distinct] : stageBuffers) {
         e.indent(depth);
@@ -419,7 +439,7 @@ static thread_local _pim_workspace_t _pim_workspace;
         os() << "free(" << x.array << ");\n";
       }
     }
-    stopTimer(6, depth);  // PIM_TIMING: 해제 비용은 H2D/kernel에 포함하지 않는다
+    stopTimer(BufferFree, depth);  // PIM_TIMING: 해제 비용은 H2D/kernel에 포함하지 않는다
     return success();
   }
 
@@ -533,16 +553,25 @@ static thread_local _pim_workspace_t _pim_workspace;
     os() << ") * sizeof(" << ct << ");\n";
     e.indent(depth);
     os() << "if (!" << id << "[" << id << "_key]) {\n";
+    stopTimer(Prepare, depth + 1);
+    startTimer(BufferAlloc, depth + 1);
     e.indent(depth + 1);
     os() << ct << "* _b = (" << ct << "*)";
     if (reuseStaging) {
       os() << "_pim_workspace.get(" << slotBase << " + " << id << "_key, "
            << buf << "_bytes);\n";
-      e.indent(depth + 1);
-      os() << "memset(_b, 0, " << buf << "_bytes);\n";
     } else {
-      os() << "calloc(" << buf << "_bytes, 1);\n";
+      os() << "malloc(" << buf << "_bytes);\n";
     }
+    stopTimer(BufferAlloc, depth + 1);
+    startTimer(BufferInit, depth + 1);
+    e.indent(depth + 1);
+    os() << "memset(_b, 0, " << buf << "_bytes);\n";
+    stopTimer(BufferInit, depth + 1);
+    int layoutSlot = LayoutOther;
+    if (auto role = st.getOperandRoleAttr())
+      layoutSlot = role.getValue() == "lhs" ? LayoutA : LayoutB;
+    startTimer(layoutSlot, depth + 1);
     ArrayRef<int64_t> tile = st.getTile();
     emitTileLoops(rank, tile, st.getSizes(), depth + 1);
     e.indent(depth + 2 + 2 * rank);
@@ -554,6 +583,8 @@ static thread_local _pim_workspace_t _pim_workspace;
                       })
          << "] = " << e.name(st.getSrc()) << "["
          << strideIndex(rank, tile, st.getOrigin(), st.getStrides()) << "];\n";
+    stopTimer(layoutSlot, depth + 1);
+    startTimer(Prepare, depth + 1);
     e.indent(depth + 1);
     os() << id << "[" << id << "_key] = _b;\n";
     e.indent(depth);
@@ -568,7 +599,7 @@ static thread_local _pim_workspace_t _pim_workspace;
     int64_t units = rt.getShape()[0];
     std::string ct = CEmitter::scalarType(rt.getElementType(), true);
     std::string arr = e.name(g.getResult());
-    startTimer(5, depth);  // PIM_TIMING: 수신 버퍼 할당을 D2H와 분리
+    startTimer(BufferAlloc, depth);  // PIM_TIMING: 수신 버퍼 할당을 D2H와 분리
     e.indent(depth);
     os() << "int64_t " << arr << "_bytes = (";
     for (auto [d, c] : llvm::enumerate(g.getCapacity()))
@@ -580,8 +611,8 @@ static thread_local _pim_workspace_t _pim_workspace;
     e.indent(depth);
     os() << "for (int64_t _u = 0; _u < " << units << "; ++_u) " << arr
          << "[_u] = (" << ct << "*)malloc(" << arr << "_bytes);\n";
-    stopTimer(5, depth);
-    startTimer(3, depth);  // PIM_TIMING: PGEMM timer[3]와 같은 prepare+push 구간
+    stopTimer(BufferAlloc, depth);
+    startTimer(D2H, depth);  // PIM_TIMING: PGEMM timer[3]와 같은 prepare+push 구간
     e.indent(depth);
     os() << "_idx = 0;\n";
     e.indent(depth);
@@ -591,7 +622,7 @@ static thread_local _pim_workspace_t _pim_workspace;
     os() << "DPU_ASSERT(dpu_push_xfer(_set, DPU_XFER_FROM_DPU, \""
          << g.getSrc() << "\", 0, " << arr
          << "_bytes, DPU_XFER_DEFAULT));\n";
-    stopTimer(3, depth);
+    stopTimer(D2H, depth);
     return success();
   }
 
@@ -607,7 +638,7 @@ static thread_local _pim_workspace_t _pim_workspace;
     std::string ct = CEmitter::scalarType(rt.getElementType(), true);
     std::string part = e.name(body.getArgument(0));
 
-    startTimer(4, depth);  // PIM_TIMING: 부분합 결합과 출력 배치 복원
+    startTimer(Prepare, depth);
     e.indent(depth);
     os() << "for (int64_t _g = 0; _g < " << groups << "; ++_g) {\n";
     emitCoords(counts, body, 1, depth + 1, "_g");
@@ -626,15 +657,15 @@ static thread_local _pim_workspace_t _pim_workspace;
     }
     e.indent(depth);
     os() << "}\n";
-    stopTimer(4, depth);
+    stopTimer(Prepare, depth);
     // 되돌리기가 끝났으므로 회수 버퍼를 놓는다.
-    startTimer(6, depth);
+    startTimer(BufferFree, depth);
     e.indent(depth);
     os() << "for (int64_t _u = 0; _u < " << rt.getShape()[0] << "; ++_u) free("
          << parts << "[_u]);\n";
     e.indent(depth);
     os() << "free(" << parts << ");\n";
-    stopTimer(6, depth);
+    stopTimer(BufferFree, depth);
     return success();
   }
 
@@ -647,7 +678,9 @@ static thread_local _pim_workspace_t _pim_workspace;
   LogicalResult emitUnstage(upmem::UnstageOp un, unsigned depth) {
     unsigned rank = un.getOrigin().size();
     ArrayRef<int64_t> tile = un.getTile();
-    auto emitBody = [&](unsigned d, StringRef assignOp) {
+    auto emitBody = [&](unsigned d, StringRef assignOp, TimingSlot slot) {
+      stopTimer(Prepare, d);
+      startTimer(slot, d);
       emitTileLoops(rank, tile, un.getSizes(), d);
       e.indent(d + 1 + 2 * rank);
       os() << e.name(un.getDst()) << "["
@@ -659,19 +692,21 @@ static thread_local _pim_workspace_t _pim_workspace;
                                  std::to_string(tile[dd]) + ")";
                         })
            << "];\n";
+      stopTimer(slot, d);
+      startTimer(Prepare, d);
     };
     if (Value acc = un.getAccumulate()) {
       e.indent(depth);
       os() << "if (" << e.name(acc) << " == 0) {\n";
-      emitBody(depth + 1, "=");
+      emitBody(depth + 1, "=", LayoutC);
       e.indent(depth);
       os() << "} else {\n";
-      emitBody(depth + 1, "+=");
+      emitBody(depth + 1, "+=", Reduction);
       e.indent(depth);
       os() << "}\n";
       return success();
     }
-    emitBody(depth, "=");
+    emitBody(depth, "=", LayoutC);
     return success();
   }
 };

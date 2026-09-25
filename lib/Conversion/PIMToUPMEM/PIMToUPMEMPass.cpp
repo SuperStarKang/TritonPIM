@@ -259,6 +259,24 @@ struct ConvertPIMToUPMEMPass
       tileOf[a.getId()] = SmallVector<int64_t>(a.getSizes());
     });
 
+    llvm::DenseMap<int64_t, StringAttr> operandRoles;
+    // 계측용 역할만 기록한다. 입력의 저장 배치나 소비 연산을 제한하지 않는다.
+    device.walk([&](linalg::MatmulOp mm) {
+      for (unsigned i = 0; i < 2; ++i) {
+        auto load = mm.getInputs()[i].getDefiningOp<pim::LoadOp>();
+        if (!load)
+          continue;
+        auto access = load.getAccess().getDefiningOp<pim::AccessOp>();
+        if (!access)
+          continue;
+        StringAttr role = StringAttr::get(ctx, i == 0 ? "lhs" : "rhs");
+        auto [entry, inserted] = operandRoles.try_emplace(access.getId(), role);
+        // 양쪽 입력이 공유하는 access는 한 번 패킹하고 layout_other로 집계한다.
+        if (!inserted && entry->second != role)
+          entry->second = StringAttr();
+      }
+    });
+
     // ── Common temporal K contract ─────────────────────────────────────────
     // K축이나 window 크기를 access에서 다시 찾지 않는다. Common IR이 표시한 local
     // reduction loop와 그 바깥 scheduling round를 그대로 소비한다.
@@ -614,7 +632,8 @@ struct ConvertPIMToUPMEMPass
           loc, stagedType(place), place.getBuffer(), place.getStart(),
           place.getSize(), place.getStrides(), place.getAllocationShape(),
           b.getDenseI64ArrayAttr(byAccess[place.getAccess()].tile),
-          place.getReplicatedOverAttr());
+          place.getReplicatedOverAttr(),
+          operandRoles.lookup(place.getAccess()));
       b.create<upmem::ToMRAMOp>(loc, dpu, staged, mramOf[place]);
     }
     // Common IR mapping 축의 device별 반복 횟수를 그 DPU에 보낸다. temporal K

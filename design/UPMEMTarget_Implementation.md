@@ -132,7 +132,7 @@ host는 기존의 스칼라별 스택 배열 대신 DPU별 구조체 배열을 �
 필드 구간만 묶어 전송하여 나머지 필드를 덮어쓰지 않는다. 메타데이터가 없는
 `foreach_unit`에는 메타데이터 배열이나 전송을 만들지 않는다.
 
-구조체 준비는 `stage`, prepare/push는 `h2d`에 집계한다. 입력 행렬의 staging과
+구조체 초기화는 `buffer_init`, 필드 대입은 `prepare`, prepare/push는 `h2d`에 집계한다. 입력 행렬의 staging과
 전송량에는 변화가 없다. 이 변경은 단일 round의 전송 호출 비용을 줄이는 UPMEM
 Target 최적화이며, round 사이의 데이터 유지나 전송 생략은 포함하지 않는다.
 
@@ -162,8 +162,9 @@ slot 번호는 host 코드 생성 시 staging 연산과 dedup 좌표에 대해 �
 A, B, 메타데이터를 모두 보내는 일반적인 GEMM에서는 H2D push가 각각 한 번씩
 발생한다. 원본에서 staging으로의 복사와 H2D 전송량은 재사용 옵션으로 줄지 않는다.
 
-입력 공간 확보·초기화·패킹은 `stage`, prepare/push는 `h2d`에 포함된다. 재사용
-모드에서는 입력 버퍼의 매번 해제만 없어지며, 출력 수신 버퍼 해제는 `host_free`에
+입력 공간 확보는 `buffer_alloc`, 초기화는 `buffer_init`, 패킹은 `layout_a/b/other`,
+prepare/push는 `h2d`에 포함된다. 재사용 모드에서는 입력 버퍼의 매번 해제만 없어지며,
+출력 수신 버퍼 해제는 `buffer_free`에
 남는다. 메타데이터 구조체 배열은 매 round 스택에서 준비하며 workspace에 넣지 않는다.
 
 **`acquire`가 확보와 적재를 함께 하는 이유.** 둘 다 커널을 부를 때마다 다시 할 일이
@@ -185,6 +186,13 @@ upmem.stage %A origin[%r, %c] sizes[%m, %n] strides[%lda, %c1]
 | `pad_to` | 결과 버퍼 shape = 배정량. 남는 자리는 0 |
 | `tile` | 유닛 버퍼를 이 단위로 쓴다 |
 | `dedup_over` | 이 축만 다른 유닛은 같은 결과를 받는다 |
+| `operand_role` | `lhs`/`rhs` 입력 패킹을 `layout_a`/`layout_b`로 계측 |
+
+GEMM RHS는 `[KT,NT]` 타일을 row-major로 패킹한다. outer tile 번호는
+`kt * num_n_tiles + nt`, inner offset은 `k * NT + n`이다.
+원본 B는 전달받은 stride로 읽고, MRAM/WRAM의 B 타일은 `[KT,NT]`로 저장한다.
+`linalg.matmul`의 RHS indexing map은 `(k,n)`이며 DPU 계산은
+`A[m*KT+k] * B[k*NT+n]`를 사용한다. 타일 내부 전치는 수행하지 않는다.
 
 `pad_to`가 `sizes`와 갈리는 이유는 `dpu_push_xfer`가 모든 DPU에 같은 바이트 수를
 요구하기 때문이다. 마지막 유닛이 덜 맡아도 배정량 크기로 보낸다.
@@ -192,6 +200,10 @@ upmem.stage %A origin[%r, %c] sizes[%m, %n] strides[%lda, %c1]
 `unstage`는 여기에 `capacity`가 더 있다. 되돌릴 때 **읽는 범위**는 실제로 쓴
 영역(`sizes`)이고 **축을 하나 건너뛰는 간격**은 버퍼 자체의 크기(`capacity`)에서
 나온다. 유닛이 배정량보다 적게 맡으면 둘이 다르므로 나누어 써야 한다.
+
+계측 v3에서 최초 partial을 쓰는 `=` 루프는 `layout_c`, 이후 `+=` 루프는 `reduction`이다.
+후자는 출력 주소 변환과 덧셈을 함께 수행한다. 모든 행동 타이머는 서로 겹치지 않으며
+시간 배열은 host 진입 때 한 번 초기화하고 모든 scheduling round에 대해 누적한다.
 
 ### 3.4 device 쪽
 

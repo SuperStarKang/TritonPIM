@@ -428,8 +428,8 @@ class PIMBackend(BaseBackend):
 
     @functools.lru_cache()
     def hash(self):
-        # Regenerate metadata layout checks with the GCC/Clang offsetof builtin.
-        return f"{self.target}-pim-common-ir-v2-input-reuse-upmem-metadata-v2-staging-v2-timing-v2"
+        # Regenerate row-major RHS tiles while retaining the action timing ABI.
+        return f"{self.target}-pim-common-ir-v2-input-reuse-upmem-metadata-v2-rhs-row-major-v1-timing-v3"
 
     def get_module_map(self) -> Dict[str, ModuleType]:
         return {}

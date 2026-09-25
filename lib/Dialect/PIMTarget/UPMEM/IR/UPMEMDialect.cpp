@@ -166,6 +166,9 @@ LogicalResult StageOp::verify() {
     return emitOpError("pad_to must have the same rank as origin");
   if (getTile().size() != getOrigin().size())
     return emitOpError("tile must have the same rank as origin");
+  if (auto role = getOperandRoleAttr())
+    if (role.getValue() != "lhs" && role.getValue() != "rhs")
+      return emitOpError("operand_role must be lhs or rhs");
   auto result = cast<MemRefType>(getResult().getType());
   return verifyFixedShape(*this, getPadTo(), result, /*leading=*/0);
 }

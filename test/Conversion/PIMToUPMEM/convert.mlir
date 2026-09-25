@@ -3,7 +3,7 @@
 // RUN: triton-shared-opt --convert-pim-to-upmem %s | FileCheck %s
 // RUN: triton-shared-opt --convert-pim-to-upmem %s | FileCheck %s --check-prefix=PIM-CLEAN
 // RUN: triton-shared-opt --convert-pim-to-upmem %s | triton-shared-translate --upmem-to-host | FileCheck %s --check-prefix=HOST
-// RUN: triton-shared-opt --convert-pim-to-upmem %s | triton-shared-translate --upmem-to-device > /dev/null
+// RUN: triton-shared-opt --convert-pim-to-upmem %s | triton-shared-translate --upmem-to-device | FileCheck %s --check-prefix=DEVICE
 // RUN: triton-shared-opt --convert-pim-to-upmem="reuse-staging=true" %s | triton-shared-translate --upmem-to-host | FileCheck %s --check-prefix=REUSE
 
 // REUSE: static thread_local _pim_workspace_t _pim_workspace;
@@ -17,6 +17,18 @@
 // REUSE-NEXT: _pim_stop(1);
 // REUSE-NEXT: _pim_start(6);
 // REUSE-NEXT: _pim_stop(6);
+
+// DEVICE: __dma_aligned int8_t {{.*}}[512];
+// DEVICE: for (int32_t _n = 0; _n < 16; ++_n)
+// DEVICE: _s += {{.*}}[_m * 32 + _k] * {{.*}}[_k * 16 + _n];
+
+// Both inputs retain row-major inner tiles: A=[8,32], B=[32,16].
+// HOST: _pim_start(9);
+// HOST: _b[{{.*}} * 256 + (_e0 * 32 + _e1)] =
+// HOST: _pim_stop(9);
+// HOST: _pim_start(10);
+// HOST: _b[{{.*}} * 512 + (_e0 * 16 + _e1)] =
+// HOST: _pim_stop(10);
 
 // Each round has exactly three H2D pushes: A, B, and all metadata together.
 // HOST: _pim_start(1);
@@ -42,10 +54,10 @@
 // PIM-CLEAN-NOT: pim.scheduling_axis
 // PIM-CLEAN-NOT: pim.combine
 
-// 버퍼마다 MRAM 심볼 하나. A=8x32, B=32x32, C=8x32이다.
+// 버퍼마다 MRAM 심볼 하나. A=8x32, logical B=32x16, C=8x16이다.
 // CHECK-DAG: upmem.mram @matmul_mram_0 : memref<256xi8, #upmem<space mram>>
-// CHECK-DAG: upmem.mram @matmul_mram_1 : memref<1024xi8, #upmem<space mram>>
-// CHECK-DAG: upmem.mram @matmul_mram_2 : memref<256xi32, #upmem<space mram>>
+// CHECK-DAG: upmem.mram @matmul_mram_1 : memref<512xi8, #upmem<space mram>>
+// CHECK-DAG: upmem.mram @matmul_mram_2 : memref<128xi32, #upmem<space mram>>
 
 // 버퍼마다 MRAM 안의 축 간격 하나(rank 2라 축 1 뿐).
 // CHECK-DAG: upmem.host_var @matmul_pitch_0_1 : index
@@ -62,8 +74,8 @@
 // CHECK-LABEL: upmem.device_func @matmul_device
 // CHECK-SAME:    upmem.lanes = 1
 // CHECK-DAG:     memref.alloc() : memref<8x32xi8, #upmem<space wram>>
-// CHECK-DAG:     memref.alloc() : memref<32x32xi8, #upmem<space wram>>
-// CHECK-DAG:     memref.alloc() : memref<8x32xi32, #upmem<space wram>>
+// CHECK-DAG:     memref.alloc() : memref<32x16xi8, #upmem<space wram>>
+// CHECK-DAG:     memref.alloc() : memref<8x16xi32, #upmem<space wram>>
 // CHECK:         %[[TX:.*]] = upmem.get_host_var @matmul_tiles_m : index
 // CHECK:         scf.for %{{.*}} = %{{.*}} to %[[TX]]
 // CHECK:           arith.addi %c0{{.*}}, %{{.*}} : index
@@ -71,7 +83,7 @@
 // CHECK:             %[[SV:.*]] = memref.subview
 // CHECK:             upmem.mram_read @matmul_mram_0[%{{.*}}], %[[SV]]
 // 계산은 WRAM memref 위에서 돌고 tensor iter_arg 는 없어진다.
-// CHECK:         linalg.matmul ins(%{{.*}}, %{{.*}} : memref<8x32xi8, #upmem<space wram>>, memref<32x32xi8, #upmem<space wram>>) outs(%{{.*}} : memref<8x32xi32, #upmem<space wram>>)
+// CHECK:         linalg.matmul ins(%{{.*}}, %{{.*}} : memref<8x32xi8, #upmem<space wram>>, memref<32x16xi8, #upmem<space wram>>) outs(%{{.*}} : memref<8x16xi32, #upmem<space wram>>)
 // CHECK:         upmem.mram_write %{{.*}}, @matmul_mram_2
 // CHECK-NOT:     iter_args
 // device 몸체에 pim op이 남지 않는다.
@@ -88,18 +100,20 @@
 // device마다 같은 바이트 수를 보내야 하므로.
 // CHECK:           %[[SA:.*]] = upmem.stage %{{.*}} origin[%{{.*}}, %{{.*}}] sizes[%{{.*}}, %{{.*}}] strides[%{{.*}}, %{{.*}}] pad_to[%{{.*}}, %{{.*}}] tile [8, 32]
 // CHECK-SAME:        dedup_over = ["n"]
+// CHECK-SAME:        operand_role = "lhs"
 // CHECK-SAME:        -> memref<8x32xi8>
 // CHECK:           upmem.to_mram %{{.*}}, %[[SA]], @matmul_mram_0
 // CHECK:           upmem.stage
 // CHECK-SAME:        dedup_over = ["m"]
+// CHECK-SAME:        operand_role = "rhs"
 // CHECK:           upmem.to_mram %{{.*}}, %{{.*}}, @matmul_mram_1
 // CHECK:         upmem.launch %[[SET]]
 // 출력은 집합 전체에서 한 번에 회수한 뒤 device마다 되돌린다.
-// CHECK:         %[[P:.*]] = upmem.gather %[[SET]], @matmul_mram_2 {{.*}} -> memref<8x8x32xi32>
+// CHECK:         %[[P:.*]] = upmem.gather %[[SET]], @matmul_mram_2 {{.*}} -> memref<8x8x16xi32>
 // CHECK:         upmem.foreach_group %[[P]] : {{.*}} axes ["m", "n", "k"] counts [2, 4, 1]
 // 되돌릴 때 읽는 범위는 실제 크기(size)지만 축 사이 간격은 배정량(capacity)이다.
 // Common pim.combine과 reduction_k round가 명시한 partial 결합을 그대로 전달한다.
-// CHECK:           upmem.unstage %{{.*}} into %{{.*}} origin[%{{.*}}, %{{.*}}] sizes[%{{.*}}, %{{.*}}] strides[%{{.*}}, %{{.*}}] capacity[%{{.*}}, %{{.*}}] accumulate %{{.*}} tile [8, 32]
+// CHECK:           upmem.unstage %{{.*}} into %{{.*}} origin[%{{.*}}, %{{.*}}] sizes[%{{.*}}, %{{.*}}] strides[%{{.*}}, %{{.*}}] capacity[%{{.*}}, %{{.*}}] accumulate %{{.*}} tile [8, 16]
 // pim 쪽은 남지 않는다.
 // CHECK-NOT:     pim.device
 // CHECK-NOT:     pim.place
@@ -114,13 +128,14 @@ module attributes {pim.target_profile = #pim.target_profile<
 func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
                   %K: i32, %N: i32, %ex: index, %ey: index)
     attributes {
-        pim.block = #pim.block<shape = [8, 32, 32]>,
+        pim.block = #pim.block<shape = [8, 16, 32]>,
         pim.block_group = #pim.block_group<blocks = [1, 1, 1]>} {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c2 = arith.constant 2 : index
   %c4 = arith.constant 4 : index
   %c8 = arith.constant 8 : index
+  %c16 = arith.constant 16 : index
   %c32 = arith.constant 32 : index
   %c0_i32 = arith.constant 0 : i32
   %lda = arith.index_cast %K : i32 to index
@@ -153,14 +168,14 @@ func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
         {direction = "in", access = 0 : i64,
          replicated_over = ["n"]} : memref<*xi8>
 
-    %bc = arith.muli %starty, %c32 : index
-    %bcn = arith.muli %tripsy, %c32 : index
-    pim.place %B start[%startk, %bc] size[%akn, %bcn] allocation_shape[%c32, %c32]
+    %bc = arith.muli %starty, %c16 : index
+    %bcn = arith.muli %tripsy, %c16 : index
+    pim.place %B start[%startk, %bc] size[%akn, %bcn] allocation_shape[%c32, %c16]
         strides[%ldb, %c1]
         {direction = "in", access = 1 : i64,
          replicated_over = ["m"]} : memref<*xi8>
 
-    pim.place %C start[%ar, %bc] size[%arn, %bcn] allocation_shape[%c8, %c32]
+    pim.place %C start[%ar, %bc] size[%arn, %bcn] allocation_shape[%c8, %c16]
         strides[%ldb, %c1]
         {direction = "out", access = 2 : i64} : memref<*xi32>
 
@@ -171,26 +186,26 @@ func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
       %m = arith.muli %gx, %c8 : index
       scf.for %ty = %c0 to %tripsy step %c1 {
         %gy = arith.addi %starty, %ty {pim.device_origin} : index
-        %n = arith.muli %gy, %c32 : index
-        %e = tensor.empty() : tensor<8x32xi32>
-        %init = linalg.fill ins(%c0_i32 : i32) outs(%e : tensor<8x32xi32>) -> tensor<8x32xi32>
+        %n = arith.muli %gy, %c16 : index
+        %e = tensor.empty() : tensor<8x16xi32>
+        %init = linalg.fill ins(%c0_i32 : i32) outs(%e : tensor<8x16xi32>) -> tensor<8x16xi32>
         %r = scf.for %tk = %c0 to %tripsk step %c1
-             iter_args(%acc = %init) -> (tensor<8x32xi32>) {
+             iter_args(%acc = %init) -> (tensor<8x16xi32>) {
           %globalTk = arith.addi %reductionRound, %tk {pim.device_origin} : index
           %k = arith.muli %globalTk, %c32 : index
           %da = pim.access %A offset %m sizes [8, 32] strides[%lda, %c1] origin[%m, %k]
                 {id = 0 : i64} : memref<*xi8> -> !pim.access
           %ta = pim.load %da : !pim.access -> tensor<8x32xi8>
-          %db = pim.access %B offset %k sizes [32, 32] strides[%ldb, %c1] origin[%k, %n]
+          %db = pim.access %B offset %k sizes [32, 16] strides[%ldb, %c1] origin[%k, %n]
                 {id = 1 : i64} : memref<*xi8> -> !pim.access
-          %tb = pim.load %db : !pim.access -> tensor<32x32xi8>
-          %mm = linalg.matmul ins(%ta, %tb : tensor<8x32xi8>, tensor<32x32xi8>)
-                outs(%acc : tensor<8x32xi32>) -> tensor<8x32xi32>
-          scf.yield %mm : tensor<8x32xi32>
+          %tb = pim.load %db : !pim.access -> tensor<32x16xi8>
+          %mm = linalg.matmul ins(%ta, %tb : tensor<8x32xi8>, tensor<32x16xi8>)
+                outs(%acc : tensor<8x16xi32>) -> tensor<8x16xi32>
+          scf.yield %mm : tensor<8x16xi32>
         } {pim.reduction = "add", pim.temporal_reduction}
-        %dc = pim.access %C offset %n sizes [8, 32] strides[%ldb, %c1] origin[%m, %n]
+        %dc = pim.access %C offset %n sizes [8, 16] strides[%ldb, %c1] origin[%m, %n]
               {id = 2 : i64} : memref<*xi32> -> !pim.access
-        pim.combine %r into %dc kind "add" : tensor<8x32xi32>, !pim.access
+        pim.combine %r into %dc kind "add" : tensor<8x16xi32>, !pim.access
       } {pim.axis = #pim.axis<"n">}
     } {pim.axis = #pim.axis<"m">}
   }
