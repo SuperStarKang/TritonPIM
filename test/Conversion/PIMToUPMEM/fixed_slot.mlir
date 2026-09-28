@@ -1,6 +1,6 @@
 // UPMEM은 PIM Common IR의 정적 allocation_shape를 정확한 MRAM slot으로 옮긴다.
 // runtime trip count나 bank 예산 균등 분할 fallback은 허용하지 않는다.
-// RUN: not triton-shared-opt --convert-pim-to-upmem %s 2>&1 | FileCheck %s
+// RUN: not triton-shared-opt --pim-form-host-plan --convert-pim-to-upmem %s 2>&1 | FileCheck %s
 
 // CHECK: convert-pim-to-upmem: allocation_shape must be the static fixed slot decided by PIM Common IR
 
@@ -22,7 +22,7 @@ func.func @dynamic_slot(%A: memref<*xi8>, %capacity: index) attributes {
     pim.place %A start[%c0] size[%c8] allocation_shape[%capacity]
         strides[%c1]
         {direction = "in", access = 0 : i64,
-         replicated_over = ["n", "k"]} : memref<*xi8>
+         shared_over = ["n", "k"]} : memref<*xi8>
 
     scf.for %m = %c0 to %c1 step %c1 {
       %globalM = arith.addi %c0, %m {pim.device_origin} : index

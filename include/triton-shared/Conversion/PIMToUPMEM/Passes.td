@@ -6,7 +6,8 @@ include "mlir/Pass/PassBase.td"
 def ConvertPIMToUPMEM : Pass<"convert-pim-to-upmem", "mlir::ModuleOp"> {
   let summary = "Convert PIM Common IR into the UPMEM execution model";
   let description = [{
-    `pim.device` + `pim.place` 를 UPMEM 의 host/device 구조로 옮긴다. Common IR이
+    `pim-form-host-plan`이 만든 `pim.partition`의 명시적 전송·실행·회수 계획을
+    UPMEM 의 host/device 구조로 옮긴다. 중간 분석 IR인 `pim.device`는 거부한다. Common IR이
     확정한 Execution Tile 경계와 resident buffer 범위는 바꾸지 않고, UPMEM의
     MRAM/WRAM·DMA·tasklet 표현만 선택한다.
 
@@ -23,12 +24,16 @@ def ConvertPIMToUPMEM : Pass<"convert-pim-to-upmem", "mlir::ModuleOp"> {
     host:
     - `upmem.acquire`: DPU 를 확보하고 device 프로그램을 적재한다. 런타임이 쥐고 있다가
       다시 주므로 짝이 되는 반납이 없다.
-    - `upmem.foreach_unit`: device 마다 하는 일. `direction = "in"` place 는
-      `upmem.stage` + `upmem.to_mram` 이 되고, replicated_over 는 stage 의 dedup_over 가
-      된다. stage 의 pad_to와 result shape는 place의 정적 allocation_shape다 —
+    - `upmem.bind_devices`: Common의 shared_over와 fixed-slot 바이트로 최대 8개
+      DPU의 논리 묶음을 선택한다. runtime은 실제 rank/member/CI에 이를 배정한다.
+      input, metadata, gather 모두 같은 assignment를 사용하며 pool은 논리 순서다.
+    - `upmem.foreach_unit`: device 마다 하는 일. `pim.broadcast`/`pim.scatter`가
+      참조하는 place는 계획 순서대로 `upmem.stage` + `upmem.to_mram` 이 되고,
+      place의 shared_over를 stage에 그대로
+      전달한다. stage의 pad_to와 result shape는 place의 정적 allocation_shape다 —
       push_xfer가 모든 DPU에 같은 바이트 수를 요구하므로 실제 tail size로는 보낼 수 없다.
-    - `upmem.launch`
-    - `direction = "out"` place 는 fixed allocation_shape의 `upmem.gather` +
+    - `pim.launch`의 계산 본문은 device 함수로 옮기고 host에 `upmem.launch`를 만든다.
+    - `pim.gather`가 참조하는 place는 fixed allocation_shape의 `upmem.gather` +
       `upmem.foreach_group` + `upmem.unstage` 가 된다.
 
     device(`upmem.device_func`):
@@ -57,7 +62,7 @@ def ConvertPIMToUPMEM : Pass<"convert-pim-to-upmem", "mlir::ModuleOp"> {
     확정한다. 이 pass는 access dependency에서 reduction 축을 찾지 않고
     `#pim.execution_tile`로 window를 다시 계산하지 않는다.
 
-    scheduling loop의 `pim.device` 한 번은 UPMEM의 stage → launch → gather 한 번이 된다.
+    scheduling loop의 `pim.partition` 한 번은 UPMEM의 stage → launch → gather 한 번이 된다.
     launch는 DPU set 전체에서 device program을 한 번 시작하는 것이며 Block Group마다
     발생하지 않는다. device-local Block Group loop 전체가 그 launch 한 번 안에서 돈다.
     각 stage/unstage 영역과 MRAM capacity는 그 round 안의 `pim.place`를 그대로 쓴다.
@@ -68,9 +73,12 @@ def ConvertPIMToUPMEM : Pass<"convert-pim-to-upmem", "mlir::ModuleOp"> {
     모든 Common scheduling loop 밖에 있어 같은 DPU set과 device binary를 round
     사이에 재사용한다. 별도 temporal host window는 만들지 않는다.
 
-    `reuse-staging`은 host의 입력 저장 공간을 round/호출 사이에 재사용한다. 내용은
-    매번 다시 채우며 input residency를 가정하지 않는다. 기본값은 false이며
-    Common scheduling이나 Group 크기는 바꾸지 않는다.
+    Host 입력/출력 pool은 Common scheduling loop 밖에서 memref.alloc으로 확보하고,
+    모든 round가 끝나면 memref.dealloc으로 해제한다. 입력은 shared_over를 제외한
+    고유 좌표별 한 slot, 출력은 DPU별 한 slot이다. stage/gather는 명시적 목적지
+    pool을 채운다. 모든 입력의 stage/to_mram과 metadata 갱신은 매 scheduling
+    round 안에서 수행한다. Pool 공간은 재사용하지만 이전 round의 입력 내용에
+    의존해 전송을 생략하지 않는다.
   }];
   let constructor = "mlir::triton::createConvertPIMToUPMEMPass()";
   let options = [
@@ -78,8 +86,6 @@ def ConvertPIMToUPMEM : Pass<"convert-pim-to-upmem", "mlir::ModuleOp"> {
            "host가 영역을 모으고 되돌릴 때 쓰는 스레드 수. 1이면 순차.">,
     Option<"nrTasklets", "nr-tasklets", "int64_t", "0",
            "DPU마다 활성화할 tasklet 수. 0이면 profile의 lanes_per_core.">,
-    Option<"reuseStaging", "reuse-staging", "bool", "false",
-           "Reuse host input staging allocations across rounds and calls.">,
   ];
   let dependentDialects = ["mlir::upmem::UPMEMDialect", "mlir::pim::PIMDialect",
                            "mlir::arith::ArithDialect", "mlir::scf::SCFDialect",

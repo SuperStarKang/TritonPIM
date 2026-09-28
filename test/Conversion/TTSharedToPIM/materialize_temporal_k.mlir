@@ -1,9 +1,18 @@
 // Common IR이 temporal K를 target에 맡기지 않고 scheduling round, device-local
 // reduction window, 정확한 resident placement, partial combine으로 모두 명시한다.
 // RUN: triton-shared-opt "--pim-map-devices=p-m=1 p-n=1 p-k=1" --pim-place-data --pim-verify -canonicalize %s | FileCheck %s
+// RUN: triton-shared-opt "--pim-map-devices=p-m=1 p-n=1 p-k=1" --pim-place-data --pim-verify --pim-reuse-execution-tile-inputs --pim-form-host-plan --pim-verify -cse -canonicalize %s | FileCheck %s --check-prefix=PLAN
 // RUN: triton-shared-opt "--pim-form-execution-tiles=tile-m=2 tile-n=2 tile-k=1" "--pim-map-devices=p-m=1 p-n=1 p-k=1" --pim-place-data --pim-verify --pim-reuse-execution-tile-inputs --pim-verify -cse -canonicalize %s | FileCheck %s --check-prefix=REUSE
-// RUN: triton-shared-opt "--pim-form-execution-tiles=tile-m=2 tile-n=2 tile-k=1" "--pim-map-devices=p-m=1 p-n=1 p-k=1" --pim-place-data --pim-verify --pim-reuse-execution-tile-inputs --pim-verify -cse -canonicalize --convert-pim-to-upmem %s | triton-shared-translate --upmem-to-device > /dev/null
-// RUN: triton-shared-opt "--pim-form-execution-tiles=tile-m=2 tile-n=2 tile-k=1" "--pim-map-devices=p-m=1 p-n=1 p-k=1" --pim-place-data --pim-verify --pim-reuse-execution-tile-inputs --pim-verify -cse -canonicalize --convert-pim-to-upmem %s | triton-shared-translate --upmem-to-host > /dev/null
+// RUN: triton-shared-opt "--pim-form-execution-tiles=tile-m=2 tile-n=2 tile-k=1" "--pim-map-devices=p-m=1 p-n=1 p-k=1" --pim-place-data --pim-verify --pim-reuse-execution-tile-inputs --pim-verify -cse -canonicalize --pim-form-host-plan --convert-pim-to-upmem %s | triton-shared-translate --upmem-to-device > /dev/null
+// RUN: triton-shared-opt "--pim-form-execution-tiles=tile-m=2 tile-n=2 tile-k=1" "--pim-map-devices=p-m=1 p-n=1 p-k=1" --pim-place-data --pim-verify --pim-reuse-execution-tile-inputs --pim-verify -cse -canonicalize --pim-form-host-plan --convert-pim-to-upmem %s | triton-shared-translate --upmem-to-host > /dev/null
+
+// PLAN-LABEL: func.func @gemm
+// PLAN: pim.partition <partitions = [1, 1, 1]>
+// PLAN-SAME: pim.execution_tile = #pim.execution_tile<groups = [2, 2, 2]>
+// PLAN: pim.launch {
+// PLAN: pim.combine {{.*}} into {{.*}} kind "add"
+// PLAN: pim.gather 2
+// PLAN: } {pim.scheduling_axis = "reduction_k"}
 
 // Dynamic K is singleton for each entered round with tile_k=p_k=1. Reuse
 // survives folding of its zero local IV, while global placement stays intact.

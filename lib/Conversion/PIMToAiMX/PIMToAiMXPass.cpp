@@ -84,9 +84,16 @@ struct ConvertPIMToAiMXPass
     if (failed(checkLegality()))
       return signalPassFailure();
 
-    SmallVector<pim::DeviceOp> devices;
-    getOperation().walk([&](pim::DeviceOp d) { devices.push_back(d); });
-    for (pim::DeviceOp d : devices)
+    WalkResult unplanned = getOperation().walk([&](pim::DeviceOp device) {
+      device.emitOpError("requires pim-form-host-plan before AiMX lowering");
+      return WalkResult::interrupt();
+    });
+    if (unplanned.wasInterrupted())
+      return signalPassFailure();
+
+    SmallVector<pim::PartitionOp> devices;
+    getOperation().walk([&](pim::PartitionOp d) { devices.push_back(d); });
+    for (pim::PartitionOp d : devices)
       if (failed(convert(d)))
         return signalPassFailure();
 
@@ -187,11 +194,13 @@ struct ConvertPIMToAiMXPass
   // device 하나
   //===--------------------------------------------------------------------===//
 
-  LogicalResult convert(pim::DeviceOp device) {
+  LogicalResult convert(pim::PartitionOp device) {
     auto func = device->getParentOfType<func::FuncOp>();
     MLIRContext *ctx = &getContext();
     Location loc = device.getLoc();
     Block *deviceBody = &device.getBody().front();
+    if (failed(device.verify()))
+      return failure();
 
     Roles roles;
     if (failed(readRoles(device, roles)))
@@ -223,6 +232,30 @@ struct ConvertPIMToAiMXPass
     if (aPlace.getStart().size() != 2 || bPlace.getStart().size() != 2)
       return device->emitError(
           "convert-pim-to-aimx: A and B must be two-dimensional");
+
+    SmallVector<int64_t> inputAccesses, outputAccesses;
+    SmallVector<Operation *> transfers;
+    pim::LaunchOp launch;
+    for (Operation &op : *deviceBody) {
+      if (auto broadcast = dyn_cast<pim::BroadcastOp>(&op)) {
+        inputAccesses.push_back(broadcast.getAccess());
+        transfers.push_back(&op);
+      } else if (auto scatter = dyn_cast<pim::ScatterOp>(&op)) {
+        inputAccesses.push_back(scatter.getAccess());
+        transfers.push_back(&op);
+      } else if (auto gather = dyn_cast<pim::GatherOp>(&op)) {
+        outputAccesses.push_back(gather.getAccess());
+        transfers.push_back(&op);
+      } else if (auto compute = dyn_cast<pim::LaunchOp>(&op)) {
+        launch = compute;
+      }
+    }
+    if (inputAccesses.size() != 2 || inputAccesses[0] != roles.a ||
+        inputAccesses[1] != roles.b || outputAccesses.size() != 1 ||
+        outputAccesses[0] != roles.c)
+      return device.emitOpError(
+          "convert-pim-to-aimx: expected A/B transfers and C gather "
+          "for the matmul execution plan");
 
     // ── block → block group → execution tile ─────────────────────────────────
     // 세 계층은 전부 Common IR 이 정했다. #pim.block은 원소 shape,
@@ -342,7 +375,12 @@ struct ConvertPIMToAiMXPass
     }
     Block *fdBody = hb.createBlock(&foreach.getBody(), {}, argTys, argLocs);
 
-    // round 계산과 pim.device를 함께 foreach_device 안으로 옮긴다. 원래 round IV와
+    // AiMX는 launch 계산을 descriptor chain으로 내린다.
+    launch.erase();
+    for (Operation *transfer : transfers)
+      transfer->erase();
+
+    // round 계산과 pim.partition을 함께 foreach_device 안으로 옮긴다. 원래 round IV와
     // device 좌표를 그대로 보존하므로 place의 전역 origin 식을 다시 만들 필요가 없다.
     scheduleRoot->moveBefore(fdBody, fdBody->end());
 
@@ -352,15 +390,6 @@ struct ConvertPIMToAiMXPass
                                       deviceBody->begin(), deviceBody->end());
     for (unsigned i = 0; i < 3; i++)
       deviceBody->getArgument(i).replaceAllUsesWith(fdBody->getArgument(i + 1));
-
-    // 논리 tile loop nest 는 통째로 사라진다. AiMX 에는 device program 이 없고
-    // 계산 자체가 descriptor chain 이다.
-    SmallVector<scf::ForOp> nests;
-    for (Operation &op : *roundBody)
-      if (auto f = dyn_cast<scf::ForOp>(&op))
-        nests.push_back(f);
-    for (scf::ForOp f : nests)
-      f.erase();
 
     PlacementBuffers buffers = buildSetup(
         fdBody, func.getName(), mPhys, kMax, nMax, fp);
@@ -428,7 +457,7 @@ struct ConvertPIMToAiMXPass
   }
 
   // matmul 의 두 입력과 결과가 어느 pim.access 에서 왔는지 읽는다.
-  LogicalResult readRoles(pim::DeviceOp device, Roles &roles) {
+  LogicalResult readRoles(pim::PartitionOp device, Roles &roles) {
     SmallVector<linalg::MatmulOp> matmuls;
     SmallVector<pim::StoreOp> stores;
     device.getBody().walk([&](Operation *op) {
@@ -439,11 +468,11 @@ struct ConvertPIMToAiMXPass
     });
     if (matmuls.size() != 1)
       return device->emitError("convert-pim-to-aimx: expected exactly one "
-                               "linalg.matmul inside pim.device, found ")
+                               "linalg.matmul inside pim.launch, found ")
              << matmuls.size();
     if (stores.size() != 1)
       return device->emitError("convert-pim-to-aimx: expected exactly one "
-                               "pim.store inside pim.device, found ")
+                               "pim.store inside pim.launch, found ")
              << stores.size();
     roles.matmul = matmuls[0];
 

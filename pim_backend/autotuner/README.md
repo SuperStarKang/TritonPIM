@@ -97,7 +97,7 @@ UPMEM timing v3는 입력 layout, 버퍼 할당·초기화, 출력 layout과 `re
 `PIMProblem`은 연산별 policy를 갖지 않는다. `compute_kind`는 PIM compute op의
 종류를 식별하는 의미 값이고, 각 `PIMAccess`는 unique buffer의 direction, dtype,
 logical axis dependency를 나타낸다. 입력 access가 사용하지 않는 축은 Common IR의
-`replicated_over`와 같은 의미다. Cache와 constraint/feature는 이 access 구성을
+`shared_over`와 같은 의미다. Cache와 constraint/feature는 이 access 구성을
 포함하므로 서로 다른 연산 결과를 섞지 않는다.
 
 ## 사용 예

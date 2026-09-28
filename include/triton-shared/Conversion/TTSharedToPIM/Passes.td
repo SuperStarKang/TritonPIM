@@ -252,7 +252,7 @@ def PIMPlaceData : Pass<"pim-place-data", "mlir::ModuleOp"> {
       파생한다. 계층 밖 loop가 resident origin을 움직이는 경우 runtime trip count로
       대체하지 않고 진단한다.
     입력의 `pim.access` origin이 어느 logical 축에 불변이면 그 축만 다른 device들은
-    같은 데이터를 받으므로 `replicated_over`로 적는다. 중복 선형화 값인 offset에서
+    같은 데이터를 받으므로 `shared_over`로 적는다. 중복 선형화 값인 offset에서
     축을 다시 추론하지 않는다. 끊기면 host staging이 device 수만큼 부풀어 오른다.
   }];
   let constructor = "mlir::triton::createPIMPlaceDataPass()";
@@ -279,6 +279,20 @@ def PIMReuseExecutionTileInputs : Pass<"pim-reuse-execution-tile-inputs", "mlir:
   let constructor = "mlir::triton::createPIMReuseExecutionTileInputsPass()";
   let dependentDialects = ["mlir::pim::PIMDialect", "mlir::arith::ArithDialect",
                            "mlir::scf::SCFDialect", "mlir::linalg::LinalgDialect"];
+}
+
+def PIMFormHostPlan : Pass<"pim-form-host-plan", "mlir::ModuleOp"> {
+  let summary = "Separate logical partitions, input transfers, compute, and output collection";
+  let description = [{
+    Run after placement and device-local input reuse. Replace each intermediate
+    pim.device with pim.partition. Keep scalar placement expressions on the
+    host and move the existing compute slice into pim.launch. Materialize one
+    broadcast or scatter per input placement and one gather per output.
+    Broadcast preserves shared_over groups; it need not be one hardware
+    broadcast call. No scheduling interchange or round-crossing reuse occurs.
+  }];
+  let constructor = "mlir::triton::createPIMFormHostPlanPass()";
+  let dependentDialects = ["mlir::pim::PIMDialect"];
 }
 
 def PIMVerify : Pass<"pim-verify", "mlir::ModuleOp"> {

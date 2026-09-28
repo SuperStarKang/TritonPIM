@@ -113,9 +113,9 @@ UPMEM timing version 3는 PIM-LLM의 기존 PGEMM `timer[1/2/3]`에 맞춰
 | 항목 | TritonPIM에서 측정하는 작업 |
 |---|---|
 | `acquire` | `upmem_acquire`: DPU set 조회, 필요시 확보·바이너리 적재 |
-| `prepare` | 입력/출력 좌표·크기·dedup 키 계산, 포인터·메타데이터 대입 |
-| `buffer_alloc` | 입력/출력 버퍼와 포인터 표 확보. 재사용 시 workspace 조회·확장 |
-| `buffer_init` | 입력 staging 버퍼·dedup 표·메타데이터의 0 초기화 |
+| `prepare` | 입력/출력 좌표·크기·공유 slot 키 계산, 포인터·메타데이터 대입 |
+| `buffer_alloc` | round 반복문 밖에서 입력/출력 Host pool을 한 번씩 할당 |
+| `buffer_init` | stage가 실행되는 고유 입력 slot과 매 round 메타데이터의 0 초기화 |
 | `layout_a` | GEMM lhs를 `[Mtile,Ktile]`로 패킹하는 복사 루프 |
 | `layout_b` | GEMM rhs를 원본 stride에서 row-major `[Ktile,Ntile]` 타일로 패킹하는 복사 루프 |
 | `layout_other` | GEMM lhs/rhs 역할이 없는 입력의 패킹 루프 |
@@ -124,10 +124,10 @@ UPMEM timing version 3는 PIM-LLM의 기존 PGEMM `timer[1/2/3]`에 맞춰
 | `d2h` | 결과의 `dpu_prepare_xfer` 루프 + 동기식 `dpu_push_xfer` |
 | `layout_c` | 최초 부분합을 출력의 strided 주소로 복사 (`=`) |
 | `reduction` | 이후 K 부분합을 출력의 strided 주소에 누산 (`+=`) |
-| `buffer_free` | 전송 후 입력 버퍼 해제와 결과 반영 후 수신 버퍼 해제 |
+| `buffer_free` | 모든 round와 결과 반영이 끝난 뒤 입력/출력 Host pool 해제 |
 
-H2D에서 `free()`를, D2H에서 수신 버퍼 `malloc()`을 제외한다. 독립된 타이머를
-사용하므로 제외한 작업이 `kernel`이나 다음 round의 transfer에 섞이지 않는다.
+Host pool의 `malloc/free`는 round 반복문 밖에서 별도로 측정하며 H2D/D2H에 포함하지 않는다.
+독립된 타이머를 사용하므로 할당·해제 비용이 `kernel`이나 transfer에 섞이지 않는다.
 `prepare`는 할당·초기화·layout·reduction 구간에서 중지하고 다시 시작하므로 중복 집계가 없다.
 패킹 타이머는 OpenMP 루프 전체를 감싼 wall time이며 원소마다 타이머를 호출하지 않는다.
 `layout_b`는 원본의 stride 주소 계산과 타일 버퍼 복사 시간이다. `reduction`도 layout 주소 계산과 누산이
@@ -140,7 +140,10 @@ H2D에서 `free()`를, D2H에서 수신 버퍼 `malloc()`을 제외한다. 독�
 `h2d/d2h`에는 SDK의 포인터 등록·전송·동기화 비용이 포함되고, `kernel`에는
 DPU 내부 DMA와 동기화도 포함된다. B 타일은 `[Ktile,Ntile]`로 저장하며 DPU는
 `A[m,k] * B[k,n]`를 계산한다. Hybrid Transpose는 제거했고 행동별 계측은 유지한다.
-논리 타일 순서, padding, dedup, MRAM 전체 바이트 수와 H2D/D2H 전송량은 유지한다.
+논리 타일 순서, padding, 공유 입력의 중복 패킹 제거와 MRAM slot 크기는 유지한다.
+입력 pool 공간은 round 사이에 재사용하지만, 입력 패킹·H2D·metadata·D2H는
+매 round 실행한다. 같은 round에서 `shared_over` 축만 다른 DPU들은 같은
+입력 pool slot을 공유하므로 그 slot은 한 번만 패킹한다.
 호스트 행동별 시간은 PGEMM의 preprocess/postprocess와 직접 대응하지 않는다.
 
 반영할 때는 사용자가 lowering과 translator를 다시 빌드한다:

@@ -1,8 +1,8 @@
 // AiMX IR이 runtime stub(C++)과 descriptor program(C 헤더)으로 나가는지 확인한다.
 // 입력은 PIM Common IR이고 두 pass를 거쳐 온다 — 손으로 쓴 AiMX IR과 실제 pass 출력이
 // 어긋나지 않도록.
-// RUN: triton-shared-opt --convert-pim-to-aimx --aimx-lower-matmul %s | triton-shared-translate --aimx-to-descriptors | FileCheck %s --check-prefix=DESC
-// RUN: triton-shared-opt --convert-pim-to-aimx --aimx-lower-matmul %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=STUB
+// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx --aimx-lower-matmul %s | triton-shared-translate --aimx-to-descriptors | FileCheck %s --check-prefix=DESC
+// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx --aimx-lower-matmul %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=STUB
 
 // ── descriptor program ──────────────────────────────────────────────────────
 // program 하나가 함수 하나다. buffer는 물리 주소로 받는다.
@@ -90,7 +90,7 @@ func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
     pim.place %A start[%ar, %c0] size[%arn, %akn] allocation_shape[%arc, %akn]
         strides[%lda, %c1]
         {direction = "in", access = 0 : i64,
-         replicated_over = ["n"]} : memref<*xf32>
+         shared_over = ["n"]} : memref<*xf32>
 
     %bc = arith.muli %starty, %c32 : index
     %bcn = arith.muli %tripsy, %c32 : index
@@ -98,7 +98,7 @@ func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
     pim.place %B start[%c0, %bc] size[%akn, %bcn] allocation_shape[%akn, %bcc]
         strides[%ldb, %c1]
         {direction = "in", access = 1 : i64,
-         replicated_over = ["m"]} : memref<*xf32>
+         shared_over = ["m"]} : memref<*xf32>
 
     pim.place %C start[%ar, %bc] size[%arn, %bcn] allocation_shape[%arc, %bcc]
         strides[%ldb, %c1]

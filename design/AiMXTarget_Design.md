@@ -1102,14 +1102,14 @@ AiMX 물리 실행 눈금 `[batch,4096/batch,256/batch]`는 Common profile에 �
 
 | 필요한 것 | 어디서 | §3의 어느 단계 |
 | --- | --- | --- |
-| PIM Device 개수와 축별 분할 | `pim.device`의 `#pim.device_mapping` | ① |
+| PIM Device 개수와 축별 분할 | 최종 `pim.partition`의 `#pim.device_mapping` | ① |
 | device 하나가 맡는 직사각형 | `pim.place`의 `allocation_shape` | ①→② |
 | 실제 유효 범위 (경계 tile) | `pim.place`의 `size` | padding 결정 |
 | host buffer 안의 위치와 간격 | `pim.place`의 `start`, `strides` | stage/unstage |
 | A / B / C 구분 | `pim.place.direction` + `pim.access.id` ↔ `linalg.matmul` operand | ③ |
 | reduction 축 | `linalg.matmul`의 고정 indexing map (A 축 1, B 축 0) | k |
 | logical tile 모양 | `pim.access.sizes` | 진단용 |
-| 같은 데이터를 받는 device | `pim.place.replicated_over` | stage 중복 제거 |
+| 같은 데이터를 받는 device | `pim.place.shared_over` | stage 중복 제거 |
 | padding 값 | `pim.access.pad` (`pim-verify`가 0임을 보장) | §6 |
 | 기계 예산 | `#pim.target_profile.bank_capacity_limit_bytes` | ② |
 
@@ -1695,7 +1695,8 @@ Triton kernel
    │  _ttir_to_ttsharedir          ← CPU/PIM 공용, target 무관
    ▼  TTSharedIR
    │  PIM_COMMON_PASSES            ← target 무관, profile만 target별
-   ▼  Placed PIM Common IR         ← 여기까지 완전히 공유
+   │  --pim-form-host-plan         ← partition + 전송/launch/gather 명시
+   ▼  Planned PIM Common IR        ← 여기까지 완전히 공유
    │
    ├─ --convert-pim-to-upmem  → UPMEM IR → --upmem-to-host / --upmem-to-device
    ├─ --convert-pim-to-aimx   → AiMX IR L1 → --aimx-lower-matmul → L2
@@ -1705,6 +1706,10 @@ Triton kernel
 
 > **PIM Common IR은 "어느 데이터가 어느 PIM Device에 몇 번 가는가"까지,
 > AiMX IR은 "그 데이터가 어떤 descriptor 열로 옮겨지고 언제 누산기가 비워지는가"부터.**
+
+Target 진입 시 `pim.partition`의 A/B 입력 전송과 C gather를 확인한다. `pim.launch`의
+matmul을 기존 compute template으로 보존한 뒤 descriptor 실행으로 내린다. 분석용
+`pim.device`를 자동 변환하거나 지원하지 않는 action 순서를 임의로 바꾸지 않는다.
 
 | 결정 | UPMEM | AiMX |
 | --- | --- | --- |

@@ -6,9 +6,11 @@ include "mlir/Pass/PassBase.td"
 def ConvertPIMToAiMX : Pass<"convert-pim-to-aimx", "mlir::ModuleOp"> {
   let summary = "Convert PIM Common IR into the AiMX host placement model";
   let description = [{
-    `pim.device` + `pim.place` 를 AiMX level 1 IR(acquire / alloc / stage /
+    `pim-form-host-plan`이 만든 `pim.partition`의 A/B 전송 → launch → C 회수 계획을
+    AiMX level 1 IR(acquire / alloc / stage /
     build_descriptors / invoke / unstage)로 옮긴다. PIM IR 이 정하지 않은 것을 여기서
     정한다: target 물리 padding, PIM DRAM 안의 pitch layout, 전치 여부.
+    중간 분석 IR인 `pim.device`나 지원하지 않는 전송 계획은 진단한다.
 
     진입 즉시 legality gate 를 지난다 — target 이 aimx 이고, unit 하나가 256 bank,
     bank 하나가 core 하나, core 하나가 16 lane 이어야 한다. AiMX는 profile의

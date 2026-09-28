@@ -1,47 +1,54 @@
 // PIM Common IR이 UPMEM host/device 구조로 바뀌는지 확인한다.
 // 각 MRAM은 Common allocation_shape의 정확한 fixed-slot 크기다.
-// RUN: triton-shared-opt --convert-pim-to-upmem %s | FileCheck %s
-// RUN: triton-shared-opt --convert-pim-to-upmem %s | FileCheck %s --check-prefix=PIM-CLEAN
-// RUN: triton-shared-opt --convert-pim-to-upmem %s | triton-shared-translate --upmem-to-host | FileCheck %s --check-prefix=HOST
-// RUN: triton-shared-opt --convert-pim-to-upmem %s | triton-shared-translate --upmem-to-device | FileCheck %s --check-prefix=DEVICE
-// RUN: triton-shared-opt --convert-pim-to-upmem="reuse-staging=true" %s | triton-shared-translate --upmem-to-host | FileCheck %s --check-prefix=REUSE
+// RUN: triton-shared-opt --pim-form-host-plan %s | triton-shared-opt | FileCheck %s --check-prefix=PLAN
+// RUN: not triton-shared-opt --convert-pim-to-upmem %s 2>&1 | FileCheck %s --check-prefix=UNPLANNED
+// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-upmem %s | FileCheck %s
+// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-upmem %s | FileCheck %s --check-prefix=PIM-CLEAN
+// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-upmem %s | triton-shared-translate --upmem-to-host | FileCheck %s --check-prefix=HOST
+// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-upmem %s | triton-shared-translate --upmem-to-device | FileCheck %s --check-prefix=DEVICE
 
-// REUSE: static thread_local _pim_workspace_t _pim_workspace;
-// REUSE: extern "C" void matmul(
-// REUSE: memset(_s0, 0,
-// REUSE: memset(_b, 0,
-// REUSE: _pim_start(1);
-// REUSE: dpu_push_xfer(_set, DPU_XFER_TO_DPU, "matmul_mram_0",
-// REUSE: dpu_push_xfer(_set, DPU_XFER_TO_DPU, "matmul_mram_1",
-// REUSE: dpu_push_xfer(_set, DPU_XFER_TO_DPU, "_pim_metadata",
-// REUSE-NEXT: _pim_stop(1);
-// REUSE-NEXT: _pim_start(6);
-// REUSE-NEXT: _pim_stop(6);
+// UNPLANNED: requires pim-form-host-plan before UPMEM lowering
+// PLAN-LABEL: func.func @matmul
+// PLAN: pim.partition <partitions = [2, 4, 1]>
+// PLAN: pim.place {{.*}}access = 0
+// PLAN-SAME: shared_over = ["n"]
+// PLAN: pim.place {{.*}}access = 1
+// PLAN-SAME: shared_over = ["m"]
+// PLAN: pim.place {{.*}}access = 2
+// PLAN: pim.broadcast 0
+// PLAN-NEXT: pim.broadcast 1
+// PLAN-NEXT: pim.launch {
+// PLAN: linalg.matmul
+// PLAN: pim.combine {{.*}} kind "add"
+// PLAN: pim.gather 2
 
 // DEVICE: __dma_aligned int8_t {{.*}}[512];
 // DEVICE: for (int32_t _n = 0; _n < 16; ++_n)
 // DEVICE: _s += {{.*}}[_m * 32 + _k] * {{.*}}[_k * 16 + _n];
 
 // Both inputs retain row-major inner tiles: A=[8,32], B=[32,16].
+// HOST: uint32_t [[MAP:v[0-9]+]][8];
+// HOST: upmem_bind_devices(_set, 3, [[MAP]]_partitions, [[MAP]]_mapping, [[MAP]]);
 // HOST: _pim_start(9);
-// HOST: _b[{{.*}} * 256 + (_e0 * 32 + _e1)] =
+// HOST: {{v[0-9]+}}[{{.*}} * 256 + (_e0 * 32 + _e1)] =
 // HOST: _pim_stop(9);
 // HOST: _pim_start(10);
-// HOST: _b[{{.*}} * 512 + (_e0 * 16 + _e1)] =
+// HOST: {{v[0-9]+}}[{{.*}} * 512 + (_e0 * 16 + _e1)] =
 // HOST: _pim_stop(10);
 
 // Each round has exactly three H2D pushes: A, B, and all metadata together.
 // HOST: _pim_start(1);
 // HOST-NEXT: _idx = 0;
-// HOST-NEXT: DPU_FOREACH{{.*}}dpu_prepare_xfer
+// HOST-NEXT: DPU_FOREACH{{.*}}dpu_prepare_xfer(_dpu, _p0{{\[}}[[MAP]][_idx]]));
 // HOST-NEXT: DPU_ASSERT(dpu_push_xfer(_set, DPU_XFER_TO_DPU, "matmul_mram_0",
 // HOST-NEXT: _idx = 0;
-// HOST-NEXT: DPU_FOREACH{{.*}}dpu_prepare_xfer
+// HOST-NEXT: DPU_FOREACH{{.*}}dpu_prepare_xfer(_dpu, _p1{{\[}}[[MAP]][_idx]]));
 // HOST-NEXT: DPU_ASSERT(dpu_push_xfer(_set, DPU_XFER_TO_DPU, "matmul_mram_1",
 // HOST-NEXT: _idx = 0;
-// HOST-NEXT: DPU_FOREACH{{.*}}dpu_prepare_xfer
+// HOST-NEXT: DPU_FOREACH{{.*}}dpu_prepare_xfer(_dpu, (uint8_t*)&_args0{{\[}}[[MAP]][_idx]] + 0));
 // HOST-NEXT: DPU_ASSERT(dpu_push_xfer(_set, DPU_XFER_TO_DPU, "_pim_metadata", 0,
 // HOST-NEXT: _pim_stop(1);
+// HOST: dpu_prepare_xfer(_dpu, {{v[0-9]+}} + (uint64_t)[[MAP]][_idx] * 128)
 
 // PIM-CLEAN-LABEL: module
 // PIM-CLEAN-NOT: #pim.target_profile
@@ -53,6 +60,11 @@
 // PIM-CLEAN-NOT: pim.temporal_reduction
 // PIM-CLEAN-NOT: pim.scheduling_axis
 // PIM-CLEAN-NOT: pim.combine
+// PIM-CLEAN-NOT: pim.partition
+// PIM-CLEAN-NOT: pim.broadcast
+// PIM-CLEAN-NOT: pim.scatter
+// PIM-CLEAN-NOT: pim.launch
+// PIM-CLEAN-NOT: pim.gather
 
 // 버퍼마다 MRAM 심볼 하나. A=8x32, logical B=32x16, C=8x16이다.
 // CHECK-DAG: upmem.mram @matmul_mram_0 : memref<256xi8, #upmem<space mram>>
@@ -95,25 +107,32 @@
 // CHECK-LABEL: func.func @matmul
 // 확보와 적재는 한 op이다. 런타임이 같은 device 수·같은 프로그램이면 쥐고 있던 것을 준다.
 // CHECK:         %[[SET:.*]] = upmem.acquire 8, @matmul_device : !upmem.set
-// CHECK:         upmem.foreach_unit %[[SET]] : !upmem.set axes ["m", "n", "k"] counts [2, 4, 1]
+// CHECK:         %[[ASSIGN:.*]] = upmem.bind_devices %[[SET]] partitions [2, 4, 1] device_mapping [2, 4, 1]
+// CHECK:         %[[AP:.*]] = memref.alloc() : memref<2x8x32xi8>
+// CHECK:         %[[BP:.*]] = memref.alloc() : memref<4x32x16xi8>
+// CHECK:         %[[P:.*]] = memref.alloc() : memref<8x8x16xi32>
+// CHECK:         upmem.foreach_unit %[[SET]] assignment %[[ASSIGN]] : !upmem.set axes ["m", "n", "k"] counts [2, 4, 1]
 // A는 column 축 device끼리 같은 것을 받는다. pad_to는 size가 아니라 capacity다 —
 // device마다 같은 바이트 수를 보내야 하므로.
 // CHECK:           %[[SA:.*]] = upmem.stage %{{.*}} origin[%{{.*}}, %{{.*}}] sizes[%{{.*}}, %{{.*}}] strides[%{{.*}}, %{{.*}}] pad_to[%{{.*}}, %{{.*}}] tile [8, 32]
-// CHECK-SAME:        dedup_over = ["n"]
 // CHECK-SAME:        operand_role = "lhs"
+// CHECK-SAME:        shared_over = ["n"]
 // CHECK-SAME:        -> memref<8x32xi8>
 // CHECK:           upmem.to_mram %{{.*}}, %[[SA]], @matmul_mram_0
 // CHECK:           upmem.stage
-// CHECK-SAME:        dedup_over = ["m"]
 // CHECK-SAME:        operand_role = "rhs"
+// CHECK-SAME:        shared_over = ["m"]
 // CHECK:           upmem.to_mram %{{.*}}, %{{.*}}, @matmul_mram_1
 // CHECK:         upmem.launch %[[SET]]
 // 출력은 집합 전체에서 한 번에 회수한 뒤 device마다 되돌린다.
-// CHECK:         %[[P:.*]] = upmem.gather %[[SET]], @matmul_mram_2 {{.*}} -> memref<8x8x16xi32>
+// CHECK:         upmem.gather %[[SET]] assignment %[[ASSIGN]], @matmul_mram_2 {{.*}} into %[[P]] : !upmem.set, memref<8x8x16xi32>
 // CHECK:         upmem.foreach_group %[[P]] : {{.*}} axes ["m", "n", "k"] counts [2, 4, 1]
 // 되돌릴 때 읽는 범위는 실제 크기(size)지만 축 사이 간격은 배정량(capacity)이다.
 // Common pim.combine과 reduction_k round가 명시한 partial 결합을 그대로 전달한다.
 // CHECK:           upmem.unstage %{{.*}} into %{{.*}} origin[%{{.*}}, %{{.*}}] sizes[%{{.*}}, %{{.*}}] strides[%{{.*}}, %{{.*}}] capacity[%{{.*}}, %{{.*}}] accumulate %{{.*}} tile [8, 16]
+// CHECK:         memref.dealloc %[[AP]]
+// CHECK:         memref.dealloc %[[BP]]
+// CHECK:         memref.dealloc %[[P]]
 // pim 쪽은 남지 않는다.
 // CHECK-NOT:     pim.device
 // CHECK-NOT:     pim.place
@@ -166,14 +185,14 @@ func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
     pim.place %A start[%ar, %startk] size[%arn, %akn] allocation_shape[%c8, %c32]
         strides[%lda, %c1]
         {direction = "in", access = 0 : i64,
-         replicated_over = ["n"]} : memref<*xi8>
+         shared_over = ["n"]} : memref<*xi8>
 
     %bc = arith.muli %starty, %c16 : index
     %bcn = arith.muli %tripsy, %c16 : index
     pim.place %B start[%startk, %bc] size[%akn, %bcn] allocation_shape[%c32, %c16]
         strides[%ldb, %c1]
         {direction = "in", access = 1 : i64,
-         replicated_over = ["m"]} : memref<*xi8>
+         shared_over = ["m"]} : memref<*xi8>
 
     pim.place %C start[%ar, %bc] size[%arn, %bcn] allocation_shape[%c8, %c16]
         strides[%ldb, %c1]

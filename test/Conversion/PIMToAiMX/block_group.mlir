@@ -1,9 +1,9 @@
 // Triton block이 하드웨어 눈금을 나누지 못하는 경우다. 예전에는 진단으로 거부했고,
 // 지금은 block group이 어긋남을 padding으로 흡수한다 — Triton block 정수 개(group)를
 // 하드웨어 단위의 정수 배(execution)에 채우고 남는 자리를 stage가 0으로 채운다.
-// RUN: triton-shared-opt --convert-pim-to-aimx=batch=2 %s | FileCheck %s
-// RUN: triton-shared-opt --convert-pim-to-aimx=batch=2 --aimx-lower-matmul %s | FileCheck %s --check-prefix=PROGRAM
-// RUN: not triton-shared-opt --convert-pim-to-aimx=batch=8 %s 2>&1 | FileCheck %s --check-prefix=BATCH-ERR
+// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx=batch=2 %s | FileCheck %s
+// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx=batch=2 --aimx-lower-matmul %s | FileCheck %s --check-prefix=PROGRAM
+// RUN: not triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx=batch=8 %s 2>&1 | FileCheck %s --check-prefix=BATCH-ERR
 
 // BATCH-ERR: intra-device plan must use bank_partitions=[batch, 256/batch, 1]
 
@@ -86,7 +86,7 @@ func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
     pim.place %A start[%ar, %c0] size[%arn, %akn] allocation_shape[%arc, %akn]
         strides[%lda, %c1]
         {direction = "in", access = 0 : i64,
-         replicated_over = ["n"]} : memref<*xf32>
+         shared_over = ["n"]} : memref<*xf32>
 
     %bc = arith.muli %starty, %c96 : index
     %bcn = arith.muli %tripsy, %c96 : index
@@ -94,7 +94,7 @@ func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
     pim.place %B start[%c0, %bc] size[%akn, %bcn] allocation_shape[%akn, %bcc]
         strides[%ldb, %c1]
         {direction = "in", access = 1 : i64,
-         replicated_over = ["m"]} : memref<*xf32>
+         shared_over = ["m"]} : memref<*xf32>
 
     pim.place %C start[%ar, %bc] size[%arn, %bcn] allocation_shape[%arc, %bcc]
         strides[%ldb, %c1]

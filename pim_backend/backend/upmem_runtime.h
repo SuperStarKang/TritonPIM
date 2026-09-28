@@ -23,6 +23,13 @@ extern "C" {
 //   - 프로세스 종료 시 atexit으로 일괄 free (per-call free 대신 1회).
 struct dpu_set_t upmem_acquire(uint32_t num_units, const char *binary_path);
 
+// 같은 rank/member 안의 CI 순서에 컴파일된 논리 묶음을 배정한다.
+// logical_for_dpu[SDK 열거 번호]는 canonical 논리 번호다.
+void upmem_bind_devices(struct dpu_set_t set, uint32_t num_axes,
+                        const uint32_t *partitions,
+                        const uint32_t *device_mapping,
+                        uint32_t *logical_for_dpu);
+
 #ifdef __cplusplus
 }
 #endif

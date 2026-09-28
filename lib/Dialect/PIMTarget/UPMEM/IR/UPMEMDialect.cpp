@@ -7,6 +7,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 
+#include <limits>
 #include <optional>
 
 using namespace mlir;
@@ -118,6 +119,8 @@ static LogicalResult verifyFixedShape(Operation *op, ValueRange extents,
     return op->emitOpError("result rank does not match its fixed-slot rank");
   if (!type.hasStaticShape())
     return op->emitOpError("fixed-slot result must have a static shape");
+  if (llvm::any_of(type.getShape(), [](int64_t extent) { return extent <= 0; }))
+    return op->emitOpError("fixed-slot shape must have positive extents");
   for (auto [d, extent] : llvm::enumerate(extents)) {
     std::optional<int64_t> value = getConstantIntValue(extent);
     if (!value)
@@ -139,12 +142,42 @@ LogicalResult MRAMOp::verify() {
   return success();
 }
 
+LogicalResult BindDevicesOp::verify() {
+  if (getPartitions().empty() ||
+      getPartitions().size() != getDeviceMapping().size())
+    return emitOpError("partitions and device_mapping must have the same nonzero rank");
+  int64_t units = 1, members = 1;
+  for (auto [count, group] : llvm::zip(getPartitions(), getDeviceMapping())) {
+    if (count <= 0 || group <= 0 || count % group != 0)
+      return emitOpError("device_mapping entries must be positive divisors of partitions");
+    if (count > std::numeric_limits<uint32_t>::max() / units)
+      return emitOpError("partition count exceeds the SDK DPU count range");
+    units *= count;
+    if (group > 8 / members)
+      return emitOpError("device_mapping must fit in an 8-DPU member group");
+    members *= group;
+  }
+  if (8 % members)
+    return emitOpError("device_mapping volume must divide 8");
+  auto acquire = getSet().getDefiningOp<AcquireOp>();
+  if (!acquire || units != acquire.getNumUnits())
+    return emitOpError("partitions must match the acquired DPU count");
+  for (Operation *user : getSet().getUsers())
+    if (isa<BindDevicesOp>(user) && user != getOperation())
+      return emitOpError("each acquired set must have one device assignment");
+  return success();
+}
+
 LogicalResult ForeachUnitOp::verify() {
   // DPU 핸들 하나 다음에 축별 좌표.
   if (failed(verifyForeachBody(*this, getBody(), getAxes(), getCounts(), 1)))
     return failure();
   if (!isa<UnitType>(getBody().front().getArgument(0).getType()))
     return emitOpError("first body argument must be !upmem.unit");
+  auto binding = getAssignment().getDefiningOp<BindDevicesOp>();
+  if (!binding || binding.getSet() != getSet() ||
+      binding.getPartitions() != getCounts())
+    return emitOpError("assignment must bind this set with the same partition counts");
   return success();
 }
 
@@ -170,17 +203,48 @@ LogicalResult StageOp::verify() {
     if (role.getValue() != "lhs" && role.getValue() != "rhs")
       return emitOpError("operand_role must be lhs or rhs");
   auto result = cast<MemRefType>(getResult().getType());
-  return verifyFixedShape(*this, getPadTo(), result, /*leading=*/0);
+  if (failed(verifyFixedShape(*this, getPadTo(), result, /*leading=*/0)))
+    return failure();
+  auto pool = cast<MemRefType>(getDst().getType());
+  if (failed(verifyFixedShape(*this, getPadTo(), pool, /*leading=*/1)))
+    return failure();
+  if (pool.getElementType() != result.getElementType() ||
+      cast<BaseMemRefType>(getSrc().getType()).getElementType() !=
+          result.getElementType())
+    return emitOpError("source, pool, and result element types must match");
+  if (pool.getMemorySpace() || !pool.getLayout().isIdentity() ||
+      result.getMemorySpace() || !result.getLayout().isIdentity())
+    return emitOpError("pool and result must be contiguous host memrefs");
+  auto foreach = dyn_cast_or_null<ForeachUnitOp>((*this)->getParentOp());
+  if (!foreach)
+    return emitOpError("must be directly inside upmem.foreach_unit");
+  ArrayAttr shared = getSharedOverAttr();
+  if (shared)
+    for (Attribute axis : shared)
+      if (!llvm::is_contained(foreach.getAxes(), axis))
+        return emitOpError("shared_over must name a foreach_unit axis");
+  int64_t slots = 1;
+  for (auto [d, axis] : llvm::enumerate(foreach.getAxes()))
+    if (!shared || !llvm::is_contained(shared, axis))
+      slots *= foreach.getCounts()[d];
+  if (pool.getShape()[0] != slots)
+    return emitOpError("pool leading extent must equal the number of distinct inputs");
+  return success();
 }
 
 LogicalResult GatherOp::verify() {
-  auto result = cast<MemRefType>(getResult().getType());
-  if (failed(verifyFixedShape(*this, getCapacity(), result, /*leading=*/1)))
+  auto pool = cast<MemRefType>(getDst().getType());
+  if (failed(verifyFixedShape(*this, getCapacity(), pool, /*leading=*/1)))
     return failure();
+  if (pool.getMemorySpace() || !pool.getLayout().isIdentity())
+    return emitOpError("destination must be a contiguous host memref");
+  auto binding = getAssignment().getDefiningOp<BindDevicesOp>();
+  if (!binding || binding.getSet() != getSet())
+    return emitOpError("assignment must bind this set");
   if (auto acquire = getSet().getDefiningOp<AcquireOp>())
-    if (result.getShape()[0] != acquire.getNumUnits())
+    if (pool.getShape()[0] != acquire.getNumUnits())
       return emitOpError(
-          "leading result extent must equal the acquired DPU count");
+          "pool leading extent must equal the acquired DPU count");
   return success();
 }
 
