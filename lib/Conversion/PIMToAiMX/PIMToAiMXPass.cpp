@@ -867,6 +867,13 @@ private:
     }
     if (execution && loop->hasAttr("pim.temporal_reduction"))
       return execution.getGroups().asArrayRef()[2];
+    // Common reuse의 0/1회 보호 loop처럼 상한이 두 상수 중 하나면 큰 쪽이 상한이다.
+    if (auto select = loop.getUpperBound().getDefiningOp<arith::SelectOp>()) {
+      auto t = getConstantIntValue(select.getTrueValue());
+      auto f = getConstantIntValue(select.getFalseValue());
+      if (lower == 0 && step == 1 && t && f && !loop.getUnsignedCmp())
+        return std::max({*t, *f, int64_t(0)});
+    }
     loop.emitError("AiMX descriptor storage needs a bounded Common loop extent");
     return failure();
   }
