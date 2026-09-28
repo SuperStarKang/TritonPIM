@@ -20,13 +20,11 @@ from dataclasses import dataclass
 from typing import Tuple, Dict
 from types import ModuleType
 from pathlib import Path
-import contextlib
 import hashlib
 import functools
 import os
 import re
 import json
-import sys
 import tempfile
 import subprocess
 
@@ -58,52 +56,6 @@ def _run_opt(mlir_text: str, passes: list) -> str:
         Path(src).write_text(mlir_text)
         subprocess.check_call([opt, src, *passes, "-o", dst])
         return Path(dst).read_text()
-
-
-# ── 경고 감추기 (지우기 쉽게 여기에 모아 둔다) ──────────────────────────────────
-# 지우려면: 아래 블록(_KNOWN_WARNING ~ _ttir_to_ttsharedir)을 통째로 지우고, add_stages의
-# ttsharedir 줄을 cpu_compiler._ttir_to_ttsharedir(src)로 되돌리고, import contextlib / sys를
-# 지운다. 컴파일 결과에는 영향이 없다 — stderr만 걸러 낸다.
-#
-# TritonToStructured의 prepass는 loop iter-arg인 정수 tensor마다 tts.get_structured_state를
-# 넣어 보고, 그것이 주소 계산에 안 쓰이면 canonicalize가 되돌린다(TritonToStructuredPass.cpp 주석).
-# 누산기 tensor가 정확히 그 경우라 정수 GEMM마다 이 경고가 뜬다. 되돌리기가 정상 동작이므로
-# 이 경고 하나만 감춘다 — 다른 진단이 하나라도 섞이면 통째로 내보낸다.
-_KNOWN_WARNING = "Rewriting GetStructuredStateOp failed."
-
-
-def _noise_only(text: str) -> bool:
-    for line in text.splitlines():
-        if ("error:" in line or "remark:" in line
-                or ("warning:" in line and _KNOWN_WARNING not in line)):
-            return False
-    return True
-
-
-@contextlib.contextmanager
-def _filtered_stderr():
-    # triton-shared-opt은 subprocess라 stderr가 터미널로 곧장 나간다. Python 층의
-    # redirect_stderr로는 못 잡으므로 파일 서술자를 바꾼다. finally라 실패해도 되돌아오고,
-    # 그때는 감출 수 없는 진단이 섞여 있으므로 그대로 보인다.
-    saved = os.dup(2)
-    buf = tempfile.TemporaryFile()
-    os.dup2(buf.fileno(), 2)
-    try:
-        yield
-    finally:
-        os.dup2(saved, 2)
-        os.close(saved)
-        buf.seek(0)
-        text = buf.read().decode("utf-8", "replace")
-        buf.close()
-        if text and not _noise_only(text):
-            sys.stderr.write(text)
-
-
-def _ttir_to_ttsharedir(ttir) -> str:
-    with _filtered_stderr():
-        return cpu_compiler._ttir_to_ttsharedir(ttir)
-# ── 경고 감추기 끝 ─────────────────────────────────────────────────────────────
 
 
 def _run_translate(mlir_text: str, which: str) -> str:
@@ -182,7 +134,6 @@ PIM_COMMON_PASSES = [
     "--pim-reuse-execution-tile-inputs",  # Group 크기를 유지하며 Tile 내부 입력 load 재사용
     "--pim-verify",                # 이동 뒤에도 hierarchy/placement 계약 유지
     "-cse",
-    "-canonicalize",
 ]
 
 
@@ -208,11 +159,17 @@ def _ttsharedir_to_pim_common(ttshared: str, options) -> str:
     # lowering은 이 값을 그대로 materialize하고 비용식이나 용량 최대화를 하지 않는다.
     et = _axis_options("tile", options.tile_m, options.tile_n, options.tile_k)
     form_execution_tiles = "--pim-form-execution-tiles" + (f"={et}" if et else "")
-    return _run_opt(ttshared, [p.format(profile=profile,
-                                        form_block_groups=form_block_groups,
-                                        map_devices=map_devices,
-                                        form_execution_tiles=form_execution_tiles)
-                               for p in PIM_COMMON_PASSES])
+    passes = [p.format(profile=profile,
+                       form_block_groups=form_block_groups,
+                       map_devices=map_devices,
+                       form_execution_tiles=form_execution_tiles)
+              for p in PIM_COMMON_PASSES]
+    # AiMX consumes the annotated loop/combine structure. General SCF
+    # canonicalization can erase single-trip loops and their axis metadata.
+    # Its target entry folds scalar arithmetic without changing those loops.
+    if options.pim_target != "aimx":
+        passes.append("-canonicalize")
+    return _run_opt(ttshared, passes)
 
 
 def _pim_common_to_upmem(pim_common: str, options) -> str:
@@ -251,20 +208,22 @@ def _upmem_to_artifact(upmem_ir: str, metadata) -> bytes:
 # 동일하고 target 고유 문자열(pass 이름·translate 이름·번들 키)만 다르다. 호출하는 배관
 # (_run_opt / _run_translate)은 target-neutral이라 그대로 재사용한다.
 
-# AiMX는 두 단계로 내린다. 첫 단계가 execution tile·padding·배치를 정하고(level 1),
-# 두 번째가 그 tile 모양에서 descriptor program을 펼친다(level 2). 두 단계를 나누는 이유는
-# level 1이 tile마다 반복되고 level 2가 launch당 한 번만 펼쳐지기 때문이다 — 그 구분이
-# IR에 보이지 않으면 chain 재사용이 codegen이 몰래 하는 결정이 된다.
+# One target pass lowers Common hierarchy and SSA directly to descriptors.
 def _aimx_passes(options):
     # 3계층은 공통 pass 가 이미 IR 에 새겼다 — block group 은 #pim.block_group 으로,
     # execution tile 상한은 #pim.execution_tile로 전달된다. batch는 PIM profile에
     # 넣지 않고 AiMX target option으로만 전달한다.
-    tile = f"--convert-pim-to-aimx=batch={options.batch}"
-    return [tile, "--aimx-lower-matmul", "-cse", "-canonicalize"]
+    tile = (f"--convert-pim-to-aimx=batch={options.batch} "
+            f"persistent={str(options.aimx_persistent).lower()}")
+    return [tile, "-cse", "-canonicalize"]
 
 
 def _pim_common_to_aimx(pim_common: str, options) -> str:
-    return _run_opt(pim_common, _aimx_passes(options))
+    # Serialize the target IR in generic form for both translators. The pinned
+    # SCF custom printer emits no_inline as both a keyword and an attribute,
+    # which its parser rejects. Keep the attribute and descriptor boundary;
+    # only the textual representation changes.
+    return _run_opt(pim_common, _aimx_passes(options) + ["--mlir-print-op-generic"])
 
 
 def _aimx_to_artifact(aimx_ir: str, metadata, options) -> bytes:
@@ -341,14 +300,16 @@ class PIMOptions:
 
     # ── aimx 전용 ───────────────────────────────────────────────────────────
     # 몇 번 카드부터 쓰는가. 런타임은 fpga_id로 pl_dma[id]를 경계 검사 없이 인덱싱하므로
-    # [base_fpga, base_fpga + num_units)가 [0, 감지된 개수) 안이어야 한다. 생성된 stub이
-    # init_pim_drv()가 돌려준 개수와 대조해 어기면 즉시 멈춘다.
+    # [base_fpga, base_fpga + num_units)가 [0, 감지된 개수) 안이어야 한다.
+    # aimx_runtime_init()은 전체 장치를 한 번 초기화하고 선택한 실행 범위를 대조한다.
     base_fpga: int = 0
     # 출력 block 을 batch x (4096/batch)로 자르는 값, {1,2,4,8}만 legal — 이것이 곧
     # arithmetic intensity 다. 실행 단위 [batch, 4096/batch, 256/batch]가 여기서
     # 나온다. BLOCK 이 이 눈금의 배수가 아니면 padding 이고, 배수면 padding 이 없다 —
     # 공통 pass 가 remark 로 노는 비율을 알려 준다.
     batch: int = 8
+    # AiMX-only policy, not a change to Common IR arithmetic semantics.
+    aimx_persistent: bool = True
     def __post_init__(self):
         # target 없이 PIM을 쓰는 것은 의도된 사용이 아니므로 기본값으로 때우지 않고 바로 터뜨린다.
         if self.pim_target is None:
@@ -413,7 +374,7 @@ class PIMBackend(BaseBackend):
         # ttir/ttsharedir/pim_common은 target-neutral이라 공유하고, 뒤 두 stage만 target로 분기한다.
         # 마지막 stage 이름은 binary_ext('pimobj')와 일치해야 CompiledKernel이 kernel을 찾는다.
         stages["ttir"] = lambda src, metadata: cpu_compiler.CPUBackend.make_ttir(src, metadata, options)
-        stages["ttsharedir"] = lambda src, metadata: _ttir_to_ttsharedir(src)
+        stages["ttsharedir"] = lambda src, metadata: cpu_compiler._ttir_to_ttsharedir(src)
         stages["pim_common"] = lambda src, metadata: _ttsharedir_to_pim_common(src, options)
         # target 분기: 변환(target_ir)과 codegen(pimobj)만 target마다 다르다(DESIGN 19).
         # __post_init__은 pim_target is None만 막으므로, 미지원 값은 여기서 fail-fast한다(fallback 금지).

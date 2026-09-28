@@ -1,766 +1,1045 @@
 #include "triton-shared/Conversion/PIMToAiMX/PIMToAiMX.h"
+#include "triton-shared/Conversion/PIMToAiMX/DescriptorBuilder.h"
 #include "triton-shared/Dialect/PIM/IR/PIMDialect.h"
 #include "triton-shared/Dialect/PIM/IR/PIMUtils.h"
-#include "triton-shared/Dialect/PIMTarget/AiMX/IR/AiMXDialect.h"
 #include "triton-shared/Dialect/PIMTarget/AiMX/IR/AiMXFootprint.h"
-
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
-#include "llvm/ADT/STLExtras.h"
-#include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/Twine.h"
-
+#include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/Support/MathExtras.h"
 #include <algorithm>
+#include <limits>
 
 using namespace mlir;
-
-namespace mlir {
-namespace triton {
+namespace mlir::triton {
 #define GEN_PASS_DEF_CONVERTPIMTOAIMX
 #include "triton-shared/Conversion/PIMToAiMX/Passes.h.inc"
-} // namespace triton
-} // namespace mlir
+}
 
 namespace {
-
-bool isBatch(int64_t b) { return b == 1 || b == 2 || b == 4 || b == 8; }
-
-// block group 한 축 — 공통 #pim.block_group 에서 읽는다. Triton block 정수 개(tiles)를
-// 하드웨어 실행 단위의 정수 배에 채운 것이고, 딱 맞지 않으면 남는 자리가 padding 이다 —
-// stage 가 0 을 채우고 unstage 가 읽지 않으므로 정확성에는 무해하고, 그 몫의 lane 과
-// reduction step 이 노는 것이 비용이다.
-struct BlockGroup {
-  int64_t tiles;  // Triton block 수
-  int64_t useful; // tiles * BLOCK — 실제 데이터
-  int64_t phys;   // 하드웨어가 도는 크기
-  int64_t pad() const { return phys - useful; }
+struct Layout {
+  int64_t usefulRows, usefulCols, rows, cols;
+};
+struct View {
+  Value buffer, offset, pitch;
+  Layout layout;
+};
+struct Placement {
+  pim::PlaceOp source;
+  View view;
+  int64_t rows, cols;
+  bool combine = false;
+  SmallVector<Value> sizes;
 };
 
-// 한 AiMX Device에서 scheduling round 전체가 공유하는 PIM DRAM 주소들이다.
-// descriptor chain은 이 주소와 execution-tile 최대 모양만 참조하므로 한 번 만든다.
-struct PlacementBuffers {
-  Value device;
-  Value pmm;
-  Value a;
-  Value arel;
-  Value b;
-  Value c;
-  Value chain;
-};
+// SSA bindings are compiler-local. There is no serialized compute template,
+// kernel-kind plan, or runtime interpreter of Common computations.
+class DeviceLowering {
+public:
+  DeviceLowering(ModuleOp module, pim::DeviceOp device,
+                 pim::TargetProfileAttr profile, int64_t batch, bool persistent,
+                 unsigned site)
+      : module(module), device(device), profile(profile), batch(batch),
+        persistent(persistent),
+        prefix((device->getParentOfType<func::FuncOp>().getName() +
+                "_device" + Twine(site)).str()),
+        setup(module.getContext()), code(module.getContext()), loc(device.getLoc()) {}
 
-// execution tile 하나가 PIM DRAM 에 요구하는 바이트 — 공통 --pim-form-execution-tiles
-// 의 k 상한 탐색과 같은 식을 써야 하므로 AiMXFootprint.h 로 옮겼다.
-using aimx::Footprint;
-using aimx::footprintOf;
+  LogicalResult run() {
+    auto partitions = device.getMapping().getPartitions().asArrayRef();
+    if (partitions[2] != 1)
+      return device.emitError("AiMX cross-device pim.combine is not implemented");
+    if (failed(collectLayouts())) return failure();
+    int64_t count;
+    if (!aimx::checkedProduct({partitions[0], partitions[1], partitions[2]}, count) ||
+        count > profile.getNumUnits())
+      return device.emitError("AiMX mapping exceeds the target device count");
+    Operation *schedule = device;
+    while (auto loop = dyn_cast_or_null<scf::ForOp>(schedule->getParentOp())) {
+      if (!loop->hasAttr("pim.scheduling_axis")) break;
+      schedule = loop;
+    }
+    OpBuilder host(schedule);
+    Value set = host.create<aimx::AcquireOp>(
+        loc, aimx::DeviceSetType::get(module.getContext()), host.getI64IntegerAttr(count));
+    host.setInsertionPoint(device);
+    auto foreach = host.create<aimx::ForeachDeviceOp>(
+        loc, set, host.getStrArrayAttr({"m", "n", "k"}), host.getDenseI64ArrayAttr(partitions));
+    if (persistent) foreach->setAttr("aimx.persistent", host.getUnitAttr());
+    SmallVector<Type> arguments{aimx::DeviceType::get(module.getContext()),
+                                host.getIndexType(), host.getIndexType(), host.getIndexType()};
+    Block *body = host.createBlock(&foreach.getBody(), {}, arguments,
+                                   SmallVector<Location>(4, loc));
+    for (unsigned i = 0; i < 3; ++i)
+      indices.map(device.getBody().front().getArgument(i), body->getArgument(i + 1));
+    setup.setInsertionPointToStart(body);
+    deviceValue = body->getArgument(0);
+    if (failed(allocate(aimx::kPMMSize, aimx::AllocKind::PMM, pmm))) return failure();
+    auto chainAllocation = setup.create<aimx::AllocOp>(
+        loc, aimx::BufferType::get(module.getContext()), deviceValue,
+        setup.getI64IntegerAttr(aimx::kGroupBytes), setup.getI64IntegerAttr(aimx::kPIMWidth),
+        aimx::AllocKindAttr::get(module.getContext(), aimx::AllocKind::Descriptor));
+    chain = chainAllocation.getBuffer();
 
-// linalg.matmul 의 operand 를 pim.access 의 id 로 되짚은 결과.
-struct Roles {
-  int64_t a = -1, b = -1, c = -1;
-  linalg::MatmulOp matmul;
-  // 이 시점의 linalg operand shape. --pim-form-block-groups 뒤이므로 원래 Triton
-  // BLOCK에 group tile 수가 곱해진 useful block-group shape다. 원래 BLOCK은
-  // #pim.block_group의 tiles로 나눠 복원한다. loop nest를 지우기 전에 읽어야 한다.
-  int64_t blockM = 0, blockN = 0, blockK = 0;
+    // The whole descriptor-construction boundary. Only arith, SCF and
+    // build_descriptors are emitted here, never retained linalg/PIM operations.
+    auto construction = setup.create<scf::ExecuteRegionOp>(loc, TypeRange{});
+    construction->setAttr("no_inline", setup.getUnitAttr());
+    Block *constructionBody = code.createBlock(&construction.getRegion());
+    code.create<scf::YieldOp>(loc);
+    code.setInsertionPoint(constructionBody->getTerminator());
+    setup.setInsertionPoint(construction);
+    // Placement coordinates may be computed before chain construction, but
+    // arithmetic using a local loop result must stay after that lowered loop.
+    for (Operation &op : device.getBody().front())
+      if (isIndexOperation(&op) && llvm::all_of(op.getOperands(), [&](Value value) {
+            return indices.contains(value) ||
+                   !device->isAncestor(value.getParentBlock()->getParentOp());
+          }))
+        cloneIndex(op, setup);
+    if (failed(createPlacements()) || failed(prepareMasks()) || failed(initializeCombines()) ||
+        failed(lowerBlock(device.getBody().front(), true)))
+      return failure();
+    int64_t chainBytes;
+    if (!aimx::checkedProduct({std::max<int64_t>(groups, 1), aimx::kGroupBytes}, chainBytes))
+      return device.emitError("AiMX descriptor chain extent overflows");
+    if (failed(account(chainBytes))) return failure();
+    chainAllocation.setBytesAttr(setup.getI64IntegerAttr(chainBytes));
+    if (bankBytes > profile.getBankCapacityLimitBytes())
+      return device.emitError("AiMX physical buffers and descriptors exceed per-bank capacity");
+    host.setInsertionPointAfter(construction);
+    for (auto &entry : placements)
+      if (entry.second.source.getDirection() == "in") stage(host, entry.second);
+    host.create<aimx::InvokeOp>(loc, deviceValue, chain);
+    for (auto &entry : placements)
+      if (entry.second.source.getDirection() == "out") unstage(host, entry.second);
+    device.erase();
+    return success();
+  }
+
+private:
+  ModuleOp module;
+  pim::DeviceOp device;
+  pim::TargetProfileAttr profile;
+  int64_t batch;
+  bool persistent;
+  std::string prefix;
+  unsigned symbol = 0;
+  OpBuilder setup, code;
+  Location loc;
+  Value deviceValue, pmm, chain;
+  IRMapping indices;
+  llvm::DenseMap<Type, Layout> layouts;
+  llvm::DenseMap<Value, View> values;
+  llvm::MapVector<int64_t, Placement> placements;
+  int64_t groups = 0, repetitions = 1, bankBytes = 0;
+
+  std::string name(StringRef role) {
+    return (Twine(prefix) + "_" + role + "_" + Twine(symbol++)).str();
+  }
+  Value c(OpBuilder &b, int64_t value) { return b.create<arith::ConstantIndexOp>(loc, value); }
+  Value mapped(Value value) { return indices.lookupOrDefault(value); }
+  SmallVector<Value> mapped(ValueRange operands) {
+    SmallVector<Value> result;
+    for (Value value : operands) result.push_back(mapped(value));
+    return result;
+  }
+  Value add(Value a, Value b) { return code.create<arith::AddIOp>(loc, a, b); }
+  Value mul(Value a, Value b) { return code.create<arith::MulIOp>(loc, a, b); }
+  static bool sameIndex(Value a, Value b) {
+    if (a == b) return true;
+    auto lhs = getConstantIntValue(a), rhs = getConstantIntValue(b);
+    return lhs && rhs && *lhs == *rhs;
+  }
+  Value sub(Value a, Value b) {
+    if (sameIndex(a, b)) return c(code, 0);
+    // Simplify local addresses, without a second proof of Common traversal.
+    if (auto sum = a.getDefiningOp<arith::AddIOp>()) {
+      if (sameIndex(sum.getLhs(), b)) return sum.getRhs();
+      if (sameIndex(sum.getRhs(), b)) return sum.getLhs();
+      if (auto base = b.getDefiningOp<arith::AddIOp>())
+        for (unsigned i = 0; i != 2; ++i)
+          for (unsigned j = 0; j != 2; ++j)
+            if (sameIndex(sum->getOperand(i), base->getOperand(j)))
+              return sub(sum->getOperand(1 - i), base->getOperand(1 - j));
+    }
+    // Common placement origins often scale a group coordinate after adding
+    // its scheduling start: (start + local) * block - start * block. Cancel
+    // the common scale before subtraction so only the resident-local offset
+    // reaches descriptors. This also handles chained block/group scales.
+    if (auto product = a.getDefiningOp<arith::MulIOp>())
+      if (auto base = b.getDefiningOp<arith::MulIOp>())
+        for (unsigned i = 0; i != 2; ++i)
+          for (unsigned j = 0; j != 2; ++j)
+            if (sameIndex(product->getOperand(i), base->getOperand(j)))
+              return mul(sub(product->getOperand(1 - i), base->getOperand(1 - j)),
+                         product->getOperand(i));
+    return code.create<arith::SubIOp>(loc, a, b);
+  }
+  Value physicalIndex(Value logical, int64_t useful, int64_t physical) {
+    if (useful == physical) return logical;
+    Value extent = c(code, useful);
+    Value group = code.create<arith::DivSIOp>(loc, logical, extent);
+    Value within = code.create<arith::RemSIOp>(loc, logical, extent);
+    return add(mul(group, c(code, physical)), within);
+  }
+  static bool isIndexOperation(Operation *op) {
+    return op->getName().getDialectNamespace() == "arith" && op->getNumRegions() == 0 &&
+           op->getNumResults() != 0 && llvm::all_of(op->getResultTypes(), [](Type t) {
+             return t.isIntOrIndex();
+           });
+  }
+  void cloneIndex(Operation &op, OpBuilder &builder) {
+    Operation *clone = builder.clone(op, indices);
+    SmallVector<Value> folded;
+    // Use each arith op's own folding semantics on the target copy. In
+    // particular, Common allocation_shape may be a product of constants.
+    // Do not canonicalize away Common loops or their hierarchy attributes.
+    if (succeeded(builder.tryFold(clone, folded)) && !folded.empty()) {
+      for (auto [from, to] : llvm::zip(op.getResults(), folded)) indices.map(from, to);
+      indices.erase(&op);
+      clone->erase();
+    }
+  }
+  LogicalResult addLayout(Operation *op, RankedTensorType type) {
+    if (layouts.count(type)) return success();
+    if (!type.hasStaticShape() || (type.getRank() != 1 && type.getRank() != 2))
+      return op->emitError("AiMX needs static rank-one or rank-two tensor tiles");
+    Type element = type.getElementType();
+    if (!element.isBF16() && !element.isF16() && !element.isF32())
+      return op->emitError("AiMX tensor storage supports BF16/F16/F32 source types");
+    int64_t rows = type.getDimSize(0), cols = type.getRank() == 1 ? 1 : type.getDimSize(1);
+    int64_t physicalCols;
+    if (rows <= 0 || !aimx::checkedRoundUp(cols, aimx::kLanes, physicalCols))
+      return op->emitError("AiMX tensor extent cannot be represented");
+    // Shared elementwise-compatible row layout. This is physical padding, not
+    // a change to the number of Common blocks, groups or execution tiles.
+    layouts[type] = {rows, cols, rows, physicalCols};
+    return success();
+  }
+  LogicalResult collectLayouts() {
+    WalkResult result = device.walk([&](Operation *op) {
+      for (Type type : op->getOperandTypes())
+        if (auto tensor = dyn_cast<RankedTensorType>(type))
+          if (failed(addLayout(op, tensor))) return WalkResult::interrupt();
+      for (Type type : op->getResultTypes())
+        if (auto tensor = dyn_cast<RankedTensorType>(type))
+          if (failed(addLayout(op, tensor))) return WalkResult::interrupt();
+      return WalkResult::advance();
+    });
+    if (result.wasInterrupted()) return failure();
+    WalkResult macLayouts = device.walk([&](Operation *op) {
+      if (!isa<linalg::MatmulOp, linalg::MatvecOp>(op)) return WalkResult::advance();
+      if (op->getNumResults() != 1 || op->getNumOperands() != 3 ||
+          !llvm::all_of(op->getOperandTypes(), [](Type type) {
+            return isa<RankedTensorType>(type);
+          })) {
+        op->emitError("AiMX MAC lowering expects tensor operands and one tensor result");
+        return WalkResult::interrupt();
+      }
+      auto &a = layouts[op->getOperand(0).getType()];
+      auto &b = layouts[op->getOperand(1).getType()];
+      auto &acc = layouts[op->getOperand(2).getType()];
+      auto &out = layouts[op->getResult(0).getType()];
+      if (!aimx::checkedRoundUp(a.rows, batch, a.rows) ||
+          !aimx::checkedRoundUp(b.rows, aimx::kRegSize, b.rows) ||
+          !aimx::checkedRoundUp(acc.rows, batch, acc.rows) ||
+          !aimx::checkedRoundUp(out.rows, batch, out.rows)) {
+        op->emitError("AiMX MAC physical row extent overflows");
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
+    if (macLayouts.wasInterrupted()) return failure();
+    // Equal logical shapes must compose even when the source dtype differs.
+    // A result reused as a MAC input needs the same row padding as that input.
+    for (auto &entry : layouts)
+      for (auto &other : layouts)
+        if (cast<RankedTensorType>(entry.first).getShape() ==
+            cast<RankedTensorType>(other.first).getShape()) {
+          int64_t rows = std::max(entry.second.rows, other.second.rows);
+          entry.second.rows = other.second.rows = rows;
+        }
+    return success();
+  }
+  LogicalResult account(int64_t bytes) {
+    if (bytes <= 0 || bytes > aimx::kMaxRuntimeAllocationBytes)
+      return device.emitError("AiMX allocation exceeds the runtime's representable size");
+    int64_t used = ((bytes + aimx::kDeviceWidth - 1) / aimx::kDeviceWidth) * aimx::kBurstSize;
+    if (llvm::AddOverflow(bankBytes, used, bankBytes))
+      return device.emitError("AiMX physical allocation extent overflows");
+    return success();
+  }
+  LogicalResult allocate(int64_t bytes, aimx::AllocKind kind, Value &buffer) {
+    if (failed(account(bytes))) return failure();
+    buffer = setup.create<aimx::AllocOp>(
+        loc, aimx::BufferType::get(module.getContext()), deviceValue,
+        setup.getI64IntegerAttr(bytes),
+        setup.getI64IntegerAttr(kind == aimx::AllocKind::PMM ? aimx::kPMMAlign : aimx::kPIMWidth),
+        aimx::AllocKindAttr::get(module.getContext(), kind));
+    return success();
+  }
+  LogicalResult scratch(Layout layout, View &view) {
+    int64_t bytes;
+    if (!aimx::checkedProduct({layout.rows, layout.cols, aimx::kTypeSize}, bytes))
+      return device.emitError("AiMX tensor allocation extent overflows");
+    if (failed(allocate(bytes, aimx::AllocKind::Data, view.buffer))) return failure();
+    view.offset = c(setup, 0);
+    view.pitch = c(setup, layout.cols * aimx::kTypeSize);
+    view.layout = layout;
+    return success();
+  }
+  bool hasFullMask(pim::AccessOp access) {
+    for (auto [axis, valid] : llvm::enumerate(access.getValid()))
+      if (getConstantIntValue(mapped(valid)) != access.getSizes()[axis]) return false;
+    return true;
+  }
+  // Common spells coordinates in both index and kernel integer arithmetic.
+  // Compare only the casts, sums and scales used by those coordinates; this is
+  // not a rewrite of the original arithmetic or of the descriptor addresses.
+  static bool sameMaskOrigin(Value a, Value b) {
+    if (sameIndex(a, b)) return true;
+    if (auto cast = a.getDefiningOp<arith::IndexCastOp>())
+      return sameMaskOrigin(cast.getIn(), b);
+    if (auto cast = b.getDefiningOp<arith::IndexCastOp>())
+      return sameMaskOrigin(a, cast.getIn());
+    Operation *lhs = a.getDefiningOp(), *rhs = b.getDefiningOp();
+    if (!lhs || !rhs || lhs->getName() != rhs->getName() ||
+        !isa<arith::AddIOp, arith::MulIOp>(lhs)) return false;
+    return (sameMaskOrigin(lhs->getOperand(0), rhs->getOperand(0)) &&
+            sameMaskOrigin(lhs->getOperand(1), rhs->getOperand(1))) ||
+           (sameMaskOrigin(lhs->getOperand(0), rhs->getOperand(1)) &&
+            sameMaskOrigin(lhs->getOperand(1), rhs->getOperand(0)));
+  }
+  // Extract the shared upper boundary from an access-local rectangular clip.
+  // Only these two equivalent forms describe one placement-wide rectangle:
+  //   min(max(end - origin, 0), size)
+  //   max(min(origin + size, end), origin) - origin
+  // Common can retain redundant min(size)/max(0) wrappers. A repeated partial
+  // mask or a clip relative to another coordinate must not become a full DMA.
+  static Value maskEnd(Value valid, Value origin, int64_t size) {
+    bool lower = false, upper = false;
+    while (true) {
+      if (auto cast = valid.getDefiningOp<arith::IndexCastOp>()) {
+        valid = cast.getIn();
+        continue;
+      }
+      Operation *op = valid.getDefiningOp();
+      if (!op || !isa<arith::MinSIOp, arith::MaxSIOp>(op)) break;
+      bool minimum = isa<arith::MinSIOp>(op);
+      int64_t bound = minimum ? size : 0;
+      if (getConstantIntValue(op->getOperand(0)) == bound)
+        valid = op->getOperand(1);
+      else if (getConstantIntValue(op->getOperand(1)) == bound)
+        valid = op->getOperand(0);
+      else break;
+      upper |= minimum;
+      lower |= !minimum;
+    }
+    auto sub = valid.getDefiningOp<arith::SubIOp>();
+    if (!sub || !sameMaskOrigin(sub.getRhs(), origin)) return {};
+    auto maximum = sub.getLhs().getDefiningOp<arith::MaxSIOp>();
+    Value clipped;
+    if (maximum) {
+      if (sameMaskOrigin(maximum.getLhs(), origin)) clipped = maximum.getRhs();
+      else if (sameMaskOrigin(maximum.getRhs(), origin)) clipped = maximum.getLhs();
+    }
+    auto minimum = clipped ? clipped.getDefiningOp<arith::MinSIOp>() : arith::MinSIOp();
+    if (minimum)
+      for (unsigned i = 0; i != 2; ++i) {
+        auto end = minimum->getOperand(i).getDefiningOp<arith::AddIOp>();
+        if (end &&
+            ((sameMaskOrigin(end.getLhs(), origin) && getConstantIntValue(end.getRhs()) == size) ||
+             (sameMaskOrigin(end.getRhs(), origin) && getConstantIntValue(end.getLhs()) == size)))
+          return minimum->getOperand(1 - i);
+      }
+    return lower && upper ? sub.getLhs() : Value();
+  }
+  LogicalResult createPlacements() {
+    llvm::DenseMap<int64_t, RankedTensorType> types;
+    llvm::DenseMap<int64_t, pim::AccessOp> accesses;
+    device.walk([&](pim::AccessOp access) { accesses[access.getId()] = access; });
+    device.walk([&](pim::LoadOp load) {
+      types[load.getAccess().getDefiningOp<pim::AccessOp>().getId()] =
+          cast<RankedTensorType>(load.getResult().getType());
+    });
+    device.walk([&](pim::StoreOp store) {
+      types[store.getAccess().getDefiningOp<pim::AccessOp>().getId()] =
+          cast<RankedTensorType>(store.getValue().getType());
+    });
+    device.walk([&](pim::CombineOp combine) {
+      types[combine.getDestination().getDefiningOp<pim::AccessOp>().getId()] =
+          cast<RankedTensorType>(combine.getPartial().getType());
+    });
+    for (Operation &op : device.getBody().front()) {
+      auto place = dyn_cast<pim::PlaceOp>(op);
+      if (!place) continue;
+      auto type = types.lookup(place.getAccess());
+      if (!type) continue; // Unconsumed placement has no target allocation.
+      Layout layout = layouts.lookup(type);
+      auto rows = getConstantIntValue(mapped(place.getAllocationShape()[0]));
+      auto cols = type.getRank() == 1 ? std::optional<int64_t>(1)
+                                     : getConstantIntValue(mapped(place.getAllocationShape()[1]));
+      int64_t physicalRows, physicalCols, bytes;
+      if (!rows || !cols ||
+          !aimx::checkedProduct({*rows / layout.usefulRows, layout.rows}, physicalRows) ||
+          !aimx::checkedProduct({*cols / layout.usefulCols, layout.cols}, physicalCols) ||
+          !aimx::checkedProduct({physicalRows, physicalCols, aimx::kTypeSize}, bytes))
+        return place.emitError("AiMX needs a representable fixed Common allocation_shape");
+      Placement placement{place, {}, physicalRows, physicalCols};
+      placement.sizes = mapped(place.getSize());
+      // Identical Common input/output placements of one memref share storage.
+      // This is necessary for a later pim.load to observe an earlier store.
+      for (auto &entry : placements) {
+        Placement &previous = entry.second;
+        if (previous.source.getBuffer() != place.getBuffer()) continue;
+        auto previousAccess = accesses.lookup(previous.source.getAccess());
+        auto currentAccess = accesses.lookup(place.getAccess());
+        // Two input masks can stage different rectangles of the same host
+        // buffer. They must not overwrite one shared resident allocation.
+        if (llvm::equal(previous.source.getStart(), place.getStart()) &&
+            llvm::equal(previous.source.getSize(), place.getSize()) &&
+            llvm::equal(previous.source.getStrides(), place.getStrides()) &&
+            ((hasFullMask(previousAccess) && hasFullMask(currentAccess)) ||
+             (llvm::equal(previousAccess.getValid(), currentAccess.getValid()) &&
+              previousAccess.getPad() == currentAccess.getPad())) &&
+            previous.rows == physicalRows && previous.cols == physicalCols &&
+            previous.view.layout.usefulRows == layout.usefulRows &&
+            previous.view.layout.usefulCols == layout.usefulCols &&
+            previous.view.layout.rows == layout.rows && previous.view.layout.cols == layout.cols) {
+          placement.view = previous.view;
+          break;
+        }
+        if (previous.source.getDirection() == "out" || place.getDirection() == "out")
+          return place.emitError("AiMX non-identical read/write placements of one memref need a shared address mapping");
+      }
+      if (placement.view.buffer) {
+        placements[place.getAccess()] = placement;
+        continue;
+      }
+      if (failed(allocate(bytes, aimx::AllocKind::Data, placement.view.buffer))) return failure();
+      placement.view.offset = c(setup, 0);
+      placement.view.pitch = c(setup, physicalCols * aimx::kTypeSize);
+      placement.view.layout = layout;
+      placements[place.getAccess()] = placement;
+    }
+    return success();
+  }
+  FailureOr<Value> firstMaskValue(Value value, IRMapping &first) {
+    if (Value result = first.lookupOrNull(value)) return result;
+    Operation *owner = value.getParentBlock()->getParentOp();
+    if (!device->isAncestor(owner)) return value;
+    if (owner == device && indices.contains(value)) return mapped(value);
+    if (auto argument = dyn_cast<BlockArgument>(value)) {
+      auto loop = dyn_cast<scf::ForOp>(owner);
+      if (!loop) {
+        owner->emitError("AiMX mask value cannot be evaluated at the placement boundary");
+        return failure();
+      }
+      auto capacity = loopCapacity(loop);
+      if (failed(capacity)) return failure();
+      if (*capacity != 1) {
+        loop.emitError("AiMX varying masks across multiple groups need per-group masked transfers");
+        return failure();
+      }
+      Value initial = argument.getArgNumber() == 0
+                          ? loop.getLowerBound()
+                          : loop.getInitArgs()[argument.getArgNumber() - 1];
+      auto result = firstMaskValue(initial, first);
+      if (succeeded(result)) first.map(value, *result);
+      return result;
+    }
+    Operation *definition = value.getDefiningOp();
+    if (!definition || !isIndexOperation(definition) || !isSpeculatable(definition)) {
+      owner->emitError("AiMX mask value must be an integer/index expression safe before a possibly empty group");
+      return failure();
+    }
+    for (Value operand : definition->getOperands()) {
+      auto result = firstMaskValue(operand, first);
+      if (failed(result)) return failure();
+      first.map(operand, *result);
+    }
+    Operation *clone = setup.clone(*definition, first);
+    SmallVector<Value> folded;
+    if (succeeded(setup.tryFold(clone, folded)) && !folded.empty()) {
+      for (auto [from, to] : llvm::zip(definition->getResults(), folded)) first.map(from, to);
+      first.erase(definition);
+      clone->erase();
+    }
+    return first.lookup(value);
+  }
+  LogicalResult prepareMasks() {
+    llvm::DenseSet<Value> read, written;
+    device.walk([&](pim::LoadOp load) {
+      auto access = load.getAccess().getDefiningOp<pim::AccessOp>();
+      auto found = placements.find(access.getId());
+      if (found != placements.end()) read.insert(found->second.view.buffer);
+    });
+    device.walk([&](pim::StoreOp store) {
+      auto access = store.getAccess().getDefiningOp<pim::AccessOp>();
+      auto found = placements.find(access.getId());
+      if (found != placements.end()) written.insert(found->second.view.buffer);
+    });
+    device.walk([&](pim::CombineOp combine) {
+      auto access = combine.getDestination().getDefiningOp<pim::AccessOp>();
+      auto found = placements.find(access.getId());
+      if (found != placements.end()) written.insert(found->second.view.buffer);
+    });
+    WalkResult result = device.walk([&](pim::AccessOp access) {
+      auto found = placements.find(access.getId());
+      if (found == placements.end()) return WalkResult::advance();
+      if (hasFullMask(access)) return WalkResult::advance();
+      Placement &placement = found->second;
+      IRMapping first;
+      bool empty = llvm::any_of(access.getValid(), [&](Value valid) {
+        return getConstantIntValue(mapped(valid)) == 0;
+      });
+      for (auto [axis, valid] : llvm::enumerate(access.getValid())) {
+        if (getConstantIntValue(mapped(valid)) == access.getSizes()[axis]) continue;
+        // A statically empty rectangle needs no per-group mask expansion.
+        // Keep one empty dimension; the other bounds cannot expose any data.
+        if (empty && getConstantIntValue(mapped(valid)) != 0) continue;
+        // Across resident groups, project an access-local clip to the same
+        // global end at the placement start. Keep Common's actual size (which
+        // also accounts for scheduling tails), never the allocation capacity
+        // or the first group's valid size. The existing stage/unstage layout
+        // then handles the whole rectangle, including per-group physical pad.
+        if (!empty && getConstantIntValue(mapped(placement.source.getAllocationShape()[axis])) !=
+            access.getSizes()[axis]) {
+          Value end = maskEnd(valid, access.getOrigin()[axis], access.getSizes()[axis]);
+          if (!end) {
+            access.emitError("AiMX masks spanning multiple resident groups need a shared rectangular bound; per-group masked transfers are not implemented");
+            return WalkResult::interrupt();
+          }
+          auto extent = firstMaskValue(end, first);
+          if (failed(extent)) return WalkResult::interrupt();
+          end = *extent;
+          if (!end.getType().isIndex())
+            end = setup.createOrFold<arith::IndexCastOp>(loc, setup.getIndexType(), end);
+          end = setup.createOrFold<arith::SubIOp>(
+              loc, end, mapped(placement.source.getStart()[axis]));
+          end = setup.createOrFold<arith::MaxSIOp>(loc, end, c(setup, 0));
+          placement.sizes[axis] = setup.createOrFold<arith::MinSIOp>(
+              loc, placement.sizes[axis], end);
+          continue;
+        }
+        // A single resident group still uses its explicit valid value.
+        auto extent = firstMaskValue(valid, first);
+        if (failed(extent)) return WalkResult::interrupt();
+        placement.sizes[axis] = setup.createOrFold<arith::MinSIOp>(
+            loc, placement.sizes[axis], *extent);
+      }
+      // A masked store followed by a load must preserve the old inactive
+      // elements. Zero-filled staging alone cannot implement that dependency.
+      if (read.contains(placement.view.buffer) && written.contains(placement.view.buffer)) {
+        access.emitError("AiMX masked read/write aliases need a masked descriptor merge");
+        return WalkResult::interrupt();
+      }
+      if (read.contains(placement.view.buffer) && access.getPad()) {
+        Attribute pad;
+        if (!matchPattern(access.getPad(), m_Constant(&pad)) ||
+            !isa<FloatAttr>(pad) || !cast<FloatAttr>(pad).getValue().isZero() ||
+            cast<FloatAttr>(pad).getValue().isNegative()) {
+          access.emitError("AiMX masked input staging supports only positive-zero or unspecified padding");
+          return WalkResult::interrupt();
+        }
+      }
+      return WalkResult::advance();
+    });
+    return failure(result.wasInterrupted());
+  }
+  DenseI64ArrayAttr padding(OpBuilder &b, int64_t useful, int64_t physical) {
+    return useful == physical ? DenseI64ArrayAttr()
+                              : b.getDenseI64ArrayAttr({useful, physical});
+  }
+  LogicalResult initializeCombines() {
+    device.walk([&](pim::CombineOp combine) {
+      auto access = combine.getDestination().getDefiningOp<pim::AccessOp>();
+      auto found = placements.find(access.getId());
+      if (found != placements.end()) found->second.combine = true;
+    });
+    for (auto &entry : placements) {
+      Placement &placement = entry.second;
+      if (!placement.combine) continue;
+      for (auto &other : placements)
+        if (other.second.source.getDirection() == "in" &&
+            other.second.view.buffer == placement.view.buffer)
+          return placement.source.emitError("AiMX combine identity storage cannot alias a staged input");
+      View zero;
+      Layout extent{placement.rows, placement.cols, placement.rows, placement.cols};
+      if (failed(constant(setup.getFloatAttr(setup.getBF16Type(), 0.0), extent, zero)) ||
+          failed(copy(zero, placement.view))) return failure();
+    }
+    return success();
+  }
+  SmallVector<Value> hostValues(OpBuilder &b, ValueRange operands, int64_t extra) {
+    auto result = mapped(operands);
+    if (result.size() == 1) result.push_back(c(b, extra));
+    return result;
+  }
+  void stage(OpBuilder &b, const Placement &placement) {
+    auto place = placement.source;
+    const auto &layout = placement.view.layout;
+    b.create<aimx::StageOp>(
+        loc, mapped(place.getBuffer()), hostValues(b, place.getStart(), 0),
+        hostValues(b, placement.sizes, 1), hostValues(b, place.getStrides(), 0),
+        ValueRange{c(b, placement.rows), c(b, placement.cols)}, c(b, placement.cols),
+        placement.view.buffer, TypeAttr::get(b.getBF16Type()), UnitAttr(),
+        padding(b, layout.usefulRows, layout.rows), padding(b, layout.usefulCols, layout.cols));
+  }
+  void unstage(OpBuilder &b, const Placement &placement) {
+    Value accumulate = c(b, 0);
+    if (placement.combine)
+      for (Operation *parent = device->getParentOp(); parent; parent = parent->getParentOp()) {
+        auto loop = dyn_cast<scf::ForOp>(parent);
+        auto axis = loop ? loop->getAttrOfType<StringAttr>("pim.scheduling_axis") : StringAttr();
+        if (axis && axis.getValue() == "reduction_k") {
+          Value later = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne,
+                                               loop.getInductionVar(), loop.getLowerBound());
+          accumulate = b.create<arith::SelectOp>(loc, later, c(b, 1), accumulate);
+          break;
+        }
+      }
+    auto place = placement.source;
+    const auto &layout = placement.view.layout;
+    b.create<aimx::UnstageOp>(
+        loc, placement.view.buffer, mapped(place.getBuffer()),
+        hostValues(b, place.getStart(), 0), hostValues(b, placement.sizes, 1),
+        hostValues(b, place.getStrides(), 0), c(b, placement.cols), accumulate,
+        TypeAttr::get(b.getBF16Type()), UnitAttr(), padding(b, layout.usefulRows, layout.rows),
+        padding(b, layout.usefulCols, layout.cols));
+  }
+  FailureOr<View> accessView(pim::AccessOp access) {
+    auto found = placements.find(access.getId());
+    if (found == placements.end()) {
+      access.emitError("AiMX access has no resident placement"); return failure();
+    }
+    Placement &placement = found->second;
+    View view = placement.view;
+    if (access.getOrigin().empty()) {
+      access.emitError("AiMX blocked placement needs Common access origins"); return failure();
+    }
+    // Origin/stride is Common's coordinate representation of its linear offset.
+    // Translate these coordinates; do not reverse-engineer a kernel loop pattern.
+    Value row = physicalIndex(sub(mapped(access.getOrigin()[0]),
+                                  mapped(placement.source.getStart()[0])),
+                              view.layout.usefulRows, view.layout.rows);
+    Value col = c(code, 0);
+    if (access.getOrigin().size() == 2)
+      col = physicalIndex(sub(mapped(access.getOrigin()[1]), mapped(placement.source.getStart()[1])),
+                           view.layout.usefulCols, view.layout.cols);
+    view.offset = add(mul(row, view.pitch), mul(col, c(code, aimx::kTypeSize)));
+    return view;
+  }
+  LogicalResult append(aimx::DescriptorSequence sequence, ArrayRef<View> views,
+                       ValueRange buffers = {}) {
+    int64_t count;
+    if (llvm::MulOverflow(sequence.groups, repetitions, count) ||
+        llvm::AddOverflow(groups, count, groups))
+      return device.emitError("AiMX descriptor extent overflows");
+    SmallVector<Value> args;
+    for (const View &view : views) args.append({view.buffer, view.offset, view.pitch});
+    llvm::append_range(args, buffers);
+    code.create<aimx::BuildDescriptorsOp>(
+        loc, FlatSymbolRefAttr::get(module.getContext(), sequence.program.getSymName()), args, chain);
+    return success();
+  }
+  LogicalResult copy(const View &from, const View &to) {
+    if (from.buffer == to.buffer && from.offset == to.offset && from.pitch == to.pitch)
+      return success();
+    return append(aimx::buildCopy(module, name("copy"), from.layout.rows, from.layout.cols),
+                  {from, to});
+  }
+  LogicalResult binary(aimx::Opcode opcode, const View &a, const View &b, const View &out) {
+    return append(aimx::buildElementwise(module, name("elementwise"), opcode,
+                                         out.layout.rows, out.layout.cols),
+                  {a, b, out}, ValueRange{pmm});
+  }
+  // Standard memref globals provide scalar fill data to existing staging.
+  LogicalResult constant(Attribute value, Layout layout, View &view) {
+    auto floating = dyn_cast<FloatAttr>(value);
+    if (!floating)
+      return device.emitError("AiMX tensor constants require a scalar floating-point value");
+    if (failed(scratch(layout, view))) return failure();
+    OpBuilder globals(module.getBody(), module.getBody()->begin());
+    std::string symbol = name("constant");
+    auto type = MemRefType::get({1}, floating.getType());
+    auto tensorType = RankedTensorType::get({1}, floating.getType());
+    auto initial = DenseElementsAttr::get(tensorType, ArrayRef<Attribute>{floating});
+    globals.create<memref::GlobalOp>(
+        loc, globals.getStringAttr(symbol), globals.getStringAttr("private"),
+        TypeAttr::get(type), initial, globals.getUnitAttr(), IntegerAttr());
+    Value source = setup.create<memref::GetGlobalOp>(loc, type, symbol);
+    Value zero = c(setup, 0);
+    setup.create<aimx::StageOp>(
+        loc, source, ValueRange{zero, zero},
+        ValueRange{c(setup, layout.usefulRows), c(setup, layout.usefulCols)},
+        ValueRange{zero, zero}, ValueRange{c(setup, layout.rows), c(setup, layout.cols)},
+        c(setup, layout.cols), view.buffer, TypeAttr::get(setup.getBF16Type()), UnitAttr(),
+        DenseI64ArrayAttr(), DenseI64ArrayAttr());
+    return success();
+  }
+  FailureOr<View> valueView(Value value) {
+    auto found = values.find(value);
+    if (found != values.end()) return found->second;
+    if (value.getDefiningOp<tensor::EmptyOp>()) {
+      View view;
+      if (failed(scratch(layouts.lookup(value.getType()), view))) return failure();
+      values[value] = view;
+      return view;
+    }
+    value.getParentBlock()->getParentOp()->emitError("AiMX operand has no lowered SSA value");
+    return failure();
+  }
+  LogicalResult lowerBinary(Operation *op, Layout layout) {
+    aimx::Opcode opcode;
+    if (isa<arith::AddFOp>(op)) opcode = aimx::Opcode::add;
+    else if (isa<arith::SubFOp>(op)) opcode = aimx::Opcode::sub;
+    else if (isa<arith::MulFOp>(op)) opcode = aimx::Opcode::mul;
+    else return op->emitError("AiMX has no descriptor lowering for this scalar operation");
+    auto operand = [&](Value value) -> FailureOr<View> {
+      auto found = values.find(value);
+      if (found != values.end()) return found->second;
+      Attribute attribute;
+      if (isa<FloatType>(value.getType()) && matchPattern(value, m_Constant(&attribute))) {
+        View view;
+        if (failed(constant(attribute, layout, view))) return failure();
+        return view;
+      }
+      return valueView(value);
+    };
+    auto a = operand(op->getOperand(0)), b = operand(op->getOperand(1));
+    if (failed(a) || failed(b)) return failure();
+    View out;
+    // A/B are read before C drains in each native elementwise chunk. Reuse
+    // only a private scalar-body intermediate whose last use is this op.
+    // Region arguments, staged constants, and loop-carried buffers are not
+    // owned by this scalar body and must remain intact for other consumers.
+    if (isa<linalg::GenericOp>(op->getParentOp()))
+      for (Value value : op->getOperands()) {
+        Operation *definition = value.getDefiningOp();
+        if (definition && definition->getBlock() == op->getBlock() &&
+            isa<arith::AddFOp, arith::SubFOp, arith::MulFOp>(definition) &&
+            value.hasOneUse()) {
+          out = values.lookup(value);
+          break;
+        }
+      }
+    if (!out.buffer && failed(scratch(layout, out))) return failure();
+    if (failed(binary(opcode, *a, *b, out))) return failure();
+    values[op->getResult(0)] = out;
+    return success();
+  }
+  LogicalResult lowerGeneric(linalg::GenericOp generic) {
+    for (auto iterator : generic.getIteratorTypesArray())
+      if (iterator != utils::IteratorType::parallel)
+        return generic.emitError("AiMX generic reduction lowering is not implemented");
+    for (AffineMap map : generic.getIndexingMapsArray())
+      if (!map.isIdentity())
+        return generic.emitError("AiMX generic projected/transpose indexing maps are not implemented");
+    if (generic->getNumResults() == 0)
+      return generic.emitError("AiMX generic lowering expects tensor results");
+    Layout layout = layouts.lookup(generic->getResult(0).getType());
+    for (auto [argument, operand] : llvm::zip(generic.getBody()->getArguments(), generic->getOperands())) {
+      if (argument.use_empty()) continue;
+      auto view = valueView(operand);
+      if (failed(view)) return failure();
+      values[argument] = *view;
+    }
+    for (Operation &op : *generic.getBody()) {
+      if (auto yield = dyn_cast<linalg::YieldOp>(op)) {
+        for (auto [result, value] : llvm::zip(generic->getResults(), yield.getValues())) {
+          auto view = valueView(value);
+          if (failed(view)) return failure();
+          values[result] = *view;
+        }
+      } else if (auto scalar = dyn_cast<arith::ConstantOp>(op)) {
+        View view;
+        if (failed(constant(scalar.getValue(), layout, view))) return failure();
+        values[scalar.getResult()] = view;
+      } else if (failed(lowerBinary(&op, layout))) return failure();
+    }
+    return success();
+  }
+  LogicalResult lowerMAC(Operation *op) {
+    auto linalg = cast<linalg::LinalgOp>(op);
+    bool vector = isa<linalg::MatvecOp>(op);
+    Block &body = op->getRegion(0).front();
+    auto yield = dyn_cast<linalg::YieldOp>(body.getTerminator());
+    auto addition = yield && yield.getValues().size() == 1
+                        ? yield.getValues()[0].getDefiningOp<arith::AddFOp>() : arith::AddFOp();
+    Value product;
+    if (addition) {
+      if (addition.getLhs() == body.getArgument(2)) product = addition.getRhs();
+      if (addition.getRhs() == body.getArgument(2)) product = addition.getLhs();
+    }
+    auto multiply = product ? product.getDefiningOp<arith::MulFOp>() : arith::MulFOp();
+    llvm::SmallPtrSet<Operation *, 8> matched;
+    auto input = [&](Value value, unsigned i) {
+      if (auto ext = value.getDefiningOp<arith::ExtFOp>()) {
+        matched.insert(ext);
+        value = ext.getIn();
+      }
+      return value == body.getArgument(i);
+    };
+    auto ctx = module.getContext();
+    auto m = getAffineDimExpr(0, ctx), n = getAffineDimExpr(1, ctx);
+    auto k = getAffineDimExpr(vector ? 1 : 2, ctx);
+    unsigned rank = vector ? 2 : 3;
+    SmallVector<AffineMap> maps{
+        AffineMap::get(rank, 0, {m, k}, ctx),
+        vector ? AffineMap::get(rank, 0, {k}, ctx) : AffineMap::get(rank, 0, {k, n}, ctx),
+        vector ? AffineMap::get(rank, 0, {m}, ctx) : AffineMap::get(rank, 0, {m, n}, ctx)};
+    if (!multiply || !input(multiply.getLhs(), 0) || !input(multiply.getRhs(), 1) ||
+        linalg.getIndexingMapsArray() != maps)
+      return op->emitError("AiMX MAC cannot represent this operation body/indexing map");
+    matched.insert(addition);
+    matched.insert(multiply);
+    matched.insert(yield);
+    for (Operation &scalar : body)
+      if (!matched.contains(&scalar) && !isOpTriviallyDead(&scalar))
+        return scalar.emitError("AiMX MAC has an unlowered scalar operation");
+    auto a = valueView(op->getOperand(0)), b = valueView(op->getOperand(1));
+    auto acc = valueView(op->getOperand(2));
+    if (failed(a) || failed(b) || failed(acc)) return failure();
+    Layout layout = layouts.lookup(op->getResult(0).getType());
+    View partial, out, zero;
+    if (failed(scratch(layout, partial)) || failed(scratch(layout, out)) ||
+        failed(constant(setup.getFloatAttr(setup.getBF16Type(), 0.0), layout, zero)) ||
+        failed(copy(zero, partial))) return failure();
+    int64_t kPhysical, arelBytes;
+    if (!aimx::checkedRoundUp(a->layout.usefulCols, aimx::kRegSize, kPhysical) ||
+        !aimx::checkedProduct({layout.rows, kPhysical, aimx::kTypeSize, aimx::kNumChannels}, arelBytes))
+      return op->emitError("AiMX MAC relayout extent overflows");
+    Value arel;
+    if (failed(allocate(arelBytes, aimx::AllocKind::Data, arel))) return failure();
+    if (failed(append(aimx::buildMatmul(module, name(vector ? "matvec" : "matmul"),
+                                       batch, layout.usefulRows, a->layout.usefulCols,
+                                       layout.usefulCols), {*a, *b, partial}, ValueRange{arel, pmm})) ||
+        failed(binary(aimx::Opcode::add, *acc, partial, out))) return failure();
+    values[op->getResult(0)] = out;
+    return success();
+  }
+  FailureOr<int64_t> loopCapacity(scf::ForOp loop) {
+    auto lower = getConstantIntValue(mapped(loop.getLowerBound()));
+    auto upper = getConstantIntValue(mapped(loop.getUpperBound()));
+    auto step = getConstantIntValue(mapped(loop.getStep()));
+    if (lower && upper && step && *step > 0) {
+      if (loop.getUnsignedCmp()) {
+        Type type = loop.getLowerBound().getType();
+        unsigned width = isa<IndexType>(type) ? 64 : cast<IntegerType>(type).getWidth();
+        if (width > 64) {
+          loop.emitError("AiMX descriptor loop bounds must fit 64 bits");
+          return failure();
+        }
+        uint64_t start = APInt(width, *lower).getZExtValue();
+        uint64_t end = APInt(width, *upper).getZExtValue();
+        if (end <= start) return int64_t(0);
+        uint64_t count = (end - start) / *step + ((end - start) % *step != 0);
+        if (count > uint64_t(std::numeric_limits<int64_t>::max())) {
+          loop.emitError("AiMX descriptor loop extent overflows");
+          return failure();
+        }
+        return static_cast<int64_t>(count);
+      }
+      int64_t span;
+      if (llvm::SubOverflow(*upper, *lower, span)) {
+        loop.emitError("AiMX descriptor loop extent overflows");
+        return failure();
+      }
+      return span <= 0 ? 0 : span / *step + (span % *step != 0);
+    }
+    auto execution = device->getAttrOfType<pim::ExecutionTileAttr>("pim.execution_tile");
+    auto axis = loop->getAttrOfType<pim::AxisAttr>("pim.axis");
+    if (execution && axis) {
+      StringRef name = axis.getName().getValue();
+      return execution.getGroups().asArrayRef()[name == "m" ? 0 : name == "n" ? 1 : 2];
+    }
+    if (execution && loop->hasAttr("pim.temporal_reduction"))
+      return execution.getGroups().asArrayRef()[2];
+    loop.emitError("AiMX descriptor storage needs a bounded Common loop extent");
+    return failure();
+  }
+  LogicalResult lowerLoop(scf::ForOp loop) {
+    SmallVector<View> carried;
+    SmallVector<Value> scalarInitial;
+    for (auto [argument, init] : llvm::zip(loop.getRegionIterArgs(), loop.getInitArgs())) {
+      if (argument.getType().isIntOrIndex()) {
+        scalarInitial.push_back(mapped(init));
+        continue;
+      }
+      if (!isa<RankedTensorType>(argument.getType()))
+        return loop.emitError("AiMX loop-carried values must be tensor data or integer/index control values");
+      View view;
+      auto initial = valueView(init);
+      if (failed(initial) || failed(scratch(layouts.lookup(argument.getType()), view)) ||
+          failed(copy(*initial, view))) return failure();
+      carried.push_back(view);
+      values[argument] = view;
+    }
+    auto capacity = loopCapacity(loop);
+    if (failed(capacity)) return failure();
+    int64_t outer = repetitions;
+    if (llvm::MulOverflow(repetitions, *capacity, repetitions))
+      return loop.emitError("AiMX descriptor loop extent overflows");
+    auto lowered = code.create<scf::ForOp>(loc, mapped(loop.getLowerBound()),
+                                          mapped(loop.getUpperBound()), mapped(loop.getStep()),
+                                          scalarInitial);
+    lowered->setAttrs(loop->getAttrs());
+    indices.map(loop.getInductionVar(), lowered.getInductionVar());
+    unsigned scalarPosition = 0;
+    for (BlockArgument argument : loop.getRegionIterArgs())
+      if (argument.getType().isIntOrIndex())
+        indices.map(argument, lowered.getRegionIterArgs()[scalarPosition++]);
+    // SCF builds an implicit terminator only for loops without iter_args.
+    if (!scalarInitial.empty()) {
+      code.setInsertionPointToEnd(lowered.getBody());
+      code.create<scf::YieldOp>(loc, lowered.getRegionIterArgs());
+    }
+    code.setInsertionPoint(lowered.getBody()->getTerminator());
+    if (failed(lowerBlock(*loop.getBody(), false))) return failure();
+    auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+    SmallVector<View> yielded;
+    SmallVector<Value> scalarYielded;
+    for (Value value : yield.getOperands()) {
+      if (value.getType().isIntOrIndex()) {
+        scalarYielded.push_back(mapped(value));
+        continue;
+      }
+      auto view = valueView(value);
+      if (failed(view)) return failure();
+      yielded.push_back(*view);
+    }
+    // Preserve parallel loop-carried assignment, including swapping tensors.
+    if (yielded.size() > 1)
+      for (View &view : yielded) {
+        View snapshot;
+        if (failed(scratch(view.layout, snapshot)) || failed(copy(view, snapshot))) return failure();
+        view = snapshot;
+      }
+    for (auto [from, to] : llvm::zip(yielded, carried))
+      if (failed(copy(from, to))) return failure();
+    lowered.getBody()->getTerminator()->setOperands(scalarYielded);
+    code.setInsertionPointAfter(lowered);
+    repetitions = outer;
+    unsigned tensorPosition = 0;
+    scalarPosition = 0;
+    for (Value result : loop.getResults()) {
+      if (result.getType().isIntOrIndex())
+        indices.map(result, lowered.getResult(scalarPosition++));
+      else
+        values[result] = carried[tensorPosition++];
+    }
+    return success();
+  }
+  LogicalResult lowerBlock(Block &body, bool root) {
+    for (Operation &op : body) {
+      if (isa<pim::PlaceOp, pim::AccessOp, scf::YieldOp>(op)) continue;
+      if (isIndexOperation(&op)) {
+        if (!root || !indices.contains(op.getResult(0))) cloneIndex(op, code);
+        continue;
+      }
+      if (isa<arith::ConstantOp>(op) && !isa<RankedTensorType>(op.getResult(0).getType()))
+        continue; // Used as data by fill/generic, not host arithmetic.
+      if (auto loop = dyn_cast<scf::ForOp>(op)) {
+        if (failed(lowerLoop(loop))) return failure();
+      } else if (auto load = dyn_cast<pim::LoadOp>(op)) {
+        auto access = load.getAccess().getDefiningOp<pim::AccessOp>();
+        auto view = accessView(access);
+        if (failed(view)) return failure();
+        View snapshot;
+        if (failed(scratch(view->layout, snapshot)) || failed(copy(*view, snapshot))) return failure();
+        values[load.getResult()] = snapshot;
+      } else if (isa<tensor::EmptyOp>(op)) {
+        continue; // Allocate only if an operation actually reads the undefined tensor.
+      } else if (auto fill = dyn_cast<linalg::FillOp>(op)) {
+        Attribute scalar;
+        if (!matchPattern(fill.getInputs()[0], m_Constant(&scalar)))
+          return fill.emitError("AiMX dynamic fill operands are not implemented");
+        for (Value result : fill->getResults()) {
+          View view;
+          if (failed(constant(scalar, layouts.lookup(result.getType()), view))) return failure();
+          values[result] = view;
+        }
+      } else if (auto generic = dyn_cast<linalg::GenericOp>(op)) {
+        if (failed(lowerGeneric(generic))) return failure();
+      } else if (isa<linalg::MatmulOp, linalg::MatvecOp>(op)) {
+        if (failed(lowerMAC(&op))) return failure();
+      } else if (isa<arith::AddFOp, arith::SubFOp, arith::MulFOp>(op)) {
+        if (failed(lowerBinary(&op, layouts.lookup(op.getResult(0).getType())))) return failure();
+      } else if (auto cast = dyn_cast<tensor::CastOp>(op)) {
+        auto view = valueView(cast.getSource());
+        if (failed(view)) return failure();
+        values[cast.getResult()] = *view;
+      } else if (auto store = dyn_cast<pim::StoreOp>(op)) {
+        auto source = valueView(store.getValue());
+        auto destination = accessView(store.getAccess().getDefiningOp<pim::AccessOp>());
+        if (failed(source) || failed(destination) || failed(copy(*source, *destination))) return failure();
+      } else if (auto combine = dyn_cast<pim::CombineOp>(op)) {
+        if (combine.getKind() != "add")
+          return combine.emitError("AiMX does not implement this pim.combine kind");
+        auto access = combine.getDestination().getDefiningOp<pim::AccessOp>();
+        auto source = valueView(combine.getPartial());
+        auto destination = accessView(access);
+        if (failed(source) || failed(destination) ||
+            failed(binary(aimx::Opcode::add, *destination, *source, *destination))) return failure();
+      } else return op.emitError("AiMX has no lowering for this Common operation");
+    }
+    return success();
+  }
 };
 
 struct ConvertPIMToAiMXPass
-    : public mlir::triton::impl::ConvertPIMToAiMXBase<ConvertPIMToAiMXPass> {
+    : mlir::triton::impl::ConvertPIMToAiMXBase<ConvertPIMToAiMXPass> {
   using ConvertPIMToAiMXBase::ConvertPIMToAiMXBase;
-
   void runOnOperation() override {
-    profile = pim::targetProfile(getOperation());
-    if (!profile) {
-      getOperation()->emitError(
-          "convert-pim-to-aimx: the module has no #pim.target_profile");
+    ModuleOp module = getOperation();
+    auto profile = pim::targetProfile(module);
+    if (!profile || profile.getTarget() != "aimx" ||
+        profile.getBanksPerUnit() != aimx::kNumBanks * aimx::kNumChannels ||
+        profile.getBankCapacityLimitBytes() <= 0) {
+      module.emitError("convert-pim-to-aimx requires an AiMX target profile");
       return signalPassFailure();
     }
-    if (failed(checkLegality()))
+    if (batch != 1 && batch != 2 && batch != 4 && batch != 8) {
+      module.emitError("AiMX batch must be 1, 2, 4, or 8");
       return signalPassFailure();
-
+    }
     SmallVector<pim::DeviceOp> devices;
-    getOperation().walk([&](pim::DeviceOp d) { devices.push_back(d); });
-    for (pim::DeviceOp d : devices)
-      if (failed(convert(d)))
+    module.walk([&](pim::DeviceOp device) { devices.push_back(device); });
+    unsigned site = 0;
+    for (pim::DeviceOp device : devices)
+      if (failed(DeviceLowering(module, device, profile, batch, persistent,
+                                site++).run()))
         return signalPassFailure();
-
-    // 공통 PIM planning 속성은 여기서 모두 소비된다. 남겨 두면 target
-    // IR이 여전히 PIM dialect에 의존하고, AiMX translator가 완전히 lowered된
-    // IR만 받는다는 경계가 깨진다.
-    getOperation()->removeAttr("pim.target_profile");
-    getOperation().walk([](func::FuncOp f) {
-      f->removeAttr("pim.block");
-      f->removeAttr("pim.block_group");
-      f->removeAttr("pim.execution_tile");
+    module->removeAttr("pim.target_profile");
+    module.walk([](func::FuncOp function) {
+      function->removeAttr("pim.block");
+      function->removeAttr("pim.block_group");
+      bool changed;
+      do {
+        changed = false;
+        SmallVector<Operation *> dead;
+        function.walk([&](Operation *op) {
+          if (op->getNumRegions() == 0 && isOpTriviallyDead(op)) dead.push_back(op);
+        });
+        for (Operation *op : llvm::reverse(dead)) { op->erase(); changed = true; }
+      } while (changed);
     });
-  }
-
-  pim::TargetProfileAttr profile;
-
-  LogicalResult checkLegality() {
-    Operation *m = getOperation();
-    if (profile.getTarget() != "aimx")
-      return m->emitError("convert-pim-to-aimx: the module targets ")
-             << profile.getTarget().getValue();
-    if (profile.getBanksPerUnit() != aimx::kNumBanks * aimx::kNumChannels ||
-        profile.getCoresPerBank() != 1 ||
-        profile.getLanesPerCore() != aimx::kALUSize)
-      return m->emitError(
-                 "convert-pim-to-aimx: AiMX topology must be 256 banks per "
-                 "unit, one core per bank, and 16 lanes per core; got ")
-             << profile.getBanksPerUnit() << " banks, "
-             << profile.getCoresPerBank() << " cores, and "
-             << profile.getLanesPerCore();
-    if (profile.getBankCapacityLimitBytes() <= 0)
-      return m->emitError(
-          "convert-pim-to-aimx: bank_capacity_limit_bytes must be positive");
-    if (!isBatch(batch))
-      return m->emitError(
-                 "convert-pim-to-aimx: batch must be one of 1, 2, 4, 8; got ")
-             << batch;
-    return success();
-  }
-
-  //===--------------------------------------------------------------------===//
-  // execution tile
-  //===--------------------------------------------------------------------===//
-
-  LogicalResult budgetBytes(Operation *at, int64_t &budget) {
-    if (std::optional<int64_t> capacity =
-            pim::unitCapacityLimitBytes(profile)) {
-      budget = *capacity;
-      return success();
-    }
-    return at->emitError(
-        "convert-pim-to-aimx: the profile capacity overflows the unit budget");
-  }
-
-  // §6.1. (t_m, t_k, t_n)은 buffer와 재사용 descriptor chain의 고정 모양이다.
-  // tail execution tile은 stage에서 이 모양까지 0 padding하고 unstage는 유효 영역만
-  // 회수한다. 할당해 보고 물러서는 길이가 없으므로 예산을 넘으면 여기서 멈춘다.
-  LogicalResult checkBudget(Operation *at, int64_t batchV, int64_t mT,
-                            int64_t kMax, int64_t nMax, Footprint &fp) {
-    int64_t budget;
-    if (failed(budgetBytes(at, budget)))
-      return failure();
-    fp = footprintOf(batchV, mT, kMax, nMax);
-    auto checkAllocation = [&](StringRef name, int64_t bytes) -> LogicalResult {
-      if (bytes <= aimx::kMaxRuntimeAllocationBytes)
-        return success();
-      return at->emitError("convert-pim-to-aimx: the ")
-             << name << " allocation needs " << bytes
-             << " byte, but the current AiMX runtime uses a signed int for "
-                "2 MiB pool expansion and supports at most "
-             << aimx::kMaxRuntimeAllocationBytes
-             << " byte in one allocation — lower tile_m, tile_n, or tile_k";
-    };
-    if (failed(checkAllocation("PMM", aimx::kPMMSize)) ||
-        failed(checkAllocation("A", fp.a)) ||
-        failed(checkAllocation("Arel", fp.arel)) ||
-        failed(checkAllocation("B", fp.b)) ||
-        failed(checkAllocation("C", fp.c)) ||
-        failed(checkAllocation("descriptor chain", fp.chain)))
-      return failure();
-    int64_t banks = profile.getBanksPerUnit();
-    int64_t bankBudget = profile.getBankCapacityLimitBytes();
-    int64_t perBank = fp.maxBankBytes();
-    if (perBank > bankBudget)
-      return at->emitError("convert-pim-to-aimx: the allocation-wise interleaved "
-                           "footprint needs ")
-             << perBank << " byte in each of " << banks
-             << " banks but bank_capacity_limit_bytes is " << bankBudget;
-    if (fp.total() > budget)
-      return at->emitError("convert-pim-to-aimx: the buffer bound (t_m=")
-             << mT << ", t_k=" << kMax << ", t_n=" << nMax << ") needs "
-             << fp.total() << " byte of PIM DRAM but the budget is " << budget
-             << " byte — lower tile_m, tile_k, or tile_n";
-    return success();
-  }
-
-  //===--------------------------------------------------------------------===//
-  // device 하나
-  //===--------------------------------------------------------------------===//
-
-  LogicalResult convert(pim::DeviceOp device) {
-    auto func = device->getParentOfType<func::FuncOp>();
-    MLIRContext *ctx = &getContext();
-    Location loc = device.getLoc();
-    Block *deviceBody = &device.getBody().front();
-
-    Roles roles;
-    if (failed(readRoles(device, roles)))
-      return failure();
-    if (failed(preserveComputeTemplate(func, roles)))
-      return failure();
-
-    llvm::DenseMap<int64_t, pim::PlaceOp> byAccess;
-    SmallVector<pim::PlaceOp> all;
-    for (Operation &op : *deviceBody)
-      if (auto p = dyn_cast<pim::PlaceOp>(&op)) {
-        byAccess[p.getAccess()] = p;
-        all.push_back(p);
-      }
-    pim::PlaceOp aPlace = byAccess.lookup(roles.a);
-    pim::PlaceOp bPlace = byAccess.lookup(roles.b);
-    pim::PlaceOp cPlace = byAccess.lookup(roles.c);
-    if (!aPlace || !bPlace || !cPlace)
-      return device->emitError("convert-pim-to-aimx: the matmul operands have "
-                               "no matching pim.place");
-    if (cPlace.getDirection() != "out")
-      return cPlace->emitError(
-          "convert-pim-to-aimx: the matmul result must be an \"out\" place");
-    // 마지막 두 축이 PIM의 2-D C tile이다. 앞축이 있으면 host buffer의
-    // origin/stride로 보존한다.
-    if (cPlace.getStart().size() < 2)
-      return cPlace->emitError(
-          "convert-pim-to-aimx: the output needs at least row and column axes");
-    if (aPlace.getStart().size() != 2 || bPlace.getStart().size() != 2)
-      return device->emitError(
-          "convert-pim-to-aimx: A and B must be two-dimensional");
-
-    // ── block → block group → execution tile ─────────────────────────────────
-    // 세 계층은 전부 Common IR 이 정했다. #pim.block은 원소 shape,
-    // #pim.block_group은 Block 개수, #pim.execution_tile은 Group 개수다. 이 pass는
-    // 파생 원소 shape를 물리 눈금으로 번역하고 padding을 stage/unstage에 옮긴다.
-    auto bg = func->getAttrOfType<pim::BlockGroupAttr>("pim.block_group");
-    if (!bg)
-      return func->emitError(
-          "convert-pim-to-aimx: the function has no #pim.block_group — run "
-          "--pim-form-block-groups after --pim-set-target-profile");
-    int64_t units[] = {batch, aimx::kLanes / batch,
-                       aimx::kRegSize / batch};
-    SmallVector<int64_t, 3> commonGroupShape = pim::groupShape(func);
-    if (commonGroupShape.size() != 3)
-      return func->emitError(
-          "convert-pim-to-aimx: cannot derive block-group shape from "
-          "#pim.block and #pim.block_group");
-    auto groupAt = [&](int i) {
-      BlockGroup g;
-      g.tiles = bg.getBlocks().asArrayRef()[i];
-      g.useful = commonGroupShape[i];
-      g.phys = (g.useful + units[i] - 1) / units[i] * units[i];
-      return g;
-    };
-    BlockGroup mGroup = groupAt(0), nGroup = groupAt(1), kGroup = groupAt(2);
-    int64_t batchV = batch;
-    // K의 논리 block-group 개수는 Common이 고른 값을 그대로 유지한다.
-    // vecA의 256-element 단위에 부족한 부분은 t_k의 물리 padding이지,
-    // 추가 논리 group이 아니다.
-
-    // Tile의 Group 개수는 Common IR이 확정했다. host loop은 파생된 유효 원소 크기로
-    // 걷고 buffer는 물리 크기로 잡는다. 이 pass는 읽기만 하고 예산을 재검사한다.
-    SmallVector<int64_t, 3> commonTileShape =
-        pim::executionTileShape(device);
-    if (!device->getAttrOfType<pim::ExecutionTileAttr>("pim.execution_tile") ||
-        commonTileShape.size() != 3 || commonTileShape[0] <= 0 ||
-        commonTileShape[1] <= 0 || commonTileShape[2] <= 0)
-      return device->emitError(
-          "convert-pim-to-aimx: #pim.execution_tile needs positive m, n, k "
-          "group counts — run --pim-form-execution-tiles");
-
-    int64_t mCount =
-        std::max<int64_t>(commonTileShape[0] / mGroup.useful, 1);
-    int64_t mUse = mCount * mGroup.useful;
-    int64_t mPhys = mCount * mGroup.phys;
-    int64_t nMax =
-        std::max<int64_t>(commonTileShape[1] / nGroup.useful, 1) *
-        nGroup.phys;
-    int64_t kCount =
-        std::max<int64_t>(commonTileShape[2] / kGroup.useful, 1);
-    int64_t kMax = (kCount * kGroup.phys + aimx::kRegSize - 1) /
-                   aimx::kRegSize * aimx::kRegSize;
-
-    Footprint fp;
-    if (failed(checkBudget(device, batchV, mPhys, kMax, nMax, fp)))
-      return failure();
-
-    // 이 attribute는 할당된 buffer와 descriptor chain의 고정 모양이다.
-    func->setAttr("aimx.tiling",
-                  aimx::TilingAttr::get(ctx, batchV, mPhys, nMax, kMax,
-                                        fp.paddedK, fp.paddedN,
-                                        /*transposed=*/false));
-    // 위 attribute 가 buffer 모양이라면 이쪽은 source 와 하드웨어의 관계다. group 이
-    // block group 당 Triton block 수, execution 이 block group 의 물리 크기다. 전부
-    // compile time 상수이고, execution tile 안의 실제 tail 크기는 place가 들고 있다.
-    auto i64s = [&](std::initializer_list<int64_t> v) {
-      return DenseI64ArrayAttr::get(ctx, v);
-    };
-    // linalg operand는 Common L1에서 이미 block group으로 묶였다. 이 grouped shape를
-    // block에 그대로 쓰고 group 수도 함께 기록하면 G를 두 번 곱하게 된다. target
-    // attribute의 block은 원래 Triton BLOCK, group은 그 BLOCK의 묶음 수로 유지한다.
-    if (roles.blockM % mGroup.tiles != 0 ||
-        roles.blockN % nGroup.tiles != 0 ||
-        roles.blockK % kGroup.tiles != 0)
-      return device->emitError(
-          "convert-pim-to-aimx: grouped linalg shape is not divisible by "
-          "#pim.block_group tile counts");
-    int64_t sourceBlockM = roles.blockM / mGroup.tiles;
-    int64_t sourceBlockN = roles.blockN / nGroup.tiles;
-    int64_t sourceBlockK = roles.blockK / kGroup.tiles;
-    func->setAttr(
-        "aimx.tile_group",
-        aimx::TileGroupAttr::get(
-            ctx, i64s({sourceBlockM, sourceBlockN, sourceBlockK}),
-            i64s({mGroup.tiles, nGroup.tiles, kGroup.tiles}),
-            i64s({mGroup.phys, nGroup.phys, kGroup.phys})));
-
-    int64_t numDevices = 1;
-    for (int64_t c : device.getMapping().getPartitions().asArrayRef())
-      numDevices *= c;
-
-    // ── host: 공통 scheduling round 바깥에 foreach_device 를 놓는다 ─────────
-    // PIM Device set은 공통 scheduling round 전체에서 동일하다. acquire와
-    // foreach_device를 가장 바깥 scheduling loop 앞으로 옮긴다. 그 결과 각 device
-    // thread 안에서 allocation/descriptor build를 한 번 하고 모든 round를 돈다.
-    Operation *scheduleRoot = device;
-    while (auto round = dyn_cast_or_null<scf::ForOp>(scheduleRoot->getParentOp())) {
-      if (!round->hasAttr("pim.scheduling_axis"))
-        break;
-      scheduleRoot = round;
-    }
-    OpBuilder setup(scheduleRoot);
-    auto setTy = aimx::DeviceSetType::get(ctx);
-    Value set = setup.create<aimx::AcquireOp>(
-        loc, setTy, setup.getI64IntegerAttr(numDevices));
-    OpBuilder hb(scheduleRoot);
-    ArrayAttr axes = hb.getStrArrayAttr({"m", "n", "k"});
-    auto counts = hb.getDenseI64ArrayAttr(
-        device.getMapping().getPartitions().asArrayRef());
-    auto foreach = hb.create<aimx::ForeachDeviceOp>(loc, set, axes, counts);
-
-    SmallVector<Type> argTys{aimx::DeviceType::get(ctx)};
-    SmallVector<Location> argLocs{loc};
-    for (unsigned i = 0; i < 3; i++) {
-      argTys.push_back(hb.getIndexType());
-      argLocs.push_back(loc);
-    }
-    Block *fdBody = hb.createBlock(&foreach.getBody(), {}, argTys, argLocs);
-
-    // round 계산과 pim.device를 함께 foreach_device 안으로 옮긴다. 원래 round IV와
-    // device 좌표를 그대로 보존하므로 place의 전역 origin 식을 다시 만들 필요가 없다.
-    scheduleRoot->moveBefore(fdBody, fdBody->end());
-
-    Block *roundBody = device->getBlock();
-    auto deviceIt = device->getIterator();
-    roundBody->getOperations().splice(deviceIt, deviceBody->getOperations(),
-                                      deviceBody->begin(), deviceBody->end());
-    for (unsigned i = 0; i < 3; i++)
-      deviceBody->getArgument(i).replaceAllUsesWith(fdBody->getArgument(i + 1));
-
-    // 논리 tile loop nest 는 통째로 사라진다. AiMX 에는 device program 이 없고
-    // 계산 자체가 descriptor chain 이다.
-    SmallVector<scf::ForOp> nests;
-    for (Operation &op : *roundBody)
-      if (auto f = dyn_cast<scf::ForOp>(&op))
-        nests.push_back(f);
-    for (scf::ForOp f : nests)
-      f.erase();
-
-    PlacementBuffers buffers = buildSetup(
-        fdBody, func.getName(), mPhys, kMax, nMax, fp);
-    buildPlacement(device.getOperation(), aPlace, bPlace, cPlace, mUse, mPhys,
-                   kMax, nMax, mGroup, nGroup, kGroup, kCount, fp, buffers);
-
-    for (pim::PlaceOp p : all)
-      p.erase();
-    device.erase();
-    // loop nest 를 지우면서 그것만 쓰던 값들이 죽은 채로 남는다. 만든 쪽이 치운다 —
-    // 남겨 두면 codegen 이 옮길 수 없는 값(누산기 초기값 f32 상수 같은 것)을 만나
-    // 실패한다.
-    eraseDead(func);
-    return success();
-  }
-
-  // L1이 operation 의미를 잃지 않도록 linalg op을 module-level
-  // aimx.compute_template으로 복제한다. 원래 op의 operand는 template
-  // block argument로 바꿔 IsolatedFromAbove 경계를 지킨다. 원래 logical loop
-  // nest는 L1 host loop로 바꾸면서 지우지만, 이 template은 L2가 descriptor
-  // program을 만들 때까지 남는다.
-  LogicalResult preserveComputeTemplate(func::FuncOp func, const Roles &roles) {
-    ModuleOp module = func->getParentOfType<ModuleOp>();
-    std::string name = (func.getName() + "_compute_template").str();
-    if (module.lookupSymbol(name))
-      return func->emitError("convert-pim-to-aimx: duplicate L1 compute template @")
-             << name;
-
-    OpBuilder mb(module.getBody(), module.getBody()->end());
-    auto tmpl = mb.create<aimx::ComputeTemplateOp>(
-        roles.matmul->getLoc(), mb.getStringAttr(name),
-        mb.getStringAttr("matmul"));
-
-    SmallVector<Type> argTypes(roles.matmul->getOperandTypes().begin(),
-                               roles.matmul->getOperandTypes().end());
-    SmallVector<Location> argLocs(argTypes.size(), roles.matmul->getLoc());
-    OpBuilder::InsertionGuard guard(mb);
-    Block *body = mb.createBlock(&tmpl.getBody(), {}, argTypes, argLocs);
-    IRMapping mapping;
-    for (auto [operand, argument] :
-         llvm::zip(roles.matmul->getOperands(), body->getArguments()))
-      mapping.map(operand, argument);
-    mb.clone(*roles.matmul, mapping);
-    return success();
-  }
-
-  // 더 이상 줄지 않을 때까지 죽은 op 을 지운다. aimx op 들은 부수 효과가 선언돼 있지
-  // 않아 isOpTriviallyDead 가 살려 두므로 이 순회에 걸리지 않는다.
-  void eraseDead(func::FuncOp func) {
-    bool changed = true;
-    while (changed) {
-      changed = false;
-      SmallVector<Operation *> dead;
-      func.walk([&](Operation *op) {
-        // region 을 가진 op 은 건드리지 않는다. 부모와 자식이 같은 목록에 들어가면
-        // 부모를 지운 뒤 자식을 다시 지우게 된다.
-        if (op->getNumRegions() == 0 && isOpTriviallyDead(op))
-          dead.push_back(op);
-      });
-      for (Operation *op : llvm::reverse(dead)) {
-        op->erase();
-        changed = true;
-      }
-    }
-  }
-
-  // matmul 의 두 입력과 결과가 어느 pim.access 에서 왔는지 읽는다.
-  LogicalResult readRoles(pim::DeviceOp device, Roles &roles) {
-    SmallVector<linalg::MatmulOp> matmuls;
-    SmallVector<pim::StoreOp> stores;
-    device.getBody().walk([&](Operation *op) {
-      if (auto mm = dyn_cast<linalg::MatmulOp>(op))
-        matmuls.push_back(mm);
-      if (auto st = dyn_cast<pim::StoreOp>(op))
-        stores.push_back(st);
-    });
-    if (matmuls.size() != 1)
-      return device->emitError("convert-pim-to-aimx: expected exactly one "
-                               "linalg.matmul inside pim.device, found ")
-             << matmuls.size();
-    if (stores.size() != 1)
-      return device->emitError("convert-pim-to-aimx: expected exactly one "
-                               "pim.store inside pim.device, found ")
-             << stores.size();
-    roles.matmul = matmuls[0];
-
-    auto idOf = [&](Value tile, int64_t &id) -> LogicalResult {
-      auto load = tile.getDefiningOp<pim::LoadOp>();
-      if (!load)
-        return device->emitError("convert-pim-to-aimx: a matmul operand does "
-                                 "not come from pim.load");
-      auto access = load.getAccess().getDefiningOp<pim::AccessOp>();
-      if (!access)
-        return device->emitError(
-            "convert-pim-to-aimx: a pim.load does not read a pim.access");
-      id = access.getId();
-      return success();
-    };
-    if (failed(idOf(matmuls[0].getInputs()[0], roles.a)) ||
-        failed(idOf(matmuls[0].getInputs()[1], roles.b)))
-      return failure();
-
-    auto outAccess = stores[0].getAccess().getDefiningOp<pim::AccessOp>();
-    if (!outAccess)
-      return device->emitError(
-          "convert-pim-to-aimx: the pim.store does not write a pim.access");
-    roles.c = outAccess.getId();
-
-    // 원소 타입. MAC 은 bfloat16 곱셈기이고 누산기도 부동소수점이다 — 정수 matmul 을
-    // 옮길 자리가 없다.
-    auto tileElem = [](Value v) {
-      return cast<RankedTensorType>(v.getType()).getElementType();
-    };
-    if (!isa<FloatType>(tileElem(matmuls[0].getInputs()[0])) ||
-        !isa<FloatType>(tileElem(matmuls[0].getInputs()[1])) ||
-        !isa<FloatType>(tileElem(matmuls[0].getOutputs()[0])))
-      return device->emitError("convert-pim-to-aimx: the AiMX MAC is a "
-                               "bfloat16 multiplier, so the matmul operands "
-                               "must be floating point");
-
-    auto aTy = cast<RankedTensorType>(matmuls[0].getInputs()[0].getType());
-    auto bTy = cast<RankedTensorType>(matmuls[0].getInputs()[1].getType());
-    if (!aTy.hasStaticShape() || !bTy.hasStaticShape())
-      return device->emitError("convert-pim-to-aimx: the matmul operands must "
-                               "have a static shape — the Triton block size has "
-                               "to be known to relate it to the hardware grid");
-    roles.blockM = aTy.getDimSize(0);
-    roles.blockK = aTy.getDimSize(1);
-    roles.blockN = bTy.getDimSize(1);
-    if (bTy.getDimSize(0) != roles.blockK)
-      return device->emitError("convert-pim-to-aimx: the matmul operands "
-                               "disagree on BLOCK_K");
-    // 0 이면 아래의 나눗셈들이 0 으로 나눈다.
-    if (roles.blockM <= 0 || roles.blockN <= 0 || roles.blockK <= 0)
-      return device->emitError("convert-pim-to-aimx: the Triton block has a "
-                               "non-positive dimension");
-
-    // 누산기는 vACC 다. 하드웨어가 0 에서 시작하므로 초기값이 0 이 아니면 답이 달라진다.
-    // --pim-form-compute 가 만든 모양에서 누산기는 reduction scf.for 의 iter_arg 이고
-    // 그 초기값이 linalg.fill 이다.
-    auto acc = dyn_cast<BlockArgument>(matmuls[0].getOutputs()[0]);
-    auto loop = acc ? dyn_cast<scf::ForOp>(acc.getOwner()->getParentOp())
-                    : scf::ForOp();
-    if (!loop)
-      return device->emitError("convert-pim-to-aimx: the accumulator is not a "
-                               "reduction loop iter_arg");
-    Value init = loop.getInitArgs()[acc.getArgNumber() - 1];
-    auto fill = init.getDefiningOp<linalg::FillOp>();
-    if (!fill)
-      return device->emitError("convert-pim-to-aimx: the accumulator is not "
-                               "initialized by linalg.fill");
-    if (!matchPattern(fill.getInputs()[0], m_AnyZeroFloat()))
-      return device->emitError(
-          "convert-pim-to-aimx: the accumulator must start at zero — vACC does");
-    return success();
-  }
-
-  //===--------------------------------------------------------------------===//
-  // level 1 배치
-  //===--------------------------------------------------------------------===//
-
-  PlacementBuffers buildSetup(Block *body, StringRef base, int64_t mPhys,
-                              int64_t kMax, int64_t nMax,
-                              const Footprint &fp) {
-    OpBuilder b(body, body->begin());
-    Location loc = body->getParentOp()->getLoc();
-    MLIRContext *ctx = b.getContext();
-    Value dev = body->getArgument(0);
-    auto bufTy = aimx::BufferType::get(ctx);
-
-    auto alloc = [&](int64_t bytes, aimx::AllocKind kind) {
-      int64_t align =
-          kind == aimx::AllocKind::PMM ? aimx::kPMMAlign : aimx::kPIMWidth;
-      return b
-          .create<aimx::AllocOp>(loc, bufTy, dev, b.getI64IntegerAttr(bytes),
-                                 b.getI64IntegerAttr(align),
-                                 aimx::AllocKindAttr::get(ctx, kind))
-          .getResult();
-    };
-
-    PlacementBuffers buffers;
-    buffers.device = dev;
-    // PMM이 먼저여야 pim_private_malloc과 일반 pim_malloc 영역의 겹침을 검사할 수 있다.
-    buffers.pmm = alloc(aimx::kPMMSize, aimx::AllocKind::PMM);
-    buffers.a = alloc(fp.a, aimx::AllocKind::Data);
-    buffers.arel = alloc(fp.arel, aimx::AllocKind::Data);
-    buffers.b = alloc(fp.b, aimx::AllocKind::Data);
-    buffers.c = alloc(fp.c, aimx::AllocKind::Data);
-    buffers.chain = alloc(fp.chain, aimx::AllocKind::Descriptor);
-
-    // descriptor는 execution-tile 최대 모양과 고정 PIM-side base address만 사용한다.
-    // tail round도 같은 chain을 실행하며, 부족한 데이터는 stage가 0으로 채우고
-    // unstage가 실제 유효 영역만 회수한다.
-    Value m = b.create<arith::ConstantIndexOp>(loc, mPhys);
-    Value k = b.create<arith::ConstantIndexOp>(loc, kMax);
-    Value paddedK = b.create<arith::ConstantIndexOp>(loc, fp.paddedK);
-    Value n = b.create<arith::ConstantIndexOp>(loc, nMax);
-    b.create<aimx::BuildDescriptorsOp>(
-        loc, FlatSymbolRefAttr::get(ctx, (base + "_relayout").str()),
-        ValueRange{m, k, paddedK, buffers.a, buffers.arel}, buffers.chain);
-    b.create<aimx::BuildDescriptorsOp>(
-        loc, FlatSymbolRefAttr::get(ctx, (base + "_compute").str()),
-        ValueRange{m, k, n, buffers.arel, buffers.b, buffers.c, buffers.pmm},
-        buffers.chain);
-    return buffers;
-  }
-
-  void buildPlacement(Operation *at, pim::PlaceOp aPlace,
-                      pim::PlaceOp bPlace, pim::PlaceOp cPlace, int64_t mUse,
-                      int64_t mPhys, int64_t kMax, int64_t nMax,
-                      const BlockGroup &mGroup, const BlockGroup &nGroup,
-                      const BlockGroup &kGroup, int64_t kCount,
-                      const Footprint &fp,
-                      const PlacementBuffers &buffers) {
-    OpBuilder b(at);
-    Location loc = at->getLoc();
-    MLIRContext *ctx = b.getContext();
-    Value dev = buffers.device;
-    auto elem = TypeAttr::get(b.getBF16Type());
-    // 이 pass 는 아직 전치를 고르지 않는다. IR 은 표현할 수 있고 규칙이 런타임 값을
-    // 필요로 할 뿐이다.
-    UnitAttr noTranspose;
-
-    // 상수는 loop 를 만들기 전에 전부 만들어 둔다. loop 뒤에 만들면 loop 안의 사용을
-    // 지배하지 못한다.
-    auto idx = [&](int64_t v) {
-      return b.create<arith::ConstantIndexOp>(loc, v).getResult();
-    };
-    Value c0 = idx(0), c1 = idx(1);
-    // m 도 n·k 와 같다: host loop 은 유효 크기로 걷고, buffer 와 descriptor program 은
-    // 물리 크기를 본다. padding 이 없으면 둘이 같다.
-    Value mUseV = idx(mUse), mPhysV = idx(mPhys);
-    Value fixedK = idx(kMax), fixedN = idx(nMax);
-    Value fixedPaddedK = idx(fp.paddedK);
-
-    // ── execution tile 안의 실제 유효 범위 ─────────────────────────────────
-    // buffer와 descriptor는 고정 최대 모양이고, 여기서는 현재 round의 유효 크기를
-    // 상한에서 clamp한다. tail은 stage가 최대 모양까지 0으로 채운다.
-    //
-    // block group 이 끼면 **유효(useful)** 크기와 **물리(phys)** 크기가 갈린다. host
-    // 가 소비하는 것(loop 전진 폭, stage/unstage 의 origin·sizes)은 유효 크기이고,
-    // PIM DRAM·chain·descriptor program 이 보는 것(pad_to, pitch, program 인자)은
-    // 물리 크기다. padding 이 없으면 둘이 같아 예전과 같은 값이 나온다.
-    //
-    // k 를 자르는 것은 **손해**이고 마지막 수단이다. k tile 하나가 통째로 한 chain 에
-    // 들어가면 reduction 이 vACC 안에서 끝나고 bf16 반올림이 출력당 한 번뿐인데, 자르면
-    // 부분합이 tile 마다 PIM 밖으로 나와 C 전송이 k tile 수만큼 곱해진다. vACC 는 출력
-    // block 하나 깊이(주소가 pmm+VACC_OFFSET 하나)라 invoke 를 건너 들고 있을 수 없으므로
-    // 이것은 피할 수 있는 비용이 아니다. 그래서 k_max 는 예산이 허락하는 한 크게 두고
-    // (1 GiB, batch 8, t_m 16, t_n 4096 이면 t_k=115712), 자르는 일은 그것을 넘을 때만
-    // 일어난다 — 현실적인 k 는 전부 한 번에 들어간다.
-    // group 수는 최소 1 이다. device 분배가 이 device 에 일을 주지 않으면(범위 0)
-    // group 수가 0 이 되고 그 곱 t_k/t_n 이 tile 수 나눗셈의 분모로 들어가 SIGFPE 다.
-    // 1 로 받치면 tile 수가 ceildiv(0, 단위) = 0 이라 loop 이 돌지 않는 no-op 이 된다.
-    Value kGroups = b.create<arith::MaxSIOp>(
-        loc,
-        b.create<arith::MinSIOp>(
-             loc,
-             b.create<arith::CeilDivSIOp>(loc, aPlace.getSize()[1],
-                                          idx(kGroup.useful))
-                 .getResult(),
-             idx(kCount))
-            .getResult(),
-        c1);
-    Value kPhysical = b.create<arith::MulIOp>(
-        loc, kGroups, idx(kGroup.phys)).getResult();
-    Value kRt = b.create<arith::MulIOp>(
-        loc,
-        b.create<arith::CeilDivSIOp>(loc, kPhysical, idx(aimx::kRegSize)),
-        idx(aimx::kRegSize));
-    Value kUse = b.create<arith::MulIOp>(
-        loc, kGroups, idx(kGroup.useful)).getResult();
-    // n 의 눈금은 block group 의 물리 폭이다 (padding 이 없으면 출력 block 폭
-    // 4096/batch 그대로). 4096 으로 올리면 batch > 1 에서 남는 열이 그대로 노는
-    // lane 이 된다 — N = 2560, batch = 8 이면 t_n 이 4096(1536 열 낭비)이 아니라
-    // 2560(낭비 0)이다. N >= n_max 면 어느 쪽이든 n_max 로 잘린다.
-    Value nGroups = b.create<arith::MaxSIOp>(
-        loc,
-        b.create<arith::MinSIOp>(
-             loc, b.create<arith::CeilDivSIOp>(
-                      loc, cPlace.getSize()[cPlace.getSize().size() - 1],
-                                          idx(nGroup.useful))
-                 .getResult(),
-             idx(nMax / nGroup.phys))
-            .getResult(),
-        c1);
-    Value nRt =
-        b.create<arith::MulIOp>(loc, nGroups, idx(nGroup.phys)).getResult();
-    Value nUse = nGroup.pad()
-                     ? b.create<arith::MulIOp>(loc, nGroups, idx(nGroup.useful))
-                           .getResult()
-                     : nRt;
-    // padding 이 있는 축만 stage / unstage 에 block group 배치를 싣는다. 없는 축은
-    // 항등이라 attr 를 아예 내지 않는다 — 그래야 stub 이 예전 코드를 그대로 낸다.
-    auto grpAttr = [&](const BlockGroup &g) {
-      return g.pad() ? b.getDenseI64ArrayAttr({g.useful, g.phys})
-                     : DenseI64ArrayAttr();
-    };
-
-    // tile 수와 loop 전진 폭은 **유효** 크기로 센다 — host 좌표는 padding 을 모른다.
-    Value mTiles =
-        b.create<arith::CeilDivSIOp>(
-             loc, cPlace.getSize()[cPlace.getSize().size() - 2], mUseV)
-            .getResult();
-    Value nTiles = b.create<arith::CeilDivSIOp>(
-        loc, cPlace.getSize()[cPlace.getSize().size() - 1], nUse);
-    // k 가 상한 안이면 이 값이 1 이고 아래 loop 은 한 번만 돈다 — 그때 나오는 코드는
-    // k 를 나누기 전과 같다.
-    Value kTiles =
-        b.create<arith::CeilDivSIOp>(loc, aPlace.getSize()[1], kUse).getResult();
-
-    // 이 tile 이 실제로 맡는 크기. 마지막 tile 이 덜 맡으면 stage 가 그만큼만 모으고
-    // 나머지 자리는 0 이 된다 — 그 0 이 누산에 그대로 더해지므로 정확성 요구사항이다.
-    auto remaining = [&](OpBuilder &ib, Value total, Value off, Value cap) {
-      Value left = ib.create<arith::SubIOp>(loc, total, off).getResult();
-      return ib.create<arith::MinSIOp>(loc, left, cap).getResult();
-    };
-
-    // ── loop 순서: n → k → m ────────────────────────────────────────────────
-    // B 가 가장 큰 buffer(t_k * t_n * 2)이고 (k, n) 에만 의존하므로 두 축을 바깥에 둔다.
-    // A 는 (m, k) 에 의존하지만 t_m * padded_k * 2 로 훨씬 작아 안쪽이 맞다. k 를 가장
-    // 안쪽에 두면 B 가 m tile 마다 다시 올라가 전송량이 m tile 수만큼 곱해진다.
-    // n 과 m 의 상대 순서를 바꾸는 것은 §8 I1 로 chain 을 재배치용과 계산용으로 나눈
-    // 뒤에만 의미가 있다 — 지금은 chain 하나에 둘 다 붙어 있어 invoke 마다 재배치가
-    // 다시 돈다.
-    auto nLoop = b.create<scf::ForOp>(loc, c0, nTiles, c1);
-    OpBuilder nb = OpBuilder::atBlockBegin(nLoop.getBody());
-    Value nOff =
-        nb.create<arith::MulIOp>(loc, nLoop.getInductionVar(), nUse).getResult();
-
-    auto kLoop = nb.create<scf::ForOp>(loc, c0, kTiles, c1);
-    OpBuilder kb = OpBuilder::atBlockBegin(kLoop.getBody());
-    Value kOff =
-        kb.create<arith::MulIOp>(loc, kLoop.getInductionVar(), kUse).getResult();
-
-    Value bRow0 =
-        kb.create<arith::AddIOp>(loc, bPlace.getStart()[0], kOff).getResult();
-    Value bCol0 =
-        kb.create<arith::AddIOp>(loc, bPlace.getStart()[1], nOff).getResult();
-    kb.create<aimx::StageOp>(
-        loc, bPlace.getBuffer(), ValueRange{bRow0, bCol0},
-        ValueRange{remaining(kb, bPlace.getSize()[0], kOff, kUse),
-                   remaining(kb, bPlace.getSize()[1], nOff, nUse)},
-        bPlace.getStrides(), ValueRange{fixedK, fixedN}, fixedN, buffers.b,
-        elem,
-        noTranspose, /*group_rows=*/grpAttr(kGroup),
-        /*group_cols=*/grpAttr(nGroup));
-
-    // 두 번째 k tile 부터는 C 를 덮는 것이 아니라 이전 부분합에 더한다. k tile 이
-    // 하나뿐이면 이 값은 언제나 0 이고 unstage 는 예전 그대로 대입만 한다.
-    Value acc =
-        kb.create<arith::SelectOp>(
-              loc,
-              kb.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne,
-                                       kLoop.getInductionVar(), c0)
-                  .getResult(),
-              c1, c0)
-            .getResult();
-
-    auto mLoop = kb.create<scf::ForOp>(loc, c0, mTiles, c1);
-    OpBuilder mb = OpBuilder::atBlockBegin(mLoop.getBody());
-    Value mOff =
-        mb.create<arith::MulIOp>(loc, mLoop.getInductionVar(), mUseV)
-            .getResult();
-
-    Value aRow0 =
-        mb.create<arith::AddIOp>(loc, aPlace.getStart()[0], mOff).getResult();
-    Value aCol0 =
-        mb.create<arith::AddIOp>(loc, aPlace.getStart()[1], kOff).getResult();
-    mb.create<aimx::StageOp>(
-        loc, aPlace.getBuffer(), ValueRange{aRow0, aCol0},
-        ValueRange{remaining(mb, aPlace.getSize()[0], mOff, mUseV),
-                   remaining(mb, aPlace.getSize()[1], kOff, kUse)},
-        aPlace.getStrides(), ValueRange{mPhysV, fixedK}, fixedPaddedK,
-        buffers.a, elem,
-        noTranspose, /*group_rows=*/grpAttr(mGroup),
-        /*group_cols=*/grpAttr(kGroup));
-
-    mb.create<aimx::InvokeOp>(loc, dev, buffers.chain);
-
-    unsigned cRank = cPlace.getStart().size();
-    SmallVector<Value> cOrigin(cPlace.getStart());
-    SmallVector<Value> cSizes(cPlace.getSize());
-    cOrigin[cRank - 2] = mb.create<arith::AddIOp>(
-        loc, cOrigin[cRank - 2], mOff);
-    cOrigin[cRank - 1] = mb.create<arith::AddIOp>(
-        loc, cOrigin[cRank - 1], nOff);
-    cSizes[cRank - 2] =
-        remaining(mb, cSizes[cRank - 2], mOff, mUseV);
-    cSizes[cRank - 1] = remaining(mb, cSizes[cRank - 1], nOff, nUse);
-    mb.create<aimx::UnstageOp>(
-        loc, buffers.c, cPlace.getBuffer(), cOrigin, cSizes,
-        cPlace.getStrides(), fixedN, acc, elem, noTranspose,
-        /*group_rows=*/grpAttr(mGroup), /*group_cols=*/grpAttr(nGroup));
   }
 };
-
 } // namespace
 
-std::unique_ptr<OperationPass<ModuleOp>>
-mlir::triton::createConvertPIMToAiMXPass() {
+std::unique_ptr<OperationPass<ModuleOp>> mlir::triton::createConvertPIMToAiMXPass() {
   return std::make_unique<ConvertPIMToAiMXPass>();
 }

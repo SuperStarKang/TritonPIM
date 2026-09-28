@@ -4,6 +4,7 @@ add_triton_library(AiMXTranslation
 
   DEPENDS
   AiMXTableGen
+  PIMTableGen
 
   LINK_LIBS PUBLIC
   MLIRIR
@@ -13,5 +14,8 @@ add_triton_library(AiMXTranslation
   MLIRFuncDialect
   MLIRMemRefDialect
   MLIRSCFDialect
+  MLIRLinalgDialect
+  MLIRTensorDialect
+  PIMIR
   AiMXIR
 )

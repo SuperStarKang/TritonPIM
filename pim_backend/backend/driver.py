@@ -145,7 +145,7 @@ def _build_upmem_so(host_src: str, device_src: str, nr_tasklets: int) -> str:
 
 def _aimx_include_dirs():
     # 생성된 stub이 쓰는 두 헤더의 자리.
-    #   pim.h       — libpim이 export하는 것 (설치본은 /usr/include)
+    #   pim.h       — AIMX_PIM_SW/include의 헤더. 같은 트리의 libpim.so와 연결한다.
     #   pim_math.h  — pim_isa_32_t / PIM_RD_INSTR_MC / pim_exec. 설치되지 않는 소스 트리 헤더라
     #                 경로를 받아야 한다. 짐작하지 않고 없으면 그 자리에서 터뜨린다.
     root = os.getenv("AIMX_PIM_SW", "")
@@ -160,6 +160,35 @@ def _aimx_include_dirs():
     return [math_dir, os.path.join(root, "include")]
 
 
+def _build_aimx_resident_runtime(includes, library: str) -> str:
+    # All AiMX kernel DSOs link this same content-addressed runtime instance.
+    # Device leases and the bounded resident-plan cache must not be per-kernel
+    # header statics. This is build plumbing only; the user controls execution.
+    backend_dir = os.path.dirname(os.path.abspath(__file__))
+    source = os.path.join(backend_dir, "aimx_resident_runtime.cpp")
+    runtime_h = Path(os.path.join(backend_dir, "aimx_runtime.h")).read_text()
+    # Rebuilding the vendor library must invalidate cached unresolved/old DSOs.
+    key = hashlib.sha256((
+        "aimx-resident-v2|" + Path(source).read_text() + runtime_h
+        + "|".join(includes) + "|pim=" + library).encode("utf-8")
+        + Path(library).read_bytes()).hexdigest()
+    cache = get_cache_manager(key)
+    so_name = f"libaimx_resident_{key[:16]}.so"
+    so_path = cache.get_file(so_name)
+    if so_path is None:
+        with tempfile.TemporaryDirectory() as tmp:
+            built = os.path.join(tmp, so_name)
+            subprocess.check_call([
+                "g++", "-O2", "-std=c++17", "-fPIC", "-shared",
+                "-Wno-unused-function", "-Wno-narrowing", "-Wno-write-strings",
+                f"-Wl,-soname,{so_name}", "-Wl,-z,defs", f"-I{backend_dir}",
+                *[f"-I{directory}" for directory in includes],
+                source, library, "-Wl,-rpath," + os.path.dirname(library),
+                "-lpthread", "-lm", "-o", built])
+            so_path = cache.put(Path(built).read_bytes(), so_name, binary=True)
+    return so_path
+
+
 def _build_aimx_so(stub_src: str, descriptors: str, base_fpga: int) -> str:
     # AiMX runtime stub(C++) + descriptor program(C 헤더)을 .so로 빌드해 경로를 돌려준다.
     # _build_upmem_so의 캐시 패턴(소스 해시 키)을 그대로 따른다.
@@ -167,6 +196,10 @@ def _build_aimx_so(stub_src: str, descriptors: str, base_fpga: int) -> str:
     # descriptor 쪽은 별도 .so가 아니라 stub이 include하는 헤더다 — program 하나가 함수
     # 하나이고 stub이 launch당 한 번만 부르므로 나눌 이유가 없다.
     includes = _aimx_include_dirs()
+    # Pair vendor headers and library explicitly; a bare -lpim can select an
+    # installed library from a different source tree.
+    library = os.path.realpath(os.path.join(includes[1], "..", "lib", "libpim.so"))
+    resident_runtime = _build_aimx_resident_runtime(includes, library)
     backend_dir = os.path.dirname(os.path.abspath(__file__))
     # aimx_runtime.h 내용을 키에 넣는다. 생성된 소스는 그대로인데 이 헤더만 고치는 경우가
     # 있고(런타임 선언·매크로), 키에 없으면 옛 .so가 그대로 재사용된다.
@@ -174,7 +207,7 @@ def _build_aimx_so(stub_src: str, descriptors: str, base_fpga: int) -> str:
     # base_fpga는 소스가 아니라 -D로 들어가므로 키에 따로 넣어야 한다.
     key = hashlib.sha256(
         (stub_src + descriptors + "|" + "|".join(includes) + "|" + runtime_h
-         + f"|fpga={base_fpga}").encode("utf-8")).hexdigest()
+         + f"|fpga={base_fpga}|resident={resident_runtime}").encode("utf-8")).hexdigest()
     cache = get_cache_manager(key)
     so_name = "pim_host.so"
     so_path = cache.get_file(so_name)
@@ -198,11 +231,15 @@ def _build_aimx_so(stub_src: str, descriptors: str, base_fpga: int) -> str:
         # -O2는 -ftree-vectorize를 매우 보수적으로만 쓰고, stride가 런타임 값인 loop을
         # stride-1 판으로 복제하는 -fversion-loops-for-strides는 -O3에서만 켜진다.
         subprocess.check_call(
-            ["g++", "-O3", "-std=c++17", "-fPIC", "-shared", "-fopenmp",
+            ["g++", "-O3", "-std=c++17", "-fPIC", "-shared", "-fopenmp", "-Wl,-z,defs",
              f"-DAIMX_BASE_FPGA={int(base_fpga)}",
+             f'-DAIMX_KERNEL_KEY="{key}"',
              "-Wno-unused-function", "-Wno-narrowing", "-Wno-write-strings",
              f"-I{tmp}", f"-I{backend_dir}", *[f"-I{d}" for d in includes],
-             stub_cpp, "-lpim", "-lpthread", "-lm", "-o", so_tmp])
+             stub_cpp, resident_runtime,
+             "-Wl,-rpath," + os.path.dirname(resident_runtime),
+             library, "-Wl,-rpath," + os.path.dirname(library),
+             "-lpthread", "-lm", "-o", so_tmp])
         so_path = cache.put(Path(so_tmp).read_bytes(), so_name, binary=True)
         # 생성된 소스를 .so 옆에 남긴다. 하드웨어에서 답이 틀릴 때 볼 곳이 여기뿐이다
         # (descriptor 주소식과 stage/unstage 인덱싱이 전부 이 두 파일에 있다).

@@ -33,7 +33,6 @@ constexpr int64_t kTypeSize = 2;      // sizeof(short) — bfloat16
 constexpr int64_t kBurstSize = 32;    // DRAM burst
 constexpr int64_t kRegSize = 256;     // vecA / vACC 한 channel 몫 (element)
 constexpr int64_t kPIMWidth = 512;    // ALU_SIZE * NUM_BANKS * TYPE_SIZE (byte)
-constexpr int64_t kChunk = 4096;      // (BURST_SIZE/TYPE_SIZE) * ALU_SIZE * NUM_CHANNELS
 constexpr int64_t kStrideShift = 33;  // pitch 를 주소에 실을 때 미는 비트 수
 constexpr int64_t kRecordBytes = 0x20;
 constexpr int64_t kGroupBytes = kRecordBytes * kNumChannels;

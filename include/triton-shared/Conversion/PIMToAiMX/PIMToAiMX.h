@@ -8,11 +8,9 @@ namespace mlir {
 namespace triton {
 
 #define GEN_PASS_DECL_CONVERTPIMTOAIMX
-#define GEN_PASS_DECL_AIMXLOWERMATMUL
 #include "triton-shared/Conversion/PIMToAiMX/Passes.h.inc"
 
 std::unique_ptr<OperationPass<ModuleOp>> createConvertPIMToAiMXPass();
-std::unique_ptr<OperationPass<ModuleOp>> createAiMXLowerMatmulPass();
 
 } // namespace triton
 } // namespace mlir
