@@ -1,6 +1,6 @@
 # triton_shared.pim_backend.torch_backend
 #
-# torch.compile된 그래프에서 aten._int_mm만 PIM semantic GEMM template로 실행한다.
+# torch.compile된 그래프에서 FP32 mm과 INT8 _int_mm을 PIM GEMM template로 실행한다.
 # 나머지 연산은 기존 CPU Inductor(C++/OpenMP)가 그대로 맡는다.
 #
 #     from triton_shared.pim_backend.torch_backend import (
@@ -15,7 +15,12 @@
 
 from .backend import PIMInductorBackend
 from ._autotuner import PIMTargetSpec, target_spec
-from .config import PIMTorchConfig, UnsupportedPIMIntMM, validate_pim_options
+from .config import (
+    PIMTorchConfig,
+    UnsupportedPIMGemm,
+    UnsupportedPIMIntMM,
+    validate_pim_options,
+)
 from .execution import PIMExecution, resolve_execution
 from .runtime_compat import set_driver_to_backend
 from .scheduling import PIMCombinedScheduling
@@ -27,6 +32,7 @@ __all__ = [
     "PIMTorchConfig",
     "PIMTargetSpec",
     "PIMExecution",
+    "UnsupportedPIMGemm",
     "UnsupportedPIMIntMM",
     "PIMCombinedScheduling",
     "pim_gemm_template",

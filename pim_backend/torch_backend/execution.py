@@ -15,8 +15,8 @@ from ._autotuner import (
     pim_launch_options,
     target_spec,
 )
-from .config import PIMTorchConfig, UnsupportedPIMIntMM, validate_pim_options
-from .template import TORCH_INT_MM_TEMPLATE_VERSION
+from .config import PIMTorchConfig, UnsupportedPIMGemm, validate_pim_options
+from .template import TORCH_GEMM_TEMPLATE_VERSION
 
 
 log = logging.getLogger(__name__)
@@ -36,6 +36,7 @@ class PIMExecution:
             "BLOCK_M": self.config.block_m,
             "BLOCK_N": self.config.block_n,
             "BLOCK_K": self.config.block_k,
+            "ACC_TYPE": f"tl.{self.problem.output_dtype}",
         }
 
     def backend_options(self):
@@ -65,17 +66,17 @@ def _seed_config(problem, target):
     for config in heuristic_seeds(problem, target, space):
         if engine.valid(config):
             return config
-    raise UnsupportedPIMIntMM("no valid Common IR seed")
+    raise UnsupportedPIMGemm("no valid Common IR seed")
 
 
 def _cached_config(problem, target, torch_config):
     cache = PIMConfigCache(
         torch_config.autotune_cache_path,
-        template_version=TORCH_INT_MM_TEMPLATE_VERSION,
+        template_version=TORCH_GEMM_TEMPLATE_VERSION,
     )
     found = cache.lookup_result(problem, target)
     if found is None:
-        raise UnsupportedPIMIntMM(
+        raise UnsupportedPIMGemm(
             f"autotune cache miss for (M,N,K)=({problem.M},{problem.N},"
             f"{problem.K}) at {torch_config.autotune_cache_path}")
     config, result = found
@@ -100,7 +101,7 @@ def resolve_execution(torch_config, problem):
 
     reason = ConstraintEngine(problem, target).check(config)
     if reason is not None:
-        raise UnsupportedPIMIntMM(
+        raise UnsupportedPIMGemm(
             f"config rejected for (M,N,K)=({problem.M},{problem.N},"
             f"{problem.K}): {reason}")
     return PIMExecution(

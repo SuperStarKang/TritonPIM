@@ -1,13 +1,13 @@
 # torch_backend — torch.compile → PIM
 
-`torch.compile` 그래프의 `aten._int_mm`을 하나의 semantic GEMM으로 만들고,
+`torch.compile` 그래프의 FP32 `aten.mm`과 INT8 `aten._int_mm`을 semantic GEMM으로 만들고,
 나머지 연산은 CPU Inductor C++ 경로로 실행한다.
 
 ```text
-CPU int8 A[M,K], B[K,N]
+CPU float32 또는 int8 A[M,K], B[K,N]
         │
         ▼
-aten._int_mm lowering
+aten.mm / aten._int_mm lowering
         │
         ├─ PIMProblem(M,N,K, A(m,k), B(k,n), C(m,n))
         └─ PIMConfig 선택
@@ -31,7 +31,7 @@ TTIR → TTShared IR → PIM Common IR
 UPMEM | AiMX target lowering
         │
         ▼
-CPU int32 C[M,N]
+CPU float32 또는 int32 C[M,N]
 ```
 
 Tensor device는 계속 CPU다. PIM은 tensor device가 아니라 이 template의 compile 및
@@ -40,6 +40,11 @@ execution backend다.
 FX graph 전체의 weight를 UPMEM에 유지하는 별도 실행 경로는
 [ResidentBlock 사용법](RESIDENT.md)을 참고한다. 기존 lowering을 유지하며,
 모든 weight가 같은 전체 DPU 집합과 공용 입력·출력 scratch를 사용한다.
+`prepare_block()`은 `linear`/`addmm`를 먼저 정규화하고 각 `mm`을 PIM 구간으로 분리한다.
+Bias, scaling, reshape 등은 CPU 구간에서 처리한다.
+`examples/torch_resident_attention.py`는 1024/4096 single-head FP32 attention의
+weight residency, 정확도와 준비/반복 실행 시간을 측정한다. 설정과 JSON 항목은
+[ResidentBlock 사용법](RESIDENT.md)의 attention 실험 항목에 설명되어 있다.
 
 ## Common IR configuration
 
@@ -52,7 +57,7 @@ Torch integration은 별도 실행 plan을 만들지 않는다.
 | Block/Group/Execution Tile와 `[p_m,p_n,p_k]` | `PIMConfig` |
 | 계층별 group/tile/round 계산 | `pim_hierarchy()` |
 
-`block_*`만 Triton template constexpr에 들어간다. `group_*`, `tile_*`, `p_*`는
+`block_*`와 누산 dtype `ACC_TYPE`이 Triton template constexpr에 들어간다. `group_*`, `tile_*`, `p_*`는
 backend option으로 Common IR에 전달된다. 특히 `p_k`는 source grid, constexpr,
 output shape에 나타나지 않는다.
 
@@ -79,7 +84,7 @@ PIMTorchConfig()                           heuristic seed
 세 경로 모두 `ConstraintEngine`을 통과한다. 직접 지정하거나 cache에서 읽은 값을
 Torch lowering이 보정하지 않는다.
 
-Torch cache context는 `torch-int-mm-semantic-k-v1` template version을 사용한다.
+Torch cache context는 `torch-gemm-semantic-k-v2` template version을 사용한다.
 직접 Triton 예제와 같은 JSON 파일을 쓸 수 있지만 측정 objective가 다르므로 entry는
 분리된다. 기본 파일은 `$TRITON_CACHE_DIR/pim_autotune_cache.json`이다.
 
@@ -259,15 +264,18 @@ warm-up 뒤 해당 모듈의 커널 참조만 임시 교체하고 호출 후 복
 | `_autotuner.py` | Common AutoTuner 객체의 단일 import 지점 |
 | `execution.py` | config 선택, Common hierarchy 로그, backend option 전달 |
 | `template.py` | M/N source grid와 하나의 semantic K reduction |
-| `lowering.py` | `aten._int_mm` → PIM template output `C[M,N]` |
+| `lowering.py` | FP32 `aten.mm`, INT8 `aten._int_mm` → PIM template output `C[M,N]` |
 | `scheduling.py` | PIM template는 Triton, 나머지는 CPU C++ scheduling |
 | `runtime_compat.py` | CPU tensor와 PIM compile target을 분리하는 runtime 연결 |
 | `backend.py` | `torch.compile` backend entry |
+| `fx_analysis.py` | GEMM shape/dtype, weight 출처 분석 |
+| `fx_normalization.py` | `linear`/`addmm` 정규화와 원본 GEMM 대응 |
+| `resident.py` | 정규화된 FX graph 분할, 고정 weight 준비와 반복 실행 |
 
 ## 현재 지원 범위
 
-- 입력은 2-D CPU `torch.int8` 두 개
-- 출력은 CPU `torch.int32`
+- 입력은 2-D CPU `torch.float32` 두 개 또는 `torch.int8` 두 개
+- 출력은 각각 CPU `torch.float32` 또는 `torch.int32`
 - static M/N/K (`dynamic=False`)
 - A/B는 row-major contiguous; 아니면 lowering이 contiguous copy를 삽입
 - template 주변 prologue/epilogue fusion은 아직 열지 않음

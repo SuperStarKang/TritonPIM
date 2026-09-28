@@ -54,7 +54,7 @@ def _artifact_bindings(target_ir, arguments, physical_inputs, weight_mask, units
     outputs = re.findall(r"upmem\.gather\s+%[\w.$]+\s+assignment\s+%[\w.$]+\s*,\s*@([\w.$]+)\s+capacity",
                           target_ir)
     declarations = re.findall(
-        r"upmem\.mram\s+@([\w.$]+)\s*:\s*memref<(\d+)x(i8|i32)\s*,", target_ir)
+        r"upmem\.mram\s+@([\w.$]+)\s*:\s*memref<(\d+)x(i8|i32|f32)\s*,", target_ir)
     if len(declarations) != 3 or len(transfers) != 2 or len(outputs) != 1:
         raise ValueError("resident Torch GEMM requires two staged inputs and one gathered output")
     if {name for name, _, _ in declarations} != set(sources) | set(outputs):
@@ -73,7 +73,7 @@ def _artifact_bindings(target_ir, arguments, physical_inputs, weight_mask, units
             if len(roles) != 1:
                 raise ValueError(f"cannot associate {symbol} with the FX operand provenance")
             role = WEIGHT if roles.pop() else INPUT
-        size = int(count) * {"i8": 1, "i32": 4}[dtype]
+        size = int(count) * {"i8": 1, "i32": 4, "f32": 4}[dtype]
         if size % 8:
             raise ValueError(f"{symbol}: MRAM transfer size {size} is not aligned to 8 bytes")
         bindings.append(Binding(symbol, size, role))

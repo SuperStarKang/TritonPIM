@@ -28,10 +28,11 @@ import triton.backends.pim.driver as pim_driver  # noqa: E402
 from torch_backend import (  # noqa: E402
     PIMInductorBackend, PIMTorchConfig, target_spec,
 )
-from torch_attention_gqa import attention_group, make_inputs  # noqa: E402
 
 
 def attention(q, k, v, mask, head_dim):
+    from torch_attention_gqa import attention_group
+
     # Reuse the existing quantized attention, returning only its final FP32
     # output. Output dequantization is part of the compiled, measured graph.
     output, _, _, row_scale = attention_group(q, k, v, mask, head_dim)
@@ -237,6 +238,8 @@ def print_report(report, verbose):
 
 
 def main():
+    from torch_attention_gqa import make_inputs
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seq", type=positive_int, default=256)
     parser.add_argument("--head-dim", type=positive_int, default=128)

@@ -14,8 +14,12 @@ from typing import Optional
 from ._autotuner import PIMConfig, PIMTargetSpec
 
 
-class UnsupportedPIMIntMM(RuntimeError):
-    """PIM template이 지원하지 않는 _int_mm을 만났을 때의 진단."""
+class UnsupportedPIMGemm(RuntimeError):
+    """Unsupported PIM GEMM shape, dtype, or configuration."""
+
+
+# 기존 import 이름을 유지한다.
+UnsupportedPIMIntMM = UnsupportedPIMGemm
 
 
 # PIMOptions로 그대로 넘어가는 key 목록. 여기 없는 이름을 backend_options에

@@ -24,7 +24,7 @@ from torch._inductor import config as inductor_config
 from torch._inductor.compile_fx import compile_fx
 
 from .config import PIMTorchConfig
-from .lowering import PIMIntMMLowering
+from .lowering import PIMGemmLowering
 from .runtime_compat import install as install_runtime_compat
 from .runtime_compat import set_driver_to_backend
 from .scheduling import PIMCombinedSchedulingInstalled
@@ -50,7 +50,7 @@ def _inductor_overrides(config: PIMTorchConfig) -> dict:
 
 
 class PIMInductorBackend:
-    """Send aten._int_mm to the PIM semantic GEMM template."""
+    """Send FP32 mm and INT8 _int_mm to the PIM GEMM template."""
 
     def __init__(self, config: PIMTorchConfig = None):
         self.config = config if config is not None else PIMTorchConfig()
@@ -79,7 +79,7 @@ class PIMInductorBackend:
 
         with ExitStack() as stack:
             stack.enter_context(inductor_config.patch(_inductor_overrides(self.config)))
-            stack.enter_context(PIMIntMMLowering(self.config))
+            stack.enter_context(PIMGemmLowering(self.config))
             stack.enter_context(PIMCombinedSchedulingInstalled())
             return compile_fx(graph_module, example_inputs)
 
