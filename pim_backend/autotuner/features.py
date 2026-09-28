@@ -39,7 +39,7 @@ def extract_features(problem, target, config):
     block_group_compute = math.prod(hierarchy.block_group_extent)
     execution_tile_compute = math.prod(config.execution_extent)
 
-    # Host staging은 pim.place.replicated_over 축의 같은 buffer를 공유한다.
+    # Host staging은 pim.place.shared_over 축의 같은 buffer를 공유한다.
     # H2D는 그 buffer를 공유하더라도 모든 active device의 MRAM으로 전송한다.
     stage_bytes = 0
     input_tile_bytes = 0

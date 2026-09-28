@@ -51,7 +51,7 @@ def _artifact_bindings(target_ir, arguments, physical_inputs, weight_mask, units
     transfers = re.findall(r"upmem\.to_mram\s+%[\w.$]+\s*,\s*(%[\w.$]+)\s*,\s*@([\w.$]+)",
                            target_ir)
     sources = {symbol: stages[stage] for stage, symbol in transfers}
-    outputs = re.findall(r"upmem\.gather\s+%[\w.$]+\s*,\s*@([\w.$]+)\s+capacity",
+    outputs = re.findall(r"upmem\.gather\s+%[\w.$]+\s+assignment\s+%[\w.$]+\s*,\s*@([\w.$]+)\s+capacity",
                           target_ir)
     declarations = re.findall(
         r"upmem\.mram\s+@([\w.$]+)\s*:\s*memref<(\d+)x(i8|i32)\s*,", target_ir)

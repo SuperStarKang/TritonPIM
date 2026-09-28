@@ -1,8 +1,8 @@
 // M/N축이 없는 Common K-only reduction의 init, temporal loop, store가 한 DPU
 // program으로 이동하고 linalg.reduce의 명시적 의미가 보존되는지 확인한다.
 // 출력은 UPMEM DMA 최소 단위인 8 byte가 되도록 두 i32 원소인 예시를 쓴다.
-// RUN: triton-shared-opt "--convert-pim-to-upmem=nr-tasklets=1" %s | FileCheck %s
-// RUN: triton-shared-opt "--convert-pim-to-upmem=nr-tasklets=1" %s | triton-shared-translate --upmem-to-device | FileCheck %s --check-prefix=DEVICE
+// RUN: triton-shared-opt --pim-form-host-plan "--convert-pim-to-upmem=nr-tasklets=1" %s | FileCheck %s
+// RUN: triton-shared-opt --pim-form-host-plan "--convert-pim-to-upmem=nr-tasklets=1" %s | triton-shared-translate --upmem-to-device | FileCheck %s --check-prefix=DEVICE
 
 // CHECK-LABEL: upmem.device_func @k_only_sum_device
 // CHECK-SAME: upmem.lanes = 1

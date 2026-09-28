@@ -181,6 +181,8 @@ PIM_COMMON_PASSES = [
     "--pim-verify",                # 공통 fail-fast 검증
     "--pim-reuse-execution-tile-inputs",  # Group 크기를 유지하며 Tile 내부 입력 load 재사용
     "--pim-verify",                # 이동 뒤에도 hierarchy/placement 계약 유지
+    "--pim-form-host-plan",        # 논리 분할·입력 전송·계산·출력 회수를 명시
+    "--pim-verify",
     "-cse",
     "-canonicalize",
 ]
@@ -222,8 +224,7 @@ def _pim_common_to_upmem(pim_common: str, options) -> str:
     return _run_opt(
         pim_common,
         [f"--convert-pim-to-upmem=host-threads={runtime.host_threads} "
-         f"nr-tasklets={runtime.nr_tasklets} "
-         f"reuse-staging={str(options.upmem_reuse_staging).lower()}"])
+         f"nr-tasklets={runtime.nr_tasklets}"])
 
 
 def _upmem_to_artifact(upmem_ir: str, metadata) -> bytes:
@@ -337,7 +338,6 @@ class PIMOptions:
     # 0이면 profile의 lanes_per_core를 모두 사용한다.
     nr_tasklets: int = 0
     host_threads: int = 8
-    upmem_reuse_staging: bool = False
 
     # ── aimx 전용 ───────────────────────────────────────────────────────────
     # 몇 번 카드부터 쓰는가. 런타임은 fpga_id로 pl_dma[id]를 경계 검사 없이 인덱싱하므로
@@ -429,8 +429,8 @@ class PIMBackend(BaseBackend):
 
     @functools.lru_cache()
     def hash(self):
-        # Regenerate metadata layout checks with the GCC/Clang offsetof builtin.
-        return f"{self.target}-pim-common-ir-v2-input-reuse-upmem-metadata-v2-staging-v2-timing-v2"
+        # Regenerate artifacts when the Common/UPMEM execution plan changes.
+        return f"{self.target}-pim-common-ir-v9-device-mapping-host-pools-host-plan-shared-over-input-reuse-upmem-metadata-v2-rhs-row-major-v1-timing-v3"
 
     def get_module_map(self) -> Dict[str, ModuleType]:
         return {}

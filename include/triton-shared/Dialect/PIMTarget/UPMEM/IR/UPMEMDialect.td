@@ -10,7 +10,7 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 //===----------------------------------------------------------------------===//
 // UPMEM dialect — UPMEM DPU 실행 모델.
 //
-// PIM Common IR(pim.device + pim.place)을 UPMEM 하드웨어에 맞춘 것이다.
+// PIM Common IR(pim.partition + 전송/launch/gather)을 UPMEM 하드웨어에 맞춘 것이다.
 // PIM IR이 답하지 않는 것을 여기서 정한다:
 //   - 메모리 계층 (host DRAM → MRAM → WRAM 3단)
 //   - 계층 사이 전송 단위 (DMA: 8 byte 정렬, 한 번에 2048 byte 이하, 연속 영역만)
@@ -72,6 +72,10 @@ def UPMEM_UnitType : UPMEM_Type<"Unit", "unit"> {
   let summary = "Handle to one DPU inside a foreach_unit body";
 }
 
+def UPMEM_AssignmentType : UPMEM_Type<"Assignment", "assignment"> {
+  let summary = "Physical DPU enumeration index to canonical logical index";
+}
+
 //===----------------------------------------------------------------------===//
 // 모듈 수준 선언 — host와 device가 이름으로 공유하는 것들.
 //===----------------------------------------------------------------------===//
@@ -115,16 +119,31 @@ def UPMEM_AcquireOp : UPMEM_Op<"acquire"> {
   let assemblyFormat = "$num_units `,` $kernel attr-dict `:` type($set)";
 }
 
+// device_mapping은 같은 member의 최대 8개 CI에 함께 놓을 논리 좌표 모양이다.
+// 각 축은 partitions의 약수다. 실제 rank/member/CI는 확보 후 SDK에서 읽는다.
+def UPMEM_BindDevicesOp : UPMEM_Op<"bind_devices"> {
+  let summary = "Bind a compiled logical grouping to the allocated physical DPUs";
+  let arguments = (ins UPMEM_SetType:$set, DenseI64ArrayAttr:$partitions,
+                       DenseI64ArrayAttr:$device_mapping);
+  let results = (outs UPMEM_AssignmentType:$assignment);
+  let assemblyFormat = [{
+    $set `partitions` $partitions `device_mapping` $device_mapping
+    attr-dict `:` type($set) `->` type($assignment)
+  }];
+  let hasVerifier = 1;
+}
+
 // DPU_FOREACH. 몸체가 유닛 하나에 대한 host 작업(영역 모으기 + MRAM 전송)이다.
 // block argument는 그 DPU 핸들 다음 축별 좌표다(axes 순서).
 // counts는 #pim.device_mapping의 partition 수를 그대로 옮긴 값이고, 곱이 alloc의 num_units와 같아야 한다.
 def UPMEM_ForeachUnitOp : UPMEM_Op<"foreach_unit", [NoTerminator]> {
   let summary = "Host loop over the DPUs of a set";
-  let arguments = (ins UPMEM_SetType:$set, StrArrayAttr:$axes,
+  let arguments = (ins UPMEM_SetType:$set, UPMEM_AssignmentType:$assignment,
+                       StrArrayAttr:$axes,
                        DenseI64ArrayAttr:$counts);
   let regions = (region SizedRegion<1>:$body);
   let assemblyFormat = [{
-    $set `:` type($set) `axes` $axes `counts` $counts
+    $set `assignment` $assignment `:` type($set) `axes` $axes `counts` $counts
     attr-dict-with-keyword $body
   }];
   let hasVerifier = 1;
@@ -141,20 +160,25 @@ def UPMEM_ForeachUnitOp : UPMEM_Op<"foreach_unit", [NoTerminator]> {
 //                          device가 타일을 DMA 한 번으로 옮긴다. 행 단위로 두면 타일의
 //                          행 수만큼 DMA가 필요하고, 한 행이 몇십 바이트라 준비 비용이
 //                          옮기는 양보다 커진다.
-//   dedup_over           = 이 축만 다른 유닛은 같은 결과를 받는다. 그 축을 뺀 조합
-//                          개수만큼만 실제로 모으면 된다(pim.place replicated_over).
-def UPMEM_StageOp : UPMEM_Op<"stage", [AttrSizedOperandSegments]> {
-  let summary = "Gather a strided region of a host buffer into a padded tile-major buffer";
-  let arguments = (ins AnyRankedOrUnrankedMemRef:$src,
+//   shared_over          = pim.place의 공유 축을 그대로 전달한다. 이 축을 제외한
+//                          좌표 조합마다 Host staging 버퍼 하나를 공유한다.
+//   operand_role         = GEMM 입력의 lhs/rhs 역할. Host layout 계측에 사용한다.
+//   dst                  = round 밖에서 할당한 [고유 입력 수, fixed slot...] pool.
+//                          결과는 그 pool 안의 현재 좌표에 해당하는 slot을 가리킨다.
+def UPMEM_StageOp : UPMEM_Op<"stage", [AttrSizedOperandSegments,
+                                      MemoryEffects<[MemRead, MemWrite]>]> {
+  let summary = "Pack an input into its shared slot in an explicit host pool";
+  let arguments = (ins AnyRankedOrUnrankedMemRef:$src, AnyMemRef:$dst,
                        Variadic<Index>:$origin, Variadic<Index>:$sizes,
                        Variadic<Index>:$strides, Variadic<Index>:$pad_to,
                        DenseI64ArrayAttr:$tile,
-                       OptionalAttr<StrArrayAttr>:$dedup_over);
+                       OptionalAttr<StrArrayAttr>:$shared_over,
+                       OptionalAttr<StrAttr>:$operand_role);
   let results = (outs AnyMemRef:$result);
   let assemblyFormat = [{
     $src `origin` `[` $origin `]` `sizes` `[` $sizes `]`
-    `strides` `[` $strides `]` `pad_to` `[` $pad_to `]` `tile` $tile
-    attr-dict `:` type($src) `->` type($result)
+    `strides` `[` $strides `]` `pad_to` `[` $pad_to `]` `tile` $tile `into` $dst
+    attr-dict `:` type($src) `,` type($dst) `->` type($result)
   }];
   let hasVerifier = 1;
 }
@@ -184,17 +208,17 @@ def UPMEM_LaunchOp : UPMEM_Op<"launch"> {
 }
 
 // dpu_push_xfer(FROM_DPU). 집합 전체에서 한 번에 회수하므로 foreach가 필요 없다.
-// 결과는 유닛 하나 몫의 shape 앞에 유닛 축이 하나 더 붙은 memref다.
+// dst는 round 밖에서 할당한 [DPU 수, fixed slot...] host pool이다.
 // capacity는 유닛 하나의 Common fixed allocation_shape다. 모든 DPU에서 같은 바이트
-// 수를 읽으며, result의 trailing static shape와 정확히 같아야 한다.
-def UPMEM_GatherOp : UPMEM_Op<"gather"> {
-  let summary = "Read one MRAM buffer back from every DPU at once";
-  let arguments = (ins UPMEM_SetType:$set, FlatSymbolRefAttr:$src,
-                       Variadic<Index>:$capacity);
-  let results = (outs AnyMemRef:$result);
+// 수를 읽으며, dst의 trailing static shape와 정확히 같아야 한다.
+def UPMEM_GatherOp : UPMEM_Op<"gather", [MemoryEffects<[MemRead, MemWrite]>]> {
+  let summary = "Read one MRAM buffer from every DPU into an explicit host pool";
+  let arguments = (ins UPMEM_SetType:$set, UPMEM_AssignmentType:$assignment,
+                       FlatSymbolRefAttr:$src,
+                       Variadic<Index>:$capacity, AnyMemRef:$dst);
   let assemblyFormat = [{
-    $set `,` $src `capacity` `[` $capacity `]` attr-dict
-    `:` type($set) `->` type($result)
+    $set `assignment` $assignment `,` $src `capacity` `[` $capacity `]` `into` $dst attr-dict
+    `:` type($set) `,` type($dst)
   }];
   let hasVerifier = 1;
 }

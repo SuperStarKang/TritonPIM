@@ -1,7 +1,7 @@
 // linalg.matvec의 A/y는 m 행을 tasklet에 나누고 x는 전체 K vector를
 // 공유한다. 공유 DMA 전·후 barrier와 DPU C의 MxK 누산 loop까지 확인한다.
-// RUN: triton-shared-opt --convert-pim-to-upmem %s | FileCheck %s --check-prefix=IR
-// RUN: triton-shared-opt --convert-pim-to-upmem %s | triton-shared-translate --upmem-to-device | FileCheck %s --check-prefix=DEVICE
+// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-upmem %s | FileCheck %s --check-prefix=IR
+// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-upmem %s | triton-shared-translate --upmem-to-device | FileCheck %s --check-prefix=DEVICE
 
 // IR-LABEL: upmem.device_func @matvec_device
 // IR-SAME: upmem.lanes = 4
@@ -50,7 +50,7 @@ func.func @matvec(%A: memref<*xf32>, %x: memref<*xf32>, %y: memref<*xf32>)
         : memref<*xf32>
     pim.place %x start[%kStart] size[%c16] allocation_shape[%c16] strides[%c1]
         {direction = "in", access = 1 : i64,
-         replicated_over = ["m"]} : memref<*xf32>
+         shared_over = ["m"]} : memref<*xf32>
     pim.place %y start[%c0] size[%c8] allocation_shape[%c8] strides[%c1]
         {direction = "out", access = 2 : i64}
         : memref<*xf32>

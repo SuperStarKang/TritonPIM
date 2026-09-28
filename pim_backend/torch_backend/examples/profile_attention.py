@@ -226,7 +226,8 @@ def print_report(report, verbose):
     print("Fused CPU operations share one time; no per-ATen time is inferred.")
     print("PIM rows include host work and transfers; kernel includes DPU compute/internal DMA.")
     print("H2D/D2H measure prepare+push, matching PGEMM; kernel measures synchronous dpu_launch.")
-    print("host_alloc is receive-buffer allocation; host_free covers input/output buffer cleanup.")
+    print("buffer_alloc/init/free separate storage management from layout_a/b/other packing.")
+    print("layout_c writes the first partial; reduction adds later partials at output addresses.")
     print("TOTAL includes tracing overhead; preparation, input generation and printing are excluded.")
     if verbose:
         for record in records:

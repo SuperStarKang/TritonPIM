@@ -270,7 +270,7 @@ def tune(problem, target, benchmark_fn, *, space=None, cache=None,
                 f"compute/byte=({features.block_group_compute_per_byte:.3f},"
                 f"{features.execution_tile_compute_per_byte:.3f}) "
                 f"schedule_util={features.schedule_utilization:.3f} "
-                f"bytes(stage/h2d/d2h/combine)="
+                f"bytes(stage/h2d/d2h/reduction)="
                 f"({features.stage_bytes},{features.h2d_bytes},"
                 f"{features.d2h_bytes},{features.reduction_bytes})",
                 end="", flush=True)

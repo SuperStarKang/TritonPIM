@@ -1,607 +1,435 @@
-# UPMEM Target IR 구현
+# PIM Common에서 UPMEM으로의 Lowering 설계
 
-PIM IR의 유닛 형태를 UPMEM DPU에서 실제로 돌아가는 host C++ / device C로 옮기는
-계층의 현재 구현을 기술한다. `PIMIR_Implementation.md`가 "어느 데이터가 어느 유닛에
-몇 번 가는가"까지를 다룬다면, 이 문서는 "그 데이터가 유닛 안에서 어떤 계층을 어떤
-단위로 오가는가"부터를 다룬다.
+범위는 [PIM Common IR](PIMCommonIR_Design.md), UPMEM IR, Host/Device 코드 생성이다.
+현재 구현을 설명하며 성능 개선을 이미 실측한 것처럼 기술하지 않는다. 아래 의사
+코드는 SSA 상수·타입·심볼 선언을 일부 생략한다.
 
-용어는 `PIMIR_Implementation.md`와 같게 쓴다. UPMEM에서 유닛은 DPU, 유닛의 큰
-메모리는 MRAM, 빠른 메모리는 WRAM, 유닛 내부 병렬 단위는 tasklet이다.
+## 1. Target IR을 따로 두는 이유
 
----
+**내용**
 
-## 1. 이 계층이 존재하는 이유
+Common이 정한 논리 계산과 데이터 영역을 UPMEM의 메모리 계층, tasklet, 물리 DPU,
+SDK 전송 단위로 구체화한다. Target lowering은 Common의 partition 수, Group/Tile
+경계, K partial의 의미를 바꾸지 않는다.
 
-PIM IR은 유닛 하나가 어떤 데이터를 맡는지까지 답한다. 그것만으로는 코드가 안 나온다.
-UPMEM 하드웨어가 답을 요구하는 것이 네 가지 더 있다.
+**근거**
 
-| 답해야 하는 것 | 하드웨어가 강제하는 것 |
-| --- | --- |
-| 메모리 계층 배치 | host DRAM → MRAM(64 MB) → WRAM(64 KB) 3단. 계산은 WRAM에서만 |
-| 계층 사이 전송 단위 | MRAM DMA는 8 byte 정렬, 한 번에 2048 byte 이하, 연속 영역만 |
-| 유닛 내부 병렬 | tasklet은 독립 스레드. 11단 pipeline이라 11개까지는 늘려도 시간이 그대로 |
-| 원본 → 유닛 레이아웃 | `dpu_push_xfer`가 모든 DPU에 같은 바이트 수를 요구한다 |
+- Host 원본은 strided layout일 수 있지만 DPU DMA는 연속된 MRAM 타일을 소비한다.
+- 같은 입력을 받는 DPU의 논리 관계만으로 실제 rank/member/CI 위치를 알 수 없다.
+- Host가 보낼 metadata와 DPU가 읽는 metadata는 같은 ABI를 사용해야 한다.
+- WRAM 공유, tasklet 행 분할, DMA 완료 동기화는 Target의 책임이다.
 
-이 넷은 전부 UPMEM 고유다. 그래서 target 중립인 PIM IR 뒤에 한 계층을 더 둔다.
+**예시**
 
-경계선은 이렇게 긋는다.
-
-> **PIM IR은 "어느 데이터가 어느 유닛에 몇 번 가는가"까지, UPMEM IR은 "그 데이터가
-> 유닛 안에서 어떤 계층을 어떤 단위로 오가는가"부터.**
-
----
-
-## 2. 전체 흐름
-
-### 2.1 컴파일
-
-```
-PIM Common IR (pim.device + pim.place + pim.combine)
-   │
-   ├ --convert-pim-to-upmem                     결정: 메모리 계층, 전송 단위,
-   │     unit-memory-bytes / local-lanes              tasklet 분배, 레이아웃
-   │     local-memory-bytes / host-threads
-   ▼
-UPMEM IR (upmem.* + scf/memref/linalg)
-   │
-   ├ triton-shared-translate --upmem-to-host    IR → C++, 메타데이터 통합 전송
-   ├ triton-shared-translate --upmem-to-device  IR → C, 동일 메타데이터 ABI
-   ▼
-{"host": host.cpp, "device": device.c}          JSON 번들 (binary_ext = pimobj)
-   │
-   ├ PIMLauncher (driver.py)                    빌드는 실행 시점에 한 번
-   ▼
-device.elf + host.so
+```text
+Common 최종 IR: partition + place + broadcast/scatter + launch + gather
+    │ convert-pim-to-upmem
+    ▼
+UPMEM IR: upmem.* + memref/scf/linalg/arith
+    ├─ upmem-to-host   → Host C++: pool, 준비, SDK 전송, 실행, 회수/합산
+    └─ upmem-to-device → DPU C: MRAM/metadata 선언, WRAM, DMA, 계산, barrier
 ```
 
-연산 배치와 메모리 접근의 변환은 `--convert-pim-to-upmem`이 담당한다. codegen은
-이 결정을 유지하면서 C/C++로 옮긴다. 메타데이터의 물리적인 구조체 배치와 전송
-묶음은 두 번역기가 공유하는 고정 ABI 규칙으로 정한다. 이는 Common의 scheduling이나
-데이터 재사용 판단을 변경하지 않는 Target 전송 구현이다.
+연산 의미를 나타내는 `linalg.matvec` 등은 Target IR에도 남고 Device 번역기가 C로
+내린다. UPMEM IR 생성 성공과 최종 C 생성 성공은 별도의 단계다.
 
-### 2.2 실행
+## 2. Op를 둔 근거
 
-한 번의 커널 호출이 하는 일이다. 괄호 안은 `PIM_TIMING` 계측의 칸 이름이다.
+정의: [UPMEMDialect.td](../include/triton-shared/Dialect/PIMTarget/UPMEM/IR/UPMEMDialect.td).
 
-```
-upmem_acquire(units, elf)          런타임이 쥐고 있던 집합을 준다 (계측 밖)
-   │
-유닛 좌표 loop                    원본에서 유닛 몫을 모아 연속 버퍼로            (stage)
-   │
-DPU_FOREACH + dpu_push_xfer      버퍼마다 집합 전체로 밀어 넣는다               (h2d)
-   │
-dpu_launch(SYNCHRONOUS)          모든 DPU가 동시에 돈다                        (kernel)
-   │
-dpu_push_xfer(FROM_DPU)          출력 버퍼를 집합 전체에서 회수                 (d2h)
-   │
-그룹 loop                         부분합을 더하고 원본으로 되돌린다              (combine)
-```
+| Op | 필요한 사실/동작 | 구체적인 소비 |
+|---|---|---|
+| `upmem.mram` | DPU의 고정 MRAM slot과 공유 심볼 | Device 전역 배열, Host 전송 대상 이름 |
+| `upmem.host_var` | Host가 Device에 제공할 scalar | 공통 metadata 구조체의 필드 |
+| `upmem.acquire` | 프로그램이 적재된 DPU set | runtime의 확보/적재 및 set 재사용 |
+| `upmem.bind_devices` | 논리 묶음과 실제 DPU의 대응 | SDK 열거 번호 → 논리 번호 표 |
+| `upmem.foreach_unit` | 논리 Device별 Host 준비 | 좌표 loop, 전송 포인터 배열과 metadata 준비 |
+| `upmem.stage` | 원본 영역을 타일 순서로 패킹 | 공유 pool slot 채우기와 zero padding |
+| `upmem.to_mram` | 해당 DPU 입력 slot 전송 | 포인터 등록 + 입력별 집합 push |
+| `upmem.to_host_var` | DPU별 scalar 값 기록 | metadata 필드 대입 후 통합 전송 |
+| `upmem.launch` | 현재 입력으로 Device 실행 | 동기식 SDK launch |
+| `upmem.gather` | MRAM 출력을 논리 위치에 회수 | assignment를 사용한 D2H |
+| `upmem.foreach_group` | 회수된 각 논리 DPU 결과 처리 | canonical 좌표로 출력 pool 순회 |
+| `upmem.unstage` | 원본 layout 복원, 필요 시 누산 | 첫 partial 대입, 이후 partial 덧셈 |
+| `upmem.device_func` | DPU에서 실행할 본문 | Device main |
+| `upmem.tasklet_id` | 현재 tasklet의 작업 번호 | 행과 DMA chunk 분담 |
+| `upmem.get_host_var` | 전달된 scalar 읽기 | metadata 구조체 필드 참조 |
+| `upmem.barrier` | WRAM 적재/소비 완료 경계 | tasklet 동기화 |
+| `upmem.mram_read/write` | MRAM↔WRAM 연속 DMA | 정렬·크기 제약이 있는 Device 전송 |
 
----
+Host pool 수명은 기존 `memref.alloc/dealloc`, 반복은 `scf.for`, 계산은 Linalg를
+사용한다. 같은 의미의 별도 PIM allocation/compute/loop Op를 추가하지 않는다.
 
-## 3. Dialect — `upmem`
+`!upmem.assignment`는 배정표이며 `!upmem.set`은 확보한 집합, `!upmem.unit`은
+foreach 본문의 DPU 손잡이다. 실제 Device 메모리는 `#upmem<space mram>` 또는
+`#upmem<space wram>`으로 구별한다.
 
-`include/triton-shared/Dialect/PIMTarget/UPMEM/IR/UPMEMDialect.td`.
+현재 정의에는 `upmem.broadcast`나 `upmem.num_tasklets` Op가 없다. Common broadcast는
+아래의 공유 포인터 전송으로 구현하고, tasklet 수는 `upmem.lanes`로 전달한다.
 
-### 3.1 타입과 메모리 공간
+## 3. Lowering 진입에서 읽는 패턴
 
-| | 뜻 |
-| --- | --- |
-| `!upmem.set` | 확보한 DPU 집합. host op들이 주고받는다 |
-| `!upmem.unit` | 집합 안의 DPU 하나. `foreach_unit` 몸체에서만 생긴다 |
-| `#upmem.space<mram>` | memref에 붙여 MRAM임을 나타낸다 |
-| `#upmem.space<wram>` | 같은 방식으로 WRAM |
+구현: [PIMToUPMEMPass.cpp](../lib/Conversion/PIMToUPMEM/PIMToUPMEMPass.cpp).
 
-### 3.2 모듈 수준 — host와 device가 이름으로 공유한다
+| Common 입력 | 찾는 방법 | 생성하는 표현/이유 |
+|---|---|---|
+| `pim.partition` | body의 place/action/launch/gather | Host와 Device를 이미 구분한 계획을 소비 |
+| 입력 전송 | broadcast/scatter의 access id로 place 조회 | 입력의 개수·이름에 의존하지 않는 stage/to_mram |
+| 출력 회수 | gather의 access id로 place 조회 | 출력마다 gather/unstage |
+| Group tile 크기 | launch 안의 `pim.access.sizes` | WRAM 계산과 tile-major MRAM의 눈금 |
+| local M/N loop | `pim.axis`와 `pim.device_origin` | 실행 횟수 전달과 로컬 좌표화 |
+| local K와 Host K round | `pim.temporal_reduction`, `pim.scheduling_axis="reduction_k"` | Common이 이미 분할한 K 범위 유지 |
+| partial 결과 | `pim.combine`의 destination/kind | 출력별 Host add 결합 여부 |
 
-| op | device C | host C++ |
-| --- | --- | --- |
-| `upmem.mram` | `__mram_noinit T sym[N];` | `dpu_push_xfer`의 심볼 이름 |
-| `upmem.host_var` | `__host struct _pim_metadata_t`의 필드 | DPU별 메타데이터 구조체의 필드 |
+미변환 `pim.device`, 누락된 compute loop, 잘못된 profile/topology, 지원하지 않는
+combiner는 진단한다. Common 실행 계획을 Target에서 다시 만드는 경로는 없다.
 
-`upmem.mram`의 크기는 유닛이 받는 최대 영역이다. 실제 배정량(capacity)이 런타임
-값이고 `__mram_noinit`은 상수 크기를 요구하므로, **유닛 메모리를 버퍼 수로 나눈
-상한**을 쓴다. 초기화하지 않는 주소 예약이라 넉넉히 잡아도 적재 비용이 없다.
+## 4. 고정 MRAM과 Host pool
 
-### 3.3 host 쪽
+### 4.1 MRAM 크기는 allocation_shape로 결정
 
-| op | C 대응 |
-| --- | --- |
-| `upmem.acquire` | `upmem_acquire(n, DPU_BINARY)` — 확보 + 적재 |
-| `upmem.foreach_unit` | 유닛 좌표 loop (준비) + `DPU_FOREACH` (전송) |
-| `upmem.stage` | 원본의 strided 영역 → 타일 단위 연속 버퍼 |
-| `upmem.to_mram` | `dpu_prepare_xfer` + `dpu_push_xfer(TO_DPU)` |
-| `upmem.to_host_var` | 유닛별 구조체 필드 대입 후 메타데이터 통합 전송 |
-| `upmem.broadcast` | `dpu_broadcast_to` — 모든 DPU에 같은 값 |
-| `upmem.launch` | `dpu_launch(SYNCHRONOUS)` |
-| `upmem.gather` | `dpu_push_xfer(FROM_DPU)` — 집합 전체에서 한 번에 |
-| `upmem.foreach_group` | 결합 축만 다른 유닛들을 묶어 먼저 합친다 |
-| `upmem.unstage` | `stage`의 반대 |
+**찾는 정보**: 각 place의 정적 `allocation_shape`와 원소 타입.
 
-**메타데이터 통합 전송.** Common IR과 UPMEM IR의 개별 스칼라 표현은 유지한다.
-`MetadataLayout.h`가 모듈의 `upmem.host_var` 선언 순서로 공통 구조체 배치를 정하고,
-host/device 번역기가 같은 정의를 생성한다. `index`의 전송 타입은 기존처럼
-`int32_t`이고, 나머지 스칼라도 기존 device 타입을 유지한다. 명시적인 padding과
-8바이트 구조체 정렬을 사용하며, 생성 소스에 필드 offset/크기와 전체 크기에 대한
-컴파일 시점 확인을 넣는다.
-
-host는 기존의 스칼라별 스택 배열 대신 DPU별 구조체 배열을 준비하고, 각
-`to_host_var`를 해당 필드에 대입한다. 일반적인 PIM lowering처럼 모든 필드를
-채우면 `foreach_unit`당 메타데이터용 `DPU_FOREACH`와 `dpu_push_xfer`를 한 번만
-생성한다. DPU별 값은 달라도 된다. 일부 필드만 갱신하는 IR에서는 갱신되는 연속
-필드 구간만 묶어 전송하여 나머지 필드를 덮어쓰지 않는다. 메타데이터가 없는
-`foreach_unit`에는 메타데이터 배열이나 전송을 만들지 않는다.
-
-구조체 준비는 `stage`, prepare/push는 `h2d`에 집계한다. 입력 행렬의 staging과
-전송량에는 변화가 없다. 이 변경은 단일 round의 전송 호출 비용을 줄이는 UPMEM
-Target 최적화이며, round 사이의 데이터 유지나 전송 생략은 포함하지 않는다.
-
-**선택적인 입력 버퍼 재사용.** 커널 launch 옵션 `upmem_reuse_staging`으로
-설정한다. 기본값은 `False`이며 기존 경로와 비교할 수 있다.
-
-| Python 옵션 | UPMEM pass 옵션 | 효과 |
-| --- | --- | --- |
-| `upmem_reuse_staging` | `reuse-staging` | 입력 staging 버퍼, dedup 포인터 표, 전송 포인터 배열의 할당 용량을 보관 |
-
-재사용 모드의 workspace는 생성 host artifact와 host thread별로 존재한다. 고유한
-staging slot마다 포인터와 확보 용량을 보관하고 부족할 때만 확장한다. 다음 round나
-호출에서 원본 포인터 또는 유효 크기가 달라져도 입력은 다시 패킹한다. dedup 목록은
-매번 비우며 데이터 slot도 0으로 채워, 유효 영역이 줄었을 때 이전 데이터가 padding에
-남지 않게 한다. D2H 수신 버퍼는 이 캐시의 대상이 아니다. 캐시 메모리는 workspace의
-수명이 끝날 때 해제되며, 서로 다른 artifact의 캐시는 별개로 유지된다. 이는 입력
-데이터의 불변성을 가정하는 캐시가 아니라 할당 공간의 재사용이다.
-
-slot 번호는 host 코드 생성 시 staging 연산과 dedup 좌표에 대해 정한다. 원본
-포인터를 캐시 키로 사용하지 않는다. 동일 artifact/thread에서 필요한 용량이 같으면
-첫 할당 이후 같은 공간을 계속 사용하며, 더 작은 요청에도 용량을 줄이지 않는다.
-최초 사용이나 용량 증가 시에만 `realloc`을 호출한다.
-
-재사용 모드도 매 round마다 전체 staging 영역을 `memset`한 뒤 유효 영역을
-패킹한다. padding만 초기화하는 구현은 아니다. 동일 입력을 공유하는 DPU에는
-그 round에 한 번 패킹한 버퍼 포인터를 배정하며, 이 dedup은 기존 경로에도 있다.
-A, B, 메타데이터를 모두 보내는 일반적인 GEMM에서는 H2D push가 각각 한 번씩
-발생한다. 원본에서 staging으로의 복사와 H2D 전송량은 재사용 옵션으로 줄지 않는다.
-
-입력 공간 확보·초기화·패킹은 `stage`, prepare/push는 `h2d`에 포함된다. 재사용
-모드에서는 입력 버퍼의 매번 해제만 없어지며, 출력 수신 버퍼 해제는 `host_free`에
-남는다. 메타데이터 구조체 배열은 매 round 스택에서 준비하며 workspace에 넣지 않는다.
-
-**`acquire`가 확보와 적재를 함께 하는 이유.** 둘 다 커널을 부를 때마다 다시 할 일이
-아니다. `dpu_alloc`은 수백 ms, `dpu_load`는 수십 ms가 드는데 둘 다 데이터와 무관하다.
-나눠 두면 "이번에는 확보만 다시" 같은 것을 표현할 수 있는데 그런 경우가 없다. 짝이
-되는 반납 op이 없는 것도 같은 이유다 — 다음 호출이 다시 쓰므로 놓을 자리가 프로세스
-끝뿐이고, 그것은 런타임이 한다.
-
-**`stage`의 필드.**
-
-```mlir
-upmem.stage %A origin[%r, %c] sizes[%m, %n] strides[%lda, %c1]
-      pad_to[%pm, %pn] tile array<i64: 8, 16> {dedup_over = ["k"]}
+```text
+MRAM bytes(input/output i) = product(allocation_shape_i) × element_bytes_i
+필요 MRAM 합계            = Σ MRAM bytes(i)
 ```
 
-| 필드 | 뜻 |
-| --- | --- |
-| `origin`/`sizes`/`strides` | 원본 안의 영역. `pim.unit_data`에서 그대로 온다 |
-| `pad_to` | 결과 버퍼 shape = 배정량. 남는 자리는 0 |
-| `tile` | 유닛 버퍼를 이 단위로 쓴다 |
-| `dedup_over` | 이 축만 다른 유닛은 같은 결과를 받는다 |
+**변환**: place마다 정확한 크기의 `upmem.mram`을 만들고 profile 예산과 비교한다.
 
-`pad_to`가 `sizes`와 갈리는 이유는 `dpu_push_xfer`가 모든 DPU에 같은 바이트 수를
-요구하기 때문이다. 마지막 유닛이 덜 맡아도 배정량 크기로 보낸다.
+**이유**: Execution Tile slot은 모든 round에서 같은 크기로 사용한다. 원본 전체 행렬
+크기나 이번 tail의 size를 MRAM 할당 크기로 사용하지 않는다. 메모리 예산을 A/B/C
+개수로 균등 분할하지도 않는다.
 
-`unstage`는 여기에 `capacity`가 더 있다. 되돌릴 때 **읽는 범위**는 실제로 쓴
-영역(`sizes`)이고 **축을 하나 건너뛰는 간격**은 버퍼 자체의 크기(`capacity`)에서
-나온다. 유닛이 배정량보다 적게 맡으면 둘이 다르므로 나누어 써야 한다.
-
-### 3.4 device 쪽
-
-| op | C 대응 |
-| --- | --- |
-| `upmem.device_func` | `int main()` |
-| `upmem.tasklet_id` | `me()` |
-| `upmem.num_tasklets` | `NR_TASKLETS` |
-| `upmem.get_host_var` | 전역 메타데이터 구조체 필드 참조 |
-| `upmem.barrier` | `barrier_wait(&_barrier)` |
-| `upmem.mram_read` | `mram_read(...)` |
-| `upmem.mram_write` | `mram_write(...)` |
-
-`mram_read`/`mram_write`는 verifier가 하드웨어 제약(정렬 8, 최대 2048)을 확인한다.
-어기면 런타임에 조용히 깨지므로 IR 수준에서 막는다.
-
----
-
-## 4. `--convert-pim-to-upmem`
-
-`lib/Conversion/PIMToUPMEM/PIMToUPMEMPass.cpp`. `pim.device` 하나를 module 수준 선언 +
-host 몸체 + `upmem.device_func`로 나눈다.
-
-### 4.1 결정 1 — MRAM 버퍼는 유닛 메모리를 버퍼 수로 나눈다
-
-```cpp
-int64_t bufferBytes = unitMemoryBytes / (inputs.size() + outputs.size());
+```text
+allocation_shape = [256,2048], dtype=i8 → MRAM slot 512 KiB
+마지막 round size = [100,300]이어도 slot은 512 KiB
 ```
 
-GEMM이면 A/B/C 셋이라 32 MB / 3 ≈ 10.6 MB씩이다. 유닛이 받는 배정량이 이보다 크면
-링커가 `.mram.noinit` 구역이 넘쳤다고 실패한다. 이것이 **큰 shape에서 split을 더 잘게
-잡아야 하는 이유**다.
+MRAM 심볼은 적재된 Device 프로그램의 고정 공간이다. 입력 내용은 각 round에서 다시
+전송한다. 이전 호출/round의 입력이 유효하다고 간주해 H2D를 생략하지 않는다.
 
-축을 하나 건너뛰는 간격(pitch)은 컴파일 시점에 모르므로 `upmem.host_var`로 축마다
-하나씩 만들어 host가 넣어 준다.
+### 4.2 Host pool의 고유 slot
 
-### 4.2 결정 2 — 타일 단위 MRAM 레이아웃
-
-`upmem.stage`가 유닛 버퍼를 **타일 단위로** 채운다. 타일 하나가 MRAM에서 연속이 되어
-device가 DMA 한 번으로 옮긴다.
-
-```
-자리 = (타일 번호를 축별 타일 수로 편 값) × 타일 원소 수 + (타일 안의 자리)
-번호[d] = origin[d] / tile[d]        축별 타일 수[d] = capacity[d] / tile[d]
+```text
+입력 pool slot 수 = product(P_axis for axis not in shared_over)
+출력 pool slot 수 = Pm × Pn × Pk
 ```
 
-행 단위로 두면 타일 하나를 옮기는 데 **그 타일의 행 수만큼** DMA가 필요하다.
-`BLOCK_M=32, BLOCK_K=16`이면 A 타일 하나에 32회이고 한 행이 16 byte다 — 준비 비용이
-옮기는 양보다 크다. 타일 단위로 두면 타일 하나당 1회이고, 2048 byte를 넘을 때만
-그만큼 쪼갠다(32×32 i32인 C 타일이 4096 byte라 2회).
+| 예시 | shared_over | slot 수 |
+|---|---|---:|
+| GEMM A | n | Pm × Pk |
+| GEMM B | m | Pn × Pk |
+| GEMV x | m, Pn=1 | Pk |
+| DPU별 출력 partial | 공유하지 않음 | Pm × Pn × Pk |
 
-`buildDMA`가 타일이 2048 byte를 넘을 때만 행 묶음으로 쪼갠다.
+**변환**: acquire, bind_devices, pool alloc은 scheduling loop 밖에 만들고 dealloc은
+그 뒤에 둔다. stage와 gather는 그 pool의 slot을 채운다.
 
-```cpp
-int64_t perDMA = shape[0];
-while (perDMA > 1 && (perDMA * rowElems * elemBytes > 2048 || shape[0] % perDMA))
-  perDMA--;
+**이유**: 같은 입력의 DPU별 복사본을 Host에 여러 개 만들 필요가 없다. 공유 주소는
+물리 전송 묶음에서 같은 cache line을 재사용할 수 있는 조건이기도 하다. pool 공간
+재사용은 round 간 전송 생략과 다른 기능이다.
+
+```text
+acquire → bind_devices → pool 할당
+for scheduling round:
+    고유 입력 slot마다 초기화 + 패킹
+    입력별 전송 + metadata 전송
+    launch
+    gather + unstage/combine
+pool 해제
 ```
 
-### 4.3 결정 3 — tasklet 분배
+### 4.3 stage가 찾고 만드는 주소
 
-`nr_tasklets > 1`이면 유닛이 맡은 타일을 tasklet에 나눈다.
+place의 `start/size/strides/allocation_shape`는 stage의
+`origin/sizes/strides/pad_to`로, access의 `sizes`는 `tile`로 전달한다.
 
-```
-병렬 grid loop들을 하나로 합친다 → tasklet 번호부터 tasklet 수만큼 건너뛰며 돈다
-선형 번호를 안쪽 축부터 나머지·몫으로 벗겨 축별 좌표를 복원한다
-```
-
-**합치는 이유:** loop 하나만 나누면 그 loop의 반복이 tasklet 수보다 적을 때 나머지
-tasklet이 논다. 유닛이 맡은 타일 수는 축을 합쳐야 제대로 나온다.
-
-**barrier가 없는 이유:** 타일마다 쓰는 자리가 겹치지 않는다. 대신 tile 버퍼를
-tasklet마다 따로 잡는다 — 앞에 tasklet 축을 하나 더 두고 자기 번호로 잘라 쓴다.
-
-```cpp
-shape.insert(shape.begin(), localLanes);       // 앞에 tasklet 축
-offsets[0] = taskletId;  sizes[0] = 1;         // 자기 몫 subview
+```text
+pool_key = shared_over 축을 제외한 논리 좌표의 평탄화
+buffer   = pool + pool_key × slot_elements
 ```
 
-### 4.4 결정 4 — WRAM 예산을 IR 수준에서 막는다
+공유 축 좌표가 모두 0인 대표 Device에서 slot을 한 번 채우고 나머지는 같은 주소를
+등록한다. 각 round마다 slot 전체를 0으로 초기화한 뒤 유효 영역만 패킹한다. tail이
+줄어들어도 이전 round 내용이 padding에 남지 않게 하기 위함이다.
 
-tile 버퍼가 tasklet 수만큼 곱해지므로 쉽게 넘친다. 넘치면 `dpu-clang`이 링크 단계에서
-수십 줄을 쏟아 내고 원인이 안 보인다.
+MRAM 내부 배치는 tile-major다.
 
-```cpp
-int64_t lanes = localLanes, budget = localMemoryBytes;
-if (wramBytes > budget)
-  return dev->emitError("tile buffers need ") << wramBytes
-         << " byte of unit fast memory (" << lanes << " tasklet(s)) but the budget is "
-         << budget << " byte; lower nr_tasklets or the BLOCK sizes";
+```text
+tile_number[d] = local_origin[d] / tile[d]
+tile_count[d]  = allocation_shape[d] / tile[d]
+MRAM 위치      = flatten(tile_number, tile_count) × product(tile)
+                 + 타일 내부 row-major 위치
 ```
 
-IR을 고치기 **전에** 본다 — 반쯤 바뀐 IR이 오류에 딸려 나오면 읽기 어렵다.
-`llvm::cl::opt`를 그대로 스트림에 넣으면 아무것도 안 찍히므로 값을 꺼내 쓴다.
+GEMM B의 타일 내부 순서는 `[Ktile,Ntile]`이며 계산은 `A[m,k]*B[k,n]`이다.
+Host stage는 SDK의 byte interleaving을 미리 수행하지 않는다.
 
-i8 GEMM에서 tile 버퍼 합계는 `BLOCK_M·BLOCK_K + BLOCK_K·BLOCK_N + 4·BLOCK_M·BLOCK_N`
-byte다. `32/32/16`이면 5,120 byte라 48 KB 예산에서 lanes가 9까지다.
+## 5. 공유 정보를 물리 DPU 배정에 적용
 
-### 4.5 device 몸체를 유닛 로컬로 만들기
+### 5.1 컴파일 시 논리 묶음 선정
 
-| 하는 일 | 왜 |
-| --- | --- |
-| loop 상한을 `upmem.get_host_var`로 | device가 자기 좌표를 몰라도 되고, 마지막 유닛이 덜 맡는 것이 값 하나로 표현된다 |
-| `pim.unit_origin`의 유닛 시작을 0으로 | 그러면 `pim.access`의 origin이 유닛 안의 위치가 된다 |
-| tile → WRAM 버퍼, 계산 → memref 형태 linalg | tensor iter_arg가 없어진다. 버퍼가 loop를 관통하므로 값을 나를 필요가 없다 |
-| `materializeExternals` | 옮겨 온 loop가 host func 안의 상수를 가리킨다. `device_func`은 그 func의 형제라 안 보이므로 다시 만든다 |
+**찾는 정보**: partition `[Pm,Pn,Pk]`, 입력별 `shared_over`, fixed-slot bytes.
+입력이 A인지 B인지 검사하지 않는다.
 
-유닛 시작을 0으로 놓는 것은 Triton이 내는 `pid * BLOCK` 형태를 전제한다. 그 형태라야
-유닛 시작에서 0이 되어 뺄셈 없이 성립한다.
+후보 `G=[gm,gn,gk]`는 각 원소가 1/2/4/8이고 해당 partition의 약수이며,
+`gm*gn*gk <= 8`이다. 같은 member의 8개 CI 자리를 정수 개의 묶음으로 채울 수 있다.
 
-**op을 지우는 순서**가 중요하다. 소비하는 쪽부터 지우지 않으면 아직 쓰이는 값을
-지우게 되고, 남은 사용처가 해제된 op을 가리킨다.
-
-```cpp
-for (Operation *op : oldStores) op->erase();          // loop 결과를 놓아 준다
-for (scf::ForOp l : loops) if (...) dropIterArgs(l);  // yield와 init을 놓아 준다
-for (Operation *op : llvm::reverse(oldCompute)) op->erase();  // 쓰는 쪽이 먼저
-for (Operation *op : oldLoads) op->erase();           // pim.access를 놓아 준다
+```text
+N = Pm × Pn × Pk
+공유 배수_i(G) = product(g_axis for axis in shared_over_i)
+비용(G)        = Σ [ bytes_i × N / 공유 배수_i(G) ]
 ```
 
-### 4.6 semantic K partial 회수
+최소 비용을 선택하고 비용이 같으면 더 큰 묶음을 선택한다. 그것도 같으면 현재 후보
+열거 순서의 첫 항목을 유지한다.
 
-Common IR은 하나의 `pim.reduction` domain을 `reduction_k` round와 `device_k`로
-이미 나눈다. UPMEM lowering은 별도 spatial K plane이나 K window를 만들지 않는다.
-각 `pim.combine ... kind "add"`는 device에서 해당 partial을 MRAM에 쓰고, host의
-`upmem.unstage accumulate`는 `reduction_k round + device_k`가 0인 첫 partial만
-대입하고 나머지를 더한다. 최종 `pim.place`의 start/size/rank는 그대로 사용한다.
+**이유**: 같은 SDK 전송 묶음에서 반복 참조할 Host 원본 주소를 늘려 고유 입력 바이트를
+줄이기 위한 모델이다. cache miss 수나 transfer latency를 직접 예측하는 식이 아니다.
+Host cache 용량, associativity, NUMA, SDK worker 수를 비용식에 넣지 않는다.
 
----
+**예시**: `P=[4,128,4]`, A/DPU=512 KiB, B/DPU=448 KiB.
 
-## 5. Codegen
+| 묶음 G | 8 DPU에서 고유한 입력 | 묶음당 모델 비용 |
+|---|---|---:|
+| `[1,8,1]` | A 1개 + B 8개 | 4096 KiB |
+| `[2,4,1]` | A 2개 + B 4개 | 2816 KiB |
+| `[4,2,1]` | A 4개 + B 2개 | 2944 KiB |
 
-### 5.1 공통 — `CEmitter`
+이 경우 `[2,4,1]`을 고른다. 실제 H2D payload는 배정 전후 동일하다. 비용 감소를
+전송 바이트 감소나 동일 비율의 시간 개선으로 해석하지 않는다.
 
-**MLIR 값 하나가 C 변수 하나, op 하나가 문장 하나.** 그래야 생성된 코드의 모든 줄을
-IR의 op으로 되짚을 수 있다. 다룰 줄 모르는 op은 추측하지 않고 에러를 낸다.
+### 5.2 실행 시 실제 topology 연결
 
-`index`는 host에서 `int64_t`, device에서 `int32_t`다. DPU가 32비트 기계다.
+[upmem_runtime.c](../pim_backend/backend/upmem_runtime.c)의 `upmem_bind_devices`는
+SDK의 `dpu_get_member_id`, `dpu_get_slice_id`로 실제 위치를 읽는다.
 
-### 5.2 host (`--upmem-to-host`)
+```text
+한 전송 묶음 = 같은 rank, 같은 member의 서로 다른 CI
+              CI 하나 안의 여러 member를 묶는 것이 아님
 
-`DPU_FOREACH`와 준비 loop를 **나누는** 것이 이 emitter의 뼈대다. `dpu_prepare_xfer`는
-DPU마다이고 `dpu_push_xfer`는 집합 전체라, 버퍼 하나에 두 자리가 필요하다.
-
-```c
-// 1. 준비: 좌표를 풀고 유닛별 결과를 배열에 담는다
-for (int64_t _u = 0; _u < UNITS; ++_u) {
-  int64_t v3 = (_u / 16) % 16;            // 유닛 좌표 (자리값 분해)
-  ...
-  int64_t _s0_key = ...;                  // dedup 축을 뺀 조합 번호
-  if (!_s0[_s0_key]) { ... }              // 그 조합에 대해 한 번만 모은다
-  _p0[_u] = v9;  _p0_n[_u] = v9_bytes;
-}
-// 2. 전송: 버퍼마다 FOREACH + push
-_idx = 0;
-DPU_FOREACH(_set, _dpu, _idx) DPU_ASSERT(dpu_prepare_xfer(_dpu, _p0[_idx]));
-DPU_ASSERT(dpu_push_xfer(_set, DPU_XFER_TO_DPU, "..._mram_0", 0, _p0_n[0], ...));
+assignment[SDK enumeration index] = canonical logical index
+canonical logical index          = ((pm*Pn)+pn)*Pk+pk
 ```
 
-**staging의 중복 제거.** `dedup_over` 축만 다른 유닛은 같은 결과를 받으므로, 그 축을
-뺀 조합마다 한 번씩만 모은다. GEMM에서 A는 n축에 불변이라 `split_n`배만큼 준비가
-줄어든다.
+8개 CI가 모두 활성인 member를 먼저 순회하고 불완전한 member를 나중에 배정한다.
+이유는 중간에 비활성 DPU가 있어도 뒤의 완전한 묶음 정렬이 밀리지 않게 하기 위함이다.
+불완전한 묶음에서도 각 논리 Device는 한 번씩 배정하지만 기대 공유도를 모두 달성하지
+못할 수 있다. 할당 수/topology가 잘못되면 오류를 낸다.
 
-**host 스레드.** 타일 loop 바깥을 묶어 나눈다. 스레드 팀을 만드는 비용이 고정이라
-타일이 스레드 수보다 적으면 나누지 않는다.
+### 5.3 입력·metadata·gather에 같은 표를 사용
 
-```c
-#pragma omp parallel for collapse(2) num_threads(8) if(v5 / 32 * v6 / 16 > 8)
+```text
+논리 순서로 준비:
+    input_ptr[logical] = shared pool slot 주소
+    metadata[logical] = 그 좌표의 실행 정보
+
+물리 SDK 순서로 전송:
+    prepare(dpu, input_ptr[assignment[physical]])
+    prepare(dpu, &metadata[assignment[physical]])
+
+물리 SDK 순서로 회수:
+    prepare(dpu, output_pool[assignment[physical]])
 ```
 
-전체 코어를 쓰면 작은 경우가 오히려 느려진다. 그래서 `host-threads`를 옵션으로 두고
-기본을 8로 잡았다.
+입력만 순서를 바꾸면 다른 DPU의 metadata를 쓰거나 출력이 잘못 합쳐질 수 있다.
+`bind_devices`를 foreach와 gather가 모두 참조하게 한 이유다.
 
-### 5.3 device (`--upmem-to-device`)
+이 변환은 Host의 canonical 준비 loop와 Device의 계산 loop를 교환하지 않는다.
+물리 위치와 논리 일을 연결하는 표만 바꾼다. 순열 자체는 추가 push를 만들지 않는다.
 
-```c
-__mram_noinit int8_t kernel_mram_0[11184810];   // host가 이름으로 채운다
-__host int32_t kernel_tiles_x;
-__dma_aligned int8_t w0[8192];                  // WRAM 타일 버퍼는 전역
-BARRIER_INIT(_barrier, NR_TASKLETS);
-int main() { ... }
+## 6. Host 전송과 metadata
+
+구현: [UPMEMToHost.cpp](../lib/Target/UPMEM/UPMEMToHost.cpp).
+
+### 6.1 준비와 push를 분리하는 이유
+
+`foreach_unit`은 먼저 논리 좌표별 scalar/패킹/포인터를 준비한다. 그 뒤 각 입력에
+대해 SDK의 DPU_FOREACH로 포인터를 등록하고 set 전체에 한 번 push한다.
+
+```text
+입력이 A와 B이면 매 round:
+    A: 모든 DPU prepare → A push 1회
+    B: 모든 DPU prepare → B push 1회
+    metadata: 모든 DPU prepare → 통합 push 1회
+    launch
 ```
 
-WRAM 버퍼를 전역으로 빼는 이유는 둘이다. 유닛 메모리가 작아 스택에 둘 수 없고,
-반복마다 새로 잡는 것이 아니라 하나를 돌려쓴다(`pim.co_resident`의 streaming).
+따라서 A/B/metadata를 통째로 한 번 push하는 구현은 아니다. B0/B1/... 타일마다
+별도로 push하는 구현도 아니다. 한 입력 slot의 서로 다른 DPU 포인터들이 한 집합
+전송에 들어간다. Common broadcast도 같은 방식이며 공유 DPU들은 같은 주소를 쓴다.
 
-**곱셈은 C의 `*` 그대로 둔다.** DPU에 32비트 곱셈기가 없어 `built_ins.h`의
-`__builtin_mul_sl_sl_rrr`(아래 16비트끼리 곱하는 한 명령)로 바꿔 봤는데 커널이 두 배
-느려졌다. 그 매크로가 인라인 어셈이라 최적화기가 안을 못 보고, 그 자리에서 loop
-펼치기와 레지스터 재사용이 막힌다. i8 피연산자면 clang이 이미 좁은 곱셈을 낸다.
+이 구조는 공유 입력 pool 주소를 유지한다. 모든 DPU에 A+B+metadata를 합친 사본을
+만들면 현재의 공유 주소 관계가 없어지므로 단순한 push 수 축소와 같은 선택이 아니다.
+현재 구현에는 전송 방식 선택 옵션이나 별도 합본 전송 경로를 추가하지 않았다.
 
----
+### 6.2 metadata ABI
 
-## 6. 런타임과 빌드
+[MetadataLayout.h](../lib/Target/UPMEM/MetadataLayout.h)는 `upmem.host_var` 선언 순서로
+공통 필드 배치와 padding을 정한다. Host/Device가 같은 구조체 정의를 사용한다.
+`index`는 전송 시 int32이며 전체 구조체 크기는 8바이트 배수다. 생성 코드에는 크기와
+필드 offset을 확인하는 컴파일 시점 검사가 있다.
 
-### 6.1 `upmem_runtime.c` — 집합 하나를 쥐고 있는다
+일반 Common lowering은 모든 필드를 채우므로 metadata를 한 번 보낸다. 손으로 작성한
+Target IR이 일부 필드만 갱신하면 기록된 연속 구간만 전송한다. 이는 전달하지 않은
+필드를 덮지 않기 위한 기존 ABI 동작이며 round 입력 상주 분석과 관계없다.
 
-```c
-struct dpu_set_t upmem_acquire(uint32_t num_units, const char *binary_path);
+### 6.3 Host thread와 시간 해석
+
+`upmem.host_threads`는 stage/unstage의 타일 복사 loop에 적용되는 OpenMP 병렬도다.
+SDK 전송 worker 수나 CPU affinity를 뜻하지 않는다. `emitTileLoops`는 복사 크기가
+일정 기준을 넘을 때만 이 병렬 loop를 사용한다.
+
+계측은 prepare, h2d, kernel, d2h, reduction, buffer_alloc/free, acquire, buffer_init,
+layout_a/b/other/c를 구분한다. h2d에는 SDK prepare+push가 포함된다. `operand_role`은
+matmul의 입력 패킹 시간 분류에만 쓰며 물리 배정 비용에는 쓰지 않는다. 현재 matvec
+입력 패킹은 layout_other로 집계된다. 계측 구간은 SDK의 cache miss 자체를 측정하지 않는다.
+
+## 7. Device 계산과 DMA 패턴
+
+### 7.1 tensor를 WRAM으로 바꾸기
+
+`collectLocalTiles`가 load 결과와 Linalg outs의 buffer 소유 관계를 구한다. tensor
+iter_arg는 초기 accumulator와 같은 WRAM 공간을 사용한다. Linalg를 memref 형태로
+다시 만들고 값 전달용 tensor iter_arg를 제거한다.
+
+이유는 매 K 반복마다 새 accumulator를 할당하지 않고 같은 WRAM을 갱신하기 위함이다.
+local loop 상한/pitch 등 Device 밖에서 오는 정수는 host_var 통로로 전달한다. 현재
+외부 runtime float scalar를 이 통로로 자동 전달하는 일반 경로는 없다.
+
+### 7.2 전역 좌표를 로컬 MRAM 좌표로 바꾸기
+
+보통 `pim.device_origin`의 전역 시작을 0으로 바꾸면 DPU 안의 tile 번호가 된다.
+Common의 local load 이동으로 이 표식이 사라질 수 있는 reused input은
+`origin-place.start`로 명시적으로 로컬화한다. 그렇지 않으면 다음 round의 전역
+시작이 작은 MRAM slot 안의 offset으로 사용될 수 있다.
+
+### 7.3 tasklet 분할은 indexing map으로 결정
+
+지원되는 Linalg operand의 indexing map에서 출력 m이 leading dimension이면 행을
+나누고, m을 사용하지 않으면 WRAM tile 전체를 공유한다. m이 다른 위치에 있거나 map이
+지원되는 projected permutation이 아니면 진단한다. 출력 행 수는 tasklet 수로
+나누어떨어져야 한다.
+
+| 계산 | 행을 나누는 operand | 공유하는 operand |
+|---|---|---|
+| matmul | A, C | B |
+| matvec | A, y | x |
+| identity pointwise | 모든 동일 shape operand | 없음 |
+
+예를 들어 matvec의 A[8,16], x[16], y[8]을 tasklet 4개가 처리하면 A/y는 각자 2행,
+x는 같은 16원소다. 이는 Device 내부 WRAM 공유이며 DPU 간 Host x pool 공유와 다른
+단계다.
+
+### 7.4 DMA와 barrier
+
+`buildDMA`는 타일을 연속 MRAM 구간으로 읽고 쓴다. 현재 구현은 2048바이트 이내의
+행 묶음을 고르며, tasklet t는 chunk t, t+lanes, ...를 담당한다. 타일이 작아 chunk가
+하나이면 실제 DMA는 tasklet 하나만 수행할 수 있다.
+
+DMA verifier는 크기·정렬 제약을 확인한다. 한 행 자체가 지원 전송 크기를 넘거나
+정렬 조건을 만족하지 못하는 shape를 임의로 다른 layout으로 바꾸지 않는다.
+
+```text
+협력 input DMA
+    ↓ barrier: 모든 입력 chunk 도착
+tasklet별 담당 행 계산
+    ↓ barrier: 반복 계산의 입력 소비 완료
+다음 K 반복의 DMA
 ```
 
-| 상황 | 하는 일 |
-| --- | --- |
-| 같은 `num_units`, 같은 elf | 쥐고 있던 집합을 그대로 준다 |
-| 같은 `num_units`, 다른 elf | `dpu_load`만 다시 (config 전환) |
-| 다른 `num_units` | 기존 집합을 놓고 새로 확보 |
-| 프로세스 끝 | `atexit`으로 한 번 놓는다 |
+뒤 barrier는 다음 반복이 공유 WRAM 입력을 덮기 전에 소비가 끝나도록 한다.
 
-집합 하나만 쥔다. 집합이 보관하는 것은 예약과 적재된 elf뿐이고 데이터는 매 호출
-다시 보내므로 여러 개를 둘 이유가 없다. 하나만 쥐므로 서로 다른 유닛 수가 쌓여 DPU가
-고갈되는 일도 없다(sweep 안전).
+### 7.5 계산 leaf의 지원 범위
 
-### 6.2 빌드 (`driver.py`)
+[UPMEMToDevice.cpp](../lib/Target/UPMEM/UPMEMToDevice.cpp)는 fill/matmul/matvec/reduce와
+identity-map/all-parallel generic을 처리한다. generic은 단일 출력·동일 정적 shape와
+[CEmitter.h](../lib/Target/UPMEM/CEmitter.h)가 지원하는 scalar arith를 요구한다.
+`math.exp`, 일반 broadcast generic, 임의 transpose 등을 자동 지원하지 않는다.
 
-```
-device.c → device.elf   dpu-upmem-dpurte-clang -O2 -DNR_TASKLETS=<nr_tasklets>
-host.cpp → host.so      g++ -O2 -std=c++17 -fPIC -shared -fopenmp
-                        -DDPU_BINARY="<elf 절대경로>" libupmem_runtime.so -Wl,-rpath,...
-```
+K-only reduce는 tasklet-local partial을 합치는 표현이 없으므로 tasklet 1개를 요구한다.
+단순히 Common에 reduction 표식이 있다는 이유로 임의 병렬 reduction이 되는 것은 아니다.
 
-`-O2`가 device에 필요하다. clang 기본인 `-O0`이면 MAC loop가 최적화되지 않아 약 두 배
-느리다.
+## 8. Gather와 partial 결합
 
-`libupmem_runtime.so`는 내용 해시를 키로 **한 번만** 빌드한다. 모든 `host.so`가 같은
-경로의 `.so`를 링크해야 동적 로더가 하나만 적재하고, 그래야 집합 캐시 전역이
-프로세스에서 공유된다. 이것이 지속 집합의 핵심이다.
+Common의 출력 `allocation_shape`만큼 DPU마다 회수하되 assignment로 논리 pool 위치를
+정한다. `foreach_group`은 그 pool을 canonical 논리 순서로 순회하고 unstage가 원본
+strided 영역에 복원한다.
 
-캐시 키는 `host_src + device_src + nr_tasklets + dpu_opt + runtime_so`다.
-`nr_tasklets`는 소스에 안 박히고 `-D`로만 들어가므로 따로 넣어야 한다.
+```text
+pim.store 출력:
+    C[destination] = received
 
----
-
-## 7. 하드웨어 제약이 IR에 남긴 자국
-
-각 제약이 어느 결정을 강제했는지의 대응표다.
-
-| 제약 | IR에 남은 것 |
-| --- | --- |
-| DMA가 연속 영역만 | `upmem.stage` / `unstage` 자체 |
-| DMA 8 byte 정렬, ≤2048 byte | `mram_read`/`write` verifier, `buildDMA`의 행 묶음 쪼개기 |
-| `push_xfer`가 균일 바이트 요구 | `stage`의 `pad_to`, `unstage`의 `capacity`, `unit_data`의 capacity/sizes 분리 |
-| `__mram_noinit`이 상수 크기 요구 | MRAM 버퍼가 유닛 메모리를 나눈 상한, pitch를 `host_var`로 |
-| WRAM 64 KB | `local_capacity_limit_bytes` 상한 검사 |
-| 11단 pipeline | tasklet 11개까지는 늘려도 시간이 그대로 → `nr_tasklets` 선택 기준 |
-| 32비트 곱셈기 없음 | (시도했다가 되돌림 — §5.3) |
-| `dpu_alloc` 수백 ms | `upmem.acquire`와 지속 집합 |
-
----
-
-## 8. 백엔드 옵션
-
-compiler와 autotuner는 `pim_backend/backend/target.py`의 동일한
-`PIMTargetSpec`을 사용한다.
-
-```python
-PIMTargetSpec(
-  common_profile=PIMTargetProfile(
-    target="upmem", num_units=2048,
-    banks_per_unit=1, cores_per_bank=1, lanes_per_core=16,
-    bank_capacity_limit_bytes=60 * 1024 * 1024,
-    local_capacity_limit_bytes=48 * 1024),
-  runtime_config=UPMEMRuntimeConfig(
-    nr_tasklets=0,  # 0이면 lanes_per_core 전체
-    host_threads=8))
+pim.combine(kind=add) 출력:
+    if reduction_round == 0 and pk == 0:
+        C[destination] = received
+    else:
+        C[destination] += received
 ```
 
-Block–Group–Execution Tile과 device mapping은 따로 복제하지 않고
-`PIMConfig` 정수 값 `group_m/n/k`, `tile_m/n/k`, `p_m/n/k`를 그대로
-compiler option으로 넘긴다. `nr_tasklets`만 UPMEM target runtime 값이며
-`lanes_per_core` 이하에서 활성 tasklet 수를 정한다.
+물리 배정이 바뀌어도 논리 partial 결합 순서는 유지된다. destination은 Common의
+place/access가 정하며 Target이 output rank에서 split-K plane을 추측하지 않는다.
 
-`pim_target`이 `target`이면 안 된다. Triton이 metadata를
-`{"target": GPUTarget, **options.__dict__}`로 만들어서 같은 이름의 옵션이 GPUTarget을
-덮어쓰고, `CompiledKernel`이 그것을 다시 읽어 `TypeError`가 난다.
+## 9. GEMV 전체 예시
 
----
+f32 A[1024,1024], x[1024], y[1024], P=[8,1,8], Block=[8,1,16],
+Group=[1,1,1], Execution Tile groups=[16,1,8]을 가정한다.
 
-## 9. 성능 — 지금까지 한 것
-
-측정은 `(1024×512)×(512×1024)` i8 GEMM, `BLOCK 32/32/16`, `split=(16,16,1)`
-(256 유닛), `nr_tasklets=8` 기준이다.
-
-| 한 것 | 전 | 후 |
-| --- | ---: | ---: |
-| 타일 단위 MRAM 레이아웃 | A 타일 하나에 DMA 32회 | 1회 |
-| 지속 집합 (`upmem.acquire`) | 160.23 ms / 6.70 GOPS | 82.01 ms / 13.09 GOPS |
-| 〃 (가장 작은 경우) | 13.87 ms | 2.23 ms |
-
-지속 집합이 들어간 뒤에야 `nr_tasklets` 16이 8보다 빨라졌다(9.09 vs 11.26 ms). 그전에는
-launch당 약 11.6 ms의 고정 비용이 유닛 내부 병렬의 차이를 덮고 있었다.
-
-되돌린 것도 적어 둔다. `__builtin_mul_sl_sl_rrr`은 커널을 59.04 → 124.91 ms로
-느리게 만들었다(§5.3).
-
-`PIM_TIMING` 계측이 보여 준 것 두 가지.
-
-- **kernel이 거의 전부다.** 작은 경우에서 host 쪽(stage + combine)이 합쳐서 0.04 ms다.
-- **`split_k`의 비용이 보인다.** `split=(8,8,8)`에서 kernel 31.31 ms에 d2h 18.74 ms,
-  combine 9.86 ms다. 유닛 8개가 각각 온전한 크기의 부분합을 돌려주므로 회수량이 8배가
-  되고 host가 그것을 8개씩 더한다. 둘을 합치면 커널보다 길다.
-
----
-
-## 10. 알려진 한계
-
-### 10.1 유닛 개수가 타일 수로 양자화된다
-
-`PIMPartitionPass`의 `narrowLoop`가 축마다 `per = ceil(전체/유닛수)`로 자르고 상한에서
-자른다. 그래서 `split_n`이 `N/BLOCK_N`을 나누지 못하면 남는 유닛이 아무 타일도 못
-받는다. `N=12288, BLOCK_N=32 → 384타일`에 `split_n=512`를 주면 384개만 일한다.
-
-균등 배분으로 바꿔도 **가장 바쁜 유닛의 타일 수는 `ceil(전체/유닛수)`로 그대로**라
-kernel 시간은 안 줄어든다. 실제로 손해인 경우는 타일 수가 유닛 수보다 **적을** 때다.
-그때는 BLOCK을 줄여 타일을 늘려야 하고, 대신 타일당 계산이 줄어 DMA 대비 계산 비중이
-떨어진다.
-
-비교 대상인 PGEMM은 출력 **원소** 단위로 나누므로 어떤 DPU 개수로도 나누어떨어진다.
-우리는 Triton의 BLOCK 타일 단위라 나누어떨어져야 한다.
-
-### 10.2 아직 안 한 최적화
-
-| | 내용 |
-| --- | --- |
-| DPU 커널 register blocking | 안쪽 loop가 MAC 하나당 load 2회다. `_m`을 여러 단으로 펼쳐 누산기를 여러 개 두면 `b` load를 나눠 쓴다 |
-| DMA double buffering | `mram_read` → 계산 → `mram_read`가 직렬이다. 다음 타일을 미리 읽으면 겹친다. WRAM이 두 배 필요하다 |
-| replicated 입력의 broadcast | A가 n축에 불변인데 유닛마다 따로 밀어 넣는다. `dpu_broadcast_to`면 한 번이다 |
-| staging 건너뛰기 | 영역이 이미 연속이고 padding이 없으면 원본 포인터를 그대로 넘길 수 있다 |
-
-### 10.3 표현하지 못하는 것
-
-- **결합 연산자는 `add`/`mul`만.** `emitForeachGroup`이 그 둘만 C로 낸다.
-- **쪼갠 축약 축들의 결합 연산자가 다르면 실패한다.** `pim.unit_data`가 연산자를
-  하나만 나른다.
-- **출력의 배정량이 유닛 좌표에 의존하면 실패한다.** 모든 유닛이 같은 바이트 수를
-  돌려줘야 `gather`가 성립한다.
-- **`pim.access`의 origin이 `pid * BLOCK` 형태가 아니면** 유닛 시작을 0으로 놓는 것이
-  성립하지 않는다.
-
-### 10.4 검증
-
-lit 테스트 세 개를 `upmem.acquire`와 `tile`/`capacity`에 맞춰 고쳤지만 **아직 돌린
-적이 없다.** `test/Target/UPMEM/codegen.mlir`의 주석 일부는 행 단위 DMA 시절 문구가
-남아 있다.
-
----
-
-## 11. 파일 위치
-
-```
-include/triton-shared/Dialect/PIMTarget/UPMEM/IR/UPMEMDialect.td   dialect 정의
-lib/Dialect/PIMTarget/UPMEM/IR/UPMEMDialect.cpp                    verifier
-
-include/triton-shared/Conversion/PIMToUPMEM/Passes.td              pass 정의와 문서
-lib/Conversion/PIMToUPMEM/PIMToUPMEMPass.cpp                       --convert-pim-to-upmem
-
-lib/Target/UPMEM/
-  CEmitter.h                  host/device 공통 (이름 짓기, arith → C)
-  UPMEMToHost.cpp             --upmem-to-host
-  UPMEMToDevice.cpp           --upmem-to-device
-
-pim_backend/backend/
-  compiler.py                 파이프라인과 옵션
-  driver.py                   빌드와 실행
-  upmem_runtime.c / .h          지속 집합
-
-test/Dialect/UPMEM/ops.mlir                 dialect 왕복
-test/Conversion/PIMToUPMEM/convert.mlir     변환
-test/Target/UPMEM/codegen.mlir              codegen
+```text
+DPU(pm,pk)의 입력: A[128*pm : +128, 128*pk : +128], x[128*pk : +128]
+DPU(pm,pk)의 출력: y_partial[128]
+Common shared_over: A=[], x=[m]
 ```
 
-실험용 스크립트는 저장소 밖에 있다.
+배정 비용은 A에는 공유가 없고 x의 m 공유만 이득이므로 G=[8,1,1]을 고른다. 완전한
+rank에서 같은 member의 CI0..7은 같은 pk, 서로 다른 pm을 받는다.
 
-```
-/home/dlrkdals/TritonPIM/workspace/GEMM/test_m5_smallest.py    작은 경우부터 단계별로
-/home/dlrkdals/TritonPIM/workspace/GEMM/test_llm_shapes.py     LLM shape + 설정 탐색
-```
-
----
-
-## 12. 직접 확인하는 방법
-
-UPMEM IR을 만든다.
-
-```bash
-cd /home/dlrkdals/TritonPIM
-<build-dir>/bin/triton-shared-opt \
-  --convert-pim-to-upmem="unit-memory-bytes=33554432 local-lanes=8 \
-                          local-memory-bytes=49152 host-threads=8" \
-  dump/<hash>/matmul_kernel_i8.pim_common
+```text
+member 0: (m0,k0) (m1,k0) ... (m7,k0) → 모두 x_pool[0]
+member 1: (m0,k1) (m1,k1) ... (m7,k1) → 모두 x_pool[1]
+...
+member 7: (m0,k7) (m1,k7) ... (m7,k7) → 모두 x_pool[7]
 ```
 
-소스를 본다.
+Host는 A pool 64 slot, x pool 8 slot, y pool 64 slot을 사용한다. Device는 16개의
+M Group과 8개의 K Group을 순회하며 WRAM matvec를 계산한다. gather 후 같은 pm의
+pk=0..7 partial을 더한다.
 
-```bash
-<build-dir>/bin/triton-shared-translate --upmem-to-host   <target_ir>
-<build-dir>/bin/triton-shared-translate --upmem-to-device <target_ir>
+A payload는 4 MiB이고 x payload는 복제분 포함 32 KiB다. 입력 공유 모델이 개선되어도
+A가 대부분이므로 GEMM에서 큰 입력을 공유할 때와 같은 시간 감소를 보장하지 않는다.
+
+현재 `examples/gemv.py`의 INT8 broadcast 오류는 이 물리 배정이 실행되기 전의 계산
+정규화 문제다. 곱셈 후 INT32 확장이 끼는 패턴과 의미 차이는
+[Common 설계 5절](PIMCommonIR_Design.md#5-계산-패턴을-어떻게-찾는가)에 설명했다.
+
+## 10. 검증 자료와 남은 확인
+
+아래는 저장소에 존재하는 테스트의 목적이며 이번 문서 정리에서 실행한 결과가 아니다.
+
+| 테스트 | 확인 목적 |
+|---|---|
+| `test/Conversion/PIMToUPMEM/convert.mlir` | 기본 Common→Target/Host/Device 연결 |
+| `test/Conversion/PIMToUPMEM/matvec.mlir` | f32 named matvec, DPU 1개/tasklet 4개, x WRAM 공유 |
+| `test/Conversion/TTSharedToPIM/form_compute_matvec.mlir` | f32 frontend 패턴 정규화 |
+| `test/Conversion/PIMToUPMEM/elementwise_pipeline.mlir` | 동일 shape add+mul 전체 변환 경로 |
+| `test/Conversion/PIMToUPMEM/device_mapping.mlir` | 공유 축·입력 바이트에 따른 GEMM 묶음 선택 |
+| `test/Target/UPMEM/device_mapping_runtime.mlir` | mock topology에서 배정의 일대일 대응과 비활성 DPU 처리 |
+| `test/Target/UPMEM/host_pool_sharing.mlir` | 고유 입력 slot 패킹과 주소 공유 |
+| `test/Target/UPMEM/metadata_bundle.mlir` | Host/Device metadata ABI와 통합 전송 |
+
+GEMV의 다중 DPU·split-K·물리 배정을 합친 수치 검증, INT8 선행 확장 패턴 지원,
+실제 SDK에서 배정 변경 전후 H2D 비교는 별도 확인이 필요하다. 컴파일 비용식은 cache
+재사용의 가설을 제공하며 성능 측정이나 cache miss 측정을 대신하지 않는다.
+
+사용자가 수정한 도구를 빌드한 후 기존 matvec 경로만 살펴보는 명령 예시는 다음과 같다.
+도구가 PATH에 등록되어 있고 저장소 루트에서 실행하는 경우다.
+
+```sh
+triton-shared-opt --pim-form-host-plan --convert-pim-to-upmem \
+  test/Conversion/PIMToUPMEM/matvec.mlir \
+  | triton-shared-translate --upmem-to-device
 ```
 
-단계별 IR 덤프.
-
-```bash
-TRITON_KERNEL_DUMP=1 TRITON_DUMP_DIR=/home/dlrkdals/TritonPIM/dump \
-TRITON_ALWAYS_COMPILE=1 python workspace/GEMM/test_m5_smallest.py
-```
-
-`dump/<hash>/`에 `ttsharedir`, `pim_common`, `target_ir`이 쌓인다.
-
-테스트.
-
-```bash
-cd /home/dlrkdals/TritonPIM/triton_shared
-cmake --build <build-dir> --target check-triton-shared-lit-tests
-```
+예상 생성 코드는 tasklet당 2행, K 16원소의 곱셈·누산 loop다. 이 f32 예제의 성공과
+현재 INT8 `gemv.py`의 성공을 같은 것으로 취급하지 않는다.

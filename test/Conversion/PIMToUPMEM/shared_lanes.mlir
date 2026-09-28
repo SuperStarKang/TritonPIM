@@ -1,8 +1,8 @@
 // 협력 lane 모드(lane_axis = m): tasklet 들이 tile 하나를 출력 행으로
 // 나눠 함께 계산한다. 버퍼는 한 벌, 적재는 chunk 분담, 경계는 barrier 다.
-// 입력은 convert.mlir 과 같은 GEMM 이고 lanes = 4 만 다르다. 8행 tile 을 4 lane 이
+// square RHS를 사용하는 GEMM에 lanes = 4를 적용한다. 8행 tile 을 4 lane 이
 // 2행씩 맡는다.
-// RUN: triton-shared-opt --convert-pim-to-upmem %s | FileCheck %s
+// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-upmem %s | FileCheck %s
 
 // CHECK-LABEL: upmem.device_func @matmul_device
 // CHECK-SAME:    upmem.lanes = 4
@@ -37,6 +37,7 @@
 
 // lane 복제 버퍼(4x…)도 없다.
 // CHECK-NOT:     memref.alloc() : memref<4x
+// CHECK-LABEL: func.func @matmul
 
 module attributes {pim.target_profile = #pim.target_profile<
     target = "upmem", num_units = 8,
@@ -84,14 +85,14 @@ func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
     pim.place %A start[%ar, %startk] size[%arn, %akn] allocation_shape[%c8, %c32]
         strides[%lda, %c1]
         {direction = "in", access = 0 : i64,
-         replicated_over = ["n"]} : memref<*xi8>
+         shared_over = ["n"]} : memref<*xi8>
 
     %bc = arith.muli %starty, %c32 : index
     %bcn = arith.muli %tripsy, %c32 : index
     pim.place %B start[%startk, %bc] size[%akn, %bcn] allocation_shape[%c32, %c32]
         strides[%ldb, %c1]
         {direction = "in", access = 1 : i64,
-         replicated_over = ["m"]} : memref<*xi8>
+         shared_over = ["m"]} : memref<*xi8>
 
     pim.place %C start[%ar, %bc] size[%arn, %bcn] allocation_shape[%c8, %c32]
         strides[%ldb, %c1]

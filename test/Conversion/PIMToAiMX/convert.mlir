@@ -1,16 +1,23 @@
 // PIM Common IR이 AiMX level 1 IR로 바뀌고, 고정 execution-tile 모양에서 descriptor
 // program이 한 번 펼쳐지는지 확인한다. tail의 유효 크기는 stage/unstage만 바꾼다.
-// RUN: triton-shared-opt --convert-pim-to-aimx %s | FileCheck %s
-// RUN: triton-shared-opt --convert-pim-to-aimx --aimx-lower-matmul %s | FileCheck %s --check-prefix=PROGRAM
-// RUN: triton-shared-opt --convert-pim-to-aimx --aimx-lower-matmul %s | FileCheck %s --check-prefix=PIM-CLEAN
-// RUN: triton-shared-opt --convert-pim-to-aimx --aimx-lower-matmul %s | triton-shared-translate --aimx-to-runtime-stub > /dev/null
-// RUN: triton-shared-opt --convert-pim-to-aimx --aimx-lower-matmul %s | triton-shared-translate --aimx-to-descriptors > /dev/null
+// RUN: not triton-shared-opt --convert-pim-to-aimx %s 2>&1 | FileCheck %s --check-prefix=UNPLANNED
+// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx %s | FileCheck %s
+// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx --aimx-lower-matmul %s | FileCheck %s --check-prefix=PROGRAM
+// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx --aimx-lower-matmul %s | FileCheck %s --check-prefix=PIM-CLEAN
+// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx --aimx-lower-matmul %s | triton-shared-translate --aimx-to-runtime-stub > /dev/null
+// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx --aimx-lower-matmul %s | triton-shared-translate --aimx-to-descriptors > /dev/null
 
+// UNPLANNED: requires pim-form-host-plan before AiMX lowering
 // PIM-CLEAN-LABEL: module
 // PIM-CLEAN-NOT: #pim.target_profile
 // PIM-CLEAN-NOT: #pim.block
 // PIM-CLEAN-NOT: #pim.block_group
 // PIM-CLEAN-NOT: #pim.execution_tile
+// PIM-CLEAN-NOT: pim.partition
+// PIM-CLEAN-NOT: pim.broadcast
+// PIM-CLEAN-NOT: pim.scatter
+// PIM-CLEAN-NOT: pim.launch
+// PIM-CLEAN-NOT: pim.gather
 
 // 이 attribute는 할당된 buffer와 재사용 descriptor chain의 고정 모양이다.
 // 계층은 Triton block → block group → execution tile이고 전부 공통 IR이 정했다 —
@@ -122,7 +129,7 @@ func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
     pim.place %A start[%ar, %c0] size[%arn, %akn] allocation_shape[%arc, %akn]
         strides[%lda, %c1]
         {direction = "in", access = 0 : i64,
-         replicated_over = ["n"]} : memref<*xf32>
+         shared_over = ["n"]} : memref<*xf32>
 
     %bc = arith.muli %starty, %c32 : index
     %bcn = arith.muli %tripsy, %c32 : index
@@ -130,7 +137,7 @@ func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
     pim.place %B start[%c0, %bc] size[%akn, %bcn] allocation_shape[%akn, %bcc]
         strides[%ldb, %c1]
         {direction = "in", access = 1 : i64,
-         replicated_over = ["m"]} : memref<*xf32>
+         shared_over = ["m"]} : memref<*xf32>
 
     pim.place %C start[%ar, %bc] size[%arn, %bcn] allocation_shape[%arc, %bcc]
         strides[%ldb, %c1]

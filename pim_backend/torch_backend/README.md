@@ -100,7 +100,7 @@ torch.compile
         ├─ warm-up 1회
         ├─ end-to-end median
         ├─ correctness sample
-        └─ stage/h2d/kernel/d2h/combine/host_alloc/host_free median (UPMEM)
+        └─ TIMING_STAGES의 행동별 median (UPMEM timing v3)
         │
         ▼
 AutoTuner record/cache
@@ -110,53 +110,89 @@ AutoTuner record/cache
 
 ## UPMEM GEMM 계측: PIM-LLM과 같은 compute/transfer 범위
 
-UPMEM timing version 2는 PIM-LLM의 기존 PGEMM `timer[1/2/3]`에 맞춰
+UPMEM timing version 3는 PIM-LLM의 기존 PGEMM `timer[1/2/3]`에 맞춰
 `h2d/kernel/d2h`를 독립적인 시작·종료 타이머로 측정한다. PIM-LLM 코드는
 수정하지 않는다. 두 구현 모두 호스트의 monotonic clock으로 재는 경과시간이다.
 
 | 항목 | TritonPIM에서 측정하는 작업 |
 |---|---|
-| `stage` | DPU 확보/필요시 바이너리 적재, 입력 staging 버퍼 할당·패킹·패딩과 인자 준비 |
+| `acquire` | `upmem_acquire`: DPU set 조회, 필요시 확보·바이너리 적재 |
+| `prepare` | 입력/출력 좌표·크기·공유 slot 키 계산, 포인터·메타데이터 대입 |
+| `buffer_alloc` | round 반복문 밖에서 입력/출력 Host pool을 한 번씩 할당 |
+| `buffer_init` | stage가 실행되는 고유 입력 slot과 매 round 메타데이터의 0 초기화 |
+| `layout_a` | GEMM lhs를 `[Mtile,Ktile]`로 패킹하는 복사 루프 |
+| `layout_b` | GEMM rhs를 원본 stride에서 row-major `[Ktile,Ntile]` 타일로 패킹하는 복사 루프 |
+| `layout_other` | GEMM lhs/rhs 역할이 없는 입력의 패킹 루프 |
 | `h2d` | 모든 입력 행렬·메타데이터의 `dpu_prepare_xfer` 루프 + 동기식 `dpu_push_xfer` |
 | `kernel` | `dpu_launch(set, DPU_SYNCHRONOUS)` 바로 앞부터 반환 직후까지 |
 | `d2h` | 결과의 `dpu_prepare_xfer` 루프 + 동기식 `dpu_push_xfer` |
-| `combine` | 결과 배치 복원과 부분합 결합 |
-| `host_alloc` | D2H 수신 버퍼의 크기 계산과 할당. 입력 staging 할당은 `stage`에 포함 |
-| `host_free` | H2D 이후 입력 버퍼 해제와 결과 결합 이후 수신 버퍼 해제 |
+| `layout_c` | 최초 부분합을 출력의 strided 주소로 복사 (`=`) |
+| `reduction` | 이후 K 부분합을 출력의 strided 주소에 누산 (`+=`) |
+| `buffer_free` | 모든 round와 결과 반영이 끝난 뒤 입력/출력 Host pool 해제 |
 
-H2D에서 `free()`를, D2H에서 수신 버퍼 `malloc()`을 제외한다. 독립된 타이머를
-사용하므로 제외한 작업이 `kernel`이나 다음 round의 transfer에 섞이지 않는다.
+Host pool의 `malloc/free`는 round 반복문 밖에서 별도로 측정하며 H2D/D2H에 포함하지 않는다.
+독립된 타이머를 사용하므로 할당·해제 비용이 `kernel`이나 transfer에 섞이지 않는다.
+`prepare`는 할당·초기화·layout·reduction 구간에서 중지하고 다시 시작하므로 중복 집계가 없다.
+패킹 타이머는 OpenMP 루프 전체를 감싼 wall time이며 원소마다 타이머를 호출하지 않는다.
+`layout_b`는 원본의 stride 주소 계산과 타일 버퍼 복사 시간이다. `reduction`도 layout 주소 계산과 누산이
+융합되어 있어 순수 덧셈 시간은 아니다. `layout_c`만으로 전체 출력 layout 비용을 뜻하지 않는다.
 시간 배열은 host GEMM 진입 시 한 번만 초기화하고, 모든 scheduling round의
 시간을 합산한다. 할당·해제와 계측 비용은 GEMM 전체 호출 시간에 계속 포함된다.
 위 항목에 속하지 않는 런처·loop 제어 등의 비용은 전체 호출 시간과 항목 합계의
 차이로 남는다.
 
 `h2d/d2h`에는 SDK의 포인터 등록·전송·동기화 비용이 포함되고, `kernel`에는
-DPU 내부 DMA와 동기화도 포함된다. 데이터 전송량, 메타데이터 전송 횟수, 타일과
-DPU 실행 코드는 이 계측 변경으로 바뀌지 않는다. `stage/combine/host_alloc/host_free`는
-TritonPIM의 호스트 작업 구분이며 PGEMM의 preprocess/postprocess와 직접 대응하지 않는다.
+DPU 내부 DMA와 동기화도 포함된다. B 타일은 `[Ktile,Ntile]`로 저장하며 DPU는
+`A[m,k] * B[k,n]`를 계산한다. Hybrid Transpose는 제거했고 행동별 계측은 유지한다.
+논리 타일 순서, padding, 공유 입력의 중복 패킹 제거와 MRAM slot 크기는 유지한다.
+입력 pool 공간은 round 사이에 재사용하지만, 입력 패킹·H2D·metadata·D2H는
+매 round 실행한다. 같은 round에서 `shared_over` 축만 다른 DPU들은 같은
+입력 pool slot을 공유하므로 그 slot은 한 번만 패킹한다.
+호스트 행동별 시간은 PGEMM의 preprocess/postprocess와 직접 대응하지 않는다.
 
-반영할 때는 사용자가 translator를 다시 빌드한다:
+반영할 때는 사용자가 lowering과 translator를 다시 빌드한다:
 
 ```bash
 cmake --build /home/dlrkdals/TritonPIM/triton/build/cmake.linux-x86_64-cpython-3.12 \
-  --target triton-shared-translate
+  --target triton-shared-opt triton-shared-translate
 ```
 
-Python backend의 compile cache version도 변경했다. 이전 실행과 캐시를 분리하려면
-`source set_env.sh` **뒤에** 다음 설정을 적용한 새 프로세스에서 GEMM을 실행한다:
+Python backend compile cache version도 변경했다. 재빌드 후 새 Python 프로세스에서 실행한다.
+driver는 네이티브 host의 timing version을 실행 전에 확인하고 버전이 다르면 중단한다.
+UPMEM은 `TIMING_STAGES` 순서의 13개 항목이며 AiMX의 5개 항목은 유지한다.
+기존 `combine` 시간은 v3의 `layout_c + reduction`과 출력 쪽 `prepare`로 나뉜다.
+이전 JSON의 `stage/combine/host_alloc/host_free`는 당시 범위로 해석해야 한다.
+Attention profiler는 JSON에 `pim_timing_version`도 기록한다.
+
+`pim_backend/examples/pim_transpose_gemm.py`는 같은 `C=AB`를 계산하면서 Host B의
+저장 배치만 비교한다. `row_major`는 원래 B(stride `(N,1)`), `k_contiguous`는
+`B.T.contiguous().T`(같은 `[K,N]` 값, stride `(1,K)`)를 전달한다. A와 출력,
+GEMM 설정과 backend의 row-major `[Ktile,Ntile]` 타일 패킹은 두 경우에 동일하다.
+직접 Triton을 호출해 실제 stride를 전달하므로 Torch lowering의 contiguous 복사가 없다.
+
+각 layout에서 warm-up 3회 이후 10회 측정한 중앙값을 나란히 출력하고,
+모든 실행 결과를 동일한 CPU int32 reference와 정확히 비교한다.
+`input_transform`은 매 호출의 B 준비 시간(전치 버퍼 할당 포함), `layout_b`는
+native B 패킹 시간이다. `input_transform+layout_b`도 매 호출에서 합산한 뒤
+중앙값을 낸다. `launch_wall`은 입력 준비를 제외하고, `e2e`는 입력 준비와 launch를
+포함한다. native stage는 `launch_wall` 안에 포함되므로 이 값들을 다시 합산하지 않는다.
+출력 할당, 입력 생성, reference 계산과 정확도 검사는 측정에서 제외한다.
+
+block `(32,32,64)`, group `(1,1,1)`, partition `(4,16,1)`의 64 DPU를 사용한다.
+Host threads는 8, tasklet은 16, staging reuse는 켠다.
+
+| `(M,N,K)` | `(tile_m,tile_n,tile_k)` |
+|---|---|
+| `(512,512,512)` | `(4,1,8)` |
+| `(1024,4096,1024)` | `(8,8,16)` |
+| `(1024,8192,2048)` | `(8,16,32)` |
+
+각 shape는 padding 없이 한 round에 맞으며 split-K는 사용하지 않는다.
+backend가 준비된 환경에서 사용자가 실행한다:
 
 ```bash
-export TRITON_CACHE_DIR=/home/dlrkdals/TritonPIM/.triton_cache_timing_v2
-export TORCHINDUCTOR_CACHE_DIR=/home/dlrkdals/TritonPIM/.inductor_cache_timing_v2
-export TRITON_ALWAYS_COMPILE=0
+python /home/dlrkdals/TritonPIM/triton_shared/pim_backend/examples/pim_transpose_gemm.py
 ```
-
-driver는 네이티브 host의 timing version을 실행 전에 확인한다. 이전 5개 항목을
-내는 host가 발견되면 새 범위로 해석하지 않고 재빌드/캐시 갱신 안내와 함께 중단한다.
-새 UPMEM 배열은 기존 5개 항목 뒤에 `host_alloc/host_free`를 추가한 7개 항목이며,
-AiMX의 5개 항목은 유지한다. 이전 JSON에 저장된 H2D/D2H/combine은 이전 범위의 값이다.
-Attention profiler는 JSON에 `pim_timing_version`도 기록한다.
 
 ## Attention 한 번의 실행을 표로 보기
 
@@ -189,7 +225,7 @@ UPMEM_PROFILE=backend=hw TRITON_ALWAYS_COMPILE=0 \
 - PIM shape는 `A @ B -> C`, CPU shape는 출력과 임시 버퍼를 포함한 tensor 인자들의
   서로 다른 shape 목록이다. 정확한 인자 순서, dtype, stride는 JSON에 남는다.
 - QK/PV의 `CPU+UPMEM` 시간은 host launcher와 전송을 포함한다. 아래 별도 표의
-  `stage/h2d/kernel/d2h/combine/host_alloc/host_free`는 각 PIM 행에 이미 포함된 세부 시간이다.
+  `TIMING_STAGES`의 13개 항목은 각 PIM 행에 이미 포함된 세부 시간이다.
   각 launch 직후 driver timing을 복사하므로 두 GEMM 모두 기록된다.
 - `kernel`에는 DPU 내부 DMA가 포함되고, `stage`에는 runtime의 DPU 확보/바이너리
   재적재 비용도 들어갈 수 있다. QK/PV 교대 호출의 실제 비용을 그대로 측정한다.

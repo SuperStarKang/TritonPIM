@@ -87,7 +87,8 @@ trade-off를 Random Forest에 설명하는 것이다.
 
 이 값들은 후보 선택에만 쓰며 compiler option이나 IR attribute를 새로 만들지 않는다.
 실행 시간은 세 번 측정한 median이 기본이고 UPMEM에서는
-`stage/h2d/kernel/d2h/combine` median도 후보 로그와 cache에 기록한다.
+`TIMING_STAGES`의 행동별 median도 후보 로그와 cache에 기록한다.
+UPMEM timing v3는 입력 layout, 버퍼 할당·초기화, 출력 layout과 `reduction`을 분리한다.
 기본 cache는 `TRITON_CACHE_DIR/pim_autotune_cache.json`에 저장한다. 저장할 때
 같은 디렉터리의 임시 파일을 완성한 뒤 교체하므로 `/tmp`를 사용하지 않으며,
 중단되더라도 기존 cache를 먼저 비우지 않는다. 0-byte 파일은 빈 cache로 취급하고
@@ -96,7 +97,7 @@ trade-off를 Random Forest에 설명하는 것이다.
 `PIMProblem`은 연산별 policy를 갖지 않는다. `compute_kind`는 PIM compute op의
 종류를 식별하는 의미 값이고, 각 `PIMAccess`는 unique buffer의 direction, dtype,
 logical axis dependency를 나타낸다. 입력 access가 사용하지 않는 축은 Common IR의
-`replicated_over`와 같은 의미다. Cache와 constraint/feature는 이 access 구성을
+`shared_over`와 같은 의미다. Cache와 constraint/feature는 이 access 구성을
 포함하므로 서로 다른 연산 결과를 섞지 않는다.
 
 ## 사용 예

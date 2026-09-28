@@ -1,9 +1,21 @@
 // Common hoists A, keeps B per Group, and UPMEM carries the hoisted input into
 // device code even when it is outside the original outermost compute loop.
 // RUN: triton-shared-opt --pim-reuse-execution-tile-inputs %s | FileCheck %s --check-prefix=COMMON
-// RUN: triton-shared-opt --pim-reuse-execution-tile-inputs --convert-pim-to-upmem %s | FileCheck %s --check-prefix=UPMEM
-// RUN: triton-shared-opt --pim-reuse-execution-tile-inputs --convert-pim-to-upmem %s | triton-shared-translate --upmem-to-device | FileCheck %s --check-prefix=C
-// RUN: triton-shared-opt --pim-reuse-execution-tile-inputs --convert-pim-to-upmem %s | triton-shared-translate --upmem-to-host > /dev/null
+// RUN: triton-shared-opt --pim-reuse-execution-tile-inputs --pim-form-host-plan %s | FileCheck %s --check-prefix=PLAN
+// RUN: triton-shared-opt --pim-reuse-execution-tile-inputs --pim-form-host-plan --convert-pim-to-upmem %s | FileCheck %s --check-prefix=UPMEM
+// RUN: triton-shared-opt --pim-reuse-execution-tile-inputs --pim-form-host-plan --convert-pim-to-upmem %s | triton-shared-translate --upmem-to-device | FileCheck %s --check-prefix=C
+// RUN: triton-shared-opt --pim-reuse-execution-tile-inputs --pim-form-host-plan --convert-pim-to-upmem %s | triton-shared-translate --upmem-to-host > /dev/null
+
+// PLAN-LABEL: func.func @reuse_n
+// PLAN: pim.partition
+// PLAN: pim.scatter 0
+// PLAN-NEXT: pim.scatter 1
+// PLAN-NEXT: pim.launch {
+// PLAN: %[[AA:.*]] = pim.access {{.*}}id = 0
+// PLAN: %[[A:.*]] = pim.load %[[AA]]
+// PLAN: scf.for
+// PLAN: linalg.matmul ins(%[[A]],
+// PLAN: pim.gather 2
 
 // COMMON-LABEL: func.func @reuse_n
 // COMMON: pim.execution_tile = #pim.execution_tile<groups = [1, 4, 1]>

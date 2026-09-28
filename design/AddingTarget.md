@@ -47,7 +47,14 @@ lowering은 Common IR의 다음 값만 읽는다.
 - `#pim.execution_tile`
 - `#pim.device_mapping<partitions=[p_m,p_n,p_k]>`
 - `pim.access/load/store/place`
+- `pim.partition`의 `pim.broadcast/scatter → pim.launch → pim.gather` 계획
 - linalg compute
+
+Common pipeline 마지막의 `--pim-form-host-plan`이 분석용 `pim.device`를 최종 계획으로
+변환한다. Target은 placement에서 전송 순서를 다시 추정하지 않고 명시적 action을
+소비한다. 전송 action의 access ID는 같은 partition의 `pim.place`를 가리킨다.
+`broadcast`는 `shared_over` 축으로 같은 입력을 받는 각 그룹의 배포이며, SDK의 특정
+broadcast 호출을 강제하지 않는다. Target의 primitive로 이 공유 관계를 보존한다.
 
 Target의 물리 padding, instruction/descriptor 생성, reduction primitive, 실제 lane
 활성화 방식은 target lowering에서 결정한다.
@@ -115,6 +122,6 @@ Target runtime option만 `PIMOptions`와 `<Target>RuntimeConfig`에 추가한다
 1. target profile이 일곱 필드로 PIM Common IR에 기록되는가
 2. Block–Group–Execution Tile attribute가 target lowering까지 보존되는가
 3. `[p_m,p_n,p_k]` mapping과 scheduling round가 target IR에 반영되는가
-4. `pim.place.allocation_shape`와 `replicated_over`를 target transfer가 사용하는가
+4. `pim.place.allocation_shape`와 `shared_over`를 target transfer가 사용하는가
 5. target 물리 capacity/padding 오류가 target lowering에서 명확히 진단되는가
 6. generated artifact가 target runtime config를 그대로 사용하는가
