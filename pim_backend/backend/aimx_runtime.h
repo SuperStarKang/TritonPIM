@@ -1,9 +1,10 @@
 // AiMX runtime shim — 생성된 stub(stub.cpp)과 descriptor program(aimx_descriptors.h)이
 // 쓰는 것만 모아 둔다. upmem_runtime.h 와 같은 자리이고 같은 역할이다.
 //
-// 여기에 정책은 없다. 진단, host 조립 buffer, bfloat16 변환 셋뿐이고 나머지는 전부
-// PIM runtime 이 이미 export 하는 것을 그대로 쓴다:
-//   pim.h       — init_pim_drv / pim_malloc / pim_private_malloc / VA2PA / datacopy_*
+// 진단, host 조립 buffer, bfloat16 변환, 그리고 AiMX 전용 resident resource ABI.
+// 연산 선택은 compiler가 하고, 공유 runtime 구현은 자원 수명만 관리한다.
+// 하위 PIM runtime의 기존 API를 사용한다:
+//   pim.h       — init_mpim_drv / totalDevNum / pim_malloc / VA2PA / datacopy_*
 //   pim_math.h  — pim_isa_32_t / PIM_RD_INSTR_MC / pim_exec
 //
 // 빌드에는 두 include 경로가 필요하다 (driver.py 의 _build_aimx_so 가 넣는다).
@@ -24,6 +25,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <mutex>
 
 // **pim_math.h 에는 extern "C" 가드가 없다.** pim.h 는 있다. 그래서 이 헤더를 C++ 에서
 // 그냥 들여오면 pim_exec 이 부르는 _pim_exec 만 C++ 이름으로 망가지고, libpim.so 가
@@ -70,6 +72,48 @@ static inline void aimx_require(int ok, const char *what) {
   if (!ok) {
     fprintf(stderr, "AIMX] %s\n", what);
     exit(1);
+  }
+}
+
+// Shared across generated kernel DSOs by libaimx_resident. A lease owns one
+// physical FPGA through staging, synchronous invocation and result collection.
+// Addresses and chain records stay live until plan replacement or explicit reset.
+struct aimx_resident_buffer {
+  uint64_t va, pa, next;
+  void *host;
+  int64_t bytes, alignment;
+  uint32_t idx;
+  int kind;
+};
+struct aimx_resident_context {
+  aimx_resident_buffer *buffers;
+  size_t count;
+  bool ready;
+  void *owner;
+};
+extern "C" {
+int aimx_runtime_init(int base_fpga, int num_fpga);
+aimx_resident_context *aimx_resident_acquire(const char *plan, int fpga,
+                                           size_t buffers);
+aimx_resident_buffer *aimx_resident_alloc(aimx_resident_context *context,
+                                         size_t slot, int64_t bytes,
+                                         int64_t alignment, int kind);
+void aimx_resident_release(aimx_resident_context *context);
+// Call only outside a lease; this frees our allocations, not the vendor driver.
+void aimx_resident_reset();
+}
+
+// Address relocation for an already-built descriptor group. The compiler emits
+// this only when record count/order are unchanged. Match mPIM_RD_INSTR_MC's
+// channel replication and high/low packing, leaving next/len/status untouched.
+// src/dst include pitch bits when the target instruction uses strided access.
+static inline void aimx_patch_descriptor_addresses(pim_isa_32_t *code,
+                                                    uint64_t src, uint64_t dst) {
+  for (unsigned channel = 0; channel < NUM_CHANNELS; ++channel) {
+    code[channel].src_l = (uint32_t)src;
+    code[channel].src_h = (uint32_t)(src >> 32);
+    code[channel].dst_l = (uint32_t)dst;
+    code[channel].dst_h = (uint32_t)(dst >> 32);
   }
 }
 
@@ -123,6 +167,9 @@ static inline void aimx_host_free(void *p, size_t bytes) {
 static inline uint16_t aimx_to_bf16(float f) {
   union { float f; uint32_t u; } c;
   c.f = f;
+  // Rounding a NaN payload must not turn it into infinity or signed zero.
+  if ((c.u & 0x7fffffffu) > 0x7f800000u)
+    return (uint16_t)((c.u >> 16) | 0x40u);
   uint32_t round = (c.u >> 16) & 1u;
   return (uint16_t)((c.u + 0x7fffu + round) >> 16);
 }

@@ -236,6 +236,22 @@ struct PIMPlaceDataPass
       // 도는 범위를 원본 버퍼의 크기로 자른다. 자르지 않으면 grid가 실제 크기보다 넓게
       // 잡힌 경우(마지막 tile이 통째로 무효인 경우) 버퍼 밖을 읽는다.
       Value length = span;
+      if (!access.getValid().empty()) {
+        if (auto valid = getConstantIntValue(access.getValid()[d])) {
+          if (*valid < 0 || *valid > access.getSizes()[d])
+            return access.emitError("pim-place-data: constant valid is outside the access size");
+          if (*valid == 0) {
+            length = c0;
+          } else if (*valid != access.getSizes()[d]) {
+            // Repeated partial groups contain holes and cannot be described
+            // by one contiguous placement. Do not silently expand their mask.
+            if (!first && getConstantIntValue(capacityTiles) != 1)
+              return access.emitError("pim-place-data: repeated constant partial masks need a non-contiguous placement");
+            Value validSize = b.create<arith::ConstantIndexOp>(loc, *valid);
+            length = b.create<arith::MinSIOp>(loc, span, validSize);
+          }
+        }
+      }
       if (!access.getValid().empty() &&
           !getConstantIntValue(access.getValid()[d])) {
         Value extent =

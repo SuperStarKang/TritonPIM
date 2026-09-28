@@ -90,6 +90,7 @@ def AiMX_AllocKindAttr : EnumAttr<AiMX_Dialect, AiMX_AllocKind, "kind">;
 //
 // batch 비트(15/16/17)는 여기 없다. batch 는 aimx.descriptor_program 의 attribute 이고
 // 그 비트는 codegen 이 유일하게 유도한다. 두 곳에 두면 서로 어긋날 수 있다.
+def AiMX_OpCopy         : I32BitEnumAttrCaseNone<"copy">;
 def AiMX_OpDescrDstMask : I32BitEnumAttrCaseBit<"descr_dst_mask", 0>;
 def AiMX_OpAMask        : I32BitEnumAttrCaseBit<"a_mask", 1>;
 def AiMX_OpBMask        : I32BitEnumAttrCaseBit<"b_mask", 2>;
@@ -110,7 +111,7 @@ def AiMX_OpLUT          : I32BitEnumAttrCaseBit<"lut", 19>;
 
 def AiMX_Opcode
     : I32BitEnumAttr<"Opcode", "AiMX descriptor status flags",
-                     [AiMX_OpDescrDstMask, AiMX_OpAMask, AiMX_OpBMask,
+                     [AiMX_OpCopy, AiMX_OpDescrDstMask, AiMX_OpAMask, AiMX_OpBMask,
                       AiMX_OpCMask, AiMX_OpMatmul, AiMX_OpAdd, AiMX_OpSub,
                       AiMX_OpMul, AiMX_OpDecoupled, AiMX_OpFusion, AiMX_OpBC,
                       AiMX_OpCL, AiMX_OpPimMode, AiMX_OpTP, AiMX_OpHold,
@@ -124,78 +125,9 @@ def AiMX_OpcodeAttr : EnumAttr<AiMX_Dialect, AiMX_Opcode, "opcode">;
 // Attributes
 //===----------------------------------------------------------------------===//
 
-// --convert-pim-to-aimx 가 고른 execution tile. --aimx-lower-matmul 이 이 값만 보고
-// descriptor program 을 펼치므로, tile 선택이라는 결정이 IR 에 한 번만 적힌다.
-//   batch     output block 을 batch x (4096/batch) 로 자르는 값. {1,2,4,8}
-//   t_m/t_n/t_k   padding이 반영된 물리 execution tile 크기
-//   padded_k  A 의 행 pitch (element). CHUNK = 4096 의 배수
-//   padded_n  B 와 C 의 행 pitch (element). 둘이 같아야 한다
-def AiMX_TilingAttr : AttrDef<AiMX_Dialect, "Tiling"> {
-  let mnemonic = "tiling";
-  let summary = "Execution tile chosen by --convert-pim-to-aimx";
-  let parameters = (ins "int64_t":$batch, "int64_t":$t_m, "int64_t":$t_n,
-                        "int64_t":$t_k, "int64_t":$padded_k,
-                        "int64_t":$padded_n, "bool":$transposed);
-  let assemblyFormat = "`<` struct(params) `>`";
-}
-
-def AiMX_TileGroupAttr : AttrDef<AiMX_Dialect, "TileGroup"> {
-  let mnemonic = "tile_group";
-  let summary = "How Triton blocks fill one block group of the hardware grid";
-  let description = [{
-    `#aimx.tiling` 은 **잡은 buffer 의 모양**이고, 이 attribute 는 **source 의 Triton
-    block 과 하드웨어 실행 눈금의 관계**다. 둘을 나누는 이유는 소비자가 다르기
-    때문이다 — buffer 모양은 runtime stub 이 쓰고, 이 관계는 legality 와 device 분할이
-    쓴다.
-
-    계층은 **Triton block → block group → execution tile** 이다. block group 은
-    Triton block 정수 개를 하드웨어 실행 단위(output block 높이 `batch`, output block
-    폭 `4096/batch`, reduction step `256/batch`)의 정수 배에 채운 것이다. 딱 맞지
-    않으면 남는 자리가 padding 이다 — stage 가 0 을 채우고 unstage 가 읽지 않으므로
-    정확성에는 무해하고, 그 몫의 lane 과 reduction step 이 노는 것이 비용이다.
-
-    `block` 은 `linalg.matmul` 의 operand 모양에서 읽은 `[BLOCK_M, BLOCK_N, BLOCK_K]` 다.
-
-    `group` 은 block group 하나가 담는 Triton block 수 `[m, n, k]` 다.
-
-    `execution` 은 block group 의 **물리 크기**다. 세 축 모두 같은 규칙이고 값은
-    공통 `#pim.block_group`의 useful 크기를 AiMX 실행 눈금에 맞춰 padding한 값이다:
-    `execution[i] = roundUp(group[i] * block[i], unit[i])`, 단위는
-    `[batch, 4096/batch, 256/batch]`. padding 은
-    `execution[i] - block[i] * group[i]` 로 유도된다 — 따로 싣지 않는다.
-
-    execution tile은 이 block group의 정수 배이고 `#aimx.tiling`의 t_m/t_n/t_k에
-    compile time 고정된다. tail round의 실제 유효 크기는 stage/unstage operand가
-    표현하며 descriptor chain 모양은 바뀌지 않는다.
-  }];
-  // DenseI64ArrayAttr 이어야 `[a, b, c]` 로 출력되고 다시 읽힌다. ArrayRefParameter 는
-  // struct(params) 안에서 대괄호 없이 나가 round-trip 이 깨진다 — 도구 사이를 MLIR
-  // 텍스트로 잇고 있으므로 그러면 파이프라인이 통째로 멈춘다. #pim.target_profile 의
-  // target lowering에서 계산한 고정 tiling 값도 같은 이유로 이 타입이다.
-  let parameters = (ins "::mlir::DenseI64ArrayAttr":$block,
-                        "::mlir::DenseI64ArrayAttr":$group,
-                        "::mlir::DenseI64ArrayAttr":$execution);
-  let assemblyFormat = "`<` struct(params) `>`";
-}
-
-//===----------------------------------------------------------------------===//
-// Level 1 — host op
-//===----------------------------------------------------------------------===//
-
-// PIM Common의 target-neutral compute를 L1에서 잃지 않기 위한 compiler-only
-// template이다. body의 block argument는 원래 linalg op의 operand와 같은
-// 순서·type이고, body에는 linalg.matmul/matvec/generic 같은 의미 연산이
-// 하나 든다. L1은 이 template을 보존하고 L2 descriptor lowering이 소비한
-// 뒤 지운다. 따라서 최종 translator가 linalg를 host 연산으로 실행하지
-// 않으면서도, operation kind·operand 순서·scalar body를 attribute로 다시
-// 인코딩하지 않고 L2까지 유지한다.
-def AiMX_ComputeTemplateOp
-    : AiMX_Op<"compute_template", [NoTerminator, Symbol, IsolatedFromAbove]> {
-  let summary = "Target compute semantics retained between AiMX L1 and L2";
-  let arguments = (ins SymbolNameAttr:$sym_name, StrAttr:$kind);
-  let regions = (region SizedRegion<1>:$body);
-  let assemblyFormat = "$sym_name `kind` $kind attr-dict-with-keyword $body";
-}
+// Host operations and descriptor programs are the final target IR.
+// A resultless scf.execute_region groups construction of one complete chain;
+// its nested SCF loops retain the Common traversal and SSA-buffer dependencies.
 
 // FPGA 를 확보한다. UPMEM 과 달리 적재할 device program 이 없으므로 커널 심볼을 받지
 // 않는다. 짝이 되는 반납 op 이 없는 것은 upmem.acquire 와 같은 이유다 — 다음 호출이
@@ -211,6 +143,15 @@ def AiMX_AcquireOp : AiMX_Op<"acquire"> {
 // block argument 는 그 FPGA 핸들 다음 축별 좌표다(axes 순서).
 // counts 는 #pim.device_mapping 의 partition 수를 그대로 옮긴 값이고, 곱이
 // acquire 의 num_devices 와 같아야 한다.
+// Optional unit attribute aimx.persistent retains this fixed allocation/build
+// plan by physical FPGA and compiled-kernel identity. The runtime leases the
+// device until the body completes; it never hoists or reorders Common rounds.
+// A different plan invalidates addresses and chain together. Invariant chains
+// replay unchanged. A fixed descriptor traversal with changing addresses can
+// patch src/dst fields while retaining next links, lengths and opcodes.
+// Dynamic min(tileGroups, remainingGroups) bounds can reuse the full-tile
+// chain under equality to tileGroups; tails preserve their actual traversal
+// and invalidate that cached full chain when they overwrite its storage.
 def AiMX_ForeachDeviceOp : AiMX_Op<"foreach_device", [NoTerminator]> {
   let summary = "Host loop over the FPGAs of a set";
   let arguments = (ins AiMX_DeviceSetType:$set, StrArrayAttr:$axes,
@@ -312,11 +253,10 @@ def AiMX_UnstageOp : AiMX_Op<"unstage", [AttrSizedOperandSegments]> {
   let hasVerifier = 1;
 }
 
-// descriptor program 하나를 chain 에 펼친다. tile loop **밖**에 두는 것이 재사용을 IR 에
-// 드러내는 방식이다 — tile 모양과 base 주소가 모두 같으므로 chain 이 모든 tile 에서
-// byte 단위로 동일하다.
-// 같은 chain 에 여러 번 펼칠 수 있고, 나오는 순서가 곧 chain 안의 순서다
-// (재배치 program 다음에 계산 program).
+// Append one descriptor sequence at its original Common computation site.
+// The surrounding scf.execute_region is the complete construction boundary;
+// nested group loops append to one chain in source order. The runtime uploads
+// and caches that complete chain, never a partially constructed group.
 def AiMX_BuildDescriptorsOp : AiMX_Op<"build_descriptors"> {
   let summary = "Expand a descriptor program into a descriptor chain";
   let arguments = (ins FlatSymbolRefAttr:$program, Variadic<AnyType>:$args,
@@ -334,7 +274,7 @@ def AiMX_InvokeOp : AiMX_Op<"invoke"> {
 }
 
 //===----------------------------------------------------------------------===//
-// Level 2 — descriptor op
+// Descriptor programs — descriptor op
 //===----------------------------------------------------------------------===//
 
 // descriptor 하나를 내는 loop nest. 몸체는 scf.for + arith + aimx.desc 다.

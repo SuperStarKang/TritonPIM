@@ -57,7 +57,6 @@ inline void registerTritonSharedDialects(mlir::DialectRegistry &registry) {
   mlir::triton::registerPIMVerifyPass();
   mlir::triton::registerConvertPIMToUPMEMPass();
   mlir::triton::registerConvertPIMToAiMXPass();
-  mlir::triton::registerAiMXLowerMatmulPass();
   mlir::triton::registerAddLLVMDebugInfoPass();
 
   // TODO: register Triton & TritonGPU passes
