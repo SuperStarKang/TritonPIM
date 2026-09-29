@@ -251,6 +251,131 @@ partition_profile correctness=PASS PIM_partitions=5 (excluded from median)
 Resident 경로의 native H2D 구간에는 전송 생략 판정과 round 시작 시 프로그램 적재 비용도 들어갈 수 있다.
 Weight tile packing은 반복 실행에도 남아 있으며, weight H2D 0을 weight 관련 CPU 비용 0으로 해석하지 않는다.
 
+## Single-head Transformer stack 실험
+
+**내용**
+`torch_resident_transformer.py`는 서로 다른 weight를 가진 Transformer block 1개, 2개 또는 4개를
+하나의 exported graph와 `ResidentBlock`에서 실행한다. Batch 1, sequence length 1024,
+hidden/head dimension 4096, head 1, SwiGLU intermediate dimension 11008의 FP32 실험이다.
+Normal orientation, 2048 DPU·16 tasklet을 고정하고, 기존 lowering과 resident runtime을 사용한다.
+
+**근거**
+- 각 block은 RMSNorm → Q/K/V → RoPE → causal attention → output projection → residual →
+  RMSNorm → SwiGLU → residual 순서다. RMSNorm epsilon은 `1e-5`, RoPE theta는 `10000`이며
+  인접한 두 채널을 회전한다. Position은 0부터 1023까지다.
+- Q/K/V/O와 gate/up/down의 고정 weight 7개를 각 DPU에 배치한다. RMSNorm의 weight와
+  RoPE/mask buffer는 CPU에서 사용한다. 모든 block의 동적 입출력은 공용 MRAM scratch를 사용한다.
+- GEMM은 block당 9개다. 원본 FX의 shape, op, layer 경로와 weight 출처를 확인하고,
+  각 GEMM이 scheduling round 하나로 실행되는 설정인지 준비 전에 확인한다.
+- Q/K/V와 gate/up은 각각 같은 입력을 사용한다. 실행마다 weight H2D 0, launch `9 × layers`,
+  activation hit `3 × layers` 이상을 확인한다. 별도 profile에서는 K/V/up의 activation H2D 0도 확인한다.
+- Model은 최종 stack 출력 하나만 반환한다. 서로 다른 입력 두 개의 최종 출력을 CPU reference와
+  `rtol=1e-4`, `atol=1e-4`로 비교하고 최대 절대 오차를 기록한다.
+
+**예시**
+
+```text
+X → RMSNorm → Q/K/V → RoPE(Q,K) → QKᵀ → scale + causal mask + softmax
+                                                          │
+                                                          PV → O → + X = H
+                                                                         │
+H → RMSNorm → gate → SiLU ─┐                                             │
+            └→ up ─────────× → down → + H → 다음 block 또는 최종 출력
+```
+
+Block은 `(16,16,32)`, group은 `(1,1,1)`, partition은 `(32,64,1)`이다.
+아래 표의 Gate/Up만 N을 11008에서 11264로 zero-pad하고 GEMM 후 논리 크기로 잘라낸다.
+Down의 K는 논리 크기 11008이다. 세 계층 lowering 자체를 변경하지 않는다.
+
+| 연산 | 논리 `(M,N,K)` | 실행 `(M,N,K)` | `(tile_m,tile_n,tile_k)` |
+|---|---|---|---|
+| Q/K/V/O 각각 | `(1024,4096,4096)` | 동일 | `(2,4,128)` |
+| QKᵀ | `(1024,1024,4096)` | 동일 | `(2,1,128)` |
+| PV | `(1024,4096,1024)` | 동일 | `(2,4,32)` |
+| Gate/Up 각각 | `(1024,11008,4096)` | `(1024,11264,4096)` | `(2,11,128)` |
+| Down | `(1024,4096,11008)` | 동일 | `(2,4,344)` |
+
+## Transformer stack 준비와 실행
+
+**내용**
+준비 전에 전체 weight와 공용 scratch의 MRAM 크기를 계산해 target 예산과 비교한다.
+실제 capture 후의 weight 영역, window 수, scratch 위치와 크기도 이 계산과 일치하는지 확인한다.
+현재 capture 방식은 최초 upload가 끝나기 전까지 전체 DPU용 packed weight를 host에 보관한다.
+
+**근거**
+- Padding을 포함한 projection weight는 block당 DPU별 12,779,520 bytes다.
+- 공용 입력 scratch는 1,409,024 bytes, 공용 출력 scratch는 22,528 bytes다.
+- Host capture 크기는 `DPU당 weight bytes × 2048`이며, 원본 model과 CPU reference,
+  layout/staging buffer 등의 메모리는 아래 수치에 추가된다.
+- 모든 block을 준비한 다음 실행하므로 반복 측정에서는 layer 교체에 따른 weight 전송이 없다.
+
+**예시**
+
+| Block 수 | DPU당 MRAM bytes | DPU당 MRAM MiB | 최초 weight 전송 / host weight capture | 실행당 launch |
+|---|---|---|---|---|
+| 1 | 14,211,072 | 13.5527 | 24.375 GiB | 9 |
+| 2 | 26,990,592 | 25.7402 | 48.75 GiB | 18 |
+| 4 | 52,549,632 | 50.1152 | 97.5 GiB | 36 |
+
+Repository root에서 사용자가 직접 실행한다. 진행 로그는 stderr, 최종 JSON은 stdout이다.
+
+```bash
+python pim_backend/torch_backend/examples/torch_resident_transformer.py --layers 1 > resident_transformer_1.json
+python pim_backend/torch_backend/examples/torch_resident_transformer.py --layers 2 > resident_transformer_2.json
+python pim_backend/torch_backend/examples/torch_resident_transformer.py --layers 4 > resident_transformer_4.json
+```
+
+각 실행은 준비 → warm-up 3회 → 일반 측정 3회 → 별도 partition profile 1회 순서다.
+Transformer profile은 각 partition을 같은 입력의 CPU reference와 비교하는 진단 실행이다.
+CPU partition은 원본 FX module, PIM partition은 논리 shape의 `torch.mm` 결과와 비교한다.
+실패하면 예외를 그대로 전달하며 partition 이름과 연산 목록을 표시한다.
+작성 과정에서는 빌드·실행·검증을 수행하지 않았다. 아래는 성공 시 기대하는 로그 형태다.
+
+```text
+# --layers 1
+preflight MRAM_bytes_per_DPU=14211072 captured_weight_host_bytes=26172456960 (other host buffers excluded)
+sample=0 correctness=PASS wall_ms=... weight_h2d=0 ... activation_hits=3 launches=9
+partition_profile correctness=PASS PIM_partitions=9 (excluded from median)
+
+# --layers 2 / --layers 4: launches=18 / launches=36
+```
+
+## Transformer JSON의 측정 범위와 남은 구현
+
+**내용**
+`median_wall_ms`는 계측 wrapper 없는 전체 `block.run()`의 중앙값이다.
+별도 profile에 layer별 attention/FFN GEMM 합계, native 단계, 전송량을 추가한다.
+CPU partition은 layer 경계를 넘을 수 있으므로 layer별 GEMM 시간과 별도로 기록한다.
+Profile 전체 시간에는 CPU reference 계산과 비교도 포함되며 `validation_ms`로 따로 기록한다.
+
+**근거**
+- `profile.layers[*].attention_gemm_ms`는 Q/K/V, QKᵀ, PV, O 여섯 GEMM partition의 시간 합이다.
+  `ffn_gemm_ms`는 gate/up/down 세 GEMM partition의 시간 합이다. 양쪽 모두 layout·전송·출력 복원을 포함한다.
+- Layer별 합계에는 독립적인 CPU partition의 RMSNorm·RoPE·mask·softmax·residual·SiLU 등이 포함되지 않는다.
+  `profile.cpu_partition_ms`와 `profile.partitions`에서 해당 시간을 확인한다.
+- `profile.layers[*].native_ms`는 DPU 실행과 host 단계를 구분한다. `h2d`에는 프로그램 로드와
+  activation 재사용 판정도 포함된다. Profile 전체 시간은 일반 측정 중앙값과 합산하지 않는다.
+- Partition reference 계산과 비교는 `partitions[*].wall_ms`에서 제외한다. 진단을 위해 CPU 계산과
+  tensor 수명이 추가되므로 이 profile의 wall time을 일반 실행 성능으로 사용하지 않는다.
+  `outside_partitions_ms`에서는 partition 실행 시간과 `validation_ms`를 모두 뺀다.
+- 이번 실험은 random weight의 single-head stack이다. Tokenizer, embedding, LM head, 실제 checkpoint,
+  multi-head/GQA, KV cache, weight eviction과 요청 단위 DPU 반환은 이후 구현 범위다.
+
+**예시**
+
+| JSON 항목 | 의미 |
+|---|---|
+| `gemms[*].layer / operation / section` | 원본 FX GEMM의 layer와 attention/FFN 구분 |
+| `gemms[*].mnk / padded_shape` | 논리 shape와 실제 실행 shape |
+| `preparation.mram_bytes_per_dpu` | 모든 layer weight와 공용 scratch 합계 |
+| `preparation.captured_weight_host_bytes` | 최초 upload 전 host가 보관하는 packed weight 합계 |
+| `samples[*].max_abs_error` | CPU reference 대비 최종 stack 출력의 최대 절대 오차 |
+| `profile.layers[*].gemm_partition_ms` | 해당 layer의 9개 GEMM partition 합계 |
+| `profile.cpu_partition_ms` | 전체 stack의 독립 CPU partition 합계 |
+| `profile.partitions[*]` | 실행 순서대로 기록한 CPU/PIM 구간 |
+| `profile.validation_ms` | Partition별 CPU reference 계산과 정확도 비교 시간 합계 |
+| `profile.partitions[*].correctness` | 같은 입력의 CPU reference와 비교한 결과; 실패 시 예외 |
+
 ## PIMLLM 비교 조건
 
 **내용**

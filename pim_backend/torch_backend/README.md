@@ -45,6 +45,11 @@ Bias, scaling, reshape 등은 CPU 구간에서 처리한다.
 `examples/torch_resident_attention.py`는 1024/4096 single-head FP32 attention의
 weight residency, 정확도와 준비/반복 실행 시간을 측정한다. 설정과 JSON 항목은
 [ResidentBlock 사용법](RESIDENT.md)의 attention 실험 항목에 설명되어 있다.
+`examples/torch_resident_transformer.py --layers 1`은 여기에 causal mask, RoPE,
+output projection, RMSNorm, residual, SwiGLU FFN을 포함한다. `--layers 2` 또는
+`--layers 4`로 서로 다른 weight를 가진 여러 block을 하나의 resident graph에서 실행한다.
+Normal orientation, FP32, 2048 DPU·16 tasklet을 사용하며, 준비 전 MRAM과 host weight
+capture 크기를 출력한다. 자세한 설정은 같은 문서의 Transformer stack 실험 항목에 있다.
 
 ## Common IR configuration
 
