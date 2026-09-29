@@ -34,7 +34,7 @@ from triton.backends.driver import DriverBase
 from triton.backends.compiler import GPUTarget
 
 import triton.backends.triton_shared.driver as cpu_driver
-from .resident import current_invocation, resident_lock
+from .runtime import current_invocation, resident_lock
 
 
 # ── PIM_TIMING (임시): 마지막 launch의 단계별 시간(ms)과 그 단계 이름.
@@ -242,8 +242,6 @@ class PIMLauncher(object):
         bundle = json.loads(bytes(cu_function).decode("utf-8"))
         invocation = current_invocation.get()
         if invocation is not None:
-            if self.pim_target != "upmem":
-                raise ValueError("ResidentBlock requires the UPMEM backend")
             if launch_enter_hook is not None:
                 launch_enter_hook(launch_metadata)
             invocation.launch(self, bundle, kernel_metadata[6],

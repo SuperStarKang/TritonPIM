@@ -12,9 +12,8 @@ from torch.fx.operator_schemas import normalize_function
 from torch.fx.passes.split_module import split_module
 from torch.utils import _pytree
 
-from triton.backends.pim.resident import (
-    ResidentInvocation, ResidentRuntime, resident_lock,
-)
+from triton.backends.pim.resident import ResidentRuntime
+from triton.backends.pim.runtime import current_session, resident_lock
 
 from ._autotuner import ConstraintEngine, PIMProblem
 from .backend import PIMInductorBackend
@@ -40,10 +39,6 @@ class ResidentGemmConfig:
             raise ValueError("resident GEMMs require an explicit target spec and PIMConfig")
         if self.torch_config.autotune_cache_path is not None:
             raise ValueError("resident GEMMs take explicit configs, not an autotune cache path")
-        if self.torch_config.spec.common_profile.target != "upmem":
-            raise ValueError("weight residency currently requires UPMEM")
-        if self.torch_config.spec.runtime_config.nr_tasklets < 1:
-            raise ValueError("resident GEMMs require an explicit positive nr_tasklets")
 
 
 def _tensor_signature(tensor):
@@ -142,14 +137,14 @@ def _gemm_operands(node):
     return arguments.kwargs["input"], arguments.kwargs["mat2"]
 
 
-def _check_config(name, gemm, config, dpu_count):
+def _check_config(name, gemm, config, num_units):
     if any(padded < logical for padded, logical in zip(config.padded_shape, gemm.mnk)):
         raise ValueError(f"{name}: padded_shape cannot shrink the logical GEMM")
     target = config.torch_config.spec
     hierarchy = config.torch_config.config
-    if (target.common_profile.num_units != dpu_count
-            or hierarchy.p_m * hierarchy.p_n * hierarchy.p_k != dpu_count):
-        raise ValueError(f"{name}: every GEMM must use the same full set of {dpu_count} DPUs")
+    if (target.common_profile.num_units != num_units
+            or hierarchy.p_m * hierarchy.p_n * hierarchy.p_k != num_units):
+        raise ValueError(f"{name}: every GEMM must use the same full set of {num_units} units")
     m, n, k = config.padded_shape
     if config.orientation == "dual":
         m, n = n, m
@@ -161,9 +156,6 @@ def _check_config(name, gemm, config, dpu_count):
     reason = ConstraintEngine(problem, target).check(hierarchy)
     if reason is not None:
         raise ValueError(f"{name}: {reason}")
-    lanes = target.runtime_config.nr_tasklets
-    if lanes > target.common_profile.lanes_per_core or hierarchy.block_m * hierarchy.group_m % lanes:
-        raise ValueError(f"{name}: nr_tasklets must divide the physical Block Group M extent")
 
 
 class _ResidentGemm(torch.nn.Module):
@@ -179,6 +171,7 @@ class _ResidentGemm(torch.nn.Module):
         placeholders = [node for node in partition.graph.nodes if node.op == "placeholder"]
         operation = next(node for node in partition.graph.nodes
                          if node.op == "call_function" and node.name == gemm.node)
+        self.operation = operation.target
         output = next(node for node in partition.graph.nodes if node.op == "output")
         if output.args[0] is not operation:
             raise ValueError(f"{name}: PIM partition must return its GEMM tensor directly")
@@ -218,14 +211,17 @@ class _ResidentGemm(torch.nn.Module):
             for index, tensor in enumerate(inputs))
         return physical[::-1] if self.config.orientation == "dual" else physical
 
-    def prepare(self):
-        start = time.perf_counter_ns()
+    def preparation_inputs(self):
         m, n, k = self.logical_shape
         inputs = tuple(weight if weight is not None else torch.zeros(shape, dtype=self.input_dtype)
                        for weight, shape in zip(self.weights, ((m, k), (k, n))))
-        physical = self._physical_inputs(inputs)
+        return self._physical_inputs(inputs)
+
+    def prepare(self):
+        start = time.perf_counter_ns()
+        physical = self.preparation_inputs()
         self.weight_layout_ms += (time.perf_counter_ns() - start) / 1e6
-        with ResidentInvocation(self, physical, capture=True):
+        with self.runtime.invocation(self, physical, capture=True):
             self.compiled(*physical)
 
     def forward(self, *inputs):
@@ -238,7 +234,7 @@ class _ResidentGemm(torch.nn.Module):
             if matrix.shape != shape or matrix.dtype != self.input_dtype or matrix.device.type != "cpu":
                 raise ValueError(f"{self.name}: GEMM input differs from its prepared shape/dtype/device")
         physical = self._physical_inputs(matrices)
-        with ResidentInvocation(self, physical, capture=False):
+        with self.runtime.invocation(self, physical, capture=False):
             output = self.compiled(*physical)
         if self.config.orientation == "dual":
             output = output.transpose(0, 1)
@@ -286,7 +282,7 @@ class ResidentBlock:
                 state.check()
             before = self.runtime.stats()
             start = time.perf_counter_ns()
-            self.runtime.library.upmem_resident_reset_inputs(self.runtime.handle)
+            self.runtime.reset_inputs()
             outputs = self.graph(*leaves)
             self.last_run_ms = (time.perf_counter_ns() - start) / 1e6
             after = self.runtime.stats()
@@ -315,6 +311,8 @@ def prepare_block(exported_program, example_inputs, *, configs, dpu_count):
     Compilation, host staging capture, ELF linking and weight H2D happen here.
     DPU GEMM execution starts only when the returned block's run() is called.
     """
+    if current_session.get() is not None:
+        raise RuntimeError("prepare_block cannot be mixed with an active PIMSession")
     with resident_lock, torch.no_grad(), ExitStack() as cleanup:
         start = time.perf_counter_ns()
         leaves, specification = _pytree.tree_flatten((example_inputs, {}))
@@ -333,6 +331,7 @@ def prepare_block(exported_program, example_inputs, *, configs, dpu_count):
         gemms = {nodes[mapping.normalized.node]: mapping for mapping in mappings}
         gemm_weights = {}
         for node, mapping in gemms.items():
+            ResidentRuntime.validate_config(configs[mapping.original.node])
             _check_config(mapping.original.node, mapping.normalized,
                           configs[mapping.original.node], dpu_count)
             gemm_weights[node] = tuple(

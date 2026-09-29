@@ -26,6 +26,10 @@ struct dpu_set_t upmem_acquire(uint32_t num_units, const char *binary_path);
 struct dpu_set_t upmem_runtime_reserve(uint32_t num_units);
 int upmem_runtime_load(const char *binary_path);
 
+// Explicit request ownership; closing frees the set immediately.
+void upmem_session_open(uint32_t num_units);
+void upmem_session_close(void);
+
 #include "upmem_resident.h"
 
 // 같은 rank/member 안의 CI 순서에 컴파일된 논리 묶음을 배정한다.

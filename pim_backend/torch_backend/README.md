@@ -276,6 +276,101 @@ warm-up 뒤 해당 모듈의 커널 참조만 임시 교체하고 호출 후 복
 | `fx_analysis.py` | GEMM shape/dtype, weight 출처 분석 |
 | `fx_normalization.py` | `linear`/`addmm` 정규화와 원본 GEMM 대응 |
 | `resident.py` | 정규화된 FX graph 분할, 고정 weight 준비와 반복 실행 |
+| `layer.py` | 하드웨어 할당 없는 `compile_layer`, `LayerPlan`, runtime FX load/run 노드 |
+| `../backend/runtime.py` | 공통 `RuntimeBackend` 계약과 요청 단위 `PIMSession` |
+| `../backend/upmem_adapter.py` | UPMEM artifact 준비, layer MRAM 교체, 명시적 자원 할당/해제 |
+
+## 요청 단위 session과 Llama TTFT
+
+`examples/torch_llama_ttft.py`는 로컬 Llama-2-7b-hf를 FP32로 불러와
+batch 1, sequence 1024, 32개 layer의 prefill과 첫 greedy token ID 생성을 수행한다.
+2048개 unit과 16개 UPMEM tasklet을 사용한다. embedding, 최종 RMSNorm,
+lm_head는 CPU에서 실행하고, layer의 7개 projection과 head별 QK/PV 64개는
+PIM에서 실행한다. QKV/epilogue fusion과 decode 반복은 포함하지 않는다.
+
+```text
+요청 전: export + FX 분석/정규화 + PIM/CPU 컴파일 + device ELF 링크
+         compile_layer(...) -> LayerPlan × 32 (DPU 할당/H2D 없음)
+
+요청:    tokenize -> PIMSession.__enter__ -> embedding
+                       │ alloc 1회
+                       v
+         LoadLayerWeights(0) -> ready_0 -> RunLayer(0) -> hidden_0, KV_0, done_0
+              ^                                                       │
+              │            LoadLayerWeights(1) <──────────────────────┘
+              │                    -> ready_1 -> RunLayer(1) -> ...
+              │                         ...
+         같은 전체 unit 집합     LoadLayerWeights(31) -> RunLayer(31)
+                                                      │
+                                    CPU norm -> lm_head -> argmax
+                                                      │ 첫 token ID: TTFT 종료
+                                           PIMSession.close -> free 1회
+```
+
+`LoadLayerWeights`와 `RunLayer`는 실제 실행되는 바깥 FX GraphModule의
+`call_module` 노드다. 바깥 그래프는 Python으로 실행하고, 안쪽 layer의 GEMM과
+CPU partition만 컴파일한다. load/run 모듈에는 `_is_impure=True`를 표시하고,
+이전 layer의 completion token을 다음 weight 교체의 입력으로 연결한다.
+session은 오래된 token, 다른 plan, 다른 thread의 실행을 거부한다.
+
+공통 코드에는 DPU handle이나 MRAM 주소가 없다. `RuntimeBackend`는
+컴파일 artifact 준비, 자원 open/close, layer 교체, kernel invocation, 누적
+통계를 정의한다. `PIMTargetSpec.common_profile.target`이 adapter를 선택한다.
+UPMEM adapter만 구현되어 있으며, 다른 target의 resident 실행 요청은
+`NotImplementedError`로 종료한다. compiler의 3계층 lowering은 변경하지 않는다.
+
+UPMEM에서는 session open/close가 `upmem_session_open/close`를 거쳐
+`dpu_alloc/free`를 호출한다. layer 교체는 이전 native resident block의
+host 상태를 해제한 뒤 같은 DPU 집합에 새 block을 연결한다. layer의 모든
+weight와 공용 input/output scratch를 배치하고, 컴파일 때 링크한 MRAM 주소와
+capture 결과를 대조한 뒤 weight를 전송한다. 현재는 `p_k=1`, 한 scheduling
+round와 weight당 한 window를 요구한다. 실행 도중의 GEMM은 weight H2D를
+생략하지만, 기존 generated host 코드의 weight packing까지 생략하지는 않는다.
+
+모든 layer의 packed weight를 host에 보관하지 않는다. 각 load 노드에서 현재
+layer만 capture하고, upload 직후 native staging buffer를 해제한다. 원본 모델과
+각 plan의 contiguous/padded weight는 host에 계속 존재한다. 현재 배치의
+weight 복제량은 layer당 24.375 GiB, 전체 요청 H2D는 780 GiB다. MRAM weight는
+DPU당 layer 하나의 12.1875 MiB만 상주하며 scratch가 추가된다. 이는 최초 기준
+구현의 비용이며, layer 교체가 weight 전송 자체를 없애는 것은 아니다.
+
+기존 `prepare_block` 예제는 기존 lifecycle을 유지한다. 새 session 실험은
+독립 프로세스에서 실행한다. 이전 API가 남긴 implicit DPU 할당이 있는
+프로세스에서는 새 session이 소유권 충돌을 진단한다.
+
+backend 환경과 하드웨어 설정을 준비한 뒤 사용자가 직접 실행한다:
+
+```bash
+cd /home/dlrkdals/TritonPIM/triton_shared/pim_backend/torch_backend/examples
+python torch_llama_ttft.py \
+  --checkpoint /path/to/models--meta-llama--Llama-2-7b-hf/snapshots/SNAPSHOT \
+  --prompt-file prompt.txt
+```
+
+`prompt.txt`는 tokenizer의 특수 token을 포함해 1024 token 이상인 일반 텍스트다.
+처음 1024 token을 사용한다. 실행 결과는 `llama_ttft_report/`에 저장된다.
+
+| 결과 | 의미 |
+|---|---|
+| `request_fx.txt`, `.dot` | 실제 load/run 노드와 layer 사이 token/activation 의존성 |
+| `layer_N_export.txt`, `.dot` | GEMM shape와 weight 출처를 표시한 원본 FX |
+| `layer_N_partitions.txt`, `.dot` | PIM GEMM/CPU partition 실행 그래프 |
+| `report.json` | 준비 시간, TTFT, layer별 load/run 시간, 전송량, correctness |
+
+`ttft_ms`는 tokenization 시작부터 첫 token ID의 `.item()`까지다. 자원 할당,
+layer별 capture/packing/upload, activation 전송, 계산, CPU 후처리를 포함한다.
+파일 읽기, 모델 로딩, export/컴파일, 첫 token 이후 free, HF reference 검사는
+제외한다. `request_ms_including_close`에는 free까지 포함된다.
+`weight_load_ms` 안에 `capture_ms`와 `upload_ms`가 포함되므로 중복 합산하지 않는다.
+capture에는 native packing 등이, upload에는 최초 program load와 weight H2D가
+포함된다. run 시간은 layer의 CPU 연산과 host 처리, 전송, PIM 연산 전체다.
+
+측정 중 Dynamo 재컴파일은 오류로 처리한다. 측정 후 allocation/free 1회씩,
+2272번의 실제 PIM launch, 모든 layer의 run 구간 weight H2D=0을 검사한다.
+CPU KV cache는 layer당 `[1,32,1024,128]` K/V이며 총 1 GiB다. HF CPU의 마지막
+logits, greedy token, 모든 layer KV와 비교하며 허용 오차는 `rtol=atol=1e-4`다.
+검사 전에 실행 통계를 먼저 저장하고, 모든 검사가 통과할 때만
+`TTFT correctness=PASS resources=1/1 launches=2272 run_weight_h2d=0`을 출력한다.
 
 ## 현재 지원 범위
 

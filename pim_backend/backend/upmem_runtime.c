@@ -12,6 +12,7 @@ static uint32_t g_num_units = 0;
 static struct dpu_set_t g_set;
 static char g_loaded[1024];  // 현재 적재된 binary 경로 (reload 필요 판단용)
 static int g_atexit_done = 0;
+static int g_session_open = 0;
 
 void upmem_bind_devices(struct dpu_set_t set, uint32_t num_axes,
                         const uint32_t *partitions,
@@ -86,10 +87,16 @@ static void upmem_free_set(void) {
     if (g_have) {
         DPU_ASSERT(dpu_free(g_set));
         g_have = 0;
+        g_num_units = 0;
+        g_loaded[0] = '\0';
     }
 }
 
 struct dpu_set_t upmem_runtime_reserve(uint32_t num_units) {
+    if (g_session_open && (!g_have || g_num_units != num_units)) {
+        fprintf(stderr, "UPMEM session cannot replace its allocated device set\n");
+        abort();
+    }
     if (!g_atexit_done) {
         atexit(upmem_free_set);
         g_atexit_done = 1;
@@ -108,6 +115,24 @@ struct dpu_set_t upmem_runtime_reserve(uint32_t num_units) {
     return g_set;
 }
 
+void upmem_session_open(uint32_t num_units) {
+    if (!num_units || g_session_open || g_have || upmem_resident_owns_set()) {
+        fprintf(stderr, "UPMEM session requires exclusive ownership of an unallocated runtime\n");
+        abort();
+    }
+    upmem_runtime_reserve(num_units);
+    g_session_open = 1;
+}
+
+void upmem_session_close(void) {
+    if (!g_session_open || !g_have || upmem_resident_owns_set()) {
+        fprintf(stderr, "UPMEM session close requires all resident layers to be released\n");
+        abort();
+    }
+    upmem_free_set();
+    g_session_open = 0;
+}
+
 int upmem_runtime_load(const char *binary_path) {
     if (strlen(binary_path) >= sizeof(g_loaded)) {
         fprintf(stderr, "UPMEM binary path exceeds runtime capacity\n");
@@ -123,6 +148,10 @@ int upmem_runtime_load(const char *binary_path) {
 struct dpu_set_t upmem_acquire(uint32_t num_units, const char *binary_path) {
     if (upmem_resident_owns_set())
         return upmem_resident_acquire(num_units);
+    if (g_session_open) {
+        fprintf(stderr, "UPMEM session execution requires a bound resident layer\n");
+        abort();
+    }
     struct dpu_set_t set = upmem_runtime_reserve(num_units);
     upmem_runtime_load(binary_path);
     return set;

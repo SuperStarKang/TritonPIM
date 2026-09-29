@@ -8,16 +8,14 @@ import struct
 import subprocess
 import tempfile
 import time
-from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
-from threading import RLock
 
 from triton.runtime.cache import get_cache_manager
 
+from .runtime import current_invocation, resident_lock
 
-current_invocation = ContextVar("upmem_resident_invocation", default=None)
-resident_lock = RLock()
+
 MRAM_BASE = 0x08000000
 WEIGHT = 1
 INPUT = 2
@@ -163,6 +161,17 @@ def _build_program(bundle, addresses):
 
 
 class ResidentRuntime:
+    @staticmethod
+    def validate_config(config):
+        target = config.torch_config.spec
+        hierarchy = config.torch_config.config
+        if target.common_profile.target != "upmem":
+            raise ValueError("this resident runtime requires UPMEM")
+        lanes = target.runtime_config.nr_tasklets
+        if (lanes < 1 or lanes > target.common_profile.lanes_per_core
+                or hierarchy.block_m * hierarchy.group_m % lanes):
+            raise ValueError("nr_tasklets must divide the physical Block Group M extent")
+
     def __init__(self, units, capacity):
         from .driver import _build_upmem_runtime
 
@@ -245,12 +254,24 @@ class ResidentRuntime:
                     window = (self.library.upmem_resident_window(kernel.handle, round_index, index)
                               if binding.role == WEIGHT else 0)
                     addresses[binding.symbol] = kernel.addresses[index][window]
-                path = _build_program(kernel.bundle, addresses)
+                path = self.program_for(kernel, addresses)
                 self.library.upmem_resident_program(kernel.handle, round_index, path.encode())
         start = time.perf_counter_ns()
         self.library.upmem_resident_upload(self.handle)
         self.upload_ms = (time.perf_counter_ns() - start) / 1e6
         self.ready = True
+
+    def library_for(self, name, bundle):
+        return ctypes.CDLL(_build_host(bundle, self.path))
+
+    def program_for(self, kernel, addresses):
+        return _build_program(kernel.bundle, addresses)
+
+    def invocation(self, kernel, physical_inputs, *, capture):
+        return ResidentInvocation(kernel, physical_inputs, capture)
+
+    def reset_inputs(self):
+        self.library.upmem_resident_reset_inputs(self.handle)
 
     def stats(self):
         if self.handle is None:
@@ -289,6 +310,8 @@ class ResidentInvocation:
     def launch(self, launcher, bundle, entry, grid, arguments):
         from . import driver
 
+        if launcher.pim_target != "upmem":
+            raise ValueError("UPMEM invocation received a different target")
         self.calls += 1
         if self.calls != 1:
             raise RuntimeError("a resident GEMM must launch exactly one generated host function")
@@ -330,7 +353,7 @@ class ResidentArtifact:
         self.bundle = bundle
         self.entry = entry
         self.bindings = bindings
-        self.library = ctypes.CDLL(_build_host(bundle, runtime.path))
+        self.library = runtime.library_for(name, bundle)
         version = ctypes.c_uint32.in_dll(self.library, "pim_timing_version").value
         if version != UPMEM_TIMING_VERSION:
             raise RuntimeError(f"UPMEM timing ABI mismatch: {version} != {UPMEM_TIMING_VERSION}")
