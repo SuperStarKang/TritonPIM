@@ -13,7 +13,6 @@
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
-#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
@@ -142,9 +141,16 @@ struct ConvertPIMToUPMEMPass
     if (failed(checkLegality()))
       return signalPassFailure();
 
-    SmallVector<pim::DeviceOp> devices;
-    getOperation().walk([&](pim::DeviceOp d) { devices.push_back(d); });
-    for (pim::DeviceOp d : devices)
+    WalkResult unplanned = getOperation().walk([&](pim::DeviceOp device) {
+      device.emitOpError("requires pim-form-host-plan before UPMEM lowering");
+      return WalkResult::interrupt();
+    });
+    if (unplanned.wasInterrupted())
+      return signalPassFailure();
+
+    SmallVector<pim::PartitionOp> devices;
+    getOperation().walk([&](pim::PartitionOp d) { devices.push_back(d); });
+    for (pim::PartitionOp d : devices)
       convert(d);
 
     // 공통 PIM planning 속성은 여기서 모두 소비된다. 남겨 두면 target
@@ -189,30 +195,39 @@ struct ConvertPIMToUPMEMPass
     return success();
   }
 
-  void convert(pim::DeviceOp device) {
+  void convert(pim::PartitionOp device) {
     auto func = device->getParentOfType<func::FuncOp>();
     ModuleOp module = getOperation();
     MLIRContext *ctx = &getContext();
     Location loc = device.getLoc();
     Block *deviceBody = &device.getBody().front();
-    if (reuseStaging)
-      module->setAttr("upmem.reuse_staging", UnitAttr::get(ctx));
-
     int64_t lanes = nrTasklets == 0 ? profile.getLanesPerCore() : nrTasklets;
-    // ── 입력 모으기 ────────────────────────────────────────────────────────
-    SmallVector<pim::PlaceOp> inputs, outputs;
-    for (Operation &op : *deviceBody)
-      if (auto p = dyn_cast<pim::PlaceOp>(&op))
-        (p.getDirection() == "out" ? outputs : inputs).push_back(p);
+    if (failed(device.verify()))
+      return signalPassFailure();
 
-    scf::ForOp nest;
-    for (Operation &op : *deviceBody)
-      if (auto f = dyn_cast<scf::ForOp>(&op)) {
-        nest = f;
-        break;
+    llvm::DenseMap<int64_t, pim::PlaceOp> placements;
+    for (pim::PlaceOp place : deviceBody->getOps<pim::PlaceOp>())
+      placements[place.getAccess()] = place;
+    SmallVector<pim::PlaceOp> inputs, outputs;
+    SmallVector<Operation *> inputTransfers, gathers;
+    pim::LaunchOp launch;
+    for (Operation &op : *deviceBody) {
+      if (auto broadcast = dyn_cast<pim::BroadcastOp>(&op)) {
+        inputs.push_back(placements.at(broadcast.getAccess()));
+        inputTransfers.push_back(&op);
+      } else if (auto scatter = dyn_cast<pim::ScatterOp>(&op)) {
+        inputs.push_back(placements.at(scatter.getAccess()));
+        inputTransfers.push_back(&op);
+      } else if (auto gather = dyn_cast<pim::GatherOp>(&op)) {
+        outputs.push_back(placements.at(gather.getAccess()));
+        gathers.push_back(&op);
+      } else if (auto compute = dyn_cast<pim::LaunchOp>(&op)) {
+        launch = compute;
       }
-    if (!nest) {
-      device->emitError("convert-pim-to-upmem: no loop nest inside pim.device");
+    }
+
+    if (launch.getBody().front().getOps<scf::ForOp>().empty()) {
+      launch.emitOpError("convert-pim-to-upmem: no compute loop inside pim.launch");
       return signalPassFailure();
     }
 
@@ -257,6 +272,24 @@ struct ConvertPIMToUPMEMPass
     llvm::DenseMap<int64_t, SmallVector<int64_t>> tileOf;
     device.walk([&](pim::AccessOp a) {
       tileOf[a.getId()] = SmallVector<int64_t>(a.getSizes());
+    });
+
+    llvm::DenseMap<int64_t, StringAttr> operandRoles;
+    // 계측용 역할만 기록한다. 입력의 저장 배치나 소비 연산을 제한하지 않는다.
+    device.walk([&](linalg::MatmulOp mm) {
+      for (unsigned i = 0; i < 2; ++i) {
+        auto load = mm.getInputs()[i].getDefiningOp<pim::LoadOp>();
+        if (!load)
+          continue;
+        auto access = load.getAccess().getDefiningOp<pim::AccessOp>();
+        if (!access)
+          continue;
+        StringAttr role = StringAttr::get(ctx, i == 0 ? "lhs" : "rhs");
+        auto [entry, inserted] = operandRoles.try_emplace(access.getId(), role);
+        // 양쪽 입력이 공유하는 access는 한 번 패킹하고 layout_other로 집계한다.
+        if (!inserted && entry->second != role)
+          entry->second = StringAttr();
+      }
     });
 
     // ── Common temporal K contract ─────────────────────────────────────────
@@ -404,6 +437,44 @@ struct ConvertPIMToUPMEMPass
       return signalPassFailure();
     }
 
+    // 같은 member의 8개 CI 안에서 읽을 고유 Host 입력 바이트를 줄인다.
+    // 공유 축의 묶음 크기만큼 같은 staging 주소를 재사용한다.
+    ArrayRef<int64_t> partitions = device.getMapping().getPartitions().asArrayRef();
+    SmallVector<int64_t, 3> deviceMapping;
+    __int128 minReadBytes = -1;
+    for (int64_t gm = 1; gm <= 8; gm *= 2)
+      for (int64_t gn = 1; gm * gn <= 8; gn *= 2)
+        for (int64_t gk = 1; gm * gn * gk <= 8; gk *= 2) {
+          if (partitions[0] % gm || partitions[1] % gn || partitions[2] % gk)
+            continue;
+          __int128 readBytes = 0;
+          for (pim::PlaceOp input : inputs) {
+            int64_t shared = 1;
+            if (auto axes = input.getSharedOverAttr())
+              for (Attribute axis : axes) {
+                StringRef name = cast<StringAttr>(axis).getValue();
+                if (name == "m")
+                  shared *= gm;
+                else if (name == "n")
+                  shared *= gn;
+                else if (name == "k")
+                  shared *= gk;
+                else {
+                  input.emitOpError("shared_over must name m, n, or k");
+                  return signalPassFailure();
+                }
+              }
+            readBytes += static_cast<__int128>(bytesOf.at(input)) *
+                         (numUnits / shared);
+          }
+          if (minReadBytes < 0 || readBytes < minReadBytes ||
+              (readBytes == minReadBytes &&
+               gm * gn * gk > deviceMapping[0] * deviceMapping[1] * deviceMapping[2])) {
+            minReadBytes = readBytes;
+            deviceMapping = {gm, gn, gk};
+          }
+        }
+
     llvm::DenseMap<Operation *, FlatSymbolRefAttr> mramOf;
     llvm::DenseMap<int64_t, Buffer> byAccess;
     for (pim::PlaceOp place : all) {
@@ -415,7 +486,7 @@ struct ConvertPIMToUPMEMPass
                   cast<BaseMemRefType>(place.getBuffer().getType()).getElementType(),
                   tileOf[id]};
       if (info.tile.size() != place.getAllocationShape().size()) {
-        place->emitError("no pim.access with this id inside pim.device");
+        place->emitError("no pim.access with this id inside pim.launch");
         return signalPassFailure();
       }
       mb.create<upmem::MRAMOp>(loc, name,
@@ -497,61 +568,12 @@ struct ConvertPIMToUPMEMPass
     dev->setAttr("upmem.lanes", mb.getI64IntegerAttr(lanes));
     Block *devBody = mb.createBlock(&dev.getBody());
 
-    // 보통 zero-init과 store는 m/n loop 안에 있지만, K-only reduction에는 그 바깥
-    // 축이 없어 `fill → temporal K loop → store`가 device body의 같은 레벨에 놓인다.
-    // 첫 loop만 떼어 내면 init은 host에 남고 store도 device에서 빠진다. 연산 이름으로
-    // 이 모양을 다시 판정하지 않고, loop의 SSA 입력과 결과에 연결된 top-level compute
-    // slice를 양방향으로 모아 원래 순서 그대로 옮긴다.
-    llvm::DenseSet<Operation *> computeSlice;
-    std::function<void(Value)> requireValue;
-    std::function<void(Operation *)> requireOperation = [&](Operation *op) {
-      if (!op || op->getBlock() != deviceBody ||
-          op->hasTrait<OpTrait::IsTerminator>() ||
-          !computeSlice.insert(op).second)
-        return;
-      for (Value operand : op->getOperands())
-        requireValue(operand);
-      // Common input reuse may put access/load definitions before the outer
-      // loop. Region captures are not operands of scf.for itself, but these
-      // tensor/access producers still belong to the device compute slice.
-      for (Region &region : op->getRegions())
-        region.walk([&](Operation *nested) {
-          for (Value operand : nested->getOperands())
-            requireValue(operand);
-        });
-    };
-    // index/integer 값은 device 분배와 host staging도 함께 사용한다. 이 정의를
-    // 이동하면 host IR에 dangling SSA use가 생긴다. scalar control 값은 제자리에
-    // 두고 materializeExternals가 device용 복제/host_var를 만든다. tensor와
-    // !pim.access처럼 device compute가 직접 소유해야 하는 값만 정의와 함께 옮긴다.
-    requireValue = [&](Value value) {
-      if (value.getType().isIntOrIndex())
-        return;
-      requireOperation(value.getDefiningOp());
-    };
-    requireOperation(nest);
-    SmallVector<Value> produced(nest->getResults());
-    while (!produced.empty()) {
-      Value value = produced.pop_back_val();
-      for (OpOperand &use : llvm::make_early_inc_range(value.getUses())) {
-        Operation *user = use.getOwner();
-        if (user->getBlock() != deviceBody ||
-            user->hasTrait<OpTrait::IsTerminator>())
-          continue;
-        bool inserted = computeSlice.insert(user).second;
-        if (!inserted)
-          continue;
-        for (Value operand : user->getOperands())
-          requireValue(operand);
-        produced.append(user->getResults().begin(), user->getResults().end());
-      }
-    }
-    SmallVector<Operation *> orderedCompute;
-    for (Operation &op : *deviceBody)
-      if (computeSlice.contains(&op))
-        orderedCompute.push_back(&op);
-    for (Operation *op : orderedCompute)
-      op->moveBefore(devBody, devBody->end());
+    // Common이 계산 본문과 Host 계획을 이미 분리했다.
+    Block &computeBody = launch.getBody().front();
+    devBody->getOperations().splice(devBody->end(), computeBody.getOperations());
+    launch.erase();
+    for (Operation *gather : gathers)
+      gather->erase();
     OpBuilder db(devBody, devBody->begin());
     for (auto [i, a] : llvm::enumerate(axes)) {
       // 상한은 host가 넣어 주는 값에서 온다.
@@ -588,12 +610,35 @@ struct ConvertPIMToUPMEMPass
     Value set = setup.create<upmem::AcquireOp>(
         loc, upmem::SetType::get(ctx), setup.getI64IntegerAttr(numUnits),
         FlatSymbolRefAttr::get(devName));
+    Value assignment = setup.create<upmem::BindDevicesOp>(
+        loc, upmem::AssignmentType::get(ctx), set,
+        setup.getDenseI64ArrayAttr(partitions),
+        setup.getDenseI64ArrayAttr(deviceMapping));
     OpBuilder hb(device);
 
     ArrayAttr axisNames = hb.getStrArrayAttr({"m", "n", "k"});
     auto counts =
         hb.getDenseI64ArrayAttr(device.getMapping().getPartitions().asArrayRef());
-    auto foreach = hb.create<upmem::ForeachUnitOp>(loc, set, axisNames, counts);
+    llvm::DenseMap<Operation *, Value> hostPools;
+    OpBuilder cleanup(scheduleRoot);
+    cleanup.setInsertionPointAfter(scheduleRoot);
+    for (pim::PlaceOp place : all) {
+      int64_t slots = 1;
+      ArrayAttr shared = place.getSharedOverAttr();
+      for (auto [d, axis] : llvm::enumerate(axisNames))
+        if (place.getDirection() == "out" || !shared ||
+            !llvm::is_contained(shared, axis))
+          slots *= counts.asArrayRef()[d];
+      MemRefType tileType = stagedType(place);
+      SmallVector<int64_t> shape{slots};
+      llvm::append_range(shape, tileType.getShape());
+      Value pool = setup.create<memref::AllocOp>(
+          loc, MemRefType::get(shape, tileType.getElementType()));
+      hostPools[place] = pool;
+      cleanup.create<memref::DeallocOp>(loc, pool);
+    }
+    auto foreach = hb.create<upmem::ForeachUnitOp>(loc, set, assignment,
+                                                 axisNames, counts);
     SmallVector<Type> argTys{upmem::UnitType::get(ctx)};
     SmallVector<Location> argLocs{loc};
     for (unsigned i = 0; i < 3; i++) {
@@ -608,14 +653,17 @@ struct ConvertPIMToUPMEMPass
       deviceBody->getArgument(i).replaceAllUsesWith(fuBody->getArgument(i + 1));
 
     Value dpu = fuBody->getArgument(0);
-    for (pim::PlaceOp place : inputs) {
-      OpBuilder b(place);
-      Value staged = b.create<upmem::StageOp>(
-          loc, stagedType(place), place.getBuffer(), place.getStart(),
-          place.getSize(), place.getStrides(), place.getAllocationShape(),
+    for (auto [place, transfer] : llvm::zip(inputs, inputTransfers)) {
+      OpBuilder b(transfer);
+      auto staged = b.create<upmem::StageOp>(
+          loc, stagedType(place), place.getBuffer(), hostPools.at(place),
+          place.getStart(), place.getSize(), place.getStrides(),
+          place.getAllocationShape(),
           b.getDenseI64ArrayAttr(byAccess[place.getAccess()].tile),
-          place.getReplicatedOverAttr());
+          place.getSharedOverAttr(),
+          operandRoles.lookup(place.getAccess()));
       b.create<upmem::ToMRAMOp>(loc, dpu, staged, mramOf[place]);
+      transfer->erase();
     }
     // Common IR mapping 축의 device별 반복 횟수를 그 DPU에 보낸다. temporal K
     // local bound도 Common IR의 외부값으로 남아 materializeExternals가 그대로 보낸다.
@@ -641,8 +689,8 @@ struct ConvertPIMToUPMEMPass
       if (combined)
         partialRound = temporalRound.getInductionVar();
       OpBuilder::InsertionGuard guard(hb);
-      if (failed(buildOutput(hb, place, set, numUnits, axisNames, counts,
-                             mramOf[place], foreach,
+      if (failed(buildOutput(hb, place, set, assignment, hostPools.at(place),
+                             axisNames, counts, mramOf[place], foreach,
                              byAccess[place.getAccess()].tile, partialRound,
                              combined)))
         return signalPassFailure();
@@ -661,7 +709,7 @@ struct ConvertPIMToUPMEMPass
   // 실제로 존재하는 m/n output loop와, 그 loop가 device 몫으로 좁혀지며 생긴
   // 상한 및 전역 좌표 복원 op을 canonical 순서로 모은다. K는 별도 pim.axis가
   // 아니라 pim.temporal_reduction loop이므로 위에서 독립적으로 처리한다.
-  LogicalResult collectAxes(pim::DeviceOp device, SmallVectorImpl<Axis> &axes) {
+  LogicalResult collectAxes(pim::PartitionOp device, SmallVectorImpl<Axis> &axes) {
     StringRef canonical[] = {"m", "n"};
     for (StringRef axisName : canonical) {
       auto name = StringAttr::get(&getContext(), axisName);
@@ -1114,7 +1162,7 @@ struct ConvertPIMToUPMEMPass
   // Common pim.place를 그대로 쓴다. Common pim.combine이 있으면 reduction_k
   // round와 device_k가 모두 0인 첫 partial만 대입하고 나머지는 누산한다.
   LogicalResult buildOutput(OpBuilder &b, pim::PlaceOp place, Value set,
-                            int64_t numUnits, ArrayAttr axes,
+                            Value assignment, Value parts, ArrayAttr axes,
                             DenseI64ArrayAttr counts, FlatSymbolRefAttr mram,
                             Operation *foreach, ArrayRef<int64_t> tile,
                             Value partialRound, bool combined) {
@@ -1139,10 +1187,7 @@ struct ConvertPIMToUPMEMPass
     SmallVector<int64_t> fixedShape;
     for (Value extent : place.getAllocationShape())
       fixedShape.push_back(*getConstantIntValue(extent));
-    SmallVector<int64_t> partsShape{numUnits};
-    llvm::append_range(partsShape, fixedShape);
-    Value parts = b.create<upmem::GatherOp>(
-        loc, MemRefType::get(partsShape, elem), set, mram, capacity);
+    b.create<upmem::GatherOp>(loc, set, assignment, mram, capacity, parts);
 
     auto group = b.create<upmem::ForeachGroupOp>(loc, parts, axes, counts);
     SmallVector<Type> argTys{MemRefType::get(fixedShape, elem)};

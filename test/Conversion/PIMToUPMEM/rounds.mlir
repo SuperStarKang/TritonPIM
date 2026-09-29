@@ -1,10 +1,30 @@
 // 공통 planner가 만든 scheduling round를 UPMEM lowering이 그대로 소비한다.
 // acquire는 round 밖에서 한 번, foreach/stage/launch/gather는 round마다 한 번이다.
-// RUN: triton-shared-opt --convert-pim-to-upmem %s | FileCheck %s
+// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-upmem %s | FileCheck %s
+// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-upmem %s | triton-shared-translate --upmem-to-host | FileCheck %s --check-prefix=POOLS --implicit-check-not=malloc --implicit-check-not='free('
+
+// POOLS: int8_t* [[A:v[0-9]+]] = (int8_t*)malloc(512 * sizeof(int8_t));
+// POOLS: int8_t* [[B:v[0-9]+]] = (int8_t*)malloc(8192 * sizeof(int8_t));
+// POOLS: int32_t* [[C:v[0-9]+]] = (int32_t*)malloc(4096 * sizeof(int32_t));
+// POOLS: for (int64_t [[RN:v[0-9]+]] =
+// POOLS-NEXT: for (int64_t [[RK:v[0-9]+]] =
+// POOLS: memset({{v[0-9]+}}, 0, 256);
+// POOLS: memset({{v[0-9]+}}, 0, 2048);
+// POOLS: dpu_push_xfer(_set, DPU_XFER_TO_DPU, "matmul_mram_0", 0, 256,
+// POOLS: dpu_push_xfer(_set, DPU_XFER_TO_DPU, "matmul_mram_1", 0, 2048,
+// POOLS: dpu_launch(_set, DPU_SYNCHRONOUS)
+// POOLS: dpu_prepare_xfer(_dpu, [[C]] + (uint64_t){{v[0-9]+}}[_idx] * 512)
+// POOLS: for (int64_t _g =
+// POOLS: free([[A]]);
+// POOLS: free([[B]]);
+// POOLS: free([[C]]);
 
 // Device set은 round loop 밖에서 한 번 확보한다.
 // CHECK: arith.ceildivsi
 // CHECK: %[[SET:.*]] = upmem.acquire 8, @matmul_device
+// CHECK-NEXT: %[[AP:.*]] = memref.alloc() : memref<2x8x32xi8>
+// CHECK-NEXT: %[[BP:.*]] = memref.alloc() : memref<4x32x64xi8>
+// CHECK-NEXT: %[[CP:.*]] = memref.alloc() : memref<8x8x64xi32>
 // CHECK: scf.for %{{.*}} = %{{.*}} to
 // CHECK:   upmem.foreach_unit %[[SET]]
 // Common spatial/temporal scheduling 안의 pim.place가 각 round의 입력 전송을 정한다.
@@ -15,9 +35,15 @@
 // CHECK-DAG: upmem.to_mram %{{.*}}, %{{.*}}, @matmul_mram_1
 // CHECK-DAG: upmem.to_host_var %{{.*}}, %{{.*}}, @matmul_tiles_n
 // CHECK-COUNT-1: upmem.launch
-// CHECK:   upmem.gather %{{.*}}, @matmul_mram_2
+// CHECK:   upmem.gather %{{.*}} assignment %{{.*}}, @matmul_mram_2
 // CHECK:   upmem.foreach_group
 // CHECK:     upmem.unstage
+// CHECK-NEXT: }
+// CHECK-NEXT: }
+// CHECK-NEXT: }
+// CHECK-NEXT: memref.dealloc %[[AP]]
+// CHECK-NEXT: memref.dealloc %[[BP]]
+// CHECK-NEXT: memref.dealloc %[[CP]]
 
 module attributes {pim.target_profile = #pim.target_profile<
     target = "upmem", num_units = 8,
@@ -72,14 +98,14 @@ func.func @matmul(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<*xi32>,
     pim.place %A start[%ar, %startk] size[%arn, %akn] allocation_shape[%c8, %c32]
         strides[%lda, %c1]
         {direction = "in", access = 0 : i64,
-         replicated_over = ["n"]} : memref<*xi8>
+         shared_over = ["n"]} : memref<*xi8>
 
     %bc = arith.muli %starty, %c32 : index
     %bcn = arith.muli %tripsy, %c32 : index
     pim.place %B start[%startk, %bc] size[%akn, %bcn] allocation_shape[%c32, %c64]
         strides[%ldb, %c1]
         {direction = "in", access = 1 : i64,
-         replicated_over = ["m"]} : memref<*xi8>
+         shared_over = ["m"]} : memref<*xi8>
 
     pim.place %C start[%ar, %bc] size[%arn, %bcn] allocation_shape[%c8, %c64]
         strides[%ldb, %c1]

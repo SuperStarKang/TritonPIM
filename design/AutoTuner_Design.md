@@ -55,7 +55,7 @@ unique pim.place buffers
   direction, dtype, layout, access-dependent axes, irregular 여부
 ```
 
-입력 access가 사용하지 않는 logical axis가 `replicated_over`다. Reduction axis는
+입력 access가 사용하지 않는 logical axis가 `shared_over`다. Reduction axis는
 input access에는 있지만 output access에는 없는 `k`로 파생한다. `axis_sources`,
 residency flag, reduction policy는 추가하지 않는다. 연산 종류는 target별 선택 knob가
 아니라 Common IR의 compute op를 식별하기 위해서만 사용한다.
@@ -135,7 +135,7 @@ Target lowering이 이미 검사하는 alignment나 reduction 위치를 공통 C
 
 - active units와 scheduling rounds
 - effective utilization과 load imbalance
-- 모든 input placement의 transfer 및 `replicated_over`에 따른 reuse 양
+- 모든 input placement의 transfer 및 `shared_over`에 따른 reuse 양
 - p_k partial output과 reduction data 양
 - padding ratio
 - local/unit memory pressure

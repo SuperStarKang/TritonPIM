@@ -27,18 +27,24 @@ func.func @matmul_kernel_i8_host(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<
 
   // CHECK: %[[SET:.*]] = upmem.acquire 2048, @matmul_kernel_i8_device : !upmem.set
   %set = upmem.acquire 2048, @matmul_kernel_i8_device : !upmem.set
+  %assignment = upmem.bind_devices %set partitions [4, 32, 16] device_mapping [2, 4, 1]
+      : !upmem.set -> !upmem.assignment
+  %a_pool = memref.alloc() : memref<64x256x512xi8>
+  %b_pool = memref.alloc() : memref<512x512x256xi8>
+  // CHECK: %[[P:.*]] = memref.alloc() : memref<2048x256x256xi32>
+  %parts = memref.alloc() : memref<2048x256x256xi32>
   // 입력은 유닛마다 영역이 다르므로 region 안에서 좌표로 계산한다.
-  // CHECK: upmem.foreach_unit %[[SET]] : !upmem.set axes ["x", "y", "k"] counts [4, 32, 16]
-  upmem.foreach_unit %set : !upmem.set axes ["x", "y", "k"] counts [4, 32, 16] {
+  // CHECK: upmem.foreach_unit %[[SET]] assignment %{{.*}} : !upmem.set axes ["x", "y", "k"] counts [4, 32, 16]
+  upmem.foreach_unit %set assignment %assignment : !upmem.set axes ["x", "y", "k"] counts [4, 32, 16] {
   ^bb0(%dpu: !upmem.unit, %pm: index, %pn: index, %kj: index):
     // A: 행 [pm*256, +256), 열 [kj*512, +512). y축 유닛끼리 같은 것을 받는다.
     %ar = arith.muli %pm, %c256 : index
     %ac = arith.muli %kj, %c512 : index
     // CHECK: %[[SA:.*]] = upmem.stage %{{.*}} origin[%{{.*}}, %{{.*}}] sizes[%{{.*}}, %{{.*}}] strides[%{{.*}}, %{{.*}}] pad_to[%{{.*}}, %{{.*}}] tile [64, 64]
-    // CHECK-SAME: dedup_over = ["y"]
+    // CHECK-SAME: shared_over = ["y"]
     %sa = upmem.stage %A origin[%ar, %ac] sizes[%c256, %c512] strides[%K, %c1]
-          pad_to[%c256, %c512] tile [64, 64] {dedup_over = ["y"]}
-          : memref<*xi8> -> memref<256x512xi8>
+          pad_to[%c256, %c512] tile [64, 64] into %a_pool {shared_over = ["y"]}
+          : memref<*xi8>, memref<64x256x512xi8> -> memref<256x512xi8>
     // CHECK: upmem.to_mram %{{.*}}, %[[SA]], @A_mram
     upmem.to_mram %dpu, %sa, @A_mram : memref<256x512xi8>
 
@@ -46,8 +52,8 @@ func.func @matmul_kernel_i8_host(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<
     %br = arith.muli %kj, %c512 : index
     %bc = arith.muli %pn, %c256 : index
     %sb = upmem.stage %B origin[%br, %bc] sizes[%c512, %c256] strides[%N, %c1]
-          pad_to[%c512, %c256] tile [64, 64] {dedup_over = ["x"]}
-          : memref<*xi8> -> memref<512x256xi8>
+          pad_to[%c512, %c256] tile [64, 64] into %b_pool {shared_over = ["x"]}
+          : memref<*xi8>, memref<512x512x256xi8> -> memref<512x256xi8>
     upmem.to_mram %dpu, %sb, @B_mram : memref<512x256xi8>
   }
 
@@ -55,9 +61,9 @@ func.func @matmul_kernel_i8_host(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<
   upmem.launch %set : !upmem.set
 
   // 출력은 집합 전체에서 한 번에 회수한다(앞 축이 유닛 축).
-  // CHECK: %[[P:.*]] = upmem.gather %[[SET]], @C_mram capacity[%{{.*}}, %{{.*}}] : !upmem.set -> memref<2048x256x256xi32>
-  %parts = upmem.gather %set, @C_mram capacity[%c256, %c256]
-      : !upmem.set -> memref<2048x256x256xi32>
+  // CHECK: upmem.gather %[[SET]] assignment %{{.*}}, @C_mram capacity[%{{.*}}, %{{.*}}] into %[[P]] : !upmem.set, memref<2048x256x256xi32>
+  upmem.gather %set assignment %assignment, @C_mram capacity[%c256, %c256] into %parts
+      : !upmem.set, memref<2048x256x256xi32>
 
   // k축 16개가 한 출력 타일의 부분합이다. 합친 뒤 원본 C로 되돌린다.
   // CHECK: upmem.foreach_group %[[P]] : memref<2048x256x256xi32> axes ["x", "y"] counts [4, 32]
@@ -75,6 +81,9 @@ func.func @matmul_kernel_i8_host(%A: memref<*xi8>, %B: memref<*xi8>, %C: memref<
         capacity[%c256, %c256] tile [64, 64]
         : memref<256x256xi32>, memref<*xi32>
   }
+  memref.dealloc %parts : memref<2048x256x256xi32>
+  memref.dealloc %b_pool : memref<512x512x256xi8>
+  memref.dealloc %a_pool : memref<64x256x512xi8>
   return
 }
 

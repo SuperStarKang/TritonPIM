@@ -1,6 +1,6 @@
 // Rank-one x/y stay rank-one in Common; AiMX uses a padded column view.
-// RUN: triton-shared-opt --pim-verify --convert-pim-to-aimx %s | FileCheck %s --check-prefix=IR --implicit-check-not=aimx.compute_template --implicit-check-not=linalg.
-// RUN: triton-shared-opt --mlir-print-op-generic --convert-pim-to-aimx %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=STUB
+// RUN: triton-shared-opt --pim-verify --pim-form-host-plan --convert-pim-to-aimx %s | FileCheck %s --check-prefix=IR --implicit-check-not=aimx.compute_template --implicit-check-not=linalg.
+// RUN: triton-shared-opt --mlir-print-op-generic --pim-form-host-plan --convert-pim-to-aimx %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=STUB
 // IR: aimx.descriptor_program @mv_device0_matvec_{{[0-9]+}} batch 8
 // IR: opcode a_mask|matmul|pim_mode
 // IR: opcode b_mask|matmul|pim_mode|stride
@@ -45,7 +45,7 @@ func.func @mv(%A: memref<*xbf16>, %X: memref<*xbf16>, %Y: memref<*xf32>)
           allocation_shape[%c8, %c96] strides[%c192, %c1]
           {direction = "in", access = 0 : i64} : memref<*xbf16>
       pim.place %X start[%kStart] size[%c96] allocation_shape[%c96]
-          strides[%c1] {direction = "in", access = 1 : i64, replicated_over = ["m"]}
+          strides[%c1] {direction = "in", access = 1 : i64, shared_over = ["m"]}
           : memref<*xbf16>
       pim.place %Y start[%mStart] size[%c8] allocation_shape[%c8]
           strides[%c1] {direction = "out", access = 2 : i64} : memref<*xf32>

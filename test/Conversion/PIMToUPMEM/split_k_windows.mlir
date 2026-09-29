@@ -1,8 +1,8 @@
 // 하나의 semantic K domain을 reduction_k round와 device_k가 나눈 Common IR을
 // UPMEM이 그대로 소비한다. source pim.axis="k"나 별도 spatial K round는 없다.
-// RUN: triton-shared-opt --convert-pim-to-upmem=host-threads=8 %s | FileCheck %s --check-prefix=IR
-// RUN: triton-shared-opt --convert-pim-to-upmem=host-threads=8 %s | triton-shared-translate --upmem-to-host | FileCheck %s --check-prefix=HOST
-// RUN: triton-shared-opt --convert-pim-to-upmem=host-threads=8 %s | triton-shared-translate --upmem-to-device | FileCheck %s --check-prefix=DEVICE
+// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-upmem=host-threads=8 %s | FileCheck %s --check-prefix=IR
+// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-upmem=host-threads=8 %s | triton-shared-translate --upmem-to-host | FileCheck %s --check-prefix=HOST
+// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-upmem=host-threads=8 %s | triton-shared-translate --upmem-to-device | FileCheck %s --check-prefix=DEVICE
 
 // K는 output axis host variable로 다시 만들지 않는다.
 // IR-NOT: tiles_k
@@ -13,7 +13,7 @@
 // IR: scf.for %[[ROUND:.*]] =
 // IR:   upmem.foreach_unit %[[SET]]
 // IR-COUNT-1: upmem.launch %[[SET]]
-// IR:   upmem.gather %[[SET]], @matmul_split_k_mram_2
+// IR:   upmem.gather %[[SET]] assignment %{{.*}}, @matmul_split_k_mram_2
 // IR:   upmem.foreach_group
 // reduction_k round와 foreach_group의 device_k로 첫 partial 여부를 정한다.
 // IR:     %[[PARTIAL:.*]] = arith.addi %[[ROUND]], %{{.*}} : index
@@ -23,7 +23,16 @@
 // HOST-NOT: matmul_split_k_tiles_k
 // HOST-NOT: tiles_reduction_k
 // HOST: if ({{.*}} == 0) {
-// HOST: +=
+// HOST-NEXT: _pim_stop(0);
+// HOST-NEXT: _pim_start(12);
+// HOST: _pim_stop(12);
+// HOST-NEXT: _pim_start(0);
+// HOST-NEXT: } else {
+// HOST-NEXT: _pim_stop(0);
+// HOST-NEXT: _pim_start(4);
+// HOST: {{.*}}] += {{.*}}[
+// HOST-NEXT: _pim_stop(4);
+// HOST-NEXT: _pim_start(0);
 
 // DEVICE-NOT: matmul_split_k_tiles_k
 // DEVICE-NOT: tiles_reduction_k
@@ -65,11 +74,11 @@ func.func @matmul_split_k(%A: memref<*xi8>, %B: memref<*xi8>,
       pim.place %A start[%c0, %kStart] size[%c8, %kSize]
           allocation_shape[%c8, %c4] strides[%c32, %c1]
           {direction = "in", access = 0 : i64,
-           replicated_over = ["n"]} : memref<*xi8>
+           shared_over = ["n"]} : memref<*xi8>
       pim.place %B start[%kStart, %c0] size[%kSize, %c8]
           allocation_shape[%c4, %c8] strides[%c8, %c1]
           {direction = "in", access = 1 : i64,
-           replicated_over = ["m"]} : memref<*xi8>
+           shared_over = ["m"]} : memref<*xi8>
       pim.place %C start[%c0, %c0] size[%c8, %c8]
           allocation_shape[%c8, %c8] strides[%c8, %c1]
           {direction = "out", access = 2 : i64} : memref<*xi32>

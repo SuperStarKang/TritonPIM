@@ -23,7 +23,8 @@ def PIM_Dialect : Dialect {
   let description = [{
     ttshared IR(--triton-to-linalg-experimental 출력)에서 올라와, 메모리 접근을
     주소 명세(pim.access)와 전송(pim.load/pim.store)으로 표현하고, 배치를
-    pim.device + pim.place 로 표현한다. 계산은 linalg 를 그대로 쓴다.
+    pim.device + pim.place 로 분석한 뒤 pim.partition 안의 명시적 전송,
+    pim.launch, 회수 계획으로 확정한다. 계산은 linalg 를 그대로 쓴다.
   }];
 
   let useDefaultTypePrinterParser = 1;
@@ -210,6 +211,45 @@ def PIM_DeviceOp : PIM_Op<"device", [NoTerminator]> {
   let hasVerifier = 1;
 }
 
+// Common 분석 중의 pim.device를 최종 Host 계획으로 분리한 논리 좌표 영역.
+// body argument는 [m,n,k]이며 물리 device 번호가 아니다. Target은 각 전송을
+// 이 좌표 집합 전체에 적용하고 launch의 계산만 device 프로그램으로 옮긴다.
+def PIM_PartitionOp : PIM_Op<"partition", [SingleBlock, NoTerminator]> {
+  let summary = "Logical partitions with an explicit host execution plan";
+  let arguments = (ins PIM_DeviceMappingAttr:$mapping);
+  let regions = (region SizedRegion<1>:$body);
+  let assemblyFormat = "$mapping attr-dict-with-keyword $body";
+  let hasVerifier = 1;
+}
+
+// access는 같은 partition의 pim.place를 가리킨다. 전송 op 하나는 전체 논리
+// 집합의 동작이며 device별 SDK 호출 횟수를 뜻하지 않는다.
+class PIM_TransferOp<string mnemonic>
+    : PIM_Op<mnemonic, [MemoryEffects<[MemRead, MemWrite]>]> {
+  let arguments = (ins I64Attr:$access);
+  let assemblyFormat = "$access attr-dict";
+  let hasVerifier = 1;
+}
+
+def PIM_BroadcastOp : PIM_TransferOp<"broadcast"> {
+  let summary = "Distribute each distinct input to its shared_over recipients";
+}
+
+def PIM_ScatterOp : PIM_TransferOp<"scatter"> {
+  let summary = "Distribute the input placement to the logical partitions";
+}
+
+def PIM_LaunchOp : PIM_Op<"launch", [SingleBlock, NoTerminator]> {
+  let summary = "Execute the enclosed per-device compute on every partition";
+  let regions = (region SizedRegion<1>:$body);
+  let assemblyFormat = "attr-dict-with-keyword $body";
+  let hasVerifier = 1;
+}
+
+def PIM_GatherOp : PIM_TransferOp<"gather"> {
+  let summary = "Collect an output placement, preserving its store/combine semantics";
+}
+
 // 버퍼 하나가 이 PIM Device 에 상주해야 하는 영역. 최종 값을 직접 싣는다.
 //   start    = 이 device 의 첫 원소 (balanced block 이 낸 값 그대로)
 //   size     = 실제로 맡는 원소 수. 경계 tile 의 유효 범위까지 반영된 값이라
@@ -219,14 +259,14 @@ def PIM_DeviceOp : PIM_Op<"device", [NoTerminator]> {
 //   strides  = 원본 버퍼 안의 축별 간격
 // direction: "in"(host→device) | "out"(device→host).
 // access: 이 영역을 유도한 pim.access 의 id.
-// replicated_over: 이 축만 다른 device 들은 같은 데이터를 받는다.
+// shared_over: 이 축만 다른 device 들은 같은 데이터를 받는다.
 def PIM_PlaceOp : PIM_Op<"place", [AttrSizedOperandSegments]> {
   let summary = "Final placement of one buffer on one PIM Device";
   let arguments = (ins AnyRankedOrUnrankedMemRef:$buffer,
                        Variadic<Index>:$start, Variadic<Index>:$size,
                        Variadic<Index>:$allocation_shape, Variadic<Index>:$strides,
                        StrAttr:$direction, I64Attr:$access,
-                       OptionalAttr<StrArrayAttr>:$replicated_over);
+                       OptionalAttr<StrArrayAttr>:$shared_over);
   let assemblyFormat = [{
     $buffer `start` `[` $start `]` `size` `[` $size `]`
     `allocation_shape` `[` $allocation_shape `]` `strides` `[` $strides `]`

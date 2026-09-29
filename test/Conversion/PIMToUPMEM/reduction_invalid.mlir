@@ -1,6 +1,6 @@
 // K-only reduction에는 아직 tasklet-local accumulator와 DPU 내부 combine이 없으므로
 // 여러 tasklet이 하나의 WRAM output을 동시에 갱신하게 두지 않는다.
-// RUN: triton-shared-opt "--convert-pim-to-upmem=nr-tasklets=2" -verify-diagnostics %s
+// RUN: triton-shared-opt --pim-form-host-plan "--convert-pim-to-upmem=nr-tasklets=2" -verify-diagnostics %s
 
 module attributes {pim.target_profile = #pim.target_profile<
     target = "upmem", num_units = 1,

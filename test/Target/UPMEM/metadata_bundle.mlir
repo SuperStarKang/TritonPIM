@@ -37,7 +37,7 @@
 // HOST-NEXT: _pim_stop(0);
 // HOST-NEXT: _pim_start(1);
 // HOST-NEXT: _idx = 0;
-// HOST-NEXT: DPU_FOREACH(_set, _dpu, _idx) DPU_ASSERT(dpu_prepare_xfer(_dpu, (uint8_t*)&_args0[_idx] + 0));
+// HOST-NEXT: DPU_FOREACH(_set, _dpu, _idx) DPU_ASSERT(dpu_prepare_xfer(_dpu, (uint8_t*)&_args0[{{v[0-9]+}}[_idx]] + 0));
 // HOST-NEXT: DPU_ASSERT(dpu_push_xfer(_set, DPU_XFER_TO_DPU, "_pim_metadata", 0, 40, DPU_XFER_DEFAULT));
 // HOST-NEXT: _pim_stop(1);
 // HOST-NOT: dpu_push_xfer
@@ -66,7 +66,9 @@ upmem.host_var @precise : f64
 func.func @metadata_kernel(%small: i8, %wide: i64, %scale: f32,
                            %short: i16, %flag: i1, %count: i32, %precise: f64) {
   %set = upmem.acquire 4, @metadata_device : !upmem.set
-  upmem.foreach_unit %set : !upmem.set axes ["m"] counts [4] {
+  %assignment = upmem.bind_devices %set partitions [4] device_mapping [4]
+      : !upmem.set -> !upmem.assignment
+  upmem.foreach_unit %set assignment %assignment : !upmem.set axes ["m"] counts [4] {
   ^bb0(%dpu: !upmem.unit, %unit: index):
     upmem.to_host_var %dpu, %wide, @wide : i64
     upmem.to_host_var %dpu, %unit, @trips : index

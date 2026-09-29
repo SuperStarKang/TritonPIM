@@ -1,7 +1,7 @@
 // The sum has two consumers and cannot be overwritten by the multiply.
 // The product dies at subtract, which can reuse its buffer.
-// RUN: triton-shared-opt --convert-pim-to-aimx %s | FileCheck %s --check-prefix=IR
-// RUN: triton-shared-opt --mlir-print-op-generic --convert-pim-to-aimx %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=STUB
+// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx %s | FileCheck %s --check-prefix=IR
+// RUN: triton-shared-opt --mlir-print-op-generic --pim-form-host-plan --convert-pim-to-aimx %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=STUB
 // IR-LABEL: func.func @epilogue_liveness
 // Three 32768-byte placements are separate from these four 16384-byte buffers:
 // two load snapshots, the live sum, and the product/subtract output.

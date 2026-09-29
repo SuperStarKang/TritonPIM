@@ -46,7 +46,7 @@ struct Placement {
 // kernel-kind plan, or runtime interpreter of Common computations.
 class DeviceLowering {
 public:
-  DeviceLowering(ModuleOp module, pim::DeviceOp device,
+  DeviceLowering(ModuleOp module, pim::PartitionOp device,
                  pim::TargetProfileAttr profile, int64_t batch, bool persistent,
                  unsigned site)
       : module(module), device(device), profile(profile), batch(batch),
@@ -118,18 +118,31 @@ public:
     if (bankBytes > profile.getBankCapacityLimitBytes())
       return device.emitError("AiMX physical buffers and descriptors exceed per-bank capacity");
     host.setInsertionPointAfter(construction);
-    for (auto &entry : placements)
-      if (entry.second.source.getDirection() == "in") stage(host, entry.second);
+    // Common 전송 계획 순서 그대로: broadcast/scatter → launch → gather.
+    // placement가 없는 access는 계산이 쓰지 않아 target 할당도 없다.
+    Block &plan = device.getBody().front();
+    for (Operation &op : plan) {
+      if (auto broadcast = dyn_cast<pim::BroadcastOp>(op)) {
+        auto found = placements.find(broadcast.getAccess());
+        if (found != placements.end())
+          stage(host, found->second, found->second.source.getSharedOverAttr());
+      } else if (auto scatter = dyn_cast<pim::ScatterOp>(op)) {
+        auto found = placements.find(scatter.getAccess());
+        if (found != placements.end()) stage(host, found->second, ArrayAttr());
+      }
+    }
     host.create<aimx::InvokeOp>(loc, deviceValue, chain);
-    for (auto &entry : placements)
-      if (entry.second.source.getDirection() == "out") unstage(host, entry.second);
+    for (auto gather : plan.getOps<pim::GatherOp>()) {
+      auto found = placements.find(gather.getAccess());
+      if (found != placements.end()) unstage(host, found->second);
+    }
     device.erase();
     return success();
   }
 
 private:
   ModuleOp module;
-  pim::DeviceOp device;
+  pim::PartitionOp device;
   pim::TargetProfileAttr profile;
   int64_t batch;
   bool persistent;
@@ -587,7 +600,7 @@ private:
     if (result.size() == 1) result.push_back(c(b, extra));
     return result;
   }
-  void stage(OpBuilder &b, const Placement &placement) {
+  void stage(OpBuilder &b, const Placement &placement, ArrayAttr sharedOver) {
     auto place = placement.source;
     const auto &layout = placement.view.layout;
     b.create<aimx::StageOp>(
@@ -595,7 +608,8 @@ private:
         hostValues(b, placement.sizes, 1), hostValues(b, place.getStrides(), 0),
         ValueRange{c(b, placement.rows), c(b, placement.cols)}, c(b, placement.cols),
         placement.view.buffer, TypeAttr::get(b.getBF16Type()), UnitAttr(),
-        padding(b, layout.usefulRows, layout.rows), padding(b, layout.usefulCols, layout.cols));
+        padding(b, layout.usefulRows, layout.rows), padding(b, layout.usefulCols, layout.cols),
+        sharedOver);
   }
   void unstage(OpBuilder &b, const Placement &placement) {
     Value accumulate = c(b, 0);
@@ -686,7 +700,7 @@ private:
         ValueRange{c(setup, layout.usefulRows), c(setup, layout.usefulCols)},
         ValueRange{zero, zero}, ValueRange{c(setup, layout.rows), c(setup, layout.cols)},
         c(setup, layout.cols), view.buffer, TypeAttr::get(setup.getBF16Type()), UnitAttr(),
-        DenseI64ArrayAttr(), DenseI64ArrayAttr());
+        DenseI64ArrayAttr(), DenseI64ArrayAttr(), ArrayAttr());
     return success();
   }
   FailureOr<View> valueView(Value value) {
@@ -952,6 +966,12 @@ private:
   LogicalResult lowerBlock(Block &body, bool root) {
     for (Operation &op : body) {
       if (isa<pim::PlaceOp, pim::AccessOp, scf::YieldOp>(op)) continue;
+      // 전송은 run()이 stage/unstage로 내린다.
+      if (isa<pim::BroadcastOp, pim::ScatterOp, pim::GatherOp>(op)) continue;
+      if (auto launch = dyn_cast<pim::LaunchOp>(op)) {
+        if (failed(lowerBlock(launch.getBody().front(), false))) return failure();
+        continue;
+      }
       if (isIndexOperation(&op)) {
         if (!root || !indices.contains(op.getResult(0))) cloneIndex(op, code);
         continue;
@@ -1022,10 +1042,16 @@ struct ConvertPIMToAiMXPass
       module.emitError("AiMX batch must be 1, 2, 4, or 8");
       return signalPassFailure();
     }
-    SmallVector<pim::DeviceOp> devices;
-    module.walk([&](pim::DeviceOp device) { devices.push_back(device); });
+    WalkResult unplanned = module.walk([&](pim::DeviceOp device) {
+      device.emitOpError("requires pim-form-host-plan before AiMX lowering");
+      return WalkResult::interrupt();
+    });
+    if (unplanned.wasInterrupted())
+      return signalPassFailure();
+    SmallVector<pim::PartitionOp> devices;
+    module.walk([&](pim::PartitionOp device) { devices.push_back(device); });
     unsigned site = 0;
-    for (pim::DeviceOp device : devices)
+    for (pim::PartitionOp device : devices)
       if (failed(DeviceLowering(module, device, profile, batch, persistent,
                                 site++).run()))
         return signalPassFailure();

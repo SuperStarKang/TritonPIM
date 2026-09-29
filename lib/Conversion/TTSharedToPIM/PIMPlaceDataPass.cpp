@@ -236,22 +236,6 @@ struct PIMPlaceDataPass
       // 도는 범위를 원본 버퍼의 크기로 자른다. 자르지 않으면 grid가 실제 크기보다 넓게
       // 잡힌 경우(마지막 tile이 통째로 무효인 경우) 버퍼 밖을 읽는다.
       Value length = span;
-      if (!access.getValid().empty()) {
-        if (auto valid = getConstantIntValue(access.getValid()[d])) {
-          if (*valid < 0 || *valid > access.getSizes()[d])
-            return access.emitError("pim-place-data: constant valid is outside the access size");
-          if (*valid == 0) {
-            length = c0;
-          } else if (*valid != access.getSizes()[d]) {
-            // Repeated partial groups contain holes and cannot be described
-            // by one contiguous placement. Do not silently expand their mask.
-            if (!first && getConstantIntValue(capacityTiles) != 1)
-              return access.emitError("pim-place-data: repeated constant partial masks need a non-contiguous placement");
-            Value validSize = b.create<arith::ConstantIndexOp>(loc, *valid);
-            length = b.create<arith::MinSIOp>(loc, span, validSize);
-          }
-        }
-      }
       if (!access.getValid().empty() &&
           !getConstantIntValue(access.getValid()[d])) {
         Value extent =
@@ -277,7 +261,7 @@ struct PIMPlaceDataPass
     }
 
     // 입력이 어느 logical 축에 불변이면 그 축만 다른 device들은 같은 데이터를 받는다.
-    SmallVector<Attribute> replicated;
+    SmallVector<Attribute> shared;
     if (!isOutput) {
       llvm::SmallPtrSet<Operation *, 4> used;
       // origin은 각 buffer 축의 실제 시작 좌표이며 device별 slice dependency의
@@ -289,7 +273,7 @@ struct PIMPlaceDataPass
       for (Value v : access.getStrides())
         pim::collectDrivers(v, loops, used);
       // mask가 origin 외의 축에 추가로 의존하면 그 device들은 서로 다른 유효
-      // 영역을 받으므로 replicated로 볼 수 없다.
+      // 영역을 받으므로 공유할 수 없다.
       for (Value v : access.getValid())
         pim::collectDrivers(v, loops, used);
       if (Value pad = access.getPad())
@@ -297,14 +281,14 @@ struct PIMPlaceDataPass
       for (scf::ForOp l : loops) {
         const LoopRange &r = ranges.find(l)->second;
         if (r.axis && !used.contains(l))
-          replicated.push_back(r.axis);
+          shared.push_back(r.axis);
       }
     }
 
     b.create<pim::PlaceOp>(
         loc, access.getBase(), start, size, allocationShape, strides,
         StringAttr::get(ctx, isOutput ? "out" : "in"), access.getIdAttr(),
-        replicated.empty() ? ArrayAttr() : ArrayAttr::get(ctx, replicated));
+        shared.empty() ? ArrayAttr() : ArrayAttr::get(ctx, shared));
     return success();
   }
 };

@@ -49,6 +49,12 @@ struct StubEmitter {
   bool havePMM = false;
   bool persistentBody = false;
   unsigned residentSite = 0, residentSlot = 0;
+  // shared_over가 있는 stage의 host pool과 slot별 once flag. foreach_device 앞에서 잡는다.
+  struct SharedPool {
+    std::string pool, once;
+    int64_t slots, bytes;
+  };
+  llvm::DenseMap<Operation *, SharedPool> sharedPools;
 
   // ── PIM_TIMING (임시) ──────────────────────────────────────────────────────
   // 어느 단계가 오래 걸리는지 보려고 넣은 계측이다. 성능 판단이 끝나면 지운다.
@@ -265,6 +271,31 @@ struct StubEmitter {
     int64_t devices = 1;
     for (int64_t n : counts)
       devices *= n;
+    // broadcast 입력: 공유 축을 뺀 좌표 조합마다 slot 하나. slot마다 처음 도착한
+    // thread 하나만 변환하고, 나머지는 그 변환이 끝난 뒤 같은 slot을 전송한다.
+    // round마다 영역이 바뀌므로 once flag는 이 foreach_device마다 새로 만든다.
+    SmallVector<SharedPool> pools;
+    for (aimx::StageOp st : body.getOps<aimx::StageOp>()) {
+      ArrayAttr shared = st.getSharedOverAttr();
+      if (!shared)
+        continue;
+      auto alloc = st.getDst().getDefiningOp<aimx::AllocOp>();
+      if (!alloc)
+        return st.emitError("aimx-to-runtime-stub: shared stage needs an aimx.alloc destination");
+      int64_t slots = 1;
+      for (auto [d, axis] : llvm::enumerate(fd.getAxes()))
+        if (!llvm::is_contained(shared, axis))
+          slots *= counts[d];
+      SharedPool pool{e.temp("_pool"), e.temp("_once"), slots,
+                      static_cast<int64_t>(alloc.getBytes())};
+      e.indent(depth);
+      os() << "char *" << pool.pool << " = (char*)aimx_host_buffer((size_t)"
+           << slots << " * " << pool.bytes << "ull);\n";
+      e.indent(depth);
+      os() << "std::once_flag " << pool.once << "[" << slots << "];\n";
+      sharedPools[st] = pool;
+      pools.push_back(pool);
+    }
     if (!counts.empty()) {
       e.indent(depth);
       os() << "#pragma omp parallel for collapse(" << counts.size()
@@ -318,6 +349,11 @@ struct StubEmitter {
     for (unsigned d = counts.size(); d > 0; d--) {
       e.indent(depth + d - 1);
       os() << "}\n";
+    }
+    for (const SharedPool &pool : pools) {
+      e.indent(depth);
+      os() << "aimx_host_free(" << pool.pool << ", (size_t)" << pool.slots
+           << " * " << pool.bytes << "ull);\n";
     }
     return success();
   }
@@ -663,7 +699,32 @@ struct StubEmitter {
 
     e.indent(depth);
     os() << "{  // aimx.stage\n";
-    e.indent(depth + 1);
+    // broadcast: 공유 slot 하나를 처음 도착한 thread만 채운다. scatter: 자기 host buffer.
+    std::string host = b.host;
+    unsigned pd = depth;
+    auto shared = sharedPools.find(op);
+    if (shared != sharedPools.end()) {
+      auto fd = cast<aimx::ForeachDeviceOp>(op->getParentOp());
+      Block &body = fd.getBody().front();
+      std::string key = e.temp("_key");
+      e.indent(depth + 1);
+      os() << "int64_t " << key << " = 0;\n";
+      for (auto [d, axis] : llvm::enumerate(fd.getAxes())) {
+        if (llvm::is_contained(op.getSharedOverAttr(), axis))
+          continue;
+        e.indent(depth + 1);
+        os() << key << " = " << key << " * " << fd.getCounts()[d] << " + "
+             << e.name(body.getArgument(d + 1)) << ";\n";
+      }
+      host = e.temp("_slot");
+      e.indent(depth + 1);
+      os() << "char *" << host << " = " << shared->second.pool << " + " << key
+           << " * " << shared->second.bytes << "ll;\n";
+      e.indent(depth + 1);
+      os() << "std::call_once(" << shared->second.once << "[" << key << "], [&] {\n";
+      pd = depth + 1;
+    }
+    e.indent(pd + 1);
     os() << "aimx_require(" << rows << " >= 0 && " << cols << " >= 0 && "
          << padRows << " > 0 && " << pitch << " > 0 && "
          << rows << " <= " << b.bytes / bytes << "ll && "
@@ -672,7 +733,7 @@ struct StubEmitter {
     // tile 모양은 런타임 값이고 buffer 크기만 compile time 상수다. 그래서 검사해야 할
     // 것은 "tile 을 넘었는가" 가 아니라 **"이 buffer 를 넘었는가"** 다. k 가 compile
     // time 상한을 넘으면 여기서 잡힌다 — 조용히 잘리지 않는다.
-    e.indent(depth + 1);
+    e.indent(pd + 1);
     os() << "aimx_require((size_t)" << padRows << " * (size_t)" << pitch << " * "
          << bytes << "u <= (size_t)" << b.bytes
          << "ull, \"the problem does not fit the PIM DRAM buffer "
@@ -680,47 +741,47 @@ struct StubEmitter {
     if (!gRows && !gCols) {
       // 아래 두 memset 의 길이가 여기서 음수가 아님을 확정한다. size_t 로 계산하므로
       // 어긋나면 조용히 buffer 밖을 지운다.
-      e.indent(depth + 1);
+      e.indent(pd + 1);
       os() << "aimx_require(" << cols << " <= " << pitch << " && " << rows
            << " <= " << padRows
            << ", \"the staged tile is wider or taller than the padded shape\");\n";
-      e.indent(depth + 1);
-      os() << "uint16_t *" << base << " = (uint16_t*)" << b.host << ";\n";
+      e.indent(pd + 1);
+      os() << "uint16_t *" << base << " = (uint16_t*)" << host << ";\n";
       // padding 은 성능이 아니라 정확성 요구사항이다 — 남는 자리의 0 이 누산에 그대로
       // 더해진다. 그러나 **남는 자리만** 채우면 된다. buffer 전체를 memset 하면 B 는
       // launch 마다 수십 MiB 를 한 번 더 훑는 셈이고, padding 이 없을 때는 그것이 전부
       // 헛일이다. 아래 둘은 padding 이 없으면 길이 0 이다.
-      e.indent(depth + 1);
+      e.indent(pd + 1);
       os() << "for (int64_t " << i << " = 0; " << i << " < " << rows << "; " << i
            << "++)\n";
-      e.indent(depth + 2);
+      e.indent(pd + 2);
       os() << "memset(" << base << " + " << i << " * " << pitch << " + " << cols
            << ", 0, (size_t)(" << pitch << " - " << cols << ") * " << bytes
            << ");\n";
-      e.indent(depth + 1);
+      e.indent(pd + 1);
       os() << "memset(" << base << " + " << rows << " * " << pitch
            << ", 0, (size_t)(" << padRows << " - " << rows << ") * (size_t)"
            << pitch << " * " << bytes << ");\n";
       // 행 주소를 밖으로 뺀다. 안쪽은 연속(또는 고정 stride) 접근이라 벡터화가 걸린다.
-      e.indent(depth + 1);
+      e.indent(pd + 1);
       os() << "for (int64_t " << i << " = 0; " << i << " < " << rows << "; " << i
            << "++) {\n";
-      e.indent(depth + 2);
+      e.indent(pd + 2);
       os() << "const " << srcTy << " *" << sr << " = " << e.name(op.getSrc())
            << " + " << hostRow(op.getOrigin(), op.getStrides(), i) << ";\n";
-      e.indent(depth + 2);
+      e.indent(pd + 2);
       os() << "uint16_t *" << dr << " = " << base << " + " << i << " * " << pitch
            << ";\n";
-      e.indent(depth + 2);
+      e.indent(pd + 2);
       os() << "for (int64_t " << j << " = 0; " << j << " < " << cols << "; " << j
            << "++)\n";
-      e.indent(depth + 3);
+      e.indent(pd + 3);
       os() << dr << "[" << j << "] = "
            << toBF16(srcElem, sr + "[" + j + " * " +
                                  e.name(op.getStrides()[rank - 1]) +
                                  "]")
            << ";\n";
-      e.indent(depth + 1);
+      e.indent(pd + 1);
       os() << "}\n";
     } else {
       // block group 경로. 논리(유효) index 가 물리 칸 (idx/useful)*phys + idx%useful
@@ -737,32 +798,32 @@ struct StubEmitter {
       };
       std::string physRows = gRows ? physOf(rows, ur, pr) : rows;
       std::string physCols = gCols ? physOf(cols, uc, pc) : cols;
-      e.indent(depth + 1);
+      e.indent(pd + 1);
       os() << "aimx_require(" << physCols << " <= " << pitch << " && "
            << physRows << " <= " << padRows
            << ", \"the staged tile is wider or taller than the padded shape\");\n";
-      e.indent(depth + 1);
-      os() << "uint16_t *" << base << " = (uint16_t*)" << b.host << ";\n";
+      e.indent(pd + 1);
+      os() << "uint16_t *" << base << " = (uint16_t*)" << host << ";\n";
       // 유효 행이 아닌 물리 행(행 group 의 pad 자리, 유효 범위 밖)은 통째로 0 이다.
       // 그 0 이 누산에 그대로 더해지므로 정확성 요구사항이다.
       std::string r = e.temp("_r");
-      e.indent(depth + 1);
+      e.indent(pd + 1);
       os() << "for (int64_t " << r << " = 0; " << r << " < " << padRows << "; "
            << r << "++)\n";
-      e.indent(depth + 2);
+      e.indent(pd + 2);
       if (gRows)
         os() << "if (" << r << " % " << pr << " >= " << ur << " || (" << r
              << " / " << pr << ") * " << ur << " + " << r << " % " << pr
              << " >= " << rows << ")\n";
       else
         os() << "if (" << r << " >= " << rows << ")\n";
-      e.indent(depth + 3);
+      e.indent(pd + 3);
       os() << "memset(" << base << " + " << r << " * " << pitch
            << ", 0, (size_t)" << pitch << " * " << bytes << ");\n";
-      e.indent(depth + 1);
+      e.indent(pd + 1);
       os() << "for (int64_t " << i << " = 0; " << i << " < " << rows << "; " << i
            << "++) {\n";
-      e.indent(depth + 2);
+      e.indent(pd + 2);
       os() << "const " << srcTy << " *" << sr << " = " << e.name(op.getSrc())
            << " + " << hostRow(op.getOrigin(), op.getStrides(), i) << ";\n";
       std::string rowIdx =
@@ -770,56 +831,60 @@ struct StubEmitter {
                       std::to_string(pr) + " + " + i + " % " +
                       std::to_string(ur) + ")"
                 : i;
-      e.indent(depth + 2);
+      e.indent(pd + 2);
       os() << "uint16_t *" << dr << " = " << base << " + " << rowIdx << " * "
            << pitch << ";\n";
       if (gCols) {
         // group 단위로 자른다 — 안쪽 loop 이 연속 접근이라야 벡터화가 걸린다.
         std::string j0 = e.temp("_g"), p0 = e.temp("_p"), w = e.temp("_w");
-        e.indent(depth + 2);
+        e.indent(pd + 2);
         os() << "int64_t " << p0 << " = 0;\n";
-        e.indent(depth + 2);
+        e.indent(pd + 2);
         os() << "for (int64_t " << j0 << " = 0; " << j0 << " < " << cols << "; "
              << j0 << " += " << uc << ") {\n";
-        e.indent(depth + 3);
+        e.indent(pd + 3);
         os() << "int64_t " << w << " = " << cols << " - " << j0 << " < " << uc
              << " ? " << cols << " - " << j0 << " : " << uc << ";\n";
-        e.indent(depth + 3);
+        e.indent(pd + 3);
         os() << "for (int64_t " << j << " = 0; " << j << " < " << w << "; " << j
              << "++)\n";
-        e.indent(depth + 4);
+        e.indent(pd + 4);
         os() << dr << "[" << p0 << " + " << j << "] = "
              << toBF16(srcElem, sr + "[(" + j0 + " + " + j + ") * " +
                                     e.name(op.getStrides()[rank - 1]) + "]")
              << ";\n";
-        e.indent(depth + 3);
+        e.indent(pd + 3);
         os() << "memset(" << dr << " + " << p0 << " + " << w << ", 0, (size_t)("
              << pc << " - " << w << ") * " << bytes << ");\n";
-        e.indent(depth + 3);
+        e.indent(pd + 3);
         os() << p0 << " += " << pc << ";\n";
-        e.indent(depth + 2);
+        e.indent(pd + 2);
         os() << "}\n";
-        e.indent(depth + 2);
+        e.indent(pd + 2);
         os() << "memset(" << dr << " + " << p0 << ", 0, (size_t)(" << pitch
              << " - " << p0 << ") * " << bytes << ");\n";
       } else {
-        e.indent(depth + 2);
+        e.indent(pd + 2);
         os() << "for (int64_t " << j << " = 0; " << j << " < " << cols << "; "
              << j << "++)\n";
-        e.indent(depth + 3);
+        e.indent(pd + 3);
         os() << dr << "[" << j << "] = "
              << toBF16(srcElem, sr + "[" + j + " * " +
                                     e.name(op.getStrides()[rank - 1]) + "]")
              << ";\n";
-        e.indent(depth + 2);
+        e.indent(pd + 2);
         os() << "memset(" << dr << " + " << cols << ", 0, (size_t)(" << pitch
              << " - " << cols << ") * " << bytes << ");\n";
       }
-      e.indent(depth + 1);
+      e.indent(pd + 1);
       os() << "}\n";
     }
+    if (shared != sharedPools.end()) {
+      e.indent(depth + 1);
+      os() << "});\n";
+    }
     e.indent(depth + 1);
-    os() << "aimx_require(datacopy_cpu2pim((void*)" << b.va << ", " << b.host
+    os() << "aimx_require(datacopy_cpu2pim((void*)" << b.va << ", " << host
          << ", (int)((size_t)" << padRows << " * (size_t)" << pitch << " * "
          << bytes << "), _fpga) >= 0, \"input upload failed\");\n";
     e.indent(depth);

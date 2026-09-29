@@ -1,16 +1,16 @@
 // Rectangular access masks project to the whole execution-tile placement.
 // This is a copy, not a GEMM pattern. Both axes contain two groups, and the
 // placement starts/ends are runtime values (including device/scheduling tails).
-// RUN: triton-shared-opt --convert-pim-to-aimx --cse --canonicalize --mlir-print-op-generic %s -o %t.aimx
+// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx --cse --canonicalize --mlir-print-op-generic %s -o %t.aimx
 // RUN: triton-shared-opt %t.aimx | FileCheck %s --check-prefix=IR
 // RUN: triton-shared-translate --aimx-to-runtime-stub %t.aimx | FileCheck %s --check-prefix=STUB
 // A partial/empty execution tile keeps fixed allocation and clips only I/O.
-// RUN: sed '/^    %remaining_m =/,$ {s/%M/%c1/g; s/%N/%c8/g; s/%start_m/%c0/g; s/%start_n/%c0/g;}' %s | triton-shared-opt --convert-pim-to-aimx --cse --canonicalize | FileCheck %s --check-prefix=TAIL
-// RUN: sed '/^    %remaining_m =/,$ {s/%M/%c0/g; s/%N/%c8/g; s/%start_m/%c0/g; s/%start_n/%c0/g;}' %s | triton-shared-opt --convert-pim-to-aimx --cse --canonicalize | FileCheck %s --check-prefix=EMPTY
+// RUN: sed '/^    %remaining_m =/,$ {s/%M/%c1/g; s/%N/%c8/g; s/%start_m/%c0/g; s/%start_n/%c0/g;}' %s | triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx --cse --canonicalize | FileCheck %s --check-prefix=TAIL
+// RUN: sed '/^    %remaining_m =/,$ {s/%M/%c0/g; s/%N/%c8/g; s/%start_m/%c0/g; s/%start_n/%c0/g;}' %s | triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx --cse --canonicalize | FileCheck %s --check-prefix=EMPTY
 // A repeated partial mask cannot be replaced by the bounding rectangle.
-// RUN: sed 's/valid\[%valid_m, %valid_n\]/valid[%c1, %valid_n]/g' %s | not triton-shared-opt --convert-pim-to-aimx 2>&1 | FileCheck %s --check-prefix=HOLES
+// RUN: sed 's/valid\[%valid_m, %valid_n\]/valid[%c1, %valid_n]/g' %s | not triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx 2>&1 | FileCheck %s --check-prefix=HOLES
 // The bound must clip this access coordinate, not an unrelated group axis.
-// RUN: sed 's/arith.subi %N, %n/arith.subi %N, %m/' %s | not triton-shared-opt --convert-pim-to-aimx 2>&1 | FileCheck %s --check-prefix=HOLES
+// RUN: sed 's/arith.subi %N, %n/arith.subi %N, %m/' %s | not triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx 2>&1 | FileCheck %s --check-prefix=HOLES
 // IR-LABEL: func.func @masked_groups
 // IR: %[[MREST:.*]] = arith.subi %arg2, %arg4 : index
 // IR: %[[MNONNEG:.*]] = arith.maxsi %[[MREST]], {{.*}} : index

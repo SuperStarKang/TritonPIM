@@ -27,7 +27,7 @@ class PIMAccess:
     """One buffer placement visible in PIM Common IR.
 
     ``axes`` is the set of logical axes used by the access.  Axes absent from
-    an input access become ``pim.place.replicated_over`` after scheduling.
+    an input access become ``pim.place.shared_over`` after scheduling.
     Each buffer is listed once even when several fused compute operations use
     it inside the same Execution Tile residency.
     """
@@ -117,7 +117,7 @@ class PIMProblem:
     def uses_aimx_matmul_primitive(self):
         return self.compute_kind in ("matmul", "matvec")
 
-    def replicated_over(self, access):
+    def shared_over(self, access):
         return tuple(
             axis for axis in AXES
             if self.axis_extents[AXES.index(axis)] > 1

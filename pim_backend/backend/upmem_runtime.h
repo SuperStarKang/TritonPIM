@@ -28,6 +28,13 @@ int upmem_runtime_load(const char *binary_path);
 
 #include "upmem_resident.h"
 
+// 같은 rank/member 안의 CI 순서에 컴파일된 논리 묶음을 배정한다.
+// logical_for_dpu[SDK 열거 번호]는 canonical 논리 번호다.
+void upmem_bind_devices(struct dpu_set_t set, uint32_t num_axes,
+                        const uint32_t *partitions,
+                        const uint32_t *device_mapping,
+                        uint32_t *logical_for_dpu);
+
 #ifdef __cplusplus
 }
 #endif

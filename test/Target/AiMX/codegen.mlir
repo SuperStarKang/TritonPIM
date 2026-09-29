@@ -1,7 +1,7 @@
 // Translate actual single-pass output, including nested construction loops.
-// RUN: sed 's/bf16/f32/g' %S/../../Conversion/PIMToAiMX/convert.mlir | triton-shared-opt --mlir-print-op-generic --convert-pim-to-aimx | triton-shared-translate --aimx-to-descriptors | FileCheck %s --check-prefix=DESC
-// RUN: sed 's/bf16/f32/g' %S/../../Conversion/PIMToAiMX/convert.mlir | triton-shared-opt --mlir-print-op-generic --convert-pim-to-aimx=persistent=false | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=STUB
-// RUN: triton-shared-opt --mlir-print-op-generic --convert-pim-to-aimx --cse --canonicalize %S/../../Conversion/PIMToAiMX/convert.mlir | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=PERSIST
+// RUN: sed 's/bf16/f32/g' %S/../../Conversion/PIMToAiMX/convert.mlir | triton-shared-opt --mlir-print-op-generic --pim-form-host-plan --convert-pim-to-aimx | triton-shared-translate --aimx-to-descriptors | FileCheck %s --check-prefix=DESC
+// RUN: sed 's/bf16/f32/g' %S/../../Conversion/PIMToAiMX/convert.mlir | triton-shared-opt --mlir-print-op-generic --pim-form-host-plan --convert-pim-to-aimx=persistent=false | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=STUB
+// RUN: triton-shared-opt --mlir-print-op-generic --pim-form-host-plan --convert-pim-to-aimx --cse --canonicalize %S/../../Conversion/PIMToAiMX/convert.mlir | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=PERSIST
 // DESC: #include "aimx_runtime.h"
 // DESC: static uint32_t aimx_prog_matmul_device0_matmul_
 // DESC: aimx_require(idx + NUM_CHANNELS <= cap

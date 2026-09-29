@@ -1,7 +1,7 @@
 // Mixed tensor/index/i32 state, parallel swaps, and a zero-trip loop.
-// RUN: triton-shared-opt --convert-pim-to-aimx %s | FileCheck %s --check-prefix=IR
-// RUN: triton-shared-opt --mlir-print-op-generic --convert-pim-to-aimx %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=STUB
-// RUN: triton-shared-opt --mlir-print-op-generic --convert-pim-to-aimx --cse --canonicalize %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=CANON
+// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx %s | FileCheck %s --check-prefix=IR
+// RUN: triton-shared-opt --mlir-print-op-generic --pim-form-host-plan --convert-pim-to-aimx %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=STUB
+// RUN: triton-shared-opt --mlir-print-op-generic --pim-form-host-plan --convert-pim-to-aimx --cse --canonicalize %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=CANON
 // IR-LABEL: func.func @scalar_carried
 // IR: %[[ZERO:[a-zA-Z0-9_]+]] = arith.constant 0 : index
 // IR: %[[ONE:[a-zA-Z0-9_]+]] = arith.constant 1 : index

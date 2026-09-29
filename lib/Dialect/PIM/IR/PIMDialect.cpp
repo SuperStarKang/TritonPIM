@@ -2,7 +2,10 @@
 
 // 생성된 op builder / attribute·type printer-parser가 사용하는 헤더들.
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/DialectImplementation.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 
@@ -89,6 +92,115 @@ LogicalResult AccessOp::verify() {
 LogicalResult DeviceOp::verify() {
   if (getBody().front().getNumArguments() != 3)
     return emitOpError("body must take the [m, n, k] unit coordinates");
+  return success();
+}
+
+LogicalResult PartitionOp::verify() {
+  if (getBody().empty() || getBody().front().getNumArguments() != 3)
+    return emitOpError("body must take the [m, n, k] logical coordinates");
+  for (BlockArgument coordinate : getBody().front().getArguments())
+    if (!coordinate.getType().isIndex())
+      return emitOpError("logical coordinates must have index type");
+
+  llvm::DenseMap<int64_t, PlaceOp> placements;
+  llvm::DenseSet<int64_t> sent, gathered;
+  bool transfersStarted = false;
+  bool launched = false;
+  for (Operation &op : getBody().front()) {
+    if (auto place = dyn_cast<PlaceOp>(&op)) {
+      if (transfersStarted)
+        return place.emitOpError("placements must precede the transfer plan");
+      if (!placements.try_emplace(place.getAccess(), place).second)
+        return place.emitOpError("duplicate placement access id");
+      continue;
+    }
+    if (isa<BroadcastOp, ScatterOp>(&op)) {
+      transfersStarted = true;
+      if (launched)
+        return op.emitOpError("input transfer must precede pim.launch");
+      int64_t access = isa<BroadcastOp>(&op)
+                           ? cast<BroadcastOp>(&op).getAccess()
+                           : cast<ScatterOp>(&op).getAccess();
+      auto found = placements.find(access);
+      if (found == placements.end() || found->second.getDirection() != "in")
+        return op.emitOpError("transfer requires an input placement with id ")
+               << access;
+      if (!sent.insert(access).second)
+        return op.emitOpError("input placement is transferred more than once");
+      continue;
+    }
+    if (isa<LaunchOp>(&op)) {
+      if (launched)
+        return op.emitOpError("partition must contain exactly one pim.launch");
+      transfersStarted = true;
+      launched = true;
+      continue;
+    }
+    if (auto gather = dyn_cast<GatherOp>(&op)) {
+      if (!launched)
+        return gather.emitOpError("gather must follow pim.launch");
+      auto found = placements.find(gather.getAccess());
+      if (found == placements.end() || found->second.getDirection() != "out")
+        return gather.emitOpError("gather requires an output placement with id ")
+               << gather.getAccess();
+      if (!gathered.insert(gather.getAccess()).second)
+        return gather.emitOpError("output placement is gathered more than once");
+      continue;
+    }
+    if (transfersStarted || op.getNumRegions() != 0 ||
+        !isMemoryEffectFree(&op) ||
+        !llvm::all_of(op.getResultTypes(), [](Type type) {
+          return type.isIntOrIndex() || isa<FloatType>(type);
+        }))
+      return op.emitOpError("host plan permits only scalar setup, placements, "
+                            "input transfers, one launch, and gathers");
+  }
+  if (!launched)
+    return emitOpError("partition must contain exactly one pim.launch");
+  for (auto &entry : placements) {
+    bool input = entry.second.getDirection() == "in";
+    if (!(input ? sent : gathered).contains(entry.first))
+      return entry.second.emitOpError(input ? "input placement has no transfer"
+                                           : "output placement has no gather");
+  }
+  return success();
+}
+
+static LogicalResult verifyTransfer(Operation *op, int64_t access,
+                                    StringRef direction, bool broadcast) {
+  auto partition = dyn_cast_or_null<PartitionOp>(op->getParentOp());
+  if (!partition)
+    return op->emitOpError("must be directly inside pim.partition");
+  for (PlaceOp place : partition.getBody().front().getOps<PlaceOp>()) {
+    if (place.getAccess() != access)
+      continue;
+    if (place.getDirection() != direction)
+      return op->emitOpError("placement direction must be ") << direction;
+    if (broadcast &&
+        (!place.getSharedOverAttr() || place.getSharedOverAttr().empty()))
+      return op->emitOpError("broadcast requires nonempty shared_over");
+    return success();
+  }
+  return op->emitOpError("no placement with access id ") << access;
+}
+
+LogicalResult BroadcastOp::verify() {
+  return verifyTransfer(*this, getAccess(), "in", true);
+}
+
+LogicalResult ScatterOp::verify() {
+  return verifyTransfer(*this, getAccess(), "in", false);
+}
+
+LogicalResult GatherOp::verify() {
+  return verifyTransfer(*this, getAccess(), "out", false);
+}
+
+LogicalResult LaunchOp::verify() {
+  if (!isa_and_nonnull<PartitionOp>((*this)->getParentOp()))
+    return emitOpError("must be directly inside pim.partition");
+  if (getBody().empty() || getBody().front().getNumArguments() != 0)
+    return emitOpError("compute body must have no block arguments");
   return success();
 }
 

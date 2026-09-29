@@ -195,6 +195,10 @@ def AiMX_AllocOp : AiMX_Op<"alloc"> {
 // 단위를 딱 채우지 못할 때 그 어긋남이 이 0 이 된다 (#aimx.tile_group). padding 이
 // 없는 축은 attr 를 아예 싣지 않는다. sizes 와 origin 은 논리(유효) 단위이고
 // pad_to 와 pitch 는 물리 단위다.
+//
+// shared_over 는 pim.broadcast 의 공유 축이다. 이 축의 좌표만 다른 device 들은 같은
+// 영역을 받으므로 host 변환은 공유 slot 마다 한 번만 하고, 전송은 device 마다 한다.
+// 없으면(pim.scatter) device 마다 변환과 전송을 모두 한다.
 def AiMX_StageOp : AiMX_Op<"stage", [AttrSizedOperandSegments]> {
   let summary = "Gather a strided host region into a pitched PIM DRAM array";
   let arguments = (ins AnyRankedOrUnrankedMemRef:$src,
@@ -203,7 +207,8 @@ def AiMX_StageOp : AiMX_Op<"stage", [AttrSizedOperandSegments]> {
                        Index:$pitch, AiMX_BufferType:$dst,
                        TypeAttr:$element_type, UnitAttr:$transpose,
                        OptionalAttr<DenseI64ArrayAttr>:$group_rows,
-                       OptionalAttr<DenseI64ArrayAttr>:$group_cols);
+                       OptionalAttr<DenseI64ArrayAttr>:$group_cols,
+                       OptionalAttr<StrArrayAttr>:$shared_over);
   let assemblyFormat = [{
     $src `origin` `[` $origin `]` `sizes` `[` $sizes `]`
     `strides` `[` $strides `]` `pad_to` `[` $pad_to `]` `pitch` $pitch
