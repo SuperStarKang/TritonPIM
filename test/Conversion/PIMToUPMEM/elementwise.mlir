@@ -1,8 +1,8 @@
 // Identity-map linalg.generic의 add+sub+mul fusion이 공통 3계층 plan을 유지한 채 UPMEM
 // WRAM 계산과 DPU C loop까지 내려가는지 확인한다. lanes=4이므로 block group의 8행을
 // tasklet마다 2행씩 맡는다.
-// RUN: triton-shared-opt --convert-pim-to-upmem %s | FileCheck %s --check-prefix=IR
-// RUN: triton-shared-opt --convert-pim-to-upmem %s | triton-shared-translate --upmem-to-device | FileCheck %s --check-prefix=DEVICE
+// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-upmem %s | FileCheck %s --check-prefix=IR
+// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-upmem %s | triton-shared-translate --upmem-to-device | FileCheck %s --check-prefix=DEVICE
 
 #map = affine_map<(d0, d1) -> (d0, d1)>
 

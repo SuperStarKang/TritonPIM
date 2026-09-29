@@ -34,20 +34,27 @@ from triton.backends.driver import DriverBase
 from triton.backends.compiler import GPUTarget
 
 import triton.backends.triton_shared.driver as cpu_driver
-from .resident import current_invocation, resident_lock
+from .runtime import current_invocation, resident_lock
 
 
 # ── PIM_TIMING (임시): 마지막 launch의 단계별 시간(ms)과 그 단계 이름.
 # 지울 때 이 표시를 찾으면 된다. 두 target의 단계 이름이 다르므로 launch마다 다시 놓는다.
-UPMEM_TIMING_VERSION = 2
+UPMEM_TIMING_VERSION = 3  # Generated host ABI; resident reports are adjusted by the runtime.
+UPMEM_RESIDENT_TIMING_VERSION = 4
 _STAGE_NAMES = {
     # H2D/D2H: prepare+push. kernel: synchronous dpu_launch only.
-    # host_alloc: receive buffers; input staging allocations remain in stage.
-    "upmem": ("stage", "h2d", "kernel", "d2h", "combine", "host_alloc", "host_free"),
+    # Exclusive action timings; summing them never counts layout twice.
+    "upmem": ("prepare", "h2d", "kernel", "d2h", "reduction",
+              "buffer_alloc", "buffer_free", "acquire", "buffer_init",
+              "layout_a", "layout_b", "layout_other", "layout_c"),
     "aimx": ("alloc", "build", "stage", "invoke", "unstage"),
 }
+UPMEM_RESIDENT_TIMING_STAGES = _STAGE_NAMES["upmem"] + ("program_load", "resident_host")
 TIMING_STAGES = _STAGE_NAMES["upmem"]
+TIMING_VERSION = UPMEM_TIMING_VERSION
 timing = [0.0] * len(TIMING_STAGES)
+# H2D role subtotals, already included in the resident h2d stage.
+resident_h2d_timing = None
 # 마지막 launch의 pim_exec 호출 수. aimx만 낸다(upmem은 0으로 둔다). execution tile 하나의
 # throughput은 invoke 시간을 이 값으로 나눠야 나오는데, host에서 tile 산술을 다시 하면
 # device 분할 규칙이 바뀔 때마다 어긋난다.
@@ -277,8 +284,6 @@ class PIMLauncher(object):
         bundle = json.loads(bytes(cu_function).decode("utf-8"))
         invocation = current_invocation.get()
         if invocation is not None:
-            if self.pim_target != "upmem":
-                raise ValueError("ResidentBlock requires the UPMEM backend")
             if launch_enter_hook is not None:
                 launch_enter_hook(launch_metadata)
             invocation.launch(self, bundle, kernel_metadata[6],
@@ -303,17 +308,12 @@ class PIMLauncher(object):
         entry = kernel_metadata[6]
         lib = ctypes.CDLL(so_path)
         if self.pim_target == "upmem":
-            # Old cached hosts export five timings with different boundaries.
-            # Reject them before launching or reading the expanded timing array.
-            try:
-                timing_version = ctypes.c_uint32.in_dll(lib, "pim_timing_version").value
-            except ValueError:
-                timing_version = None
+            timing_version = ctypes.c_uint32.in_dll(lib, "pim_timing_version").value
             if timing_version != UPMEM_TIMING_VERSION:
                 raise RuntimeError(
                     f"UPMEM timing version {timing_version!r}; expected {UPMEM_TIMING_VERSION}. "
-                    "Rebuild triton-shared-translate, then regenerate the Triton artifacts "
-                    "(use a fresh TRITON_CACHE_DIR and TORCHINDUCTOR_CACHE_DIR).")
+                    "Rebuild triton-shared-opt and triton-shared-translate, then regenerate the Triton artifacts "
+                    "with the current backend compiler version.")
         fn = getattr(lib, entry)
         # 커널 인자를 원래 순서대로, 그 뒤에 grid 크기 셋.
         # grid는 컴파일 캐시 키에 없으므로(jit.py가 캐시를 조회한 뒤 정규화한다) 반드시
@@ -332,8 +332,10 @@ class PIMLauncher(object):
         # ── PIM_TIMING (임시): 생성된 host 코드가 단계별 시간을 전역 배열에 남긴다.
         # 성능 판단이 끝나면 이 블록과 위의 PIM_TIMING 정의, UPMEMToHost.cpp / AiMXToRuntimeStub.cpp의
         # 같은 표시를 지운다. 단계 이름은 target마다 다르므로 같이 놓는다.
-        global TIMING_STAGES, invokes
+        global TIMING_STAGES, TIMING_VERSION, resident_h2d_timing, invokes
         TIMING_STAGES = _STAGE_NAMES[self.pim_target]
+        TIMING_VERSION = UPMEM_TIMING_VERSION if self.pim_target == "upmem" else None
+        resident_h2d_timing = None
         timing[:] = list((ctypes.c_double * len(TIMING_STAGES)).in_dll(lib, "pim_timing_ms"))
         # 이 전역은 AiMXToRuntimeStub.cpp만 낸다. upmem .so에서 in_dll을 부르면
         # ValueError로 launch 자체가 실패하므로 target을 보고 부른다.
@@ -383,7 +385,7 @@ def _pim_do_bench(fn, warmup=1, rep=3, quantiles=None, return_mode="mean", **kwa
     # warmup은 선택이 아니다. config마다 첫 호출에 device.elf 컴파일과 (num_units가 바뀌었으면)
     # DPU set 재예약이 섞여 들어온다.
     #
-    # 재는 것은 launch 전체(staging + h2d + kernel + d2h + combine)다. tile 크기를 바꾸면 전송량도
+    # 재는 것은 host 준비와 layout, h2d, kernel, d2h, reduction 전체다. tile 크기를 바꾸면 전송량도
     # 함께 변하므로 pim_timing_ms의 kernel 단계만 떼어 재면 최소화 대상이 어긋난다.
     from triton.testing import _summarize_statistics
 

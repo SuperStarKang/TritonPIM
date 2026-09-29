@@ -1,10 +1,10 @@
 // Native operations follow the scalar body's SSA and operand order.
-// RUN: triton-shared-opt --pim-verify --convert-pim-to-aimx %s | FileCheck %s --check-prefix=ADD
-// RUN: sed 's/arith.addf/arith.subf/' %s | triton-shared-opt --convert-pim-to-aimx | FileCheck %s --check-prefix=SUB
-// RUN: sed 's/arith.addf/arith.mulf/' %s | triton-shared-opt --convert-pim-to-aimx | FileCheck %s --check-prefix=MUL
-// RUN: sed 's/arith.addf %lhs, %rhs/arith.subf %rhs, %lhs/' %s | triton-shared-opt --convert-pim-to-aimx | FileCheck %s --check-prefix=REVERSE
-// RUN: triton-shared-opt --mlir-print-op-generic --convert-pim-to-aimx --cse --canonicalize %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=STUB
-// RUN: sed 's/arith.addf/arith.divf/' %s | not triton-shared-opt --convert-pim-to-aimx 2>&1 | FileCheck %s --check-prefix=UNSUPPORTED
+// RUN: triton-shared-opt --pim-verify --pim-form-host-plan --convert-pim-to-aimx %s | FileCheck %s --check-prefix=ADD
+// RUN: sed 's/arith.addf/arith.subf/' %s | triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx | FileCheck %s --check-prefix=SUB
+// RUN: sed 's/arith.addf/arith.mulf/' %s | triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx | FileCheck %s --check-prefix=MUL
+// RUN: sed 's/arith.addf %lhs, %rhs/arith.subf %rhs, %lhs/' %s | triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx | FileCheck %s --check-prefix=REVERSE
+// RUN: triton-shared-opt --mlir-print-op-generic --pim-form-host-plan --convert-pim-to-aimx --cse --canonicalize %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=STUB
+// RUN: sed 's/arith.addf/arith.divf/' %s | not triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx 2>&1 | FileCheck %s --check-prefix=UNSUPPORTED
 // ADD: aimx.descriptor_program @pointwise_device0_elementwise_{{[0-9]+}} batch 1
 // ADD: len 8192 opcode descr_dst_mask|a_mask|add
 // ADD: len 8192 opcode b_mask|add|pim_mode

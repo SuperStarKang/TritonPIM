@@ -79,9 +79,18 @@ struct PIMVerifyPass
     }
     if (failed(verifyFunctions(profile)))
       return signalPassFailure();
-    WalkResult result = getOperation().walk([&](pim::DeviceOp device) {
-      return succeeded(verifyDevice(device, profile)) ? WalkResult::advance()
-                                                      : WalkResult::interrupt();
+    WalkResult result = getOperation().walk([&](Operation *op) {
+      if (auto device = dyn_cast<pim::DeviceOp>(op))
+        return succeeded(verifyDevice(op, device.getBody().front(),
+                                      device.getMapping(), profile))
+                   ? WalkResult::advance()
+                   : WalkResult::interrupt();
+      if (auto partition = dyn_cast<pim::PartitionOp>(op))
+        return succeeded(verifyDevice(op, partition.getBody().front(),
+                                      partition.getMapping(), profile))
+                   ? WalkResult::advance()
+                   : WalkResult::interrupt();
+      return WalkResult::advance();
     });
     if (result.wasInterrupted())
       signalPassFailure();
@@ -107,9 +116,9 @@ struct PIMVerifyPass
         return WalkResult::interrupt();
       }
 
-      pim::DeviceOp device;
-      func.walk([&](pim::DeviceOp candidate) {
-        if (!device)
+      Operation *device = nullptr;
+      func.walk([&](Operation *candidate) {
+        if (!device && isa<pim::DeviceOp, pim::PartitionOp>(candidate))
           device = candidate;
       });
       auto execution =
@@ -118,14 +127,15 @@ struct PIMVerifyPass
                  : pim::ExecutionTileAttr();
       if (!execution) {
         func->emitError(
-            "pim-verify: every PIM function needs a pim.device with "
+            "pim-verify: every PIM function needs a device or partition with "
             "#pim.execution_tile");
         return WalkResult::interrupt();
       }
 
       SmallVector<scf::ForOp> loops;
       func.walk<WalkOrder::PreOrder>([&](scf::ForOp loop) {
-        if (loop->getParentOfType<pim::DeviceOp>())
+        if (loop->getParentOfType<pim::DeviceOp>() ||
+            loop->getParentOfType<pim::PartitionOp>())
           loops.push_back(loop);
       });
       scf::ForOp axes[3];
@@ -194,20 +204,21 @@ struct PIMVerifyPass
     return failure(result.wasInterrupted());
   }
 
-  LogicalResult verifyDevice(pim::DeviceOp device,
+  LogicalResult verifyDevice(Operation *device, Block &deviceBody,
+                             pim::DeviceMappingAttr mapping,
                              pim::TargetProfileAttr profile) {
     auto execution =
         device->getAttrOfType<pim::ExecutionTileAttr>("pim.execution_tile");
     if (!execution)
       return device->emitError(
-          "pim-verify: every pim.device needs #pim.execution_tile");
+          "pim-verify: every device or partition needs #pim.execution_tile");
 
     SmallVector<scf::ForOp> temporalReductions;
     SmallVector<scf::ForOp> semanticReductions;
     SmallVector<scf::ForOp> spatialAxes[2];
     SmallVector<scf::ForOp> deviceLoops;
     scf::ForOp spatialK;
-    device.getBody().walk<WalkOrder::PreOrder>([&](scf::ForOp loop) {
+    device->walk<WalkOrder::PreOrder>([&](scf::ForOp loop) {
       deviceLoops.push_back(loop);
       if (loop->hasAttr("pim.temporal_reduction"))
         temporalReductions.push_back(loop);
@@ -287,8 +298,7 @@ struct PIMVerifyPass
                << name << " axis needs one scheduling round";
     }
 
-    ArrayRef<int64_t> partitions =
-        device.getMapping().getPartitions().asArrayRef();
+    ArrayRef<int64_t> partitions = mapping.getPartitions().asArrayRef();
     if (partitions[0] > 1 && spatialAxes[0].empty())
       return device->emitError(
           "pim-verify: p_m > 1 requires one spatial M axis");
@@ -312,7 +322,7 @@ struct PIMVerifyPass
              << profile.getNumUnits();
 
     llvm::DenseMap<int64_t, pim::AccessOp> accesses;
-    WalkResult accessResult = device.walk([&](pim::AccessOp access) {
+    WalkResult accessResult = device->walk([&](pim::AccessOp access) {
       if (access.getOrigin().size() != access.getSizes().size()) {
         access->emitError(
             "pim-verify: origin rank must equal access sizes rank");
@@ -336,7 +346,7 @@ struct PIMVerifyPass
 
     llvm::DenseMap<int64_t, pim::PlaceOp> placements;
     int64_t staticAllocationBytes = 0;
-    for (Operation &operation : device.getBody().front()) {
+    for (Operation &operation : deviceBody) {
       auto place = dyn_cast<pim::PlaceOp>(&operation);
       if (!place)
         continue;
@@ -416,7 +426,7 @@ struct PIMVerifyPass
              << " placements";
 
     SmallVector<Value> kRoots;
-    kRoots.push_back(device.getBody().front().getArgument(2));
+    kRoots.push_back(deviceBody.getArgument(2));
     for (scf::ForOp loop : temporalReductions)
       kRoots.push_back(loop.getInductionVar());
     for (scf::ForOp loop : temporalRounds)
@@ -451,7 +461,7 @@ struct PIMVerifyPass
       return success();
     };
 
-    WalkResult storeResult = device.walk([&](pim::StoreOp store) {
+    WalkResult storeResult = device->walk([&](pim::StoreOp store) {
       auto access = store.getAccess().getDefiningOp<pim::AccessOp>();
       if (!access) {
         store->emitError(
@@ -464,7 +474,7 @@ struct PIMVerifyPass
     });
     if (storeResult.wasInterrupted())
       return failure();
-    WalkResult combineResult = device.walk([&](pim::CombineOp combine) {
+    WalkResult combineResult = device->walk([&](pim::CombineOp combine) {
       auto access =
           combine.getDestination().getDefiningOp<pim::AccessOp>();
       if (!access || failed(verifyFinalAccess(access, combine)))
@@ -484,11 +494,11 @@ struct PIMVerifyPass
       bool wrongKind = false;
       StringAttr reductionKind =
           reduction->getAttrOfType<StringAttr>("pim.reduction");
-      device.walk([&](pim::StoreOp store) {
+      device->walk([&](pim::StoreOp store) {
         if (!directStore && dependsOn(store.getValue(), reduction.getResults()))
           directStore = store;
       });
-      device.walk([&](pim::CombineOp combine) {
+      device->walk([&](pim::CombineOp combine) {
         if (!dependsOn(combine.getPartial(), reduction.getResults())) {
           if (!unrelatedCombine)
             unrelatedCombine = combine;
@@ -520,7 +530,7 @@ struct PIMVerifyPass
             "pim-verify: reduction and combine kinds must match");
     } else if (semanticReductions.empty()) {
       pim::CombineOp unexplained;
-      device.walk([&](pim::CombineOp combine) {
+      device->walk([&](pim::CombineOp combine) {
         if (!unexplained)
           unexplained = combine;
       });

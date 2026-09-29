@@ -1,0 +1,3046 @@
+graph():
+    %activation : [num_users=2] = placeholder[target=activation]
+    %resident_p_layers_0_input_layernorm_weight : [num_users=1] = get_attr[target=resident_p_layers_0_input_layernorm_weight]
+    %submod_0 : [num_users=2] = call_module[target=submod_0](args = (%activation, %resident_p_layers_0_input_layernorm_weight), kwargs = {})
+    %getitem : [num_users=1] = call_function[target=operator.getitem](args = (%submod_0, 0), kwargs = {})
+    %getitem_1 : [num_users=2] = call_function[target=operator.getitem](args = (%submod_0, 1), kwargs = {})
+    %resident_t : [num_users=1] = get_attr[target=resident_t]
+    %submod_1 : [num_users=1] = call_module[target=submod_1](args = (%getitem, %resident_t), kwargs = {})
+    %submod_2 : [num_users=2] = call_module[target=submod_2](args = (%submod_1, %getitem_1), kwargs = {})
+    %getitem_2 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_2, 0), kwargs = {})
+    %getitem_3 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_2, 1), kwargs = {})
+    %resident_t_1 : [num_users=1] = get_attr[target=resident_t_1]
+    %submod_3 : [num_users=1] = call_module[target=submod_3](args = (%getitem_2, %resident_t_1), kwargs = {})
+    %submod_4 : [num_users=2] = call_module[target=submod_4](args = (%submod_3, %getitem_1), kwargs = {})
+    %getitem_4 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_4, 0), kwargs = {})
+    %getitem_5 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_4, 1), kwargs = {})
+    %resident_t_2 : [num_users=1] = get_attr[target=resident_t_2]
+    %submod_5 : [num_users=1] = call_module[target=submod_5](args = (%getitem_4, %resident_t_2), kwargs = {})
+    %resident_b_layers_1_cosine : [num_users=2] = get_attr[target=resident_b_layers_1_cosine]
+    %resident_b_layers_1_sine : [num_users=2] = get_attr[target=resident_b_layers_1_sine]
+    %submod_6 : [num_users=5] = call_module[target=submod_6](args = (%submod_5, %resident_b_layers_1_cosine, %resident_b_layers_1_sine, %getitem_3, %getitem_5), kwargs = {})
+    %getitem_6 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_6, 0), kwargs = {})
+    %getitem_7 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_6, 1), kwargs = {})
+    %getitem_8 : [num_users=32] = call_function[target=operator.getitem](args = (%submod_6, 2), kwargs = {})
+    %getitem_9 : [num_users=31] = call_function[target=operator.getitem](args = (%submod_6, 3), kwargs = {})
+    %getitem_10 : [num_users=31] = call_function[target=operator.getitem](args = (%submod_6, 4), kwargs = {})
+    %submod_7 : [num_users=1] = call_module[target=submod_7](args = (%getitem_6, %getitem_7), kwargs = {})
+    %resident_b_layers_1_causal_mask : [num_users=64] = get_attr[target=resident_b_layers_1_causal_mask]
+    %submod_8 : [num_users=2] = call_module[target=submod_8](args = (%submod_7, %resident_b_layers_1_causal_mask, %getitem_8), kwargs = {})
+    %getitem_11 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_8, 0), kwargs = {})
+    %getitem_12 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_8, 1), kwargs = {})
+    %submod_9 : [num_users=1] = call_module[target=submod_9](args = (%getitem_11, %getitem_12), kwargs = {})
+    %submod_10 : [num_users=2] = call_module[target=submod_10](args = (%getitem_9, %getitem_10), kwargs = {})
+    %getitem_13 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_10, 0), kwargs = {})
+    %getitem_14 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_10, 1), kwargs = {})
+    %submod_11 : [num_users=1] = call_module[target=submod_11](args = (%getitem_13, %getitem_14), kwargs = {})
+    %submod_12 : [num_users=2] = call_module[target=submod_12](args = (%submod_11, %resident_b_layers_1_causal_mask, %getitem_8), kwargs = {})
+    %getitem_15 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_12, 0), kwargs = {})
+    %getitem_16 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_12, 1), kwargs = {})
+    %submod_13 : [num_users=1] = call_module[target=submod_13](args = (%getitem_15, %getitem_16), kwargs = {})
+    %submod_14 : [num_users=2] = call_module[target=submod_14](args = (%getitem_9, %getitem_10), kwargs = {})
+    %getitem_17 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_14, 0), kwargs = {})
+    %getitem_18 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_14, 1), kwargs = {})
+    %submod_15 : [num_users=1] = call_module[target=submod_15](args = (%getitem_17, %getitem_18), kwargs = {})
+    %submod_16 : [num_users=2] = call_module[target=submod_16](args = (%submod_15, %resident_b_layers_1_causal_mask, %getitem_8), kwargs = {})
+    %getitem_19 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_16, 0), kwargs = {})
+    %getitem_20 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_16, 1), kwargs = {})
+    %submod_17 : [num_users=1] = call_module[target=submod_17](args = (%getitem_19, %getitem_20), kwargs = {})
+    %submod_18 : [num_users=2] = call_module[target=submod_18](args = (%getitem_9, %getitem_10), kwargs = {})
+    %getitem_21 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_18, 0), kwargs = {})
+    %getitem_22 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_18, 1), kwargs = {})
+    %submod_19 : [num_users=1] = call_module[target=submod_19](args = (%getitem_21, %getitem_22), kwargs = {})
+    %submod_20 : [num_users=2] = call_module[target=submod_20](args = (%submod_19, %resident_b_layers_1_causal_mask, %getitem_8), kwargs = {})
+    %getitem_23 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_20, 0), kwargs = {})
+    %getitem_24 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_20, 1), kwargs = {})
+    %submod_21 : [num_users=1] = call_module[target=submod_21](args = (%getitem_23, %getitem_24), kwargs = {})
+    %submod_22 : [num_users=2] = call_module[target=submod_22](args = (%getitem_9, %getitem_10), kwargs = {})
+    %getitem_25 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_22, 0), kwargs = {})
+    %getitem_26 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_22, 1), kwargs = {})
+    %submod_23 : [num_users=1] = call_module[target=submod_23](args = (%getitem_25, %getitem_26), kwargs = {})
+    %submod_24 : [num_users=2] = call_module[target=submod_24](args = (%submod_23, %resident_b_layers_1_causal_mask, %getitem_8), kwargs = {})
+    %getitem_27 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_24, 0), kwargs = {})
+    %getitem_28 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_24, 1), kwargs = {})
+    %submod_25 : [num_users=1] = call_module[target=submod_25](args = (%getitem_27, %getitem_28), kwargs = {})
+    %submod_26 : [num_users=2] = call_module[target=submod_26](args = (%getitem_9, %getitem_10), kwargs = {})
+    %getitem_29 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_26, 0), kwargs = {})
+    %getitem_30 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_26, 1), kwargs = {})
+    %submod_27 : [num_users=1] = call_module[target=submod_27](args = (%getitem_29, %getitem_30), kwargs = {})
+    %submod_28 : [num_users=2] = call_module[target=submod_28](args = (%submod_27, %resident_b_layers_1_causal_mask, %getitem_8), kwargs = {})
+    %getitem_31 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_28, 0), kwargs = {})
+    %getitem_32 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_28, 1), kwargs = {})
+    %submod_29 : [num_users=1] = call_module[target=submod_29](args = (%getitem_31, %getitem_32), kwargs = {})
+    %submod_30 : [num_users=2] = call_module[target=submod_30](args = (%getitem_9, %getitem_10), kwargs = {})
+    %getitem_33 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_30, 0), kwargs = {})
+    %getitem_34 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_30, 1), kwargs = {})
+    %submod_31 : [num_users=1] = call_module[target=submod_31](args = (%getitem_33, %getitem_34), kwargs = {})
+    %submod_32 : [num_users=2] = call_module[target=submod_32](args = (%submod_31, %resident_b_layers_1_causal_mask, %getitem_8), kwargs = {})
+    %getitem_35 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_32, 0), kwargs = {})
+    %getitem_36 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_32, 1), kwargs = {})
+    %submod_33 : [num_users=1] = call_module[target=submod_33](args = (%getitem_35, %getitem_36), kwargs = {})
+    %submod_34 : [num_users=2] = call_module[target=submod_34](args = (%getitem_9, %getitem_10), kwargs = {})
+    %getitem_37 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_34, 0), kwargs = {})
+    %getitem_38 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_34, 1), kwargs = {})
+    %submod_35 : [num_users=1] = call_module[target=submod_35](args = (%getitem_37, %getitem_38), kwargs = {})
+    %submod_36 : [num_users=2] = call_module[target=submod_36](args = (%submod_35, %resident_b_layers_1_causal_mask, %getitem_8), kwargs = {})
+    %getitem_39 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_36, 0), kwargs = {})
+    %getitem_40 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_36, 1), kwargs = {})
+    %submod_37 : [num_users=1] = call_module[target=submod_37](args = (%getitem_39, %getitem_40), kwargs = {})
+    %submod_38 : [num_users=2] = call_module[target=submod_38](args = (%getitem_9, %getitem_10), kwargs = {})
+    %getitem_41 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_38, 0), kwargs = {})
+    %getitem_42 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_38, 1), kwargs = {})
+    %submod_39 : [num_users=1] = call_module[target=submod_39](args = (%getitem_41, %getitem_42), kwargs = {})
+    %submod_40 : [num_users=2] = call_module[target=submod_40](args = (%submod_39, %resident_b_layers_1_causal_mask, %getitem_8), kwargs = {})
+    %getitem_43 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_40, 0), kwargs = {})
+    %getitem_44 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_40, 1), kwargs = {})
+    %submod_41 : [num_users=1] = call_module[target=submod_41](args = (%getitem_43, %getitem_44), kwargs = {})
+    %submod_42 : [num_users=2] = call_module[target=submod_42](args = (%getitem_9, %getitem_10), kwargs = {})
+    %getitem_45 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_42, 0), kwargs = {})
+    %getitem_46 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_42, 1), kwargs = {})
+    %submod_43 : [num_users=1] = call_module[target=submod_43](args = (%getitem_45, %getitem_46), kwargs = {})
+    %submod_44 : [num_users=2] = call_module[target=submod_44](args = (%submod_43, %resident_b_layers_1_causal_mask, %getitem_8), kwargs = {})
+    %getitem_47 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_44, 0), kwargs = {})
+    %getitem_48 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_44, 1), kwargs = {})
+    %submod_45 : [num_users=1] = call_module[target=submod_45](args = (%getitem_47, %getitem_48), kwargs = {})
+    %submod_46 : [num_users=2] = call_module[target=submod_46](args = (%getitem_9, %getitem_10), kwargs = {})
+    %getitem_49 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_46, 0), kwargs = {})
+    %getitem_50 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_46, 1), kwargs = {})
+    %submod_47 : [num_users=1] = call_module[target=submod_47](args = (%getitem_49, %getitem_50), kwargs = {})
+    %submod_48 : [num_users=2] = call_module[target=submod_48](args = (%submod_47, %resident_b_layers_1_causal_mask, %getitem_8), kwargs = {})
+    %getitem_51 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_48, 0), kwargs = {})
+    %getitem_52 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_48, 1), kwargs = {})
+    %submod_49 : [num_users=1] = call_module[target=submod_49](args = (%getitem_51, %getitem_52), kwargs = {})
+    %submod_50 : [num_users=2] = call_module[target=submod_50](args = (%getitem_9, %getitem_10), kwargs = {})
+    %getitem_53 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_50, 0), kwargs = {})
+    %getitem_54 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_50, 1), kwargs = {})
+    %submod_51 : [num_users=1] = call_module[target=submod_51](args = (%getitem_53, %getitem_54), kwargs = {})
+    %submod_52 : [num_users=2] = call_module[target=submod_52](args = (%submod_51, %resident_b_layers_1_causal_mask, %getitem_8), kwargs = {})
+    %getitem_55 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_52, 0), kwargs = {})
+    %getitem_56 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_52, 1), kwargs = {})
+    %submod_53 : [num_users=1] = call_module[target=submod_53](args = (%getitem_55, %getitem_56), kwargs = {})
+    %submod_54 : [num_users=2] = call_module[target=submod_54](args = (%getitem_9, %getitem_10), kwargs = {})
+    %getitem_57 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_54, 0), kwargs = {})
+    %getitem_58 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_54, 1), kwargs = {})
+    %submod_55 : [num_users=1] = call_module[target=submod_55](args = (%getitem_57, %getitem_58), kwargs = {})
+    %submod_56 : [num_users=2] = call_module[target=submod_56](args = (%submod_55, %resident_b_layers_1_causal_mask, %getitem_8), kwargs = {})
+    %getitem_59 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_56, 0), kwargs = {})
+    %getitem_60 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_56, 1), kwargs = {})
+    %submod_57 : [num_users=1] = call_module[target=submod_57](args = (%getitem_59, %getitem_60), kwargs = {})
+    %submod_58 : [num_users=2] = call_module[target=submod_58](args = (%getitem_9, %getitem_10), kwargs = {})
+    %getitem_61 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_58, 0), kwargs = {})
+    %getitem_62 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_58, 1), kwargs = {})
+    %submod_59 : [num_users=1] = call_module[target=submod_59](args = (%getitem_61, %getitem_62), kwargs = {})
+    %submod_60 : [num_users=2] = call_module[target=submod_60](args = (%submod_59, %resident_b_layers_1_causal_mask, %getitem_8), kwargs = {})
+    %getitem_63 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_60, 0), kwargs = {})
+    %getitem_64 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_60, 1), kwargs = {})
+    %submod_61 : [num_users=1] = call_module[target=submod_61](args = (%getitem_63, %getitem_64), kwargs = {})
+    %submod_62 : [num_users=2] = call_module[target=submod_62](args = (%getitem_9, %getitem_10), kwargs = {})
+    %getitem_65 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_62, 0), kwargs = {})
+    %getitem_66 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_62, 1), kwargs = {})
+    %submod_63 : [num_users=1] = call_module[target=submod_63](args = (%getitem_65, %getitem_66), kwargs = {})
+    %submod_64 : [num_users=2] = call_module[target=submod_64](args = (%submod_63, %resident_b_layers_1_causal_mask, %getitem_8), kwargs = {})
+    %getitem_67 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_64, 0), kwargs = {})
+    %getitem_68 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_64, 1), kwargs = {})
+    %submod_65 : [num_users=1] = call_module[target=submod_65](args = (%getitem_67, %getitem_68), kwargs = {})
+    %submod_66 : [num_users=2] = call_module[target=submod_66](args = (%getitem_9, %getitem_10), kwargs = {})
+    %getitem_69 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_66, 0), kwargs = {})
+    %getitem_70 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_66, 1), kwargs = {})
+    %submod_67 : [num_users=1] = call_module[target=submod_67](args = (%getitem_69, %getitem_70), kwargs = {})
+    %submod_68 : [num_users=2] = call_module[target=submod_68](args = (%submod_67, %resident_b_layers_1_causal_mask, %getitem_8), kwargs = {})
+    %getitem_71 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_68, 0), kwargs = {})
+    %getitem_72 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_68, 1), kwargs = {})
+    %submod_69 : [num_users=1] = call_module[target=submod_69](args = (%getitem_71, %getitem_72), kwargs = {})
+    %submod_70 : [num_users=2] = call_module[target=submod_70](args = (%getitem_9, %getitem_10), kwargs = {})
+    %getitem_73 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_70, 0), kwargs = {})
+    %getitem_74 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_70, 1), kwargs = {})
+    %submod_71 : [num_users=1] = call_module[target=submod_71](args = (%getitem_73, %getitem_74), kwargs = {})
+    %submod_72 : [num_users=2] = call_module[target=submod_72](args = (%submod_71, %resident_b_layers_1_causal_mask, %getitem_8), kwargs = {})
+    %getitem_75 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_72, 0), kwargs = {})
+    %getitem_76 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_72, 1), kwargs = {})
+    %submod_73 : [num_users=1] = call_module[target=submod_73](args = (%getitem_75, %getitem_76), kwargs = {})
+    %submod_74 : [num_users=2] = call_module[target=submod_74](args = (%getitem_9, %getitem_10), kwargs = {})
+    %getitem_77 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_74, 0), kwargs = {})
+    %getitem_78 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_74, 1), kwargs = {})
+    %submod_75 : [num_users=1] = call_module[target=submod_75](args = (%getitem_77, %getitem_78), kwargs = {})
+    %submod_76 : [num_users=2] = call_module[target=submod_76](args = (%submod_75, %resident_b_layers_1_causal_mask, %getitem_8), kwargs = {})
+    %getitem_79 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_76, 0), kwargs = {})
+    %getitem_80 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_76, 1), kwargs = {})
+    %submod_77 : [num_users=1] = call_module[target=submod_77](args = (%getitem_79, %getitem_80), kwargs = {})
+    %submod_78 : [num_users=2] = call_module[target=submod_78](args = (%getitem_9, %getitem_10), kwargs = {})
+    %getitem_81 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_78, 0), kwargs = {})
+    %getitem_82 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_78, 1), kwargs = {})
+    %submod_79 : [num_users=1] = call_module[target=submod_79](args = (%getitem_81, %getitem_82), kwargs = {})
+    %submod_80 : [num_users=2] = call_module[target=submod_80](args = (%submod_79, %resident_b_layers_1_causal_mask, %getitem_8), kwargs = {})
+    %getitem_83 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_80, 0), kwargs = {})
+    %getitem_84 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_80, 1), kwargs = {})
+    %submod_81 : [num_users=1] = call_module[target=submod_81](args = (%getitem_83, %getitem_84), kwargs = {})
+    %submod_82 : [num_users=2] = call_module[target=submod_82](args = (%getitem_9, %getitem_10), kwargs = {})
+    %getitem_85 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_82, 0), kwargs = {})
+    %getitem_86 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_82, 1), kwargs = {})
+    %submod_83 : [num_users=1] = call_module[target=submod_83](args = (%getitem_85, %getitem_86), kwargs = {})
+    %submod_84 : [num_users=2] = call_module[target=submod_84](args = (%submod_83, %resident_b_layers_1_causal_mask, %getitem_8), kwargs = {})
+    %getitem_87 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_84, 0), kwargs = {})
+    %getitem_88 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_84, 1), kwargs = {})
+    %submod_85 : [num_users=1] = call_module[target=submod_85](args = (%getitem_87, %getitem_88), kwargs = {})
+    %submod_86 : [num_users=2] = call_module[target=submod_86](args = (%getitem_9, %getitem_10), kwargs = {})
+    %getitem_89 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_86, 0), kwargs = {})
+    %getitem_90 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_86, 1), kwargs = {})
+    %submod_87 : [num_users=1] = call_module[target=submod_87](args = (%getitem_89, %getitem_90), kwargs = {})
+    %submod_88 : [num_users=2] = call_module[target=submod_88](args = (%submod_87, %resident_b_layers_1_causal_mask, %getitem_8), kwargs = {})
+    %getitem_91 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_88, 0), kwargs = {})
+    %getitem_92 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_88, 1), kwargs = {})
+    %submod_89 : [num_users=1] = call_module[target=submod_89](args = (%getitem_91, %getitem_92), kwargs = {})
+    %submod_90 : [num_users=2] = call_module[target=submod_90](args = (%getitem_9, %getitem_10), kwargs = {})
+    %getitem_93 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_90, 0), kwargs = {})
+    %getitem_94 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_90, 1), kwargs = {})
+    %submod_91 : [num_users=1] = call_module[target=submod_91](args = (%getitem_93, %getitem_94), kwargs = {})
+    %submod_92 : [num_users=2] = call_module[target=submod_92](args = (%submod_91, %resident_b_layers_1_causal_mask, %getitem_8), kwargs = {})
+    %getitem_95 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_92, 0), kwargs = {})
+    %getitem_96 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_92, 1), kwargs = {})
+    %submod_93 : [num_users=1] = call_module[target=submod_93](args = (%getitem_95, %getitem_96), kwargs = {})
+    %submod_94 : [num_users=2] = call_module[target=submod_94](args = (%getitem_9, %getitem_10), kwargs = {})
+    %getitem_97 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_94, 0), kwargs = {})
+    %getitem_98 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_94, 1), kwargs = {})
+    %submod_95 : [num_users=1] = call_module[target=submod_95](args = (%getitem_97, %getitem_98), kwargs = {})
+    %submod_96 : [num_users=2] = call_module[target=submod_96](args = (%submod_95, %resident_b_layers_1_causal_mask, %getitem_8), kwargs = {})
+    %getitem_99 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_96, 0), kwargs = {})
+    %getitem_100 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_96, 1), kwargs = {})
+    %submod_97 : [num_users=1] = call_module[target=submod_97](args = (%getitem_99, %getitem_100), kwargs = {})
+    %submod_98 : [num_users=2] = call_module[target=submod_98](args = (%getitem_9, %getitem_10), kwargs = {})
+    %getitem_101 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_98, 0), kwargs = {})
+    %getitem_102 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_98, 1), kwargs = {})
+    %submod_99 : [num_users=1] = call_module[target=submod_99](args = (%getitem_101, %getitem_102), kwargs = {})
+    %submod_100 : [num_users=2] = call_module[target=submod_100](args = (%submod_99, %resident_b_layers_1_causal_mask, %getitem_8), kwargs = {})
+    %getitem_103 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_100, 0), kwargs = {})
+    %getitem_104 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_100, 1), kwargs = {})
+    %submod_101 : [num_users=1] = call_module[target=submod_101](args = (%getitem_103, %getitem_104), kwargs = {})
+    %submod_102 : [num_users=2] = call_module[target=submod_102](args = (%getitem_9, %getitem_10), kwargs = {})
+    %getitem_105 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_102, 0), kwargs = {})
+    %getitem_106 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_102, 1), kwargs = {})
+    %submod_103 : [num_users=1] = call_module[target=submod_103](args = (%getitem_105, %getitem_106), kwargs = {})
+    %submod_104 : [num_users=2] = call_module[target=submod_104](args = (%submod_103, %resident_b_layers_1_causal_mask, %getitem_8), kwargs = {})
+    %getitem_107 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_104, 0), kwargs = {})
+    %getitem_108 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_104, 1), kwargs = {})
+    %submod_105 : [num_users=1] = call_module[target=submod_105](args = (%getitem_107, %getitem_108), kwargs = {})
+    %submod_106 : [num_users=2] = call_module[target=submod_106](args = (%getitem_9, %getitem_10), kwargs = {})
+    %getitem_109 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_106, 0), kwargs = {})
+    %getitem_110 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_106, 1), kwargs = {})
+    %submod_107 : [num_users=1] = call_module[target=submod_107](args = (%getitem_109, %getitem_110), kwargs = {})
+    %submod_108 : [num_users=2] = call_module[target=submod_108](args = (%submod_107, %resident_b_layers_1_causal_mask, %getitem_8), kwargs = {})
+    %getitem_111 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_108, 0), kwargs = {})
+    %getitem_112 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_108, 1), kwargs = {})
+    %submod_109 : [num_users=1] = call_module[target=submod_109](args = (%getitem_111, %getitem_112), kwargs = {})
+    %submod_110 : [num_users=2] = call_module[target=submod_110](args = (%getitem_9, %getitem_10), kwargs = {})
+    %getitem_113 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_110, 0), kwargs = {})
+    %getitem_114 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_110, 1), kwargs = {})
+    %submod_111 : [num_users=1] = call_module[target=submod_111](args = (%getitem_113, %getitem_114), kwargs = {})
+    %submod_112 : [num_users=2] = call_module[target=submod_112](args = (%submod_111, %resident_b_layers_1_causal_mask, %getitem_8), kwargs = {})
+    %getitem_115 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_112, 0), kwargs = {})
+    %getitem_116 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_112, 1), kwargs = {})
+    %submod_113 : [num_users=1] = call_module[target=submod_113](args = (%getitem_115, %getitem_116), kwargs = {})
+    %submod_114 : [num_users=2] = call_module[target=submod_114](args = (%getitem_9, %getitem_10), kwargs = {})
+    %getitem_117 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_114, 0), kwargs = {})
+    %getitem_118 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_114, 1), kwargs = {})
+    %submod_115 : [num_users=1] = call_module[target=submod_115](args = (%getitem_117, %getitem_118), kwargs = {})
+    %submod_116 : [num_users=2] = call_module[target=submod_116](args = (%submod_115, %resident_b_layers_1_causal_mask, %getitem_8), kwargs = {})
+    %getitem_119 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_116, 0), kwargs = {})
+    %getitem_120 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_116, 1), kwargs = {})
+    %submod_117 : [num_users=1] = call_module[target=submod_117](args = (%getitem_119, %getitem_120), kwargs = {})
+    %submod_118 : [num_users=2] = call_module[target=submod_118](args = (%getitem_9, %getitem_10), kwargs = {})
+    %getitem_121 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_118, 0), kwargs = {})
+    %getitem_122 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_118, 1), kwargs = {})
+    %submod_119 : [num_users=1] = call_module[target=submod_119](args = (%getitem_121, %getitem_122), kwargs = {})
+    %submod_120 : [num_users=2] = call_module[target=submod_120](args = (%submod_119, %resident_b_layers_1_causal_mask, %getitem_8), kwargs = {})
+    %getitem_123 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_120, 0), kwargs = {})
+    %getitem_124 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_120, 1), kwargs = {})
+    %submod_121 : [num_users=1] = call_module[target=submod_121](args = (%getitem_123, %getitem_124), kwargs = {})
+    %submod_122 : [num_users=2] = call_module[target=submod_122](args = (%getitem_9, %getitem_10), kwargs = {})
+    %getitem_125 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_122, 0), kwargs = {})
+    %getitem_126 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_122, 1), kwargs = {})
+    %submod_123 : [num_users=1] = call_module[target=submod_123](args = (%getitem_125, %getitem_126), kwargs = {})
+    %submod_124 : [num_users=2] = call_module[target=submod_124](args = (%submod_123, %resident_b_layers_1_causal_mask, %getitem_8), kwargs = {})
+    %getitem_127 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_124, 0), kwargs = {})
+    %getitem_128 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_124, 1), kwargs = {})
+    %submod_125 : [num_users=1] = call_module[target=submod_125](args = (%getitem_127, %getitem_128), kwargs = {})
+    %submod_126 : [num_users=2] = call_module[target=submod_126](args = (%getitem_9, %getitem_10), kwargs = {})
+    %getitem_129 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_126, 0), kwargs = {})
+    %getitem_130 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_126, 1), kwargs = {})
+    %submod_127 : [num_users=1] = call_module[target=submod_127](args = (%getitem_129, %getitem_130), kwargs = {})
+    %submod_128 : [num_users=2] = call_module[target=submod_128](args = (%submod_127, %resident_b_layers_1_causal_mask, %getitem_8), kwargs = {})
+    %getitem_131 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_128, 0), kwargs = {})
+    %getitem_132 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_128, 1), kwargs = {})
+    %submod_129 : [num_users=1] = call_module[target=submod_129](args = (%getitem_131, %getitem_132), kwargs = {})
+    %submod_130 : [num_users=2] = call_module[target=submod_130](args = (%getitem_9, %getitem_10), kwargs = {})
+    %getitem_133 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_130, 0), kwargs = {})
+    %getitem_134 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_130, 1), kwargs = {})
+    %submod_131 : [num_users=1] = call_module[target=submod_131](args = (%getitem_133, %getitem_134), kwargs = {})
+    %submod_132 : [num_users=2] = call_module[target=submod_132](args = (%submod_131, %resident_b_layers_1_causal_mask, %getitem_8), kwargs = {})
+    %getitem_135 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_132, 0), kwargs = {})
+    %getitem_136 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_132, 1), kwargs = {})
+    %submod_133 : [num_users=1] = call_module[target=submod_133](args = (%getitem_135, %getitem_136), kwargs = {})
+    %submod_134 : [num_users=1] = call_module[target=submod_134](args = (%submod_9, %submod_13, %submod_17, %submod_21, %submod_25, %submod_29, %submod_33, %submod_37, %submod_41, %submod_45, %submod_49, %submod_53, %submod_57, %submod_61, %submod_65, %submod_69, %submod_73, %submod_77, %submod_81, %submod_85, %submod_89, %submod_93, %submod_97, %submod_101, %submod_105, %submod_109, %submod_113, %submod_117, %submod_121, %submod_125, %submod_129, %submod_133), kwargs = {})
+    %resident_t_35 : [num_users=1] = get_attr[target=resident_t_35]
+    %submod_135 : [num_users=1] = call_module[target=submod_135](args = (%submod_134, %resident_t_35), kwargs = {})
+    %resident_p_layers_0_post_attention_layernorm_weight : [num_users=1] = get_attr[target=resident_p_layers_0_post_attention_layernorm_weight]
+    %submod_136 : [num_users=3] = call_module[target=submod_136](args = (%submod_135, %activation, %resident_p_layers_0_post_attention_layernorm_weight), kwargs = {})
+    %getitem_137 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_136, 0), kwargs = {})
+    %getitem_138 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_136, 1), kwargs = {})
+    %getitem_139 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_136, 2), kwargs = {})
+    %resident_t_36 : [num_users=1] = get_attr[target=resident_t_36]
+    %submod_137 : [num_users=1] = call_module[target=submod_137](args = (%getitem_137, %resident_t_36), kwargs = {})
+    %submod_138 : [num_users=2] = call_module[target=submod_138](args = (%submod_137, %getitem_138), kwargs = {})
+    %getitem_140 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_138, 0), kwargs = {})
+    %getitem_141 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_138, 1), kwargs = {})
+    %resident_t_37 : [num_users=1] = get_attr[target=resident_t_37]
+    %submod_139 : [num_users=1] = call_module[target=submod_139](args = (%getitem_140, %resident_t_37), kwargs = {})
+    %submod_140 : [num_users=1] = call_module[target=submod_140](args = (%submod_139, %getitem_141), kwargs = {})
+    %resident_t_38 : [num_users=1] = get_attr[target=resident_t_38]
+    %submod_141 : [num_users=1] = call_module[target=submod_141](args = (%submod_140, %resident_t_38), kwargs = {})
+    %resident_p_layers_1_input_layernorm_weight : [num_users=1] = get_attr[target=resident_p_layers_1_input_layernorm_weight]
+    %submod_142 : [num_users=3] = call_module[target=submod_142](args = (%submod_141, %getitem_139, %resident_p_layers_1_input_layernorm_weight), kwargs = {})
+    %getitem_142 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_142, 0), kwargs = {})
+    %getitem_143 : [num_users=2] = call_function[target=operator.getitem](args = (%submod_142, 1), kwargs = {})
+    %getitem_144 : [num_users=2] = call_function[target=operator.getitem](args = (%submod_142, 2), kwargs = {})
+    %resident_t_39 : [num_users=1] = get_attr[target=resident_t_39]
+    %submod_143 : [num_users=1] = call_module[target=submod_143](args = (%getitem_142, %resident_t_39), kwargs = {})
+    %submod_144 : [num_users=2] = call_module[target=submod_144](args = (%submod_143, %getitem_143), kwargs = {})
+    %getitem_145 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_144, 0), kwargs = {})
+    %getitem_146 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_144, 1), kwargs = {})
+    %resident_t_40 : [num_users=1] = get_attr[target=resident_t_40]
+    %submod_145 : [num_users=1] = call_module[target=submod_145](args = (%getitem_145, %resident_t_40), kwargs = {})
+    %submod_146 : [num_users=2] = call_module[target=submod_146](args = (%submod_145, %getitem_143), kwargs = {})
+    %getitem_147 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_146, 0), kwargs = {})
+    %getitem_148 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_146, 1), kwargs = {})
+    %resident_t_41 : [num_users=1] = get_attr[target=resident_t_41]
+    %submod_147 : [num_users=1] = call_module[target=submod_147](args = (%getitem_147, %resident_t_41), kwargs = {})
+    %submod_148 : [num_users=5] = call_module[target=submod_148](args = (%submod_147, %resident_b_layers_1_cosine, %resident_b_layers_1_sine, %getitem_146, %getitem_148), kwargs = {})
+    %getitem_149 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_148, 0), kwargs = {})
+    %getitem_150 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_148, 1), kwargs = {})
+    %getitem_151 : [num_users=32] = call_function[target=operator.getitem](args = (%submod_148, 2), kwargs = {})
+    %getitem_152 : [num_users=31] = call_function[target=operator.getitem](args = (%submod_148, 3), kwargs = {})
+    %getitem_153 : [num_users=31] = call_function[target=operator.getitem](args = (%submod_148, 4), kwargs = {})
+    %submod_149 : [num_users=1] = call_module[target=submod_149](args = (%getitem_149, %getitem_150), kwargs = {})
+    %submod_150 : [num_users=2] = call_module[target=submod_150](args = (%submod_149, %resident_b_layers_1_causal_mask, %getitem_151), kwargs = {})
+    %getitem_154 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_150, 0), kwargs = {})
+    %getitem_155 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_150, 1), kwargs = {})
+    %submod_151 : [num_users=1] = call_module[target=submod_151](args = (%getitem_154, %getitem_155), kwargs = {})
+    %submod_152 : [num_users=2] = call_module[target=submod_152](args = (%getitem_152, %getitem_153), kwargs = {})
+    %getitem_156 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_152, 0), kwargs = {})
+    %getitem_157 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_152, 1), kwargs = {})
+    %submod_153 : [num_users=1] = call_module[target=submod_153](args = (%getitem_156, %getitem_157), kwargs = {})
+    %submod_154 : [num_users=2] = call_module[target=submod_154](args = (%submod_153, %resident_b_layers_1_causal_mask, %getitem_151), kwargs = {})
+    %getitem_158 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_154, 0), kwargs = {})
+    %getitem_159 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_154, 1), kwargs = {})
+    %submod_155 : [num_users=1] = call_module[target=submod_155](args = (%getitem_158, %getitem_159), kwargs = {})
+    %submod_156 : [num_users=2] = call_module[target=submod_156](args = (%getitem_152, %getitem_153), kwargs = {})
+    %getitem_160 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_156, 0), kwargs = {})
+    %getitem_161 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_156, 1), kwargs = {})
+    %submod_157 : [num_users=1] = call_module[target=submod_157](args = (%getitem_160, %getitem_161), kwargs = {})
+    %submod_158 : [num_users=2] = call_module[target=submod_158](args = (%submod_157, %resident_b_layers_1_causal_mask, %getitem_151), kwargs = {})
+    %getitem_162 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_158, 0), kwargs = {})
+    %getitem_163 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_158, 1), kwargs = {})
+    %submod_159 : [num_users=1] = call_module[target=submod_159](args = (%getitem_162, %getitem_163), kwargs = {})
+    %submod_160 : [num_users=2] = call_module[target=submod_160](args = (%getitem_152, %getitem_153), kwargs = {})
+    %getitem_164 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_160, 0), kwargs = {})
+    %getitem_165 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_160, 1), kwargs = {})
+    %submod_161 : [num_users=1] = call_module[target=submod_161](args = (%getitem_164, %getitem_165), kwargs = {})
+    %submod_162 : [num_users=2] = call_module[target=submod_162](args = (%submod_161, %resident_b_layers_1_causal_mask, %getitem_151), kwargs = {})
+    %getitem_166 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_162, 0), kwargs = {})
+    %getitem_167 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_162, 1), kwargs = {})
+    %submod_163 : [num_users=1] = call_module[target=submod_163](args = (%getitem_166, %getitem_167), kwargs = {})
+    %submod_164 : [num_users=2] = call_module[target=submod_164](args = (%getitem_152, %getitem_153), kwargs = {})
+    %getitem_168 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_164, 0), kwargs = {})
+    %getitem_169 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_164, 1), kwargs = {})
+    %submod_165 : [num_users=1] = call_module[target=submod_165](args = (%getitem_168, %getitem_169), kwargs = {})
+    %submod_166 : [num_users=2] = call_module[target=submod_166](args = (%submod_165, %resident_b_layers_1_causal_mask, %getitem_151), kwargs = {})
+    %getitem_170 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_166, 0), kwargs = {})
+    %getitem_171 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_166, 1), kwargs = {})
+    %submod_167 : [num_users=1] = call_module[target=submod_167](args = (%getitem_170, %getitem_171), kwargs = {})
+    %submod_168 : [num_users=2] = call_module[target=submod_168](args = (%getitem_152, %getitem_153), kwargs = {})
+    %getitem_172 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_168, 0), kwargs = {})
+    %getitem_173 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_168, 1), kwargs = {})
+    %submod_169 : [num_users=1] = call_module[target=submod_169](args = (%getitem_172, %getitem_173), kwargs = {})
+    %submod_170 : [num_users=2] = call_module[target=submod_170](args = (%submod_169, %resident_b_layers_1_causal_mask, %getitem_151), kwargs = {})
+    %getitem_174 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_170, 0), kwargs = {})
+    %getitem_175 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_170, 1), kwargs = {})
+    %submod_171 : [num_users=1] = call_module[target=submod_171](args = (%getitem_174, %getitem_175), kwargs = {})
+    %submod_172 : [num_users=2] = call_module[target=submod_172](args = (%getitem_152, %getitem_153), kwargs = {})
+    %getitem_176 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_172, 0), kwargs = {})
+    %getitem_177 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_172, 1), kwargs = {})
+    %submod_173 : [num_users=1] = call_module[target=submod_173](args = (%getitem_176, %getitem_177), kwargs = {})
+    %submod_174 : [num_users=2] = call_module[target=submod_174](args = (%submod_173, %resident_b_layers_1_causal_mask, %getitem_151), kwargs = {})
+    %getitem_178 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_174, 0), kwargs = {})
+    %getitem_179 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_174, 1), kwargs = {})
+    %submod_175 : [num_users=1] = call_module[target=submod_175](args = (%getitem_178, %getitem_179), kwargs = {})
+    %submod_176 : [num_users=2] = call_module[target=submod_176](args = (%getitem_152, %getitem_153), kwargs = {})
+    %getitem_180 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_176, 0), kwargs = {})
+    %getitem_181 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_176, 1), kwargs = {})
+    %submod_177 : [num_users=1] = call_module[target=submod_177](args = (%getitem_180, %getitem_181), kwargs = {})
+    %submod_178 : [num_users=2] = call_module[target=submod_178](args = (%submod_177, %resident_b_layers_1_causal_mask, %getitem_151), kwargs = {})
+    %getitem_182 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_178, 0), kwargs = {})
+    %getitem_183 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_178, 1), kwargs = {})
+    %submod_179 : [num_users=1] = call_module[target=submod_179](args = (%getitem_182, %getitem_183), kwargs = {})
+    %submod_180 : [num_users=2] = call_module[target=submod_180](args = (%getitem_152, %getitem_153), kwargs = {})
+    %getitem_184 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_180, 0), kwargs = {})
+    %getitem_185 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_180, 1), kwargs = {})
+    %submod_181 : [num_users=1] = call_module[target=submod_181](args = (%getitem_184, %getitem_185), kwargs = {})
+    %submod_182 : [num_users=2] = call_module[target=submod_182](args = (%submod_181, %resident_b_layers_1_causal_mask, %getitem_151), kwargs = {})
+    %getitem_186 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_182, 0), kwargs = {})
+    %getitem_187 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_182, 1), kwargs = {})
+    %submod_183 : [num_users=1] = call_module[target=submod_183](args = (%getitem_186, %getitem_187), kwargs = {})
+    %submod_184 : [num_users=2] = call_module[target=submod_184](args = (%getitem_152, %getitem_153), kwargs = {})
+    %getitem_188 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_184, 0), kwargs = {})
+    %getitem_189 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_184, 1), kwargs = {})
+    %submod_185 : [num_users=1] = call_module[target=submod_185](args = (%getitem_188, %getitem_189), kwargs = {})
+    %submod_186 : [num_users=2] = call_module[target=submod_186](args = (%submod_185, %resident_b_layers_1_causal_mask, %getitem_151), kwargs = {})
+    %getitem_190 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_186, 0), kwargs = {})
+    %getitem_191 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_186, 1), kwargs = {})
+    %submod_187 : [num_users=1] = call_module[target=submod_187](args = (%getitem_190, %getitem_191), kwargs = {})
+    %submod_188 : [num_users=2] = call_module[target=submod_188](args = (%getitem_152, %getitem_153), kwargs = {})
+    %getitem_192 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_188, 0), kwargs = {})
+    %getitem_193 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_188, 1), kwargs = {})
+    %submod_189 : [num_users=1] = call_module[target=submod_189](args = (%getitem_192, %getitem_193), kwargs = {})
+    %submod_190 : [num_users=2] = call_module[target=submod_190](args = (%submod_189, %resident_b_layers_1_causal_mask, %getitem_151), kwargs = {})
+    %getitem_194 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_190, 0), kwargs = {})
+    %getitem_195 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_190, 1), kwargs = {})
+    %submod_191 : [num_users=1] = call_module[target=submod_191](args = (%getitem_194, %getitem_195), kwargs = {})
+    %submod_192 : [num_users=2] = call_module[target=submod_192](args = (%getitem_152, %getitem_153), kwargs = {})
+    %getitem_196 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_192, 0), kwargs = {})
+    %getitem_197 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_192, 1), kwargs = {})
+    %submod_193 : [num_users=1] = call_module[target=submod_193](args = (%getitem_196, %getitem_197), kwargs = {})
+    %submod_194 : [num_users=2] = call_module[target=submod_194](args = (%submod_193, %resident_b_layers_1_causal_mask, %getitem_151), kwargs = {})
+    %getitem_198 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_194, 0), kwargs = {})
+    %getitem_199 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_194, 1), kwargs = {})
+    %submod_195 : [num_users=1] = call_module[target=submod_195](args = (%getitem_198, %getitem_199), kwargs = {})
+    %submod_196 : [num_users=2] = call_module[target=submod_196](args = (%getitem_152, %getitem_153), kwargs = {})
+    %getitem_200 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_196, 0), kwargs = {})
+    %getitem_201 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_196, 1), kwargs = {})
+    %submod_197 : [num_users=1] = call_module[target=submod_197](args = (%getitem_200, %getitem_201), kwargs = {})
+    %submod_198 : [num_users=2] = call_module[target=submod_198](args = (%submod_197, %resident_b_layers_1_causal_mask, %getitem_151), kwargs = {})
+    %getitem_202 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_198, 0), kwargs = {})
+    %getitem_203 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_198, 1), kwargs = {})
+    %submod_199 : [num_users=1] = call_module[target=submod_199](args = (%getitem_202, %getitem_203), kwargs = {})
+    %submod_200 : [num_users=2] = call_module[target=submod_200](args = (%getitem_152, %getitem_153), kwargs = {})
+    %getitem_204 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_200, 0), kwargs = {})
+    %getitem_205 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_200, 1), kwargs = {})
+    %submod_201 : [num_users=1] = call_module[target=submod_201](args = (%getitem_204, %getitem_205), kwargs = {})
+    %submod_202 : [num_users=2] = call_module[target=submod_202](args = (%submod_201, %resident_b_layers_1_causal_mask, %getitem_151), kwargs = {})
+    %getitem_206 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_202, 0), kwargs = {})
+    %getitem_207 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_202, 1), kwargs = {})
+    %submod_203 : [num_users=1] = call_module[target=submod_203](args = (%getitem_206, %getitem_207), kwargs = {})
+    %submod_204 : [num_users=2] = call_module[target=submod_204](args = (%getitem_152, %getitem_153), kwargs = {})
+    %getitem_208 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_204, 0), kwargs = {})
+    %getitem_209 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_204, 1), kwargs = {})
+    %submod_205 : [num_users=1] = call_module[target=submod_205](args = (%getitem_208, %getitem_209), kwargs = {})
+    %submod_206 : [num_users=2] = call_module[target=submod_206](args = (%submod_205, %resident_b_layers_1_causal_mask, %getitem_151), kwargs = {})
+    %getitem_210 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_206, 0), kwargs = {})
+    %getitem_211 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_206, 1), kwargs = {})
+    %submod_207 : [num_users=1] = call_module[target=submod_207](args = (%getitem_210, %getitem_211), kwargs = {})
+    %submod_208 : [num_users=2] = call_module[target=submod_208](args = (%getitem_152, %getitem_153), kwargs = {})
+    %getitem_212 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_208, 0), kwargs = {})
+    %getitem_213 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_208, 1), kwargs = {})
+    %submod_209 : [num_users=1] = call_module[target=submod_209](args = (%getitem_212, %getitem_213), kwargs = {})
+    %submod_210 : [num_users=2] = call_module[target=submod_210](args = (%submod_209, %resident_b_layers_1_causal_mask, %getitem_151), kwargs = {})
+    %getitem_214 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_210, 0), kwargs = {})
+    %getitem_215 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_210, 1), kwargs = {})
+    %submod_211 : [num_users=1] = call_module[target=submod_211](args = (%getitem_214, %getitem_215), kwargs = {})
+    %submod_212 : [num_users=2] = call_module[target=submod_212](args = (%getitem_152, %getitem_153), kwargs = {})
+    %getitem_216 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_212, 0), kwargs = {})
+    %getitem_217 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_212, 1), kwargs = {})
+    %submod_213 : [num_users=1] = call_module[target=submod_213](args = (%getitem_216, %getitem_217), kwargs = {})
+    %submod_214 : [num_users=2] = call_module[target=submod_214](args = (%submod_213, %resident_b_layers_1_causal_mask, %getitem_151), kwargs = {})
+    %getitem_218 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_214, 0), kwargs = {})
+    %getitem_219 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_214, 1), kwargs = {})
+    %submod_215 : [num_users=1] = call_module[target=submod_215](args = (%getitem_218, %getitem_219), kwargs = {})
+    %submod_216 : [num_users=2] = call_module[target=submod_216](args = (%getitem_152, %getitem_153), kwargs = {})
+    %getitem_220 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_216, 0), kwargs = {})
+    %getitem_221 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_216, 1), kwargs = {})
+    %submod_217 : [num_users=1] = call_module[target=submod_217](args = (%getitem_220, %getitem_221), kwargs = {})
+    %submod_218 : [num_users=2] = call_module[target=submod_218](args = (%submod_217, %resident_b_layers_1_causal_mask, %getitem_151), kwargs = {})
+    %getitem_222 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_218, 0), kwargs = {})
+    %getitem_223 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_218, 1), kwargs = {})
+    %submod_219 : [num_users=1] = call_module[target=submod_219](args = (%getitem_222, %getitem_223), kwargs = {})
+    %submod_220 : [num_users=2] = call_module[target=submod_220](args = (%getitem_152, %getitem_153), kwargs = {})
+    %getitem_224 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_220, 0), kwargs = {})
+    %getitem_225 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_220, 1), kwargs = {})
+    %submod_221 : [num_users=1] = call_module[target=submod_221](args = (%getitem_224, %getitem_225), kwargs = {})
+    %submod_222 : [num_users=2] = call_module[target=submod_222](args = (%submod_221, %resident_b_layers_1_causal_mask, %getitem_151), kwargs = {})
+    %getitem_226 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_222, 0), kwargs = {})
+    %getitem_227 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_222, 1), kwargs = {})
+    %submod_223 : [num_users=1] = call_module[target=submod_223](args = (%getitem_226, %getitem_227), kwargs = {})
+    %submod_224 : [num_users=2] = call_module[target=submod_224](args = (%getitem_152, %getitem_153), kwargs = {})
+    %getitem_228 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_224, 0), kwargs = {})
+    %getitem_229 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_224, 1), kwargs = {})
+    %submod_225 : [num_users=1] = call_module[target=submod_225](args = (%getitem_228, %getitem_229), kwargs = {})
+    %submod_226 : [num_users=2] = call_module[target=submod_226](args = (%submod_225, %resident_b_layers_1_causal_mask, %getitem_151), kwargs = {})
+    %getitem_230 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_226, 0), kwargs = {})
+    %getitem_231 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_226, 1), kwargs = {})
+    %submod_227 : [num_users=1] = call_module[target=submod_227](args = (%getitem_230, %getitem_231), kwargs = {})
+    %submod_228 : [num_users=2] = call_module[target=submod_228](args = (%getitem_152, %getitem_153), kwargs = {})
+    %getitem_232 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_228, 0), kwargs = {})
+    %getitem_233 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_228, 1), kwargs = {})
+    %submod_229 : [num_users=1] = call_module[target=submod_229](args = (%getitem_232, %getitem_233), kwargs = {})
+    %submod_230 : [num_users=2] = call_module[target=submod_230](args = (%submod_229, %resident_b_layers_1_causal_mask, %getitem_151), kwargs = {})
+    %getitem_234 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_230, 0), kwargs = {})
+    %getitem_235 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_230, 1), kwargs = {})
+    %submod_231 : [num_users=1] = call_module[target=submod_231](args = (%getitem_234, %getitem_235), kwargs = {})
+    %submod_232 : [num_users=2] = call_module[target=submod_232](args = (%getitem_152, %getitem_153), kwargs = {})
+    %getitem_236 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_232, 0), kwargs = {})
+    %getitem_237 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_232, 1), kwargs = {})
+    %submod_233 : [num_users=1] = call_module[target=submod_233](args = (%getitem_236, %getitem_237), kwargs = {})
+    %submod_234 : [num_users=2] = call_module[target=submod_234](args = (%submod_233, %resident_b_layers_1_causal_mask, %getitem_151), kwargs = {})
+    %getitem_238 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_234, 0), kwargs = {})
+    %getitem_239 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_234, 1), kwargs = {})
+    %submod_235 : [num_users=1] = call_module[target=submod_235](args = (%getitem_238, %getitem_239), kwargs = {})
+    %submod_236 : [num_users=2] = call_module[target=submod_236](args = (%getitem_152, %getitem_153), kwargs = {})
+    %getitem_240 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_236, 0), kwargs = {})
+    %getitem_241 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_236, 1), kwargs = {})
+    %submod_237 : [num_users=1] = call_module[target=submod_237](args = (%getitem_240, %getitem_241), kwargs = {})
+    %submod_238 : [num_users=2] = call_module[target=submod_238](args = (%submod_237, %resident_b_layers_1_causal_mask, %getitem_151), kwargs = {})
+    %getitem_242 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_238, 0), kwargs = {})
+    %getitem_243 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_238, 1), kwargs = {})
+    %submod_239 : [num_users=1] = call_module[target=submod_239](args = (%getitem_242, %getitem_243), kwargs = {})
+    %submod_240 : [num_users=2] = call_module[target=submod_240](args = (%getitem_152, %getitem_153), kwargs = {})
+    %getitem_244 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_240, 0), kwargs = {})
+    %getitem_245 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_240, 1), kwargs = {})
+    %submod_241 : [num_users=1] = call_module[target=submod_241](args = (%getitem_244, %getitem_245), kwargs = {})
+    %submod_242 : [num_users=2] = call_module[target=submod_242](args = (%submod_241, %resident_b_layers_1_causal_mask, %getitem_151), kwargs = {})
+    %getitem_246 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_242, 0), kwargs = {})
+    %getitem_247 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_242, 1), kwargs = {})
+    %submod_243 : [num_users=1] = call_module[target=submod_243](args = (%getitem_246, %getitem_247), kwargs = {})
+    %submod_244 : [num_users=2] = call_module[target=submod_244](args = (%getitem_152, %getitem_153), kwargs = {})
+    %getitem_248 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_244, 0), kwargs = {})
+    %getitem_249 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_244, 1), kwargs = {})
+    %submod_245 : [num_users=1] = call_module[target=submod_245](args = (%getitem_248, %getitem_249), kwargs = {})
+    %submod_246 : [num_users=2] = call_module[target=submod_246](args = (%submod_245, %resident_b_layers_1_causal_mask, %getitem_151), kwargs = {})
+    %getitem_250 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_246, 0), kwargs = {})
+    %getitem_251 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_246, 1), kwargs = {})
+    %submod_247 : [num_users=1] = call_module[target=submod_247](args = (%getitem_250, %getitem_251), kwargs = {})
+    %submod_248 : [num_users=2] = call_module[target=submod_248](args = (%getitem_152, %getitem_153), kwargs = {})
+    %getitem_252 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_248, 0), kwargs = {})
+    %getitem_253 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_248, 1), kwargs = {})
+    %submod_249 : [num_users=1] = call_module[target=submod_249](args = (%getitem_252, %getitem_253), kwargs = {})
+    %submod_250 : [num_users=2] = call_module[target=submod_250](args = (%submod_249, %resident_b_layers_1_causal_mask, %getitem_151), kwargs = {})
+    %getitem_254 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_250, 0), kwargs = {})
+    %getitem_255 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_250, 1), kwargs = {})
+    %submod_251 : [num_users=1] = call_module[target=submod_251](args = (%getitem_254, %getitem_255), kwargs = {})
+    %submod_252 : [num_users=2] = call_module[target=submod_252](args = (%getitem_152, %getitem_153), kwargs = {})
+    %getitem_256 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_252, 0), kwargs = {})
+    %getitem_257 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_252, 1), kwargs = {})
+    %submod_253 : [num_users=1] = call_module[target=submod_253](args = (%getitem_256, %getitem_257), kwargs = {})
+    %submod_254 : [num_users=2] = call_module[target=submod_254](args = (%submod_253, %resident_b_layers_1_causal_mask, %getitem_151), kwargs = {})
+    %getitem_258 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_254, 0), kwargs = {})
+    %getitem_259 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_254, 1), kwargs = {})
+    %submod_255 : [num_users=1] = call_module[target=submod_255](args = (%getitem_258, %getitem_259), kwargs = {})
+    %submod_256 : [num_users=2] = call_module[target=submod_256](args = (%getitem_152, %getitem_153), kwargs = {})
+    %getitem_260 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_256, 0), kwargs = {})
+    %getitem_261 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_256, 1), kwargs = {})
+    %submod_257 : [num_users=1] = call_module[target=submod_257](args = (%getitem_260, %getitem_261), kwargs = {})
+    %submod_258 : [num_users=2] = call_module[target=submod_258](args = (%submod_257, %resident_b_layers_1_causal_mask, %getitem_151), kwargs = {})
+    %getitem_262 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_258, 0), kwargs = {})
+    %getitem_263 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_258, 1), kwargs = {})
+    %submod_259 : [num_users=1] = call_module[target=submod_259](args = (%getitem_262, %getitem_263), kwargs = {})
+    %submod_260 : [num_users=2] = call_module[target=submod_260](args = (%getitem_152, %getitem_153), kwargs = {})
+    %getitem_264 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_260, 0), kwargs = {})
+    %getitem_265 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_260, 1), kwargs = {})
+    %submod_261 : [num_users=1] = call_module[target=submod_261](args = (%getitem_264, %getitem_265), kwargs = {})
+    %submod_262 : [num_users=2] = call_module[target=submod_262](args = (%submod_261, %resident_b_layers_1_causal_mask, %getitem_151), kwargs = {})
+    %getitem_266 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_262, 0), kwargs = {})
+    %getitem_267 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_262, 1), kwargs = {})
+    %submod_263 : [num_users=1] = call_module[target=submod_263](args = (%getitem_266, %getitem_267), kwargs = {})
+    %submod_264 : [num_users=2] = call_module[target=submod_264](args = (%getitem_152, %getitem_153), kwargs = {})
+    %getitem_268 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_264, 0), kwargs = {})
+    %getitem_269 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_264, 1), kwargs = {})
+    %submod_265 : [num_users=1] = call_module[target=submod_265](args = (%getitem_268, %getitem_269), kwargs = {})
+    %submod_266 : [num_users=2] = call_module[target=submod_266](args = (%submod_265, %resident_b_layers_1_causal_mask, %getitem_151), kwargs = {})
+    %getitem_270 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_266, 0), kwargs = {})
+    %getitem_271 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_266, 1), kwargs = {})
+    %submod_267 : [num_users=1] = call_module[target=submod_267](args = (%getitem_270, %getitem_271), kwargs = {})
+    %submod_268 : [num_users=2] = call_module[target=submod_268](args = (%getitem_152, %getitem_153), kwargs = {})
+    %getitem_272 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_268, 0), kwargs = {})
+    %getitem_273 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_268, 1), kwargs = {})
+    %submod_269 : [num_users=1] = call_module[target=submod_269](args = (%getitem_272, %getitem_273), kwargs = {})
+    %submod_270 : [num_users=2] = call_module[target=submod_270](args = (%submod_269, %resident_b_layers_1_causal_mask, %getitem_151), kwargs = {})
+    %getitem_274 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_270, 0), kwargs = {})
+    %getitem_275 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_270, 1), kwargs = {})
+    %submod_271 : [num_users=1] = call_module[target=submod_271](args = (%getitem_274, %getitem_275), kwargs = {})
+    %submod_272 : [num_users=2] = call_module[target=submod_272](args = (%getitem_152, %getitem_153), kwargs = {})
+    %getitem_276 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_272, 0), kwargs = {})
+    %getitem_277 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_272, 1), kwargs = {})
+    %submod_273 : [num_users=1] = call_module[target=submod_273](args = (%getitem_276, %getitem_277), kwargs = {})
+    %submod_274 : [num_users=2] = call_module[target=submod_274](args = (%submod_273, %resident_b_layers_1_causal_mask, %getitem_151), kwargs = {})
+    %getitem_278 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_274, 0), kwargs = {})
+    %getitem_279 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_274, 1), kwargs = {})
+    %submod_275 : [num_users=1] = call_module[target=submod_275](args = (%getitem_278, %getitem_279), kwargs = {})
+    %submod_276 : [num_users=1] = call_module[target=submod_276](args = (%submod_151, %submod_155, %submod_159, %submod_163, %submod_167, %submod_171, %submod_175, %submod_179, %submod_183, %submod_187, %submod_191, %submod_195, %submod_199, %submod_203, %submod_207, %submod_211, %submod_215, %submod_219, %submod_223, %submod_227, %submod_231, %submod_235, %submod_239, %submod_243, %submod_247, %submod_251, %submod_255, %submod_259, %submod_263, %submod_267, %submod_271, %submod_275), kwargs = {})
+    %resident_t_74 : [num_users=1] = get_attr[target=resident_t_74]
+    %submod_277 : [num_users=1] = call_module[target=submod_277](args = (%submod_276, %resident_t_74), kwargs = {})
+    %resident_p_layers_1_post_attention_layernorm_weight : [num_users=1] = get_attr[target=resident_p_layers_1_post_attention_layernorm_weight]
+    %submod_278 : [num_users=3] = call_module[target=submod_278](args = (%submod_277, %getitem_144, %resident_p_layers_1_post_attention_layernorm_weight), kwargs = {})
+    %getitem_280 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_278, 0), kwargs = {})
+    %getitem_281 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_278, 1), kwargs = {})
+    %getitem_282 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_278, 2), kwargs = {})
+    %resident_t_75 : [num_users=1] = get_attr[target=resident_t_75]
+    %submod_279 : [num_users=1] = call_module[target=submod_279](args = (%getitem_280, %resident_t_75), kwargs = {})
+    %submod_280 : [num_users=2] = call_module[target=submod_280](args = (%submod_279, %getitem_281), kwargs = {})
+    %getitem_283 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_280, 0), kwargs = {})
+    %getitem_284 : [num_users=1] = call_function[target=operator.getitem](args = (%submod_280, 1), kwargs = {})
+    %resident_t_76 : [num_users=1] = get_attr[target=resident_t_76]
+    %submod_281 : [num_users=1] = call_module[target=submod_281](args = (%getitem_283, %resident_t_76), kwargs = {})
+    %submod_282 : [num_users=1] = call_module[target=submod_282](args = (%submod_281, %getitem_284), kwargs = {})
+    %resident_t_77 : [num_users=1] = get_attr[target=resident_t_77]
+    %submod_283 : [num_users=1] = call_module[target=submod_283](args = (%submod_282, %resident_t_77), kwargs = {})
+    %submod_284 : [num_users=1] = call_module[target=submod_284](args = (%submod_283, %getitem_282), kwargs = {})
+    return (getitem_144, submod_284)
+
+
+
+
+def forward(self, activation):
+    resident_p_layers_0_input_layernorm_weight = self.resident_p_layers_0_input_layernorm_weight
+    submod_0 = self.submod_0(activation, resident_p_layers_0_input_layernorm_weight);  resident_p_layers_0_input_layernorm_weight = None
+    getitem = submod_0[0]
+    getitem_1 = submod_0[1];  submod_0 = None
+    resident_t = self.resident_t
+    submod_1 = self.submod_1(getitem, resident_t);  getitem = resident_t = None
+    submod_2 = self.submod_2(submod_1, getitem_1);  submod_1 = None
+    getitem_2 = submod_2[0]
+    getitem_3 = submod_2[1];  submod_2 = None
+    resident_t_1 = self.resident_t_1
+    submod_3 = self.submod_3(getitem_2, resident_t_1);  getitem_2 = resident_t_1 = None
+    submod_4 = self.submod_4(submod_3, getitem_1);  submod_3 = getitem_1 = None
+    getitem_4 = submod_4[0]
+    getitem_5 = submod_4[1];  submod_4 = None
+    resident_t_2 = self.resident_t_2
+    submod_5 = self.submod_5(getitem_4, resident_t_2);  getitem_4 = resident_t_2 = None
+    resident_b_layers_1_cosine = self.resident_b_layers_1_cosine
+    resident_b_layers_1_sine = self.resident_b_layers_1_sine
+    submod_6 = self.submod_6(submod_5, resident_b_layers_1_cosine, resident_b_layers_1_sine, getitem_3, getitem_5);  submod_5 = getitem_3 = getitem_5 = None
+    getitem_6 = submod_6[0]
+    getitem_7 = submod_6[1]
+    getitem_8 = submod_6[2]
+    getitem_9 = submod_6[3]
+    getitem_10 = submod_6[4];  submod_6 = None
+    submod_7 = self.submod_7(getitem_6, getitem_7);  getitem_6 = getitem_7 = None
+    resident_b_layers_1_causal_mask = self.resident_b_layers_1_causal_mask
+    submod_8 = self.submod_8(submod_7, resident_b_layers_1_causal_mask, getitem_8);  submod_7 = None
+    getitem_11 = submod_8[0]
+    getitem_12 = submod_8[1];  submod_8 = None
+    submod_9 = self.submod_9(getitem_11, getitem_12);  getitem_11 = getitem_12 = None
+    submod_10 = self.submod_10(getitem_9, getitem_10)
+    getitem_13 = submod_10[0]
+    getitem_14 = submod_10[1];  submod_10 = None
+    submod_11 = self.submod_11(getitem_13, getitem_14);  getitem_13 = getitem_14 = None
+    submod_12 = self.submod_12(submod_11, resident_b_layers_1_causal_mask, getitem_8);  submod_11 = None
+    getitem_15 = submod_12[0]
+    getitem_16 = submod_12[1];  submod_12 = None
+    submod_13 = self.submod_13(getitem_15, getitem_16);  getitem_15 = getitem_16 = None
+    submod_14 = self.submod_14(getitem_9, getitem_10)
+    getitem_17 = submod_14[0]
+    getitem_18 = submod_14[1];  submod_14 = None
+    submod_15 = self.submod_15(getitem_17, getitem_18);  getitem_17 = getitem_18 = None
+    submod_16 = self.submod_16(submod_15, resident_b_layers_1_causal_mask, getitem_8);  submod_15 = None
+    getitem_19 = submod_16[0]
+    getitem_20 = submod_16[1];  submod_16 = None
+    submod_17 = self.submod_17(getitem_19, getitem_20);  getitem_19 = getitem_20 = None
+    submod_18 = self.submod_18(getitem_9, getitem_10)
+    getitem_21 = submod_18[0]
+    getitem_22 = submod_18[1];  submod_18 = None
+    submod_19 = self.submod_19(getitem_21, getitem_22);  getitem_21 = getitem_22 = None
+    submod_20 = self.submod_20(submod_19, resident_b_layers_1_causal_mask, getitem_8);  submod_19 = None
+    getitem_23 = submod_20[0]
+    getitem_24 = submod_20[1];  submod_20 = None
+    submod_21 = self.submod_21(getitem_23, getitem_24);  getitem_23 = getitem_24 = None
+    submod_22 = self.submod_22(getitem_9, getitem_10)
+    getitem_25 = submod_22[0]
+    getitem_26 = submod_22[1];  submod_22 = None
+    submod_23 = self.submod_23(getitem_25, getitem_26);  getitem_25 = getitem_26 = None
+    submod_24 = self.submod_24(submod_23, resident_b_layers_1_causal_mask, getitem_8);  submod_23 = None
+    getitem_27 = submod_24[0]
+    getitem_28 = submod_24[1];  submod_24 = None
+    submod_25 = self.submod_25(getitem_27, getitem_28);  getitem_27 = getitem_28 = None
+    submod_26 = self.submod_26(getitem_9, getitem_10)
+    getitem_29 = submod_26[0]
+    getitem_30 = submod_26[1];  submod_26 = None
+    submod_27 = self.submod_27(getitem_29, getitem_30);  getitem_29 = getitem_30 = None
+    submod_28 = self.submod_28(submod_27, resident_b_layers_1_causal_mask, getitem_8);  submod_27 = None
+    getitem_31 = submod_28[0]
+    getitem_32 = submod_28[1];  submod_28 = None
+    submod_29 = self.submod_29(getitem_31, getitem_32);  getitem_31 = getitem_32 = None
+    submod_30 = self.submod_30(getitem_9, getitem_10)
+    getitem_33 = submod_30[0]
+    getitem_34 = submod_30[1];  submod_30 = None
+    submod_31 = self.submod_31(getitem_33, getitem_34);  getitem_33 = getitem_34 = None
+    submod_32 = self.submod_32(submod_31, resident_b_layers_1_causal_mask, getitem_8);  submod_31 = None
+    getitem_35 = submod_32[0]
+    getitem_36 = submod_32[1];  submod_32 = None
+    submod_33 = self.submod_33(getitem_35, getitem_36);  getitem_35 = getitem_36 = None
+    submod_34 = self.submod_34(getitem_9, getitem_10)
+    getitem_37 = submod_34[0]
+    getitem_38 = submod_34[1];  submod_34 = None
+    submod_35 = self.submod_35(getitem_37, getitem_38);  getitem_37 = getitem_38 = None
+    submod_36 = self.submod_36(submod_35, resident_b_layers_1_causal_mask, getitem_8);  submod_35 = None
+    getitem_39 = submod_36[0]
+    getitem_40 = submod_36[1];  submod_36 = None
+    submod_37 = self.submod_37(getitem_39, getitem_40);  getitem_39 = getitem_40 = None
+    submod_38 = self.submod_38(getitem_9, getitem_10)
+    getitem_41 = submod_38[0]
+    getitem_42 = submod_38[1];  submod_38 = None
+    submod_39 = self.submod_39(getitem_41, getitem_42);  getitem_41 = getitem_42 = None
+    submod_40 = self.submod_40(submod_39, resident_b_layers_1_causal_mask, getitem_8);  submod_39 = None
+    getitem_43 = submod_40[0]
+    getitem_44 = submod_40[1];  submod_40 = None
+    submod_41 = self.submod_41(getitem_43, getitem_44);  getitem_43 = getitem_44 = None
+    submod_42 = self.submod_42(getitem_9, getitem_10)
+    getitem_45 = submod_42[0]
+    getitem_46 = submod_42[1];  submod_42 = None
+    submod_43 = self.submod_43(getitem_45, getitem_46);  getitem_45 = getitem_46 = None
+    submod_44 = self.submod_44(submod_43, resident_b_layers_1_causal_mask, getitem_8);  submod_43 = None
+    getitem_47 = submod_44[0]
+    getitem_48 = submod_44[1];  submod_44 = None
+    submod_45 = self.submod_45(getitem_47, getitem_48);  getitem_47 = getitem_48 = None
+    submod_46 = self.submod_46(getitem_9, getitem_10)
+    getitem_49 = submod_46[0]
+    getitem_50 = submod_46[1];  submod_46 = None
+    submod_47 = self.submod_47(getitem_49, getitem_50);  getitem_49 = getitem_50 = None
+    submod_48 = self.submod_48(submod_47, resident_b_layers_1_causal_mask, getitem_8);  submod_47 = None
+    getitem_51 = submod_48[0]
+    getitem_52 = submod_48[1];  submod_48 = None
+    submod_49 = self.submod_49(getitem_51, getitem_52);  getitem_51 = getitem_52 = None
+    submod_50 = self.submod_50(getitem_9, getitem_10)
+    getitem_53 = submod_50[0]
+    getitem_54 = submod_50[1];  submod_50 = None
+    submod_51 = self.submod_51(getitem_53, getitem_54);  getitem_53 = getitem_54 = None
+    submod_52 = self.submod_52(submod_51, resident_b_layers_1_causal_mask, getitem_8);  submod_51 = None
+    getitem_55 = submod_52[0]
+    getitem_56 = submod_52[1];  submod_52 = None
+    submod_53 = self.submod_53(getitem_55, getitem_56);  getitem_55 = getitem_56 = None
+    submod_54 = self.submod_54(getitem_9, getitem_10)
+    getitem_57 = submod_54[0]
+    getitem_58 = submod_54[1];  submod_54 = None
+    submod_55 = self.submod_55(getitem_57, getitem_58);  getitem_57 = getitem_58 = None
+    submod_56 = self.submod_56(submod_55, resident_b_layers_1_causal_mask, getitem_8);  submod_55 = None
+    getitem_59 = submod_56[0]
+    getitem_60 = submod_56[1];  submod_56 = None
+    submod_57 = self.submod_57(getitem_59, getitem_60);  getitem_59 = getitem_60 = None
+    submod_58 = self.submod_58(getitem_9, getitem_10)
+    getitem_61 = submod_58[0]
+    getitem_62 = submod_58[1];  submod_58 = None
+    submod_59 = self.submod_59(getitem_61, getitem_62);  getitem_61 = getitem_62 = None
+    submod_60 = self.submod_60(submod_59, resident_b_layers_1_causal_mask, getitem_8);  submod_59 = None
+    getitem_63 = submod_60[0]
+    getitem_64 = submod_60[1];  submod_60 = None
+    submod_61 = self.submod_61(getitem_63, getitem_64);  getitem_63 = getitem_64 = None
+    submod_62 = self.submod_62(getitem_9, getitem_10)
+    getitem_65 = submod_62[0]
+    getitem_66 = submod_62[1];  submod_62 = None
+    submod_63 = self.submod_63(getitem_65, getitem_66);  getitem_65 = getitem_66 = None
+    submod_64 = self.submod_64(submod_63, resident_b_layers_1_causal_mask, getitem_8);  submod_63 = None
+    getitem_67 = submod_64[0]
+    getitem_68 = submod_64[1];  submod_64 = None
+    submod_65 = self.submod_65(getitem_67, getitem_68);  getitem_67 = getitem_68 = None
+    submod_66 = self.submod_66(getitem_9, getitem_10)
+    getitem_69 = submod_66[0]
+    getitem_70 = submod_66[1];  submod_66 = None
+    submod_67 = self.submod_67(getitem_69, getitem_70);  getitem_69 = getitem_70 = None
+    submod_68 = self.submod_68(submod_67, resident_b_layers_1_causal_mask, getitem_8);  submod_67 = None
+    getitem_71 = submod_68[0]
+    getitem_72 = submod_68[1];  submod_68 = None
+    submod_69 = self.submod_69(getitem_71, getitem_72);  getitem_71 = getitem_72 = None
+    submod_70 = self.submod_70(getitem_9, getitem_10)
+    getitem_73 = submod_70[0]
+    getitem_74 = submod_70[1];  submod_70 = None
+    submod_71 = self.submod_71(getitem_73, getitem_74);  getitem_73 = getitem_74 = None
+    submod_72 = self.submod_72(submod_71, resident_b_layers_1_causal_mask, getitem_8);  submod_71 = None
+    getitem_75 = submod_72[0]
+    getitem_76 = submod_72[1];  submod_72 = None
+    submod_73 = self.submod_73(getitem_75, getitem_76);  getitem_75 = getitem_76 = None
+    submod_74 = self.submod_74(getitem_9, getitem_10)
+    getitem_77 = submod_74[0]
+    getitem_78 = submod_74[1];  submod_74 = None
+    submod_75 = self.submod_75(getitem_77, getitem_78);  getitem_77 = getitem_78 = None
+    submod_76 = self.submod_76(submod_75, resident_b_layers_1_causal_mask, getitem_8);  submod_75 = None
+    getitem_79 = submod_76[0]
+    getitem_80 = submod_76[1];  submod_76 = None
+    submod_77 = self.submod_77(getitem_79, getitem_80);  getitem_79 = getitem_80 = None
+    submod_78 = self.submod_78(getitem_9, getitem_10)
+    getitem_81 = submod_78[0]
+    getitem_82 = submod_78[1];  submod_78 = None
+    submod_79 = self.submod_79(getitem_81, getitem_82);  getitem_81 = getitem_82 = None
+    submod_80 = self.submod_80(submod_79, resident_b_layers_1_causal_mask, getitem_8);  submod_79 = None
+    getitem_83 = submod_80[0]
+    getitem_84 = submod_80[1];  submod_80 = None
+    submod_81 = self.submod_81(getitem_83, getitem_84);  getitem_83 = getitem_84 = None
+    submod_82 = self.submod_82(getitem_9, getitem_10)
+    getitem_85 = submod_82[0]
+    getitem_86 = submod_82[1];  submod_82 = None
+    submod_83 = self.submod_83(getitem_85, getitem_86);  getitem_85 = getitem_86 = None
+    submod_84 = self.submod_84(submod_83, resident_b_layers_1_causal_mask, getitem_8);  submod_83 = None
+    getitem_87 = submod_84[0]
+    getitem_88 = submod_84[1];  submod_84 = None
+    submod_85 = self.submod_85(getitem_87, getitem_88);  getitem_87 = getitem_88 = None
+    submod_86 = self.submod_86(getitem_9, getitem_10)
+    getitem_89 = submod_86[0]
+    getitem_90 = submod_86[1];  submod_86 = None
+    submod_87 = self.submod_87(getitem_89, getitem_90);  getitem_89 = getitem_90 = None
+    submod_88 = self.submod_88(submod_87, resident_b_layers_1_causal_mask, getitem_8);  submod_87 = None
+    getitem_91 = submod_88[0]
+    getitem_92 = submod_88[1];  submod_88 = None
+    submod_89 = self.submod_89(getitem_91, getitem_92);  getitem_91 = getitem_92 = None
+    submod_90 = self.submod_90(getitem_9, getitem_10)
+    getitem_93 = submod_90[0]
+    getitem_94 = submod_90[1];  submod_90 = None
+    submod_91 = self.submod_91(getitem_93, getitem_94);  getitem_93 = getitem_94 = None
+    submod_92 = self.submod_92(submod_91, resident_b_layers_1_causal_mask, getitem_8);  submod_91 = None
+    getitem_95 = submod_92[0]
+    getitem_96 = submod_92[1];  submod_92 = None
+    submod_93 = self.submod_93(getitem_95, getitem_96);  getitem_95 = getitem_96 = None
+    submod_94 = self.submod_94(getitem_9, getitem_10)
+    getitem_97 = submod_94[0]
+    getitem_98 = submod_94[1];  submod_94 = None
+    submod_95 = self.submod_95(getitem_97, getitem_98);  getitem_97 = getitem_98 = None
+    submod_96 = self.submod_96(submod_95, resident_b_layers_1_causal_mask, getitem_8);  submod_95 = None
+    getitem_99 = submod_96[0]
+    getitem_100 = submod_96[1];  submod_96 = None
+    submod_97 = self.submod_97(getitem_99, getitem_100);  getitem_99 = getitem_100 = None
+    submod_98 = self.submod_98(getitem_9, getitem_10)
+    getitem_101 = submod_98[0]
+    getitem_102 = submod_98[1];  submod_98 = None
+    submod_99 = self.submod_99(getitem_101, getitem_102);  getitem_101 = getitem_102 = None
+    submod_100 = self.submod_100(submod_99, resident_b_layers_1_causal_mask, getitem_8);  submod_99 = None
+    getitem_103 = submod_100[0]
+    getitem_104 = submod_100[1];  submod_100 = None
+    submod_101 = self.submod_101(getitem_103, getitem_104);  getitem_103 = getitem_104 = None
+    submod_102 = self.submod_102(getitem_9, getitem_10)
+    getitem_105 = submod_102[0]
+    getitem_106 = submod_102[1];  submod_102 = None
+    submod_103 = self.submod_103(getitem_105, getitem_106);  getitem_105 = getitem_106 = None
+    submod_104 = self.submod_104(submod_103, resident_b_layers_1_causal_mask, getitem_8);  submod_103 = None
+    getitem_107 = submod_104[0]
+    getitem_108 = submod_104[1];  submod_104 = None
+    submod_105 = self.submod_105(getitem_107, getitem_108);  getitem_107 = getitem_108 = None
+    submod_106 = self.submod_106(getitem_9, getitem_10)
+    getitem_109 = submod_106[0]
+    getitem_110 = submod_106[1];  submod_106 = None
+    submod_107 = self.submod_107(getitem_109, getitem_110);  getitem_109 = getitem_110 = None
+    submod_108 = self.submod_108(submod_107, resident_b_layers_1_causal_mask, getitem_8);  submod_107 = None
+    getitem_111 = submod_108[0]
+    getitem_112 = submod_108[1];  submod_108 = None
+    submod_109 = self.submod_109(getitem_111, getitem_112);  getitem_111 = getitem_112 = None
+    submod_110 = self.submod_110(getitem_9, getitem_10)
+    getitem_113 = submod_110[0]
+    getitem_114 = submod_110[1];  submod_110 = None
+    submod_111 = self.submod_111(getitem_113, getitem_114);  getitem_113 = getitem_114 = None
+    submod_112 = self.submod_112(submod_111, resident_b_layers_1_causal_mask, getitem_8);  submod_111 = None
+    getitem_115 = submod_112[0]
+    getitem_116 = submod_112[1];  submod_112 = None
+    submod_113 = self.submod_113(getitem_115, getitem_116);  getitem_115 = getitem_116 = None
+    submod_114 = self.submod_114(getitem_9, getitem_10)
+    getitem_117 = submod_114[0]
+    getitem_118 = submod_114[1];  submod_114 = None
+    submod_115 = self.submod_115(getitem_117, getitem_118);  getitem_117 = getitem_118 = None
+    submod_116 = self.submod_116(submod_115, resident_b_layers_1_causal_mask, getitem_8);  submod_115 = None
+    getitem_119 = submod_116[0]
+    getitem_120 = submod_116[1];  submod_116 = None
+    submod_117 = self.submod_117(getitem_119, getitem_120);  getitem_119 = getitem_120 = None
+    submod_118 = self.submod_118(getitem_9, getitem_10)
+    getitem_121 = submod_118[0]
+    getitem_122 = submod_118[1];  submod_118 = None
+    submod_119 = self.submod_119(getitem_121, getitem_122);  getitem_121 = getitem_122 = None
+    submod_120 = self.submod_120(submod_119, resident_b_layers_1_causal_mask, getitem_8);  submod_119 = None
+    getitem_123 = submod_120[0]
+    getitem_124 = submod_120[1];  submod_120 = None
+    submod_121 = self.submod_121(getitem_123, getitem_124);  getitem_123 = getitem_124 = None
+    submod_122 = self.submod_122(getitem_9, getitem_10)
+    getitem_125 = submod_122[0]
+    getitem_126 = submod_122[1];  submod_122 = None
+    submod_123 = self.submod_123(getitem_125, getitem_126);  getitem_125 = getitem_126 = None
+    submod_124 = self.submod_124(submod_123, resident_b_layers_1_causal_mask, getitem_8);  submod_123 = None
+    getitem_127 = submod_124[0]
+    getitem_128 = submod_124[1];  submod_124 = None
+    submod_125 = self.submod_125(getitem_127, getitem_128);  getitem_127 = getitem_128 = None
+    submod_126 = self.submod_126(getitem_9, getitem_10)
+    getitem_129 = submod_126[0]
+    getitem_130 = submod_126[1];  submod_126 = None
+    submod_127 = self.submod_127(getitem_129, getitem_130);  getitem_129 = getitem_130 = None
+    submod_128 = self.submod_128(submod_127, resident_b_layers_1_causal_mask, getitem_8);  submod_127 = None
+    getitem_131 = submod_128[0]
+    getitem_132 = submod_128[1];  submod_128 = None
+    submod_129 = self.submod_129(getitem_131, getitem_132);  getitem_131 = getitem_132 = None
+    submod_130 = self.submod_130(getitem_9, getitem_10);  getitem_9 = getitem_10 = None
+    getitem_133 = submod_130[0]
+    getitem_134 = submod_130[1];  submod_130 = None
+    submod_131 = self.submod_131(getitem_133, getitem_134);  getitem_133 = getitem_134 = None
+    submod_132 = self.submod_132(submod_131, resident_b_layers_1_causal_mask, getitem_8);  submod_131 = getitem_8 = None
+    getitem_135 = submod_132[0]
+    getitem_136 = submod_132[1];  submod_132 = None
+    submod_133 = self.submod_133(getitem_135, getitem_136);  getitem_135 = getitem_136 = None
+    submod_134 = self.submod_134(submod_9, submod_13, submod_17, submod_21, submod_25, submod_29, submod_33, submod_37, submod_41, submod_45, submod_49, submod_53, submod_57, submod_61, submod_65, submod_69, submod_73, submod_77, submod_81, submod_85, submod_89, submod_93, submod_97, submod_101, submod_105, submod_109, submod_113, submod_117, submod_121, submod_125, submod_129, submod_133);  submod_9 = submod_13 = submod_17 = submod_21 = submod_25 = submod_29 = submod_33 = submod_37 = submod_41 = submod_45 = submod_49 = submod_53 = submod_57 = submod_61 = submod_65 = submod_69 = submod_73 = submod_77 = submod_81 = submod_85 = submod_89 = submod_93 = submod_97 = submod_101 = submod_105 = submod_109 = submod_113 = submod_117 = submod_121 = submod_125 = submod_129 = submod_133 = None
+    resident_t_35 = self.resident_t_35
+    submod_135 = self.submod_135(submod_134, resident_t_35);  submod_134 = resident_t_35 = None
+    resident_p_layers_0_post_attention_layernorm_weight = self.resident_p_layers_0_post_attention_layernorm_weight
+    submod_136 = self.submod_136(submod_135, activation, resident_p_layers_0_post_attention_layernorm_weight);  submod_135 = activation = resident_p_layers_0_post_attention_layernorm_weight = None
+    getitem_137 = submod_136[0]
+    getitem_138 = submod_136[1]
+    getitem_139 = submod_136[2];  submod_136 = None
+    resident_t_36 = self.resident_t_36
+    submod_137 = self.submod_137(getitem_137, resident_t_36);  getitem_137 = resident_t_36 = None
+    submod_138 = self.submod_138(submod_137, getitem_138);  submod_137 = getitem_138 = None
+    getitem_140 = submod_138[0]
+    getitem_141 = submod_138[1];  submod_138 = None
+    resident_t_37 = self.resident_t_37
+    submod_139 = self.submod_139(getitem_140, resident_t_37);  getitem_140 = resident_t_37 = None
+    submod_140 = self.submod_140(submod_139, getitem_141);  submod_139 = getitem_141 = None
+    resident_t_38 = self.resident_t_38
+    submod_141 = self.submod_141(submod_140, resident_t_38);  submod_140 = resident_t_38 = None
+    resident_p_layers_1_input_layernorm_weight = self.resident_p_layers_1_input_layernorm_weight
+    submod_142 = self.submod_142(submod_141, getitem_139, resident_p_layers_1_input_layernorm_weight);  submod_141 = getitem_139 = resident_p_layers_1_input_layernorm_weight = None
+    getitem_142 = submod_142[0]
+    getitem_143 = submod_142[1]
+    getitem_144 = submod_142[2];  submod_142 = None
+    resident_t_39 = self.resident_t_39
+    submod_143 = self.submod_143(getitem_142, resident_t_39);  getitem_142 = resident_t_39 = None
+    submod_144 = self.submod_144(submod_143, getitem_143);  submod_143 = None
+    getitem_145 = submod_144[0]
+    getitem_146 = submod_144[1];  submod_144 = None
+    resident_t_40 = self.resident_t_40
+    submod_145 = self.submod_145(getitem_145, resident_t_40);  getitem_145 = resident_t_40 = None
+    submod_146 = self.submod_146(submod_145, getitem_143);  submod_145 = getitem_143 = None
+    getitem_147 = submod_146[0]
+    getitem_148 = submod_146[1];  submod_146 = None
+    resident_t_41 = self.resident_t_41
+    submod_147 = self.submod_147(getitem_147, resident_t_41);  getitem_147 = resident_t_41 = None
+    submod_148 = self.submod_148(submod_147, resident_b_layers_1_cosine, resident_b_layers_1_sine, getitem_146, getitem_148);  submod_147 = resident_b_layers_1_cosine = resident_b_layers_1_sine = getitem_146 = getitem_148 = None
+    getitem_149 = submod_148[0]
+    getitem_150 = submod_148[1]
+    getitem_151 = submod_148[2]
+    getitem_152 = submod_148[3]
+    getitem_153 = submod_148[4];  submod_148 = None
+    submod_149 = self.submod_149(getitem_149, getitem_150);  getitem_149 = getitem_150 = None
+    submod_150 = self.submod_150(submod_149, resident_b_layers_1_causal_mask, getitem_151);  submod_149 = None
+    getitem_154 = submod_150[0]
+    getitem_155 = submod_150[1];  submod_150 = None
+    submod_151 = self.submod_151(getitem_154, getitem_155);  getitem_154 = getitem_155 = None
+    submod_152 = self.submod_152(getitem_152, getitem_153)
+    getitem_156 = submod_152[0]
+    getitem_157 = submod_152[1];  submod_152 = None
+    submod_153 = self.submod_153(getitem_156, getitem_157);  getitem_156 = getitem_157 = None
+    submod_154 = self.submod_154(submod_153, resident_b_layers_1_causal_mask, getitem_151);  submod_153 = None
+    getitem_158 = submod_154[0]
+    getitem_159 = submod_154[1];  submod_154 = None
+    submod_155 = self.submod_155(getitem_158, getitem_159);  getitem_158 = getitem_159 = None
+    submod_156 = self.submod_156(getitem_152, getitem_153)
+    getitem_160 = submod_156[0]
+    getitem_161 = submod_156[1];  submod_156 = None
+    submod_157 = self.submod_157(getitem_160, getitem_161);  getitem_160 = getitem_161 = None
+    submod_158 = self.submod_158(submod_157, resident_b_layers_1_causal_mask, getitem_151);  submod_157 = None
+    getitem_162 = submod_158[0]
+    getitem_163 = submod_158[1];  submod_158 = None
+    submod_159 = self.submod_159(getitem_162, getitem_163);  getitem_162 = getitem_163 = None
+    submod_160 = self.submod_160(getitem_152, getitem_153)
+    getitem_164 = submod_160[0]
+    getitem_165 = submod_160[1];  submod_160 = None
+    submod_161 = self.submod_161(getitem_164, getitem_165);  getitem_164 = getitem_165 = None
+    submod_162 = self.submod_162(submod_161, resident_b_layers_1_causal_mask, getitem_151);  submod_161 = None
+    getitem_166 = submod_162[0]
+    getitem_167 = submod_162[1];  submod_162 = None
+    submod_163 = self.submod_163(getitem_166, getitem_167);  getitem_166 = getitem_167 = None
+    submod_164 = self.submod_164(getitem_152, getitem_153)
+    getitem_168 = submod_164[0]
+    getitem_169 = submod_164[1];  submod_164 = None
+    submod_165 = self.submod_165(getitem_168, getitem_169);  getitem_168 = getitem_169 = None
+    submod_166 = self.submod_166(submod_165, resident_b_layers_1_causal_mask, getitem_151);  submod_165 = None
+    getitem_170 = submod_166[0]
+    getitem_171 = submod_166[1];  submod_166 = None
+    submod_167 = self.submod_167(getitem_170, getitem_171);  getitem_170 = getitem_171 = None
+    submod_168 = self.submod_168(getitem_152, getitem_153)
+    getitem_172 = submod_168[0]
+    getitem_173 = submod_168[1];  submod_168 = None
+    submod_169 = self.submod_169(getitem_172, getitem_173);  getitem_172 = getitem_173 = None
+    submod_170 = self.submod_170(submod_169, resident_b_layers_1_causal_mask, getitem_151);  submod_169 = None
+    getitem_174 = submod_170[0]
+    getitem_175 = submod_170[1];  submod_170 = None
+    submod_171 = self.submod_171(getitem_174, getitem_175);  getitem_174 = getitem_175 = None
+    submod_172 = self.submod_172(getitem_152, getitem_153)
+    getitem_176 = submod_172[0]
+    getitem_177 = submod_172[1];  submod_172 = None
+    submod_173 = self.submod_173(getitem_176, getitem_177);  getitem_176 = getitem_177 = None
+    submod_174 = self.submod_174(submod_173, resident_b_layers_1_causal_mask, getitem_151);  submod_173 = None
+    getitem_178 = submod_174[0]
+    getitem_179 = submod_174[1];  submod_174 = None
+    submod_175 = self.submod_175(getitem_178, getitem_179);  getitem_178 = getitem_179 = None
+    submod_176 = self.submod_176(getitem_152, getitem_153)
+    getitem_180 = submod_176[0]
+    getitem_181 = submod_176[1];  submod_176 = None
+    submod_177 = self.submod_177(getitem_180, getitem_181);  getitem_180 = getitem_181 = None
+    submod_178 = self.submod_178(submod_177, resident_b_layers_1_causal_mask, getitem_151);  submod_177 = None
+    getitem_182 = submod_178[0]
+    getitem_183 = submod_178[1];  submod_178 = None
+    submod_179 = self.submod_179(getitem_182, getitem_183);  getitem_182 = getitem_183 = None
+    submod_180 = self.submod_180(getitem_152, getitem_153)
+    getitem_184 = submod_180[0]
+    getitem_185 = submod_180[1];  submod_180 = None
+    submod_181 = self.submod_181(getitem_184, getitem_185);  getitem_184 = getitem_185 = None
+    submod_182 = self.submod_182(submod_181, resident_b_layers_1_causal_mask, getitem_151);  submod_181 = None
+    getitem_186 = submod_182[0]
+    getitem_187 = submod_182[1];  submod_182 = None
+    submod_183 = self.submod_183(getitem_186, getitem_187);  getitem_186 = getitem_187 = None
+    submod_184 = self.submod_184(getitem_152, getitem_153)
+    getitem_188 = submod_184[0]
+    getitem_189 = submod_184[1];  submod_184 = None
+    submod_185 = self.submod_185(getitem_188, getitem_189);  getitem_188 = getitem_189 = None
+    submod_186 = self.submod_186(submod_185, resident_b_layers_1_causal_mask, getitem_151);  submod_185 = None
+    getitem_190 = submod_186[0]
+    getitem_191 = submod_186[1];  submod_186 = None
+    submod_187 = self.submod_187(getitem_190, getitem_191);  getitem_190 = getitem_191 = None
+    submod_188 = self.submod_188(getitem_152, getitem_153)
+    getitem_192 = submod_188[0]
+    getitem_193 = submod_188[1];  submod_188 = None
+    submod_189 = self.submod_189(getitem_192, getitem_193);  getitem_192 = getitem_193 = None
+    submod_190 = self.submod_190(submod_189, resident_b_layers_1_causal_mask, getitem_151);  submod_189 = None
+    getitem_194 = submod_190[0]
+    getitem_195 = submod_190[1];  submod_190 = None
+    submod_191 = self.submod_191(getitem_194, getitem_195);  getitem_194 = getitem_195 = None
+    submod_192 = self.submod_192(getitem_152, getitem_153)
+    getitem_196 = submod_192[0]
+    getitem_197 = submod_192[1];  submod_192 = None
+    submod_193 = self.submod_193(getitem_196, getitem_197);  getitem_196 = getitem_197 = None
+    submod_194 = self.submod_194(submod_193, resident_b_layers_1_causal_mask, getitem_151);  submod_193 = None
+    getitem_198 = submod_194[0]
+    getitem_199 = submod_194[1];  submod_194 = None
+    submod_195 = self.submod_195(getitem_198, getitem_199);  getitem_198 = getitem_199 = None
+    submod_196 = self.submod_196(getitem_152, getitem_153)
+    getitem_200 = submod_196[0]
+    getitem_201 = submod_196[1];  submod_196 = None
+    submod_197 = self.submod_197(getitem_200, getitem_201);  getitem_200 = getitem_201 = None
+    submod_198 = self.submod_198(submod_197, resident_b_layers_1_causal_mask, getitem_151);  submod_197 = None
+    getitem_202 = submod_198[0]
+    getitem_203 = submod_198[1];  submod_198 = None
+    submod_199 = self.submod_199(getitem_202, getitem_203);  getitem_202 = getitem_203 = None
+    submod_200 = self.submod_200(getitem_152, getitem_153)
+    getitem_204 = submod_200[0]
+    getitem_205 = submod_200[1];  submod_200 = None
+    submod_201 = self.submod_201(getitem_204, getitem_205);  getitem_204 = getitem_205 = None
+    submod_202 = self.submod_202(submod_201, resident_b_layers_1_causal_mask, getitem_151);  submod_201 = None
+    getitem_206 = submod_202[0]
+    getitem_207 = submod_202[1];  submod_202 = None
+    submod_203 = self.submod_203(getitem_206, getitem_207);  getitem_206 = getitem_207 = None
+    submod_204 = self.submod_204(getitem_152, getitem_153)
+    getitem_208 = submod_204[0]
+    getitem_209 = submod_204[1];  submod_204 = None
+    submod_205 = self.submod_205(getitem_208, getitem_209);  getitem_208 = getitem_209 = None
+    submod_206 = self.submod_206(submod_205, resident_b_layers_1_causal_mask, getitem_151);  submod_205 = None
+    getitem_210 = submod_206[0]
+    getitem_211 = submod_206[1];  submod_206 = None
+    submod_207 = self.submod_207(getitem_210, getitem_211);  getitem_210 = getitem_211 = None
+    submod_208 = self.submod_208(getitem_152, getitem_153)
+    getitem_212 = submod_208[0]
+    getitem_213 = submod_208[1];  submod_208 = None
+    submod_209 = self.submod_209(getitem_212, getitem_213);  getitem_212 = getitem_213 = None
+    submod_210 = self.submod_210(submod_209, resident_b_layers_1_causal_mask, getitem_151);  submod_209 = None
+    getitem_214 = submod_210[0]
+    getitem_215 = submod_210[1];  submod_210 = None
+    submod_211 = self.submod_211(getitem_214, getitem_215);  getitem_214 = getitem_215 = None
+    submod_212 = self.submod_212(getitem_152, getitem_153)
+    getitem_216 = submod_212[0]
+    getitem_217 = submod_212[1];  submod_212 = None
+    submod_213 = self.submod_213(getitem_216, getitem_217);  getitem_216 = getitem_217 = None
+    submod_214 = self.submod_214(submod_213, resident_b_layers_1_causal_mask, getitem_151);  submod_213 = None
+    getitem_218 = submod_214[0]
+    getitem_219 = submod_214[1];  submod_214 = None
+    submod_215 = self.submod_215(getitem_218, getitem_219);  getitem_218 = getitem_219 = None
+    submod_216 = self.submod_216(getitem_152, getitem_153)
+    getitem_220 = submod_216[0]
+    getitem_221 = submod_216[1];  submod_216 = None
+    submod_217 = self.submod_217(getitem_220, getitem_221);  getitem_220 = getitem_221 = None
+    submod_218 = self.submod_218(submod_217, resident_b_layers_1_causal_mask, getitem_151);  submod_217 = None
+    getitem_222 = submod_218[0]
+    getitem_223 = submod_218[1];  submod_218 = None
+    submod_219 = self.submod_219(getitem_222, getitem_223);  getitem_222 = getitem_223 = None
+    submod_220 = self.submod_220(getitem_152, getitem_153)
+    getitem_224 = submod_220[0]
+    getitem_225 = submod_220[1];  submod_220 = None
+    submod_221 = self.submod_221(getitem_224, getitem_225);  getitem_224 = getitem_225 = None
+    submod_222 = self.submod_222(submod_221, resident_b_layers_1_causal_mask, getitem_151);  submod_221 = None
+    getitem_226 = submod_222[0]
+    getitem_227 = submod_222[1];  submod_222 = None
+    submod_223 = self.submod_223(getitem_226, getitem_227);  getitem_226 = getitem_227 = None
+    submod_224 = self.submod_224(getitem_152, getitem_153)
+    getitem_228 = submod_224[0]
+    getitem_229 = submod_224[1];  submod_224 = None
+    submod_225 = self.submod_225(getitem_228, getitem_229);  getitem_228 = getitem_229 = None
+    submod_226 = self.submod_226(submod_225, resident_b_layers_1_causal_mask, getitem_151);  submod_225 = None
+    getitem_230 = submod_226[0]
+    getitem_231 = submod_226[1];  submod_226 = None
+    submod_227 = self.submod_227(getitem_230, getitem_231);  getitem_230 = getitem_231 = None
+    submod_228 = self.submod_228(getitem_152, getitem_153)
+    getitem_232 = submod_228[0]
+    getitem_233 = submod_228[1];  submod_228 = None
+    submod_229 = self.submod_229(getitem_232, getitem_233);  getitem_232 = getitem_233 = None
+    submod_230 = self.submod_230(submod_229, resident_b_layers_1_causal_mask, getitem_151);  submod_229 = None
+    getitem_234 = submod_230[0]
+    getitem_235 = submod_230[1];  submod_230 = None
+    submod_231 = self.submod_231(getitem_234, getitem_235);  getitem_234 = getitem_235 = None
+    submod_232 = self.submod_232(getitem_152, getitem_153)
+    getitem_236 = submod_232[0]
+    getitem_237 = submod_232[1];  submod_232 = None
+    submod_233 = self.submod_233(getitem_236, getitem_237);  getitem_236 = getitem_237 = None
+    submod_234 = self.submod_234(submod_233, resident_b_layers_1_causal_mask, getitem_151);  submod_233 = None
+    getitem_238 = submod_234[0]
+    getitem_239 = submod_234[1];  submod_234 = None
+    submod_235 = self.submod_235(getitem_238, getitem_239);  getitem_238 = getitem_239 = None
+    submod_236 = self.submod_236(getitem_152, getitem_153)
+    getitem_240 = submod_236[0]
+    getitem_241 = submod_236[1];  submod_236 = None
+    submod_237 = self.submod_237(getitem_240, getitem_241);  getitem_240 = getitem_241 = None
+    submod_238 = self.submod_238(submod_237, resident_b_layers_1_causal_mask, getitem_151);  submod_237 = None
+    getitem_242 = submod_238[0]
+    getitem_243 = submod_238[1];  submod_238 = None
+    submod_239 = self.submod_239(getitem_242, getitem_243);  getitem_242 = getitem_243 = None
+    submod_240 = self.submod_240(getitem_152, getitem_153)
+    getitem_244 = submod_240[0]
+    getitem_245 = submod_240[1];  submod_240 = None
+    submod_241 = self.submod_241(getitem_244, getitem_245);  getitem_244 = getitem_245 = None
+    submod_242 = self.submod_242(submod_241, resident_b_layers_1_causal_mask, getitem_151);  submod_241 = None
+    getitem_246 = submod_242[0]
+    getitem_247 = submod_242[1];  submod_242 = None
+    submod_243 = self.submod_243(getitem_246, getitem_247);  getitem_246 = getitem_247 = None
+    submod_244 = self.submod_244(getitem_152, getitem_153)
+    getitem_248 = submod_244[0]
+    getitem_249 = submod_244[1];  submod_244 = None
+    submod_245 = self.submod_245(getitem_248, getitem_249);  getitem_248 = getitem_249 = None
+    submod_246 = self.submod_246(submod_245, resident_b_layers_1_causal_mask, getitem_151);  submod_245 = None
+    getitem_250 = submod_246[0]
+    getitem_251 = submod_246[1];  submod_246 = None
+    submod_247 = self.submod_247(getitem_250, getitem_251);  getitem_250 = getitem_251 = None
+    submod_248 = self.submod_248(getitem_152, getitem_153)
+    getitem_252 = submod_248[0]
+    getitem_253 = submod_248[1];  submod_248 = None
+    submod_249 = self.submod_249(getitem_252, getitem_253);  getitem_252 = getitem_253 = None
+    submod_250 = self.submod_250(submod_249, resident_b_layers_1_causal_mask, getitem_151);  submod_249 = None
+    getitem_254 = submod_250[0]
+    getitem_255 = submod_250[1];  submod_250 = None
+    submod_251 = self.submod_251(getitem_254, getitem_255);  getitem_254 = getitem_255 = None
+    submod_252 = self.submod_252(getitem_152, getitem_153)
+    getitem_256 = submod_252[0]
+    getitem_257 = submod_252[1];  submod_252 = None
+    submod_253 = self.submod_253(getitem_256, getitem_257);  getitem_256 = getitem_257 = None
+    submod_254 = self.submod_254(submod_253, resident_b_layers_1_causal_mask, getitem_151);  submod_253 = None
+    getitem_258 = submod_254[0]
+    getitem_259 = submod_254[1];  submod_254 = None
+    submod_255 = self.submod_255(getitem_258, getitem_259);  getitem_258 = getitem_259 = None
+    submod_256 = self.submod_256(getitem_152, getitem_153)
+    getitem_260 = submod_256[0]
+    getitem_261 = submod_256[1];  submod_256 = None
+    submod_257 = self.submod_257(getitem_260, getitem_261);  getitem_260 = getitem_261 = None
+    submod_258 = self.submod_258(submod_257, resident_b_layers_1_causal_mask, getitem_151);  submod_257 = None
+    getitem_262 = submod_258[0]
+    getitem_263 = submod_258[1];  submod_258 = None
+    submod_259 = self.submod_259(getitem_262, getitem_263);  getitem_262 = getitem_263 = None
+    submod_260 = self.submod_260(getitem_152, getitem_153)
+    getitem_264 = submod_260[0]
+    getitem_265 = submod_260[1];  submod_260 = None
+    submod_261 = self.submod_261(getitem_264, getitem_265);  getitem_264 = getitem_265 = None
+    submod_262 = self.submod_262(submod_261, resident_b_layers_1_causal_mask, getitem_151);  submod_261 = None
+    getitem_266 = submod_262[0]
+    getitem_267 = submod_262[1];  submod_262 = None
+    submod_263 = self.submod_263(getitem_266, getitem_267);  getitem_266 = getitem_267 = None
+    submod_264 = self.submod_264(getitem_152, getitem_153)
+    getitem_268 = submod_264[0]
+    getitem_269 = submod_264[1];  submod_264 = None
+    submod_265 = self.submod_265(getitem_268, getitem_269);  getitem_268 = getitem_269 = None
+    submod_266 = self.submod_266(submod_265, resident_b_layers_1_causal_mask, getitem_151);  submod_265 = None
+    getitem_270 = submod_266[0]
+    getitem_271 = submod_266[1];  submod_266 = None
+    submod_267 = self.submod_267(getitem_270, getitem_271);  getitem_270 = getitem_271 = None
+    submod_268 = self.submod_268(getitem_152, getitem_153)
+    getitem_272 = submod_268[0]
+    getitem_273 = submod_268[1];  submod_268 = None
+    submod_269 = self.submod_269(getitem_272, getitem_273);  getitem_272 = getitem_273 = None
+    submod_270 = self.submod_270(submod_269, resident_b_layers_1_causal_mask, getitem_151);  submod_269 = None
+    getitem_274 = submod_270[0]
+    getitem_275 = submod_270[1];  submod_270 = None
+    submod_271 = self.submod_271(getitem_274, getitem_275);  getitem_274 = getitem_275 = None
+    submod_272 = self.submod_272(getitem_152, getitem_153);  getitem_152 = getitem_153 = None
+    getitem_276 = submod_272[0]
+    getitem_277 = submod_272[1];  submod_272 = None
+    submod_273 = self.submod_273(getitem_276, getitem_277);  getitem_276 = getitem_277 = None
+    submod_274 = self.submod_274(submod_273, resident_b_layers_1_causal_mask, getitem_151);  submod_273 = resident_b_layers_1_causal_mask = getitem_151 = None
+    getitem_278 = submod_274[0]
+    getitem_279 = submod_274[1];  submod_274 = None
+    submod_275 = self.submod_275(getitem_278, getitem_279);  getitem_278 = getitem_279 = None
+    submod_276 = self.submod_276(submod_151, submod_155, submod_159, submod_163, submod_167, submod_171, submod_175, submod_179, submod_183, submod_187, submod_191, submod_195, submod_199, submod_203, submod_207, submod_211, submod_215, submod_219, submod_223, submod_227, submod_231, submod_235, submod_239, submod_243, submod_247, submod_251, submod_255, submod_259, submod_263, submod_267, submod_271, submod_275);  submod_151 = submod_155 = submod_159 = submod_163 = submod_167 = submod_171 = submod_175 = submod_179 = submod_183 = submod_187 = submod_191 = submod_195 = submod_199 = submod_203 = submod_207 = submod_211 = submod_215 = submod_219 = submod_223 = submod_227 = submod_231 = submod_235 = submod_239 = submod_243 = submod_247 = submod_251 = submod_255 = submod_259 = submod_263 = submod_267 = submod_271 = submod_275 = None
+    resident_t_74 = self.resident_t_74
+    submod_277 = self.submod_277(submod_276, resident_t_74);  submod_276 = resident_t_74 = None
+    resident_p_layers_1_post_attention_layernorm_weight = self.resident_p_layers_1_post_attention_layernorm_weight
+    submod_278 = self.submod_278(submod_277, getitem_144, resident_p_layers_1_post_attention_layernorm_weight);  submod_277 = resident_p_layers_1_post_attention_layernorm_weight = None
+    getitem_280 = submod_278[0]
+    getitem_281 = submod_278[1]
+    getitem_282 = submod_278[2];  submod_278 = None
+    resident_t_75 = self.resident_t_75
+    submod_279 = self.submod_279(getitem_280, resident_t_75);  getitem_280 = resident_t_75 = None
+    submod_280 = self.submod_280(submod_279, getitem_281);  submod_279 = getitem_281 = None
+    getitem_283 = submod_280[0]
+    getitem_284 = submod_280[1];  submod_280 = None
+    resident_t_76 = self.resident_t_76
+    submod_281 = self.submod_281(getitem_283, resident_t_76);  getitem_283 = resident_t_76 = None
+    submod_282 = self.submod_282(submod_281, getitem_284);  submod_281 = getitem_284 = None
+    resident_t_77 = self.resident_t_77
+    submod_283 = self.submod_283(submod_282, resident_t_77);  submod_282 = resident_t_77 = None
+    submod_284 = self.submod_284(submod_283, getitem_282);  submod_283 = getitem_282 = None
+    return (getitem_144, submod_284)
+    
+
+# CPU partition: submod_0
+
+
+
+def forward(self, activation, p_layers_0_input_layernorm_weight):
+    _assert_tensor_metadata = torch.ops.aten._assert_tensor_metadata.default(activation, None, None, torch.float32, device = device(type='cpu'), layout = torch.strided);  _assert_tensor_metadata = None
+    pow_1 = torch.ops.aten.pow.Tensor_Scalar(activation, 2)
+    mean = torch.ops.aten.mean.dim(pow_1, [-1], True);  pow_1 = None
+    add = torch.ops.aten.add.Tensor(mean, 1e-05);  mean = None
+    rsqrt = torch.ops.aten.rsqrt.default(add);  add = None
+    mul = torch.ops.aten.mul.Tensor(activation, rsqrt);  activation = rsqrt = None
+    _assert_tensor_metadata_1 = torch.ops.aten._assert_tensor_metadata.default(mul, None, None, torch.float32, device = device(type='cpu'), layout = torch.strided);  _assert_tensor_metadata_1 = None
+    mul_1 = torch.ops.aten.mul.Tensor(p_layers_0_input_layernorm_weight, mul);  p_layers_0_input_layernorm_weight = mul = None
+    view = torch.ops.aten.view.default(mul_1, [1024, 4096])
+    return (view, mul_1)
+    
+
+# CPU partition: submod_2
+
+
+
+def forward(self, mm, mul_1):
+    view_1 = torch.ops.aten.view.default(mm, [1, 1024, 4096]);  mm = None
+    view_2 = torch.ops.aten.view.default(view_1, [1, 1024, 32, 128]);  view_1 = None
+    transpose = torch.ops.aten.transpose.int(view_2, 1, 2);  view_2 = None
+    view_3 = torch.ops.aten.view.default(mul_1, [1024, 4096]);  mul_1 = None
+    return (view_3, transpose)
+    
+
+# CPU partition: submod_4
+
+
+
+def forward(self, mm_1, mul_1):
+    view_4 = torch.ops.aten.view.default(mm_1, [1, 1024, 4096]);  mm_1 = None
+    view_5 = torch.ops.aten.view.default(view_4, [1, 1024, 32, 128]);  view_4 = None
+    transpose_1 = torch.ops.aten.transpose.int(view_5, 1, 2);  view_5 = None
+    view_6 = torch.ops.aten.view.default(mul_1, [1024, 4096]);  mul_1 = None
+    return (view_6, transpose_1)
+    
+
+# CPU partition: submod_6
+
+
+
+def forward(self, mm_2, b_layers_1_cosine, b_layers_1_sine, transpose, transpose_1):
+    view_7 = torch.ops.aten.view.default(mm_2, [1, 1024, 4096]);  mm_2 = None
+    view_8 = torch.ops.aten.view.default(view_7, [1, 1024, 32, 128]);  view_7 = None
+    transpose_2 = torch.ops.aten.transpose.int(view_8, 1, 2);  view_8 = None
+    unsqueeze = torch.ops.aten.unsqueeze.default(b_layers_1_cosine, 1);  b_layers_1_cosine = None
+    unsqueeze_1 = torch.ops.aten.unsqueeze.default(b_layers_1_sine, 1);  b_layers_1_sine = None
+    mul_2 = torch.ops.aten.mul.Tensor(transpose, unsqueeze)
+    slice_1 = torch.ops.aten.slice.Tensor(transpose, 3, 0, 64)
+    slice_2 = torch.ops.aten.slice.Tensor(transpose, 3, 64, 9223372036854775807);  transpose = None
+    neg = torch.ops.aten.neg.default(slice_2);  slice_2 = None
+    cat = torch.ops.aten.cat.default([neg, slice_1], -1);  neg = slice_1 = None
+    mul_3 = torch.ops.aten.mul.Tensor(cat, unsqueeze_1);  cat = None
+    add_1 = torch.ops.aten.add.Tensor(mul_2, mul_3);  mul_2 = mul_3 = None
+    mul_4 = torch.ops.aten.mul.Tensor(transpose_1, unsqueeze);  unsqueeze = None
+    slice_3 = torch.ops.aten.slice.Tensor(transpose_1, 3, 0, 64)
+    slice_4 = torch.ops.aten.slice.Tensor(transpose_1, 3, 64, 9223372036854775807);  transpose_1 = None
+    neg_1 = torch.ops.aten.neg.default(slice_4);  slice_4 = None
+    cat_1 = torch.ops.aten.cat.default([neg_1, slice_3], -1);  neg_1 = slice_3 = None
+    mul_5 = torch.ops.aten.mul.Tensor(cat_1, unsqueeze_1);  cat_1 = unsqueeze_1 = None
+    add_2 = torch.ops.aten.add.Tensor(mul_4, mul_5);  mul_4 = mul_5 = None
+    view_9 = torch.ops.aten.view.default(add_1, [32, 1024, 128]);  add_1 = None
+    clone = torch.ops.aten.clone.default(view_9, memory_format = torch.contiguous_format);  view_9 = None
+    select = torch.ops.aten.select.int(add_2, 0, 0);  add_2 = None
+    clone_1 = torch.ops.aten.clone.default(select, memory_format = torch.contiguous_format);  select = None
+    select_1 = torch.ops.aten.select.int(transpose_2, 0, 0);  transpose_2 = None
+    clone_2 = torch.ops.aten.clone.default(select_1, memory_format = torch.contiguous_format);  select_1 = None
+    select_2 = torch.ops.aten.select.int(clone, 0, 0)
+    select_3 = torch.ops.aten.select.int(clone_1, 0, 0)
+    t_3 = torch.ops.aten.t.default(select_3);  select_3 = None
+    return (select_2, t_3, clone_2, clone, clone_1)
+    
+
+# CPU partition: submod_8
+
+
+
+def forward(self, mm_3, b_layers_1_causal_mask, clone_2):
+    mul_6 = torch.ops.aten.mul.Tensor(mm_3, 0.08838834764831845);  mm_3 = None
+    view_10 = torch.ops.aten.view.default(mul_6, [1, 1024, 1024]);  mul_6 = None
+    add_3 = torch.ops.aten.add.Tensor(view_10, b_layers_1_causal_mask);  view_10 = b_layers_1_causal_mask = None
+    softmax = torch.ops.aten.softmax.int(add_3, -1, torch.float32);  add_3 = None
+    view_11 = torch.ops.aten.view.default(softmax, [1024, 1024]);  softmax = None
+    select_4 = torch.ops.aten.select.int(clone_2, 0, 0);  clone_2 = None
+    return (view_11, select_4)
+    
+
+# CPU partition: submod_10
+
+
+
+def forward(self, clone, clone_1):
+    select_5 = torch.ops.aten.select.int(clone, 0, 1);  clone = None
+    select_6 = torch.ops.aten.select.int(clone_1, 0, 1);  clone_1 = None
+    t_4 = torch.ops.aten.t.default(select_6);  select_6 = None
+    return (select_5, t_4)
+    
+
+# CPU partition: submod_12
+
+
+
+def forward(self, mm_5, b_layers_1_causal_mask, clone_2):
+    mul_7 = torch.ops.aten.mul.Tensor(mm_5, 0.08838834764831845);  mm_5 = None
+    view_12 = torch.ops.aten.view.default(mul_7, [1, 1024, 1024]);  mul_7 = None
+    add_4 = torch.ops.aten.add.Tensor(view_12, b_layers_1_causal_mask);  view_12 = b_layers_1_causal_mask = None
+    softmax_1 = torch.ops.aten.softmax.int(add_4, -1, torch.float32);  add_4 = None
+    view_13 = torch.ops.aten.view.default(softmax_1, [1024, 1024]);  softmax_1 = None
+    select_7 = torch.ops.aten.select.int(clone_2, 0, 1);  clone_2 = None
+    return (view_13, select_7)
+    
+
+# CPU partition: submod_14
+
+
+
+def forward(self, clone, clone_1):
+    select_8 = torch.ops.aten.select.int(clone, 0, 2);  clone = None
+    select_9 = torch.ops.aten.select.int(clone_1, 0, 2);  clone_1 = None
+    t_5 = torch.ops.aten.t.default(select_9);  select_9 = None
+    return (select_8, t_5)
+    
+
+# CPU partition: submod_16
+
+
+
+def forward(self, mm_7, b_layers_1_causal_mask, clone_2):
+    mul_8 = torch.ops.aten.mul.Tensor(mm_7, 0.08838834764831845);  mm_7 = None
+    view_14 = torch.ops.aten.view.default(mul_8, [1, 1024, 1024]);  mul_8 = None
+    add_5 = torch.ops.aten.add.Tensor(view_14, b_layers_1_causal_mask);  view_14 = b_layers_1_causal_mask = None
+    softmax_2 = torch.ops.aten.softmax.int(add_5, -1, torch.float32);  add_5 = None
+    view_15 = torch.ops.aten.view.default(softmax_2, [1024, 1024]);  softmax_2 = None
+    select_10 = torch.ops.aten.select.int(clone_2, 0, 2);  clone_2 = None
+    return (view_15, select_10)
+    
+
+# CPU partition: submod_18
+
+
+
+def forward(self, clone, clone_1):
+    select_11 = torch.ops.aten.select.int(clone, 0, 3);  clone = None
+    select_12 = torch.ops.aten.select.int(clone_1, 0, 3);  clone_1 = None
+    t_6 = torch.ops.aten.t.default(select_12);  select_12 = None
+    return (select_11, t_6)
+    
+
+# CPU partition: submod_20
+
+
+
+def forward(self, mm_9, b_layers_1_causal_mask, clone_2):
+    mul_9 = torch.ops.aten.mul.Tensor(mm_9, 0.08838834764831845);  mm_9 = None
+    view_16 = torch.ops.aten.view.default(mul_9, [1, 1024, 1024]);  mul_9 = None
+    add_6 = torch.ops.aten.add.Tensor(view_16, b_layers_1_causal_mask);  view_16 = b_layers_1_causal_mask = None
+    softmax_3 = torch.ops.aten.softmax.int(add_6, -1, torch.float32);  add_6 = None
+    view_17 = torch.ops.aten.view.default(softmax_3, [1024, 1024]);  softmax_3 = None
+    select_13 = torch.ops.aten.select.int(clone_2, 0, 3);  clone_2 = None
+    return (view_17, select_13)
+    
+
+# CPU partition: submod_22
+
+
+
+def forward(self, clone, clone_1):
+    select_14 = torch.ops.aten.select.int(clone, 0, 4);  clone = None
+    select_15 = torch.ops.aten.select.int(clone_1, 0, 4);  clone_1 = None
+    t_7 = torch.ops.aten.t.default(select_15);  select_15 = None
+    return (select_14, t_7)
+    
+
+# CPU partition: submod_24
+
+
+
+def forward(self, mm_11, b_layers_1_causal_mask, clone_2):
+    mul_10 = torch.ops.aten.mul.Tensor(mm_11, 0.08838834764831845);  mm_11 = None
+    view_18 = torch.ops.aten.view.default(mul_10, [1, 1024, 1024]);  mul_10 = None
+    add_7 = torch.ops.aten.add.Tensor(view_18, b_layers_1_causal_mask);  view_18 = b_layers_1_causal_mask = None
+    softmax_4 = torch.ops.aten.softmax.int(add_7, -1, torch.float32);  add_7 = None
+    view_19 = torch.ops.aten.view.default(softmax_4, [1024, 1024]);  softmax_4 = None
+    select_16 = torch.ops.aten.select.int(clone_2, 0, 4);  clone_2 = None
+    return (view_19, select_16)
+    
+
+# CPU partition: submod_26
+
+
+
+def forward(self, clone, clone_1):
+    select_17 = torch.ops.aten.select.int(clone, 0, 5);  clone = None
+    select_18 = torch.ops.aten.select.int(clone_1, 0, 5);  clone_1 = None
+    t_8 = torch.ops.aten.t.default(select_18);  select_18 = None
+    return (select_17, t_8)
+    
+
+# CPU partition: submod_28
+
+
+
+def forward(self, mm_13, b_layers_1_causal_mask, clone_2):
+    mul_11 = torch.ops.aten.mul.Tensor(mm_13, 0.08838834764831845);  mm_13 = None
+    view_20 = torch.ops.aten.view.default(mul_11, [1, 1024, 1024]);  mul_11 = None
+    add_8 = torch.ops.aten.add.Tensor(view_20, b_layers_1_causal_mask);  view_20 = b_layers_1_causal_mask = None
+    softmax_5 = torch.ops.aten.softmax.int(add_8, -1, torch.float32);  add_8 = None
+    view_21 = torch.ops.aten.view.default(softmax_5, [1024, 1024]);  softmax_5 = None
+    select_19 = torch.ops.aten.select.int(clone_2, 0, 5);  clone_2 = None
+    return (view_21, select_19)
+    
+
+# CPU partition: submod_30
+
+
+
+def forward(self, clone, clone_1):
+    select_20 = torch.ops.aten.select.int(clone, 0, 6);  clone = None
+    select_21 = torch.ops.aten.select.int(clone_1, 0, 6);  clone_1 = None
+    t_9 = torch.ops.aten.t.default(select_21);  select_21 = None
+    return (select_20, t_9)
+    
+
+# CPU partition: submod_32
+
+
+
+def forward(self, mm_15, b_layers_1_causal_mask, clone_2):
+    mul_12 = torch.ops.aten.mul.Tensor(mm_15, 0.08838834764831845);  mm_15 = None
+    view_22 = torch.ops.aten.view.default(mul_12, [1, 1024, 1024]);  mul_12 = None
+    add_9 = torch.ops.aten.add.Tensor(view_22, b_layers_1_causal_mask);  view_22 = b_layers_1_causal_mask = None
+    softmax_6 = torch.ops.aten.softmax.int(add_9, -1, torch.float32);  add_9 = None
+    view_23 = torch.ops.aten.view.default(softmax_6, [1024, 1024]);  softmax_6 = None
+    select_22 = torch.ops.aten.select.int(clone_2, 0, 6);  clone_2 = None
+    return (view_23, select_22)
+    
+
+# CPU partition: submod_34
+
+
+
+def forward(self, clone, clone_1):
+    select_23 = torch.ops.aten.select.int(clone, 0, 7);  clone = None
+    select_24 = torch.ops.aten.select.int(clone_1, 0, 7);  clone_1 = None
+    t_10 = torch.ops.aten.t.default(select_24);  select_24 = None
+    return (select_23, t_10)
+    
+
+# CPU partition: submod_36
+
+
+
+def forward(self, mm_17, b_layers_1_causal_mask, clone_2):
+    mul_13 = torch.ops.aten.mul.Tensor(mm_17, 0.08838834764831845);  mm_17 = None
+    view_24 = torch.ops.aten.view.default(mul_13, [1, 1024, 1024]);  mul_13 = None
+    add_10 = torch.ops.aten.add.Tensor(view_24, b_layers_1_causal_mask);  view_24 = b_layers_1_causal_mask = None
+    softmax_7 = torch.ops.aten.softmax.int(add_10, -1, torch.float32);  add_10 = None
+    view_25 = torch.ops.aten.view.default(softmax_7, [1024, 1024]);  softmax_7 = None
+    select_25 = torch.ops.aten.select.int(clone_2, 0, 7);  clone_2 = None
+    return (view_25, select_25)
+    
+
+# CPU partition: submod_38
+
+
+
+def forward(self, clone, clone_1):
+    select_26 = torch.ops.aten.select.int(clone, 0, 8);  clone = None
+    select_27 = torch.ops.aten.select.int(clone_1, 0, 8);  clone_1 = None
+    t_11 = torch.ops.aten.t.default(select_27);  select_27 = None
+    return (select_26, t_11)
+    
+
+# CPU partition: submod_40
+
+
+
+def forward(self, mm_19, b_layers_1_causal_mask, clone_2):
+    mul_14 = torch.ops.aten.mul.Tensor(mm_19, 0.08838834764831845);  mm_19 = None
+    view_26 = torch.ops.aten.view.default(mul_14, [1, 1024, 1024]);  mul_14 = None
+    add_11 = torch.ops.aten.add.Tensor(view_26, b_layers_1_causal_mask);  view_26 = b_layers_1_causal_mask = None
+    softmax_8 = torch.ops.aten.softmax.int(add_11, -1, torch.float32);  add_11 = None
+    view_27 = torch.ops.aten.view.default(softmax_8, [1024, 1024]);  softmax_8 = None
+    select_28 = torch.ops.aten.select.int(clone_2, 0, 8);  clone_2 = None
+    return (view_27, select_28)
+    
+
+# CPU partition: submod_42
+
+
+
+def forward(self, clone, clone_1):
+    select_29 = torch.ops.aten.select.int(clone, 0, 9);  clone = None
+    select_30 = torch.ops.aten.select.int(clone_1, 0, 9);  clone_1 = None
+    t_12 = torch.ops.aten.t.default(select_30);  select_30 = None
+    return (select_29, t_12)
+    
+
+# CPU partition: submod_44
+
+
+
+def forward(self, mm_21, b_layers_1_causal_mask, clone_2):
+    mul_15 = torch.ops.aten.mul.Tensor(mm_21, 0.08838834764831845);  mm_21 = None
+    view_28 = torch.ops.aten.view.default(mul_15, [1, 1024, 1024]);  mul_15 = None
+    add_12 = torch.ops.aten.add.Tensor(view_28, b_layers_1_causal_mask);  view_28 = b_layers_1_causal_mask = None
+    softmax_9 = torch.ops.aten.softmax.int(add_12, -1, torch.float32);  add_12 = None
+    view_29 = torch.ops.aten.view.default(softmax_9, [1024, 1024]);  softmax_9 = None
+    select_31 = torch.ops.aten.select.int(clone_2, 0, 9);  clone_2 = None
+    return (view_29, select_31)
+    
+
+# CPU partition: submod_46
+
+
+
+def forward(self, clone, clone_1):
+    select_32 = torch.ops.aten.select.int(clone, 0, 10);  clone = None
+    select_33 = torch.ops.aten.select.int(clone_1, 0, 10);  clone_1 = None
+    t_13 = torch.ops.aten.t.default(select_33);  select_33 = None
+    return (select_32, t_13)
+    
+
+# CPU partition: submod_48
+
+
+
+def forward(self, mm_23, b_layers_1_causal_mask, clone_2):
+    mul_16 = torch.ops.aten.mul.Tensor(mm_23, 0.08838834764831845);  mm_23 = None
+    view_30 = torch.ops.aten.view.default(mul_16, [1, 1024, 1024]);  mul_16 = None
+    add_13 = torch.ops.aten.add.Tensor(view_30, b_layers_1_causal_mask);  view_30 = b_layers_1_causal_mask = None
+    softmax_10 = torch.ops.aten.softmax.int(add_13, -1, torch.float32);  add_13 = None
+    view_31 = torch.ops.aten.view.default(softmax_10, [1024, 1024]);  softmax_10 = None
+    select_34 = torch.ops.aten.select.int(clone_2, 0, 10);  clone_2 = None
+    return (view_31, select_34)
+    
+
+# CPU partition: submod_50
+
+
+
+def forward(self, clone, clone_1):
+    select_35 = torch.ops.aten.select.int(clone, 0, 11);  clone = None
+    select_36 = torch.ops.aten.select.int(clone_1, 0, 11);  clone_1 = None
+    t_14 = torch.ops.aten.t.default(select_36);  select_36 = None
+    return (select_35, t_14)
+    
+
+# CPU partition: submod_52
+
+
+
+def forward(self, mm_25, b_layers_1_causal_mask, clone_2):
+    mul_17 = torch.ops.aten.mul.Tensor(mm_25, 0.08838834764831845);  mm_25 = None
+    view_32 = torch.ops.aten.view.default(mul_17, [1, 1024, 1024]);  mul_17 = None
+    add_14 = torch.ops.aten.add.Tensor(view_32, b_layers_1_causal_mask);  view_32 = b_layers_1_causal_mask = None
+    softmax_11 = torch.ops.aten.softmax.int(add_14, -1, torch.float32);  add_14 = None
+    view_33 = torch.ops.aten.view.default(softmax_11, [1024, 1024]);  softmax_11 = None
+    select_37 = torch.ops.aten.select.int(clone_2, 0, 11);  clone_2 = None
+    return (view_33, select_37)
+    
+
+# CPU partition: submod_54
+
+
+
+def forward(self, clone, clone_1):
+    select_38 = torch.ops.aten.select.int(clone, 0, 12);  clone = None
+    select_39 = torch.ops.aten.select.int(clone_1, 0, 12);  clone_1 = None
+    t_15 = torch.ops.aten.t.default(select_39);  select_39 = None
+    return (select_38, t_15)
+    
+
+# CPU partition: submod_56
+
+
+
+def forward(self, mm_27, b_layers_1_causal_mask, clone_2):
+    mul_18 = torch.ops.aten.mul.Tensor(mm_27, 0.08838834764831845);  mm_27 = None
+    view_34 = torch.ops.aten.view.default(mul_18, [1, 1024, 1024]);  mul_18 = None
+    add_15 = torch.ops.aten.add.Tensor(view_34, b_layers_1_causal_mask);  view_34 = b_layers_1_causal_mask = None
+    softmax_12 = torch.ops.aten.softmax.int(add_15, -1, torch.float32);  add_15 = None
+    view_35 = torch.ops.aten.view.default(softmax_12, [1024, 1024]);  softmax_12 = None
+    select_40 = torch.ops.aten.select.int(clone_2, 0, 12);  clone_2 = None
+    return (view_35, select_40)
+    
+
+# CPU partition: submod_58
+
+
+
+def forward(self, clone, clone_1):
+    select_41 = torch.ops.aten.select.int(clone, 0, 13);  clone = None
+    select_42 = torch.ops.aten.select.int(clone_1, 0, 13);  clone_1 = None
+    t_16 = torch.ops.aten.t.default(select_42);  select_42 = None
+    return (select_41, t_16)
+    
+
+# CPU partition: submod_60
+
+
+
+def forward(self, mm_29, b_layers_1_causal_mask, clone_2):
+    mul_19 = torch.ops.aten.mul.Tensor(mm_29, 0.08838834764831845);  mm_29 = None
+    view_36 = torch.ops.aten.view.default(mul_19, [1, 1024, 1024]);  mul_19 = None
+    add_16 = torch.ops.aten.add.Tensor(view_36, b_layers_1_causal_mask);  view_36 = b_layers_1_causal_mask = None
+    softmax_13 = torch.ops.aten.softmax.int(add_16, -1, torch.float32);  add_16 = None
+    view_37 = torch.ops.aten.view.default(softmax_13, [1024, 1024]);  softmax_13 = None
+    select_43 = torch.ops.aten.select.int(clone_2, 0, 13);  clone_2 = None
+    return (view_37, select_43)
+    
+
+# CPU partition: submod_62
+
+
+
+def forward(self, clone, clone_1):
+    select_44 = torch.ops.aten.select.int(clone, 0, 14);  clone = None
+    select_45 = torch.ops.aten.select.int(clone_1, 0, 14);  clone_1 = None
+    t_17 = torch.ops.aten.t.default(select_45);  select_45 = None
+    return (select_44, t_17)
+    
+
+# CPU partition: submod_64
+
+
+
+def forward(self, mm_31, b_layers_1_causal_mask, clone_2):
+    mul_20 = torch.ops.aten.mul.Tensor(mm_31, 0.08838834764831845);  mm_31 = None
+    view_38 = torch.ops.aten.view.default(mul_20, [1, 1024, 1024]);  mul_20 = None
+    add_17 = torch.ops.aten.add.Tensor(view_38, b_layers_1_causal_mask);  view_38 = b_layers_1_causal_mask = None
+    softmax_14 = torch.ops.aten.softmax.int(add_17, -1, torch.float32);  add_17 = None
+    view_39 = torch.ops.aten.view.default(softmax_14, [1024, 1024]);  softmax_14 = None
+    select_46 = torch.ops.aten.select.int(clone_2, 0, 14);  clone_2 = None
+    return (view_39, select_46)
+    
+
+# CPU partition: submod_66
+
+
+
+def forward(self, clone, clone_1):
+    select_47 = torch.ops.aten.select.int(clone, 0, 15);  clone = None
+    select_48 = torch.ops.aten.select.int(clone_1, 0, 15);  clone_1 = None
+    t_18 = torch.ops.aten.t.default(select_48);  select_48 = None
+    return (select_47, t_18)
+    
+
+# CPU partition: submod_68
+
+
+
+def forward(self, mm_33, b_layers_1_causal_mask, clone_2):
+    mul_21 = torch.ops.aten.mul.Tensor(mm_33, 0.08838834764831845);  mm_33 = None
+    view_40 = torch.ops.aten.view.default(mul_21, [1, 1024, 1024]);  mul_21 = None
+    add_18 = torch.ops.aten.add.Tensor(view_40, b_layers_1_causal_mask);  view_40 = b_layers_1_causal_mask = None
+    softmax_15 = torch.ops.aten.softmax.int(add_18, -1, torch.float32);  add_18 = None
+    view_41 = torch.ops.aten.view.default(softmax_15, [1024, 1024]);  softmax_15 = None
+    select_49 = torch.ops.aten.select.int(clone_2, 0, 15);  clone_2 = None
+    return (view_41, select_49)
+    
+
+# CPU partition: submod_70
+
+
+
+def forward(self, clone, clone_1):
+    select_50 = torch.ops.aten.select.int(clone, 0, 16);  clone = None
+    select_51 = torch.ops.aten.select.int(clone_1, 0, 16);  clone_1 = None
+    t_19 = torch.ops.aten.t.default(select_51);  select_51 = None
+    return (select_50, t_19)
+    
+
+# CPU partition: submod_72
+
+
+
+def forward(self, mm_35, b_layers_1_causal_mask, clone_2):
+    mul_22 = torch.ops.aten.mul.Tensor(mm_35, 0.08838834764831845);  mm_35 = None
+    view_42 = torch.ops.aten.view.default(mul_22, [1, 1024, 1024]);  mul_22 = None
+    add_19 = torch.ops.aten.add.Tensor(view_42, b_layers_1_causal_mask);  view_42 = b_layers_1_causal_mask = None
+    softmax_16 = torch.ops.aten.softmax.int(add_19, -1, torch.float32);  add_19 = None
+    view_43 = torch.ops.aten.view.default(softmax_16, [1024, 1024]);  softmax_16 = None
+    select_52 = torch.ops.aten.select.int(clone_2, 0, 16);  clone_2 = None
+    return (view_43, select_52)
+    
+
+# CPU partition: submod_74
+
+
+
+def forward(self, clone, clone_1):
+    select_53 = torch.ops.aten.select.int(clone, 0, 17);  clone = None
+    select_54 = torch.ops.aten.select.int(clone_1, 0, 17);  clone_1 = None
+    t_20 = torch.ops.aten.t.default(select_54);  select_54 = None
+    return (select_53, t_20)
+    
+
+# CPU partition: submod_76
+
+
+
+def forward(self, mm_37, b_layers_1_causal_mask, clone_2):
+    mul_23 = torch.ops.aten.mul.Tensor(mm_37, 0.08838834764831845);  mm_37 = None
+    view_44 = torch.ops.aten.view.default(mul_23, [1, 1024, 1024]);  mul_23 = None
+    add_20 = torch.ops.aten.add.Tensor(view_44, b_layers_1_causal_mask);  view_44 = b_layers_1_causal_mask = None
+    softmax_17 = torch.ops.aten.softmax.int(add_20, -1, torch.float32);  add_20 = None
+    view_45 = torch.ops.aten.view.default(softmax_17, [1024, 1024]);  softmax_17 = None
+    select_55 = torch.ops.aten.select.int(clone_2, 0, 17);  clone_2 = None
+    return (view_45, select_55)
+    
+
+# CPU partition: submod_78
+
+
+
+def forward(self, clone, clone_1):
+    select_56 = torch.ops.aten.select.int(clone, 0, 18);  clone = None
+    select_57 = torch.ops.aten.select.int(clone_1, 0, 18);  clone_1 = None
+    t_21 = torch.ops.aten.t.default(select_57);  select_57 = None
+    return (select_56, t_21)
+    
+
+# CPU partition: submod_80
+
+
+
+def forward(self, mm_39, b_layers_1_causal_mask, clone_2):
+    mul_24 = torch.ops.aten.mul.Tensor(mm_39, 0.08838834764831845);  mm_39 = None
+    view_46 = torch.ops.aten.view.default(mul_24, [1, 1024, 1024]);  mul_24 = None
+    add_21 = torch.ops.aten.add.Tensor(view_46, b_layers_1_causal_mask);  view_46 = b_layers_1_causal_mask = None
+    softmax_18 = torch.ops.aten.softmax.int(add_21, -1, torch.float32);  add_21 = None
+    view_47 = torch.ops.aten.view.default(softmax_18, [1024, 1024]);  softmax_18 = None
+    select_58 = torch.ops.aten.select.int(clone_2, 0, 18);  clone_2 = None
+    return (view_47, select_58)
+    
+
+# CPU partition: submod_82
+
+
+
+def forward(self, clone, clone_1):
+    select_59 = torch.ops.aten.select.int(clone, 0, 19);  clone = None
+    select_60 = torch.ops.aten.select.int(clone_1, 0, 19);  clone_1 = None
+    t_22 = torch.ops.aten.t.default(select_60);  select_60 = None
+    return (select_59, t_22)
+    
+
+# CPU partition: submod_84
+
+
+
+def forward(self, mm_41, b_layers_1_causal_mask, clone_2):
+    mul_25 = torch.ops.aten.mul.Tensor(mm_41, 0.08838834764831845);  mm_41 = None
+    view_48 = torch.ops.aten.view.default(mul_25, [1, 1024, 1024]);  mul_25 = None
+    add_22 = torch.ops.aten.add.Tensor(view_48, b_layers_1_causal_mask);  view_48 = b_layers_1_causal_mask = None
+    softmax_19 = torch.ops.aten.softmax.int(add_22, -1, torch.float32);  add_22 = None
+    view_49 = torch.ops.aten.view.default(softmax_19, [1024, 1024]);  softmax_19 = None
+    select_61 = torch.ops.aten.select.int(clone_2, 0, 19);  clone_2 = None
+    return (view_49, select_61)
+    
+
+# CPU partition: submod_86
+
+
+
+def forward(self, clone, clone_1):
+    select_62 = torch.ops.aten.select.int(clone, 0, 20);  clone = None
+    select_63 = torch.ops.aten.select.int(clone_1, 0, 20);  clone_1 = None
+    t_23 = torch.ops.aten.t.default(select_63);  select_63 = None
+    return (select_62, t_23)
+    
+
+# CPU partition: submod_88
+
+
+
+def forward(self, mm_43, b_layers_1_causal_mask, clone_2):
+    mul_26 = torch.ops.aten.mul.Tensor(mm_43, 0.08838834764831845);  mm_43 = None
+    view_50 = torch.ops.aten.view.default(mul_26, [1, 1024, 1024]);  mul_26 = None
+    add_23 = torch.ops.aten.add.Tensor(view_50, b_layers_1_causal_mask);  view_50 = b_layers_1_causal_mask = None
+    softmax_20 = torch.ops.aten.softmax.int(add_23, -1, torch.float32);  add_23 = None
+    view_51 = torch.ops.aten.view.default(softmax_20, [1024, 1024]);  softmax_20 = None
+    select_64 = torch.ops.aten.select.int(clone_2, 0, 20);  clone_2 = None
+    return (view_51, select_64)
+    
+
+# CPU partition: submod_90
+
+
+
+def forward(self, clone, clone_1):
+    select_65 = torch.ops.aten.select.int(clone, 0, 21);  clone = None
+    select_66 = torch.ops.aten.select.int(clone_1, 0, 21);  clone_1 = None
+    t_24 = torch.ops.aten.t.default(select_66);  select_66 = None
+    return (select_65, t_24)
+    
+
+# CPU partition: submod_92
+
+
+
+def forward(self, mm_45, b_layers_1_causal_mask, clone_2):
+    mul_27 = torch.ops.aten.mul.Tensor(mm_45, 0.08838834764831845);  mm_45 = None
+    view_52 = torch.ops.aten.view.default(mul_27, [1, 1024, 1024]);  mul_27 = None
+    add_24 = torch.ops.aten.add.Tensor(view_52, b_layers_1_causal_mask);  view_52 = b_layers_1_causal_mask = None
+    softmax_21 = torch.ops.aten.softmax.int(add_24, -1, torch.float32);  add_24 = None
+    view_53 = torch.ops.aten.view.default(softmax_21, [1024, 1024]);  softmax_21 = None
+    select_67 = torch.ops.aten.select.int(clone_2, 0, 21);  clone_2 = None
+    return (view_53, select_67)
+    
+
+# CPU partition: submod_94
+
+
+
+def forward(self, clone, clone_1):
+    select_68 = torch.ops.aten.select.int(clone, 0, 22);  clone = None
+    select_69 = torch.ops.aten.select.int(clone_1, 0, 22);  clone_1 = None
+    t_25 = torch.ops.aten.t.default(select_69);  select_69 = None
+    return (select_68, t_25)
+    
+
+# CPU partition: submod_96
+
+
+
+def forward(self, mm_47, b_layers_1_causal_mask, clone_2):
+    mul_28 = torch.ops.aten.mul.Tensor(mm_47, 0.08838834764831845);  mm_47 = None
+    view_54 = torch.ops.aten.view.default(mul_28, [1, 1024, 1024]);  mul_28 = None
+    add_25 = torch.ops.aten.add.Tensor(view_54, b_layers_1_causal_mask);  view_54 = b_layers_1_causal_mask = None
+    softmax_22 = torch.ops.aten.softmax.int(add_25, -1, torch.float32);  add_25 = None
+    view_55 = torch.ops.aten.view.default(softmax_22, [1024, 1024]);  softmax_22 = None
+    select_70 = torch.ops.aten.select.int(clone_2, 0, 22);  clone_2 = None
+    return (view_55, select_70)
+    
+
+# CPU partition: submod_98
+
+
+
+def forward(self, clone, clone_1):
+    select_71 = torch.ops.aten.select.int(clone, 0, 23);  clone = None
+    select_72 = torch.ops.aten.select.int(clone_1, 0, 23);  clone_1 = None
+    t_26 = torch.ops.aten.t.default(select_72);  select_72 = None
+    return (select_71, t_26)
+    
+
+# CPU partition: submod_100
+
+
+
+def forward(self, mm_49, b_layers_1_causal_mask, clone_2):
+    mul_29 = torch.ops.aten.mul.Tensor(mm_49, 0.08838834764831845);  mm_49 = None
+    view_56 = torch.ops.aten.view.default(mul_29, [1, 1024, 1024]);  mul_29 = None
+    add_26 = torch.ops.aten.add.Tensor(view_56, b_layers_1_causal_mask);  view_56 = b_layers_1_causal_mask = None
+    softmax_23 = torch.ops.aten.softmax.int(add_26, -1, torch.float32);  add_26 = None
+    view_57 = torch.ops.aten.view.default(softmax_23, [1024, 1024]);  softmax_23 = None
+    select_73 = torch.ops.aten.select.int(clone_2, 0, 23);  clone_2 = None
+    return (view_57, select_73)
+    
+
+# CPU partition: submod_102
+
+
+
+def forward(self, clone, clone_1):
+    select_74 = torch.ops.aten.select.int(clone, 0, 24);  clone = None
+    select_75 = torch.ops.aten.select.int(clone_1, 0, 24);  clone_1 = None
+    t_27 = torch.ops.aten.t.default(select_75);  select_75 = None
+    return (select_74, t_27)
+    
+
+# CPU partition: submod_104
+
+
+
+def forward(self, mm_51, b_layers_1_causal_mask, clone_2):
+    mul_30 = torch.ops.aten.mul.Tensor(mm_51, 0.08838834764831845);  mm_51 = None
+    view_58 = torch.ops.aten.view.default(mul_30, [1, 1024, 1024]);  mul_30 = None
+    add_27 = torch.ops.aten.add.Tensor(view_58, b_layers_1_causal_mask);  view_58 = b_layers_1_causal_mask = None
+    softmax_24 = torch.ops.aten.softmax.int(add_27, -1, torch.float32);  add_27 = None
+    view_59 = torch.ops.aten.view.default(softmax_24, [1024, 1024]);  softmax_24 = None
+    select_76 = torch.ops.aten.select.int(clone_2, 0, 24);  clone_2 = None
+    return (view_59, select_76)
+    
+
+# CPU partition: submod_106
+
+
+
+def forward(self, clone, clone_1):
+    select_77 = torch.ops.aten.select.int(clone, 0, 25);  clone = None
+    select_78 = torch.ops.aten.select.int(clone_1, 0, 25);  clone_1 = None
+    t_28 = torch.ops.aten.t.default(select_78);  select_78 = None
+    return (select_77, t_28)
+    
+
+# CPU partition: submod_108
+
+
+
+def forward(self, mm_53, b_layers_1_causal_mask, clone_2):
+    mul_31 = torch.ops.aten.mul.Tensor(mm_53, 0.08838834764831845);  mm_53 = None
+    view_60 = torch.ops.aten.view.default(mul_31, [1, 1024, 1024]);  mul_31 = None
+    add_28 = torch.ops.aten.add.Tensor(view_60, b_layers_1_causal_mask);  view_60 = b_layers_1_causal_mask = None
+    softmax_25 = torch.ops.aten.softmax.int(add_28, -1, torch.float32);  add_28 = None
+    view_61 = torch.ops.aten.view.default(softmax_25, [1024, 1024]);  softmax_25 = None
+    select_79 = torch.ops.aten.select.int(clone_2, 0, 25);  clone_2 = None
+    return (view_61, select_79)
+    
+
+# CPU partition: submod_110
+
+
+
+def forward(self, clone, clone_1):
+    select_80 = torch.ops.aten.select.int(clone, 0, 26);  clone = None
+    select_81 = torch.ops.aten.select.int(clone_1, 0, 26);  clone_1 = None
+    t_29 = torch.ops.aten.t.default(select_81);  select_81 = None
+    return (select_80, t_29)
+    
+
+# CPU partition: submod_112
+
+
+
+def forward(self, mm_55, b_layers_1_causal_mask, clone_2):
+    mul_32 = torch.ops.aten.mul.Tensor(mm_55, 0.08838834764831845);  mm_55 = None
+    view_62 = torch.ops.aten.view.default(mul_32, [1, 1024, 1024]);  mul_32 = None
+    add_29 = torch.ops.aten.add.Tensor(view_62, b_layers_1_causal_mask);  view_62 = b_layers_1_causal_mask = None
+    softmax_26 = torch.ops.aten.softmax.int(add_29, -1, torch.float32);  add_29 = None
+    view_63 = torch.ops.aten.view.default(softmax_26, [1024, 1024]);  softmax_26 = None
+    select_82 = torch.ops.aten.select.int(clone_2, 0, 26);  clone_2 = None
+    return (view_63, select_82)
+    
+
+# CPU partition: submod_114
+
+
+
+def forward(self, clone, clone_1):
+    select_83 = torch.ops.aten.select.int(clone, 0, 27);  clone = None
+    select_84 = torch.ops.aten.select.int(clone_1, 0, 27);  clone_1 = None
+    t_30 = torch.ops.aten.t.default(select_84);  select_84 = None
+    return (select_83, t_30)
+    
+
+# CPU partition: submod_116
+
+
+
+def forward(self, mm_57, b_layers_1_causal_mask, clone_2):
+    mul_33 = torch.ops.aten.mul.Tensor(mm_57, 0.08838834764831845);  mm_57 = None
+    view_64 = torch.ops.aten.view.default(mul_33, [1, 1024, 1024]);  mul_33 = None
+    add_30 = torch.ops.aten.add.Tensor(view_64, b_layers_1_causal_mask);  view_64 = b_layers_1_causal_mask = None
+    softmax_27 = torch.ops.aten.softmax.int(add_30, -1, torch.float32);  add_30 = None
+    view_65 = torch.ops.aten.view.default(softmax_27, [1024, 1024]);  softmax_27 = None
+    select_85 = torch.ops.aten.select.int(clone_2, 0, 27);  clone_2 = None
+    return (view_65, select_85)
+    
+
+# CPU partition: submod_118
+
+
+
+def forward(self, clone, clone_1):
+    select_86 = torch.ops.aten.select.int(clone, 0, 28);  clone = None
+    select_87 = torch.ops.aten.select.int(clone_1, 0, 28);  clone_1 = None
+    t_31 = torch.ops.aten.t.default(select_87);  select_87 = None
+    return (select_86, t_31)
+    
+
+# CPU partition: submod_120
+
+
+
+def forward(self, mm_59, b_layers_1_causal_mask, clone_2):
+    mul_34 = torch.ops.aten.mul.Tensor(mm_59, 0.08838834764831845);  mm_59 = None
+    view_66 = torch.ops.aten.view.default(mul_34, [1, 1024, 1024]);  mul_34 = None
+    add_31 = torch.ops.aten.add.Tensor(view_66, b_layers_1_causal_mask);  view_66 = b_layers_1_causal_mask = None
+    softmax_28 = torch.ops.aten.softmax.int(add_31, -1, torch.float32);  add_31 = None
+    view_67 = torch.ops.aten.view.default(softmax_28, [1024, 1024]);  softmax_28 = None
+    select_88 = torch.ops.aten.select.int(clone_2, 0, 28);  clone_2 = None
+    return (view_67, select_88)
+    
+
+# CPU partition: submod_122
+
+
+
+def forward(self, clone, clone_1):
+    select_89 = torch.ops.aten.select.int(clone, 0, 29);  clone = None
+    select_90 = torch.ops.aten.select.int(clone_1, 0, 29);  clone_1 = None
+    t_32 = torch.ops.aten.t.default(select_90);  select_90 = None
+    return (select_89, t_32)
+    
+
+# CPU partition: submod_124
+
+
+
+def forward(self, mm_61, b_layers_1_causal_mask, clone_2):
+    mul_35 = torch.ops.aten.mul.Tensor(mm_61, 0.08838834764831845);  mm_61 = None
+    view_68 = torch.ops.aten.view.default(mul_35, [1, 1024, 1024]);  mul_35 = None
+    add_32 = torch.ops.aten.add.Tensor(view_68, b_layers_1_causal_mask);  view_68 = b_layers_1_causal_mask = None
+    softmax_29 = torch.ops.aten.softmax.int(add_32, -1, torch.float32);  add_32 = None
+    view_69 = torch.ops.aten.view.default(softmax_29, [1024, 1024]);  softmax_29 = None
+    select_91 = torch.ops.aten.select.int(clone_2, 0, 29);  clone_2 = None
+    return (view_69, select_91)
+    
+
+# CPU partition: submod_126
+
+
+
+def forward(self, clone, clone_1):
+    select_92 = torch.ops.aten.select.int(clone, 0, 30);  clone = None
+    select_93 = torch.ops.aten.select.int(clone_1, 0, 30);  clone_1 = None
+    t_33 = torch.ops.aten.t.default(select_93);  select_93 = None
+    return (select_92, t_33)
+    
+
+# CPU partition: submod_128
+
+
+
+def forward(self, mm_63, b_layers_1_causal_mask, clone_2):
+    mul_36 = torch.ops.aten.mul.Tensor(mm_63, 0.08838834764831845);  mm_63 = None
+    view_70 = torch.ops.aten.view.default(mul_36, [1, 1024, 1024]);  mul_36 = None
+    add_33 = torch.ops.aten.add.Tensor(view_70, b_layers_1_causal_mask);  view_70 = b_layers_1_causal_mask = None
+    softmax_30 = torch.ops.aten.softmax.int(add_33, -1, torch.float32);  add_33 = None
+    view_71 = torch.ops.aten.view.default(softmax_30, [1024, 1024]);  softmax_30 = None
+    select_94 = torch.ops.aten.select.int(clone_2, 0, 30);  clone_2 = None
+    return (view_71, select_94)
+    
+
+# CPU partition: submod_130
+
+
+
+def forward(self, clone, clone_1):
+    select_95 = torch.ops.aten.select.int(clone, 0, 31);  clone = None
+    select_96 = torch.ops.aten.select.int(clone_1, 0, 31);  clone_1 = None
+    t_34 = torch.ops.aten.t.default(select_96);  select_96 = None
+    return (select_95, t_34)
+    
+
+# CPU partition: submod_132
+
+
+
+def forward(self, mm_65, b_layers_1_causal_mask, clone_2):
+    mul_37 = torch.ops.aten.mul.Tensor(mm_65, 0.08838834764831845);  mm_65 = None
+    view_72 = torch.ops.aten.view.default(mul_37, [1, 1024, 1024]);  mul_37 = None
+    add_34 = torch.ops.aten.add.Tensor(view_72, b_layers_1_causal_mask);  view_72 = b_layers_1_causal_mask = None
+    softmax_31 = torch.ops.aten.softmax.int(add_34, -1, torch.float32);  add_34 = None
+    view_73 = torch.ops.aten.view.default(softmax_31, [1024, 1024]);  softmax_31 = None
+    select_97 = torch.ops.aten.select.int(clone_2, 0, 31);  clone_2 = None
+    return (view_73, select_97)
+    
+
+# CPU partition: submod_134
+
+
+
+def forward(self, mm_4, mm_6, mm_8, mm_10, mm_12, mm_14, mm_16, mm_18, mm_20, mm_22, mm_24, mm_26, mm_28, mm_30, mm_32, mm_34, mm_36, mm_38, mm_40, mm_42, mm_44, mm_46, mm_48, mm_50, mm_52, mm_54, mm_56, mm_58, mm_60, mm_62, mm_64, mm_66):
+    cat_2 = torch.ops.aten.cat.default([mm_4, mm_6, mm_8, mm_10, mm_12, mm_14, mm_16, mm_18, mm_20, mm_22, mm_24, mm_26, mm_28, mm_30, mm_32, mm_34, mm_36, mm_38, mm_40, mm_42, mm_44, mm_46, mm_48, mm_50, mm_52, mm_54, mm_56, mm_58, mm_60, mm_62, mm_64, mm_66]);  mm_4 = mm_6 = mm_8 = mm_10 = mm_12 = mm_14 = mm_16 = mm_18 = mm_20 = mm_22 = mm_24 = mm_26 = mm_28 = mm_30 = mm_32 = mm_34 = mm_36 = mm_38 = mm_40 = mm_42 = mm_44 = mm_46 = mm_48 = mm_50 = mm_52 = mm_54 = mm_56 = mm_58 = mm_60 = mm_62 = mm_64 = mm_66 = None
+    view_74 = torch.ops.aten.view.default(cat_2, [32, 1024, 128]);  cat_2 = None
+    transpose_3 = torch.ops.aten.transpose.int(view_74, 0, 1);  view_74 = None
+    clone_3 = torch.ops.aten.clone.default(transpose_3, memory_format = torch.contiguous_format);  transpose_3 = None
+    _unsafe_view = torch.ops.aten._unsafe_view.default(clone_3, [1, 1024, 4096]);  clone_3 = None
+    view_75 = torch.ops.aten.view.default(_unsafe_view, [1024, 4096]);  _unsafe_view = None
+    return view_75
+    
+
+# CPU partition: submod_136
+
+
+
+def forward(self, mm_67, activation, p_layers_0_post_attention_layernorm_weight):
+    view_76 = torch.ops.aten.view.default(mm_67, [1, 1024, 4096]);  mm_67 = None
+    add_35 = torch.ops.aten.add.Tensor(activation, view_76);  activation = view_76 = None
+    _assert_tensor_metadata_2 = torch.ops.aten._assert_tensor_metadata.default(add_35, None, None, torch.float32, device = device(type='cpu'), layout = torch.strided);  _assert_tensor_metadata_2 = None
+    pow_2 = torch.ops.aten.pow.Tensor_Scalar(add_35, 2)
+    mean_1 = torch.ops.aten.mean.dim(pow_2, [-1], True);  pow_2 = None
+    add_36 = torch.ops.aten.add.Tensor(mean_1, 1e-05);  mean_1 = None
+    rsqrt_1 = torch.ops.aten.rsqrt.default(add_36);  add_36 = None
+    mul_38 = torch.ops.aten.mul.Tensor(add_35, rsqrt_1);  rsqrt_1 = None
+    _assert_tensor_metadata_3 = torch.ops.aten._assert_tensor_metadata.default(mul_38, None, None, torch.float32, device = device(type='cpu'), layout = torch.strided);  _assert_tensor_metadata_3 = None
+    mul_39 = torch.ops.aten.mul.Tensor(p_layers_0_post_attention_layernorm_weight, mul_38);  p_layers_0_post_attention_layernorm_weight = mul_38 = None
+    view_77 = torch.ops.aten.view.default(mul_39, [1024, 4096])
+    return (view_77, mul_39, add_35)
+    
+
+# CPU partition: submod_138
+
+
+
+def forward(self, mm_68, mul_39):
+    view_78 = torch.ops.aten.view.default(mm_68, [1, 1024, 11008]);  mm_68 = None
+    silu = torch.ops.aten.silu.default(view_78);  view_78 = None
+    view_79 = torch.ops.aten.view.default(mul_39, [1024, 4096]);  mul_39 = None
+    return (view_79, silu)
+    
+
+# CPU partition: submod_140
+
+
+
+def forward(self, mm_69, silu):
+    view_80 = torch.ops.aten.view.default(mm_69, [1, 1024, 11008]);  mm_69 = None
+    mul_40 = torch.ops.aten.mul.Tensor(silu, view_80);  silu = view_80 = None
+    view_81 = torch.ops.aten.view.default(mul_40, [1024, 11008]);  mul_40 = None
+    return view_81
+    
+
+# CPU partition: submod_142
+
+
+
+def forward(self, mm_70, add_35, p_layers_1_input_layernorm_weight):
+    view_82 = torch.ops.aten.view.default(mm_70, [1, 1024, 4096]);  mm_70 = None
+    add_37 = torch.ops.aten.add.Tensor(add_35, view_82);  add_35 = view_82 = None
+    _assert_tensor_metadata_4 = torch.ops.aten._assert_tensor_metadata.default(add_37, None, None, torch.float32, device = device(type='cpu'), layout = torch.strided);  _assert_tensor_metadata_4 = None
+    pow_3 = torch.ops.aten.pow.Tensor_Scalar(add_37, 2)
+    mean_2 = torch.ops.aten.mean.dim(pow_3, [-1], True);  pow_3 = None
+    add_38 = torch.ops.aten.add.Tensor(mean_2, 1e-05);  mean_2 = None
+    rsqrt_2 = torch.ops.aten.rsqrt.default(add_38);  add_38 = None
+    mul_41 = torch.ops.aten.mul.Tensor(add_37, rsqrt_2);  rsqrt_2 = None
+    _assert_tensor_metadata_5 = torch.ops.aten._assert_tensor_metadata.default(mul_41, None, None, torch.float32, device = device(type='cpu'), layout = torch.strided);  _assert_tensor_metadata_5 = None
+    mul_42 = torch.ops.aten.mul.Tensor(p_layers_1_input_layernorm_weight, mul_41);  p_layers_1_input_layernorm_weight = mul_41 = None
+    view_83 = torch.ops.aten.view.default(mul_42, [1024, 4096])
+    return (view_83, mul_42, add_37)
+    
+
+# CPU partition: submod_144
+
+
+
+def forward(self, mm_71, mul_42):
+    view_84 = torch.ops.aten.view.default(mm_71, [1, 1024, 4096]);  mm_71 = None
+    view_85 = torch.ops.aten.view.default(view_84, [1, 1024, 32, 128]);  view_84 = None
+    transpose_4 = torch.ops.aten.transpose.int(view_85, 1, 2);  view_85 = None
+    view_86 = torch.ops.aten.view.default(mul_42, [1024, 4096]);  mul_42 = None
+    return (view_86, transpose_4)
+    
+
+# CPU partition: submod_146
+
+
+
+def forward(self, mm_72, mul_42):
+    view_87 = torch.ops.aten.view.default(mm_72, [1, 1024, 4096]);  mm_72 = None
+    view_88 = torch.ops.aten.view.default(view_87, [1, 1024, 32, 128]);  view_87 = None
+    transpose_5 = torch.ops.aten.transpose.int(view_88, 1, 2);  view_88 = None
+    view_89 = torch.ops.aten.view.default(mul_42, [1024, 4096]);  mul_42 = None
+    return (view_89, transpose_5)
+    
+
+# CPU partition: submod_148
+
+
+
+def forward(self, mm_73, b_layers_1_cosine, b_layers_1_sine, transpose_4, transpose_5):
+    view_90 = torch.ops.aten.view.default(mm_73, [1, 1024, 4096]);  mm_73 = None
+    view_91 = torch.ops.aten.view.default(view_90, [1, 1024, 32, 128]);  view_90 = None
+    transpose_6 = torch.ops.aten.transpose.int(view_91, 1, 2);  view_91 = None
+    unsqueeze_2 = torch.ops.aten.unsqueeze.default(b_layers_1_cosine, 1);  b_layers_1_cosine = None
+    unsqueeze_3 = torch.ops.aten.unsqueeze.default(b_layers_1_sine, 1);  b_layers_1_sine = None
+    mul_43 = torch.ops.aten.mul.Tensor(transpose_4, unsqueeze_2)
+    slice_5 = torch.ops.aten.slice.Tensor(transpose_4, 3, 0, 64)
+    slice_6 = torch.ops.aten.slice.Tensor(transpose_4, 3, 64, 9223372036854775807);  transpose_4 = None
+    neg_2 = torch.ops.aten.neg.default(slice_6);  slice_6 = None
+    cat_3 = torch.ops.aten.cat.default([neg_2, slice_5], -1);  neg_2 = slice_5 = None
+    mul_44 = torch.ops.aten.mul.Tensor(cat_3, unsqueeze_3);  cat_3 = None
+    add_39 = torch.ops.aten.add.Tensor(mul_43, mul_44);  mul_43 = mul_44 = None
+    mul_45 = torch.ops.aten.mul.Tensor(transpose_5, unsqueeze_2);  unsqueeze_2 = None
+    slice_7 = torch.ops.aten.slice.Tensor(transpose_5, 3, 0, 64)
+    slice_8 = torch.ops.aten.slice.Tensor(transpose_5, 3, 64, 9223372036854775807);  transpose_5 = None
+    neg_3 = torch.ops.aten.neg.default(slice_8);  slice_8 = None
+    cat_4 = torch.ops.aten.cat.default([neg_3, slice_7], -1);  neg_3 = slice_7 = None
+    mul_46 = torch.ops.aten.mul.Tensor(cat_4, unsqueeze_3);  cat_4 = unsqueeze_3 = None
+    add_40 = torch.ops.aten.add.Tensor(mul_45, mul_46);  mul_45 = mul_46 = None
+    view_92 = torch.ops.aten.view.default(add_39, [32, 1024, 128]);  add_39 = None
+    clone_4 = torch.ops.aten.clone.default(view_92, memory_format = torch.contiguous_format);  view_92 = None
+    select_98 = torch.ops.aten.select.int(add_40, 0, 0);  add_40 = None
+    clone_5 = torch.ops.aten.clone.default(select_98, memory_format = torch.contiguous_format);  select_98 = None
+    select_99 = torch.ops.aten.select.int(transpose_6, 0, 0);  transpose_6 = None
+    clone_6 = torch.ops.aten.clone.default(select_99, memory_format = torch.contiguous_format);  select_99 = None
+    select_100 = torch.ops.aten.select.int(clone_4, 0, 0)
+    select_101 = torch.ops.aten.select.int(clone_5, 0, 0)
+    t_42 = torch.ops.aten.t.default(select_101);  select_101 = None
+    return (select_100, t_42, clone_6, clone_4, clone_5)
+    
+
+# CPU partition: submod_150
+
+
+
+def forward(self, mm_74, b_layers_1_causal_mask, clone_6):
+    mul_47 = torch.ops.aten.mul.Tensor(mm_74, 0.08838834764831845);  mm_74 = None
+    view_93 = torch.ops.aten.view.default(mul_47, [1, 1024, 1024]);  mul_47 = None
+    add_41 = torch.ops.aten.add.Tensor(view_93, b_layers_1_causal_mask);  view_93 = b_layers_1_causal_mask = None
+    softmax_32 = torch.ops.aten.softmax.int(add_41, -1, torch.float32);  add_41 = None
+    view_94 = torch.ops.aten.view.default(softmax_32, [1024, 1024]);  softmax_32 = None
+    select_102 = torch.ops.aten.select.int(clone_6, 0, 0);  clone_6 = None
+    return (view_94, select_102)
+    
+
+# CPU partition: submod_152
+
+
+
+def forward(self, clone_4, clone_5):
+    select_103 = torch.ops.aten.select.int(clone_4, 0, 1);  clone_4 = None
+    select_104 = torch.ops.aten.select.int(clone_5, 0, 1);  clone_5 = None
+    t_43 = torch.ops.aten.t.default(select_104);  select_104 = None
+    return (select_103, t_43)
+    
+
+# CPU partition: submod_154
+
+
+
+def forward(self, mm_76, b_layers_1_causal_mask, clone_6):
+    mul_48 = torch.ops.aten.mul.Tensor(mm_76, 0.08838834764831845);  mm_76 = None
+    view_95 = torch.ops.aten.view.default(mul_48, [1, 1024, 1024]);  mul_48 = None
+    add_42 = torch.ops.aten.add.Tensor(view_95, b_layers_1_causal_mask);  view_95 = b_layers_1_causal_mask = None
+    softmax_33 = torch.ops.aten.softmax.int(add_42, -1, torch.float32);  add_42 = None
+    view_96 = torch.ops.aten.view.default(softmax_33, [1024, 1024]);  softmax_33 = None
+    select_105 = torch.ops.aten.select.int(clone_6, 0, 1);  clone_6 = None
+    return (view_96, select_105)
+    
+
+# CPU partition: submod_156
+
+
+
+def forward(self, clone_4, clone_5):
+    select_106 = torch.ops.aten.select.int(clone_4, 0, 2);  clone_4 = None
+    select_107 = torch.ops.aten.select.int(clone_5, 0, 2);  clone_5 = None
+    t_44 = torch.ops.aten.t.default(select_107);  select_107 = None
+    return (select_106, t_44)
+    
+
+# CPU partition: submod_158
+
+
+
+def forward(self, mm_78, b_layers_1_causal_mask, clone_6):
+    mul_49 = torch.ops.aten.mul.Tensor(mm_78, 0.08838834764831845);  mm_78 = None
+    view_97 = torch.ops.aten.view.default(mul_49, [1, 1024, 1024]);  mul_49 = None
+    add_43 = torch.ops.aten.add.Tensor(view_97, b_layers_1_causal_mask);  view_97 = b_layers_1_causal_mask = None
+    softmax_34 = torch.ops.aten.softmax.int(add_43, -1, torch.float32);  add_43 = None
+    view_98 = torch.ops.aten.view.default(softmax_34, [1024, 1024]);  softmax_34 = None
+    select_108 = torch.ops.aten.select.int(clone_6, 0, 2);  clone_6 = None
+    return (view_98, select_108)
+    
+
+# CPU partition: submod_160
+
+
+
+def forward(self, clone_4, clone_5):
+    select_109 = torch.ops.aten.select.int(clone_4, 0, 3);  clone_4 = None
+    select_110 = torch.ops.aten.select.int(clone_5, 0, 3);  clone_5 = None
+    t_45 = torch.ops.aten.t.default(select_110);  select_110 = None
+    return (select_109, t_45)
+    
+
+# CPU partition: submod_162
+
+
+
+def forward(self, mm_80, b_layers_1_causal_mask, clone_6):
+    mul_50 = torch.ops.aten.mul.Tensor(mm_80, 0.08838834764831845);  mm_80 = None
+    view_99 = torch.ops.aten.view.default(mul_50, [1, 1024, 1024]);  mul_50 = None
+    add_44 = torch.ops.aten.add.Tensor(view_99, b_layers_1_causal_mask);  view_99 = b_layers_1_causal_mask = None
+    softmax_35 = torch.ops.aten.softmax.int(add_44, -1, torch.float32);  add_44 = None
+    view_100 = torch.ops.aten.view.default(softmax_35, [1024, 1024]);  softmax_35 = None
+    select_111 = torch.ops.aten.select.int(clone_6, 0, 3);  clone_6 = None
+    return (view_100, select_111)
+    
+
+# CPU partition: submod_164
+
+
+
+def forward(self, clone_4, clone_5):
+    select_112 = torch.ops.aten.select.int(clone_4, 0, 4);  clone_4 = None
+    select_113 = torch.ops.aten.select.int(clone_5, 0, 4);  clone_5 = None
+    t_46 = torch.ops.aten.t.default(select_113);  select_113 = None
+    return (select_112, t_46)
+    
+
+# CPU partition: submod_166
+
+
+
+def forward(self, mm_82, b_layers_1_causal_mask, clone_6):
+    mul_51 = torch.ops.aten.mul.Tensor(mm_82, 0.08838834764831845);  mm_82 = None
+    view_101 = torch.ops.aten.view.default(mul_51, [1, 1024, 1024]);  mul_51 = None
+    add_45 = torch.ops.aten.add.Tensor(view_101, b_layers_1_causal_mask);  view_101 = b_layers_1_causal_mask = None
+    softmax_36 = torch.ops.aten.softmax.int(add_45, -1, torch.float32);  add_45 = None
+    view_102 = torch.ops.aten.view.default(softmax_36, [1024, 1024]);  softmax_36 = None
+    select_114 = torch.ops.aten.select.int(clone_6, 0, 4);  clone_6 = None
+    return (view_102, select_114)
+    
+
+# CPU partition: submod_168
+
+
+
+def forward(self, clone_4, clone_5):
+    select_115 = torch.ops.aten.select.int(clone_4, 0, 5);  clone_4 = None
+    select_116 = torch.ops.aten.select.int(clone_5, 0, 5);  clone_5 = None
+    t_47 = torch.ops.aten.t.default(select_116);  select_116 = None
+    return (select_115, t_47)
+    
+
+# CPU partition: submod_170
+
+
+
+def forward(self, mm_84, b_layers_1_causal_mask, clone_6):
+    mul_52 = torch.ops.aten.mul.Tensor(mm_84, 0.08838834764831845);  mm_84 = None
+    view_103 = torch.ops.aten.view.default(mul_52, [1, 1024, 1024]);  mul_52 = None
+    add_46 = torch.ops.aten.add.Tensor(view_103, b_layers_1_causal_mask);  view_103 = b_layers_1_causal_mask = None
+    softmax_37 = torch.ops.aten.softmax.int(add_46, -1, torch.float32);  add_46 = None
+    view_104 = torch.ops.aten.view.default(softmax_37, [1024, 1024]);  softmax_37 = None
+    select_117 = torch.ops.aten.select.int(clone_6, 0, 5);  clone_6 = None
+    return (view_104, select_117)
+    
+
+# CPU partition: submod_172
+
+
+
+def forward(self, clone_4, clone_5):
+    select_118 = torch.ops.aten.select.int(clone_4, 0, 6);  clone_4 = None
+    select_119 = torch.ops.aten.select.int(clone_5, 0, 6);  clone_5 = None
+    t_48 = torch.ops.aten.t.default(select_119);  select_119 = None
+    return (select_118, t_48)
+    
+
+# CPU partition: submod_174
+
+
+
+def forward(self, mm_86, b_layers_1_causal_mask, clone_6):
+    mul_53 = torch.ops.aten.mul.Tensor(mm_86, 0.08838834764831845);  mm_86 = None
+    view_105 = torch.ops.aten.view.default(mul_53, [1, 1024, 1024]);  mul_53 = None
+    add_47 = torch.ops.aten.add.Tensor(view_105, b_layers_1_causal_mask);  view_105 = b_layers_1_causal_mask = None
+    softmax_38 = torch.ops.aten.softmax.int(add_47, -1, torch.float32);  add_47 = None
+    view_106 = torch.ops.aten.view.default(softmax_38, [1024, 1024]);  softmax_38 = None
+    select_120 = torch.ops.aten.select.int(clone_6, 0, 6);  clone_6 = None
+    return (view_106, select_120)
+    
+
+# CPU partition: submod_176
+
+
+
+def forward(self, clone_4, clone_5):
+    select_121 = torch.ops.aten.select.int(clone_4, 0, 7);  clone_4 = None
+    select_122 = torch.ops.aten.select.int(clone_5, 0, 7);  clone_5 = None
+    t_49 = torch.ops.aten.t.default(select_122);  select_122 = None
+    return (select_121, t_49)
+    
+
+# CPU partition: submod_178
+
+
+
+def forward(self, mm_88, b_layers_1_causal_mask, clone_6):
+    mul_54 = torch.ops.aten.mul.Tensor(mm_88, 0.08838834764831845);  mm_88 = None
+    view_107 = torch.ops.aten.view.default(mul_54, [1, 1024, 1024]);  mul_54 = None
+    add_48 = torch.ops.aten.add.Tensor(view_107, b_layers_1_causal_mask);  view_107 = b_layers_1_causal_mask = None
+    softmax_39 = torch.ops.aten.softmax.int(add_48, -1, torch.float32);  add_48 = None
+    view_108 = torch.ops.aten.view.default(softmax_39, [1024, 1024]);  softmax_39 = None
+    select_123 = torch.ops.aten.select.int(clone_6, 0, 7);  clone_6 = None
+    return (view_108, select_123)
+    
+
+# CPU partition: submod_180
+
+
+
+def forward(self, clone_4, clone_5):
+    select_124 = torch.ops.aten.select.int(clone_4, 0, 8);  clone_4 = None
+    select_125 = torch.ops.aten.select.int(clone_5, 0, 8);  clone_5 = None
+    t_50 = torch.ops.aten.t.default(select_125);  select_125 = None
+    return (select_124, t_50)
+    
+
+# CPU partition: submod_182
+
+
+
+def forward(self, mm_90, b_layers_1_causal_mask, clone_6):
+    mul_55 = torch.ops.aten.mul.Tensor(mm_90, 0.08838834764831845);  mm_90 = None
+    view_109 = torch.ops.aten.view.default(mul_55, [1, 1024, 1024]);  mul_55 = None
+    add_49 = torch.ops.aten.add.Tensor(view_109, b_layers_1_causal_mask);  view_109 = b_layers_1_causal_mask = None
+    softmax_40 = torch.ops.aten.softmax.int(add_49, -1, torch.float32);  add_49 = None
+    view_110 = torch.ops.aten.view.default(softmax_40, [1024, 1024]);  softmax_40 = None
+    select_126 = torch.ops.aten.select.int(clone_6, 0, 8);  clone_6 = None
+    return (view_110, select_126)
+    
+
+# CPU partition: submod_184
+
+
+
+def forward(self, clone_4, clone_5):
+    select_127 = torch.ops.aten.select.int(clone_4, 0, 9);  clone_4 = None
+    select_128 = torch.ops.aten.select.int(clone_5, 0, 9);  clone_5 = None
+    t_51 = torch.ops.aten.t.default(select_128);  select_128 = None
+    return (select_127, t_51)
+    
+
+# CPU partition: submod_186
+
+
+
+def forward(self, mm_92, b_layers_1_causal_mask, clone_6):
+    mul_56 = torch.ops.aten.mul.Tensor(mm_92, 0.08838834764831845);  mm_92 = None
+    view_111 = torch.ops.aten.view.default(mul_56, [1, 1024, 1024]);  mul_56 = None
+    add_50 = torch.ops.aten.add.Tensor(view_111, b_layers_1_causal_mask);  view_111 = b_layers_1_causal_mask = None
+    softmax_41 = torch.ops.aten.softmax.int(add_50, -1, torch.float32);  add_50 = None
+    view_112 = torch.ops.aten.view.default(softmax_41, [1024, 1024]);  softmax_41 = None
+    select_129 = torch.ops.aten.select.int(clone_6, 0, 9);  clone_6 = None
+    return (view_112, select_129)
+    
+
+# CPU partition: submod_188
+
+
+
+def forward(self, clone_4, clone_5):
+    select_130 = torch.ops.aten.select.int(clone_4, 0, 10);  clone_4 = None
+    select_131 = torch.ops.aten.select.int(clone_5, 0, 10);  clone_5 = None
+    t_52 = torch.ops.aten.t.default(select_131);  select_131 = None
+    return (select_130, t_52)
+    
+
+# CPU partition: submod_190
+
+
+
+def forward(self, mm_94, b_layers_1_causal_mask, clone_6):
+    mul_57 = torch.ops.aten.mul.Tensor(mm_94, 0.08838834764831845);  mm_94 = None
+    view_113 = torch.ops.aten.view.default(mul_57, [1, 1024, 1024]);  mul_57 = None
+    add_51 = torch.ops.aten.add.Tensor(view_113, b_layers_1_causal_mask);  view_113 = b_layers_1_causal_mask = None
+    softmax_42 = torch.ops.aten.softmax.int(add_51, -1, torch.float32);  add_51 = None
+    view_114 = torch.ops.aten.view.default(softmax_42, [1024, 1024]);  softmax_42 = None
+    select_132 = torch.ops.aten.select.int(clone_6, 0, 10);  clone_6 = None
+    return (view_114, select_132)
+    
+
+# CPU partition: submod_192
+
+
+
+def forward(self, clone_4, clone_5):
+    select_133 = torch.ops.aten.select.int(clone_4, 0, 11);  clone_4 = None
+    select_134 = torch.ops.aten.select.int(clone_5, 0, 11);  clone_5 = None
+    t_53 = torch.ops.aten.t.default(select_134);  select_134 = None
+    return (select_133, t_53)
+    
+
+# CPU partition: submod_194
+
+
+
+def forward(self, mm_96, b_layers_1_causal_mask, clone_6):
+    mul_58 = torch.ops.aten.mul.Tensor(mm_96, 0.08838834764831845);  mm_96 = None
+    view_115 = torch.ops.aten.view.default(mul_58, [1, 1024, 1024]);  mul_58 = None
+    add_52 = torch.ops.aten.add.Tensor(view_115, b_layers_1_causal_mask);  view_115 = b_layers_1_causal_mask = None
+    softmax_43 = torch.ops.aten.softmax.int(add_52, -1, torch.float32);  add_52 = None
+    view_116 = torch.ops.aten.view.default(softmax_43, [1024, 1024]);  softmax_43 = None
+    select_135 = torch.ops.aten.select.int(clone_6, 0, 11);  clone_6 = None
+    return (view_116, select_135)
+    
+
+# CPU partition: submod_196
+
+
+
+def forward(self, clone_4, clone_5):
+    select_136 = torch.ops.aten.select.int(clone_4, 0, 12);  clone_4 = None
+    select_137 = torch.ops.aten.select.int(clone_5, 0, 12);  clone_5 = None
+    t_54 = torch.ops.aten.t.default(select_137);  select_137 = None
+    return (select_136, t_54)
+    
+
+# CPU partition: submod_198
+
+
+
+def forward(self, mm_98, b_layers_1_causal_mask, clone_6):
+    mul_59 = torch.ops.aten.mul.Tensor(mm_98, 0.08838834764831845);  mm_98 = None
+    view_117 = torch.ops.aten.view.default(mul_59, [1, 1024, 1024]);  mul_59 = None
+    add_53 = torch.ops.aten.add.Tensor(view_117, b_layers_1_causal_mask);  view_117 = b_layers_1_causal_mask = None
+    softmax_44 = torch.ops.aten.softmax.int(add_53, -1, torch.float32);  add_53 = None
+    view_118 = torch.ops.aten.view.default(softmax_44, [1024, 1024]);  softmax_44 = None
+    select_138 = torch.ops.aten.select.int(clone_6, 0, 12);  clone_6 = None
+    return (view_118, select_138)
+    
+
+# CPU partition: submod_200
+
+
+
+def forward(self, clone_4, clone_5):
+    select_139 = torch.ops.aten.select.int(clone_4, 0, 13);  clone_4 = None
+    select_140 = torch.ops.aten.select.int(clone_5, 0, 13);  clone_5 = None
+    t_55 = torch.ops.aten.t.default(select_140);  select_140 = None
+    return (select_139, t_55)
+    
+
+# CPU partition: submod_202
+
+
+
+def forward(self, mm_100, b_layers_1_causal_mask, clone_6):
+    mul_60 = torch.ops.aten.mul.Tensor(mm_100, 0.08838834764831845);  mm_100 = None
+    view_119 = torch.ops.aten.view.default(mul_60, [1, 1024, 1024]);  mul_60 = None
+    add_54 = torch.ops.aten.add.Tensor(view_119, b_layers_1_causal_mask);  view_119 = b_layers_1_causal_mask = None
+    softmax_45 = torch.ops.aten.softmax.int(add_54, -1, torch.float32);  add_54 = None
+    view_120 = torch.ops.aten.view.default(softmax_45, [1024, 1024]);  softmax_45 = None
+    select_141 = torch.ops.aten.select.int(clone_6, 0, 13);  clone_6 = None
+    return (view_120, select_141)
+    
+
+# CPU partition: submod_204
+
+
+
+def forward(self, clone_4, clone_5):
+    select_142 = torch.ops.aten.select.int(clone_4, 0, 14);  clone_4 = None
+    select_143 = torch.ops.aten.select.int(clone_5, 0, 14);  clone_5 = None
+    t_56 = torch.ops.aten.t.default(select_143);  select_143 = None
+    return (select_142, t_56)
+    
+
+# CPU partition: submod_206
+
+
+
+def forward(self, mm_102, b_layers_1_causal_mask, clone_6):
+    mul_61 = torch.ops.aten.mul.Tensor(mm_102, 0.08838834764831845);  mm_102 = None
+    view_121 = torch.ops.aten.view.default(mul_61, [1, 1024, 1024]);  mul_61 = None
+    add_55 = torch.ops.aten.add.Tensor(view_121, b_layers_1_causal_mask);  view_121 = b_layers_1_causal_mask = None
+    softmax_46 = torch.ops.aten.softmax.int(add_55, -1, torch.float32);  add_55 = None
+    view_122 = torch.ops.aten.view.default(softmax_46, [1024, 1024]);  softmax_46 = None
+    select_144 = torch.ops.aten.select.int(clone_6, 0, 14);  clone_6 = None
+    return (view_122, select_144)
+    
+
+# CPU partition: submod_208
+
+
+
+def forward(self, clone_4, clone_5):
+    select_145 = torch.ops.aten.select.int(clone_4, 0, 15);  clone_4 = None
+    select_146 = torch.ops.aten.select.int(clone_5, 0, 15);  clone_5 = None
+    t_57 = torch.ops.aten.t.default(select_146);  select_146 = None
+    return (select_145, t_57)
+    
+
+# CPU partition: submod_210
+
+
+
+def forward(self, mm_104, b_layers_1_causal_mask, clone_6):
+    mul_62 = torch.ops.aten.mul.Tensor(mm_104, 0.08838834764831845);  mm_104 = None
+    view_123 = torch.ops.aten.view.default(mul_62, [1, 1024, 1024]);  mul_62 = None
+    add_56 = torch.ops.aten.add.Tensor(view_123, b_layers_1_causal_mask);  view_123 = b_layers_1_causal_mask = None
+    softmax_47 = torch.ops.aten.softmax.int(add_56, -1, torch.float32);  add_56 = None
+    view_124 = torch.ops.aten.view.default(softmax_47, [1024, 1024]);  softmax_47 = None
+    select_147 = torch.ops.aten.select.int(clone_6, 0, 15);  clone_6 = None
+    return (view_124, select_147)
+    
+
+# CPU partition: submod_212
+
+
+
+def forward(self, clone_4, clone_5):
+    select_148 = torch.ops.aten.select.int(clone_4, 0, 16);  clone_4 = None
+    select_149 = torch.ops.aten.select.int(clone_5, 0, 16);  clone_5 = None
+    t_58 = torch.ops.aten.t.default(select_149);  select_149 = None
+    return (select_148, t_58)
+    
+
+# CPU partition: submod_214
+
+
+
+def forward(self, mm_106, b_layers_1_causal_mask, clone_6):
+    mul_63 = torch.ops.aten.mul.Tensor(mm_106, 0.08838834764831845);  mm_106 = None
+    view_125 = torch.ops.aten.view.default(mul_63, [1, 1024, 1024]);  mul_63 = None
+    add_57 = torch.ops.aten.add.Tensor(view_125, b_layers_1_causal_mask);  view_125 = b_layers_1_causal_mask = None
+    softmax_48 = torch.ops.aten.softmax.int(add_57, -1, torch.float32);  add_57 = None
+    view_126 = torch.ops.aten.view.default(softmax_48, [1024, 1024]);  softmax_48 = None
+    select_150 = torch.ops.aten.select.int(clone_6, 0, 16);  clone_6 = None
+    return (view_126, select_150)
+    
+
+# CPU partition: submod_216
+
+
+
+def forward(self, clone_4, clone_5):
+    select_151 = torch.ops.aten.select.int(clone_4, 0, 17);  clone_4 = None
+    select_152 = torch.ops.aten.select.int(clone_5, 0, 17);  clone_5 = None
+    t_59 = torch.ops.aten.t.default(select_152);  select_152 = None
+    return (select_151, t_59)
+    
+
+# CPU partition: submod_218
+
+
+
+def forward(self, mm_108, b_layers_1_causal_mask, clone_6):
+    mul_64 = torch.ops.aten.mul.Tensor(mm_108, 0.08838834764831845);  mm_108 = None
+    view_127 = torch.ops.aten.view.default(mul_64, [1, 1024, 1024]);  mul_64 = None
+    add_58 = torch.ops.aten.add.Tensor(view_127, b_layers_1_causal_mask);  view_127 = b_layers_1_causal_mask = None
+    softmax_49 = torch.ops.aten.softmax.int(add_58, -1, torch.float32);  add_58 = None
+    view_128 = torch.ops.aten.view.default(softmax_49, [1024, 1024]);  softmax_49 = None
+    select_153 = torch.ops.aten.select.int(clone_6, 0, 17);  clone_6 = None
+    return (view_128, select_153)
+    
+
+# CPU partition: submod_220
+
+
+
+def forward(self, clone_4, clone_5):
+    select_154 = torch.ops.aten.select.int(clone_4, 0, 18);  clone_4 = None
+    select_155 = torch.ops.aten.select.int(clone_5, 0, 18);  clone_5 = None
+    t_60 = torch.ops.aten.t.default(select_155);  select_155 = None
+    return (select_154, t_60)
+    
+
+# CPU partition: submod_222
+
+
+
+def forward(self, mm_110, b_layers_1_causal_mask, clone_6):
+    mul_65 = torch.ops.aten.mul.Tensor(mm_110, 0.08838834764831845);  mm_110 = None
+    view_129 = torch.ops.aten.view.default(mul_65, [1, 1024, 1024]);  mul_65 = None
+    add_59 = torch.ops.aten.add.Tensor(view_129, b_layers_1_causal_mask);  view_129 = b_layers_1_causal_mask = None
+    softmax_50 = torch.ops.aten.softmax.int(add_59, -1, torch.float32);  add_59 = None
+    view_130 = torch.ops.aten.view.default(softmax_50, [1024, 1024]);  softmax_50 = None
+    select_156 = torch.ops.aten.select.int(clone_6, 0, 18);  clone_6 = None
+    return (view_130, select_156)
+    
+
+# CPU partition: submod_224
+
+
+
+def forward(self, clone_4, clone_5):
+    select_157 = torch.ops.aten.select.int(clone_4, 0, 19);  clone_4 = None
+    select_158 = torch.ops.aten.select.int(clone_5, 0, 19);  clone_5 = None
+    t_61 = torch.ops.aten.t.default(select_158);  select_158 = None
+    return (select_157, t_61)
+    
+
+# CPU partition: submod_226
+
+
+
+def forward(self, mm_112, b_layers_1_causal_mask, clone_6):
+    mul_66 = torch.ops.aten.mul.Tensor(mm_112, 0.08838834764831845);  mm_112 = None
+    view_131 = torch.ops.aten.view.default(mul_66, [1, 1024, 1024]);  mul_66 = None
+    add_60 = torch.ops.aten.add.Tensor(view_131, b_layers_1_causal_mask);  view_131 = b_layers_1_causal_mask = None
+    softmax_51 = torch.ops.aten.softmax.int(add_60, -1, torch.float32);  add_60 = None
+    view_132 = torch.ops.aten.view.default(softmax_51, [1024, 1024]);  softmax_51 = None
+    select_159 = torch.ops.aten.select.int(clone_6, 0, 19);  clone_6 = None
+    return (view_132, select_159)
+    
+
+# CPU partition: submod_228
+
+
+
+def forward(self, clone_4, clone_5):
+    select_160 = torch.ops.aten.select.int(clone_4, 0, 20);  clone_4 = None
+    select_161 = torch.ops.aten.select.int(clone_5, 0, 20);  clone_5 = None
+    t_62 = torch.ops.aten.t.default(select_161);  select_161 = None
+    return (select_160, t_62)
+    
+
+# CPU partition: submod_230
+
+
+
+def forward(self, mm_114, b_layers_1_causal_mask, clone_6):
+    mul_67 = torch.ops.aten.mul.Tensor(mm_114, 0.08838834764831845);  mm_114 = None
+    view_133 = torch.ops.aten.view.default(mul_67, [1, 1024, 1024]);  mul_67 = None
+    add_61 = torch.ops.aten.add.Tensor(view_133, b_layers_1_causal_mask);  view_133 = b_layers_1_causal_mask = None
+    softmax_52 = torch.ops.aten.softmax.int(add_61, -1, torch.float32);  add_61 = None
+    view_134 = torch.ops.aten.view.default(softmax_52, [1024, 1024]);  softmax_52 = None
+    select_162 = torch.ops.aten.select.int(clone_6, 0, 20);  clone_6 = None
+    return (view_134, select_162)
+    
+
+# CPU partition: submod_232
+
+
+
+def forward(self, clone_4, clone_5):
+    select_163 = torch.ops.aten.select.int(clone_4, 0, 21);  clone_4 = None
+    select_164 = torch.ops.aten.select.int(clone_5, 0, 21);  clone_5 = None
+    t_63 = torch.ops.aten.t.default(select_164);  select_164 = None
+    return (select_163, t_63)
+    
+
+# CPU partition: submod_234
+
+
+
+def forward(self, mm_116, b_layers_1_causal_mask, clone_6):
+    mul_68 = torch.ops.aten.mul.Tensor(mm_116, 0.08838834764831845);  mm_116 = None
+    view_135 = torch.ops.aten.view.default(mul_68, [1, 1024, 1024]);  mul_68 = None
+    add_62 = torch.ops.aten.add.Tensor(view_135, b_layers_1_causal_mask);  view_135 = b_layers_1_causal_mask = None
+    softmax_53 = torch.ops.aten.softmax.int(add_62, -1, torch.float32);  add_62 = None
+    view_136 = torch.ops.aten.view.default(softmax_53, [1024, 1024]);  softmax_53 = None
+    select_165 = torch.ops.aten.select.int(clone_6, 0, 21);  clone_6 = None
+    return (view_136, select_165)
+    
+
+# CPU partition: submod_236
+
+
+
+def forward(self, clone_4, clone_5):
+    select_166 = torch.ops.aten.select.int(clone_4, 0, 22);  clone_4 = None
+    select_167 = torch.ops.aten.select.int(clone_5, 0, 22);  clone_5 = None
+    t_64 = torch.ops.aten.t.default(select_167);  select_167 = None
+    return (select_166, t_64)
+    
+
+# CPU partition: submod_238
+
+
+
+def forward(self, mm_118, b_layers_1_causal_mask, clone_6):
+    mul_69 = torch.ops.aten.mul.Tensor(mm_118, 0.08838834764831845);  mm_118 = None
+    view_137 = torch.ops.aten.view.default(mul_69, [1, 1024, 1024]);  mul_69 = None
+    add_63 = torch.ops.aten.add.Tensor(view_137, b_layers_1_causal_mask);  view_137 = b_layers_1_causal_mask = None
+    softmax_54 = torch.ops.aten.softmax.int(add_63, -1, torch.float32);  add_63 = None
+    view_138 = torch.ops.aten.view.default(softmax_54, [1024, 1024]);  softmax_54 = None
+    select_168 = torch.ops.aten.select.int(clone_6, 0, 22);  clone_6 = None
+    return (view_138, select_168)
+    
+
+# CPU partition: submod_240
+
+
+
+def forward(self, clone_4, clone_5):
+    select_169 = torch.ops.aten.select.int(clone_4, 0, 23);  clone_4 = None
+    select_170 = torch.ops.aten.select.int(clone_5, 0, 23);  clone_5 = None
+    t_65 = torch.ops.aten.t.default(select_170);  select_170 = None
+    return (select_169, t_65)
+    
+
+# CPU partition: submod_242
+
+
+
+def forward(self, mm_120, b_layers_1_causal_mask, clone_6):
+    mul_70 = torch.ops.aten.mul.Tensor(mm_120, 0.08838834764831845);  mm_120 = None
+    view_139 = torch.ops.aten.view.default(mul_70, [1, 1024, 1024]);  mul_70 = None
+    add_64 = torch.ops.aten.add.Tensor(view_139, b_layers_1_causal_mask);  view_139 = b_layers_1_causal_mask = None
+    softmax_55 = torch.ops.aten.softmax.int(add_64, -1, torch.float32);  add_64 = None
+    view_140 = torch.ops.aten.view.default(softmax_55, [1024, 1024]);  softmax_55 = None
+    select_171 = torch.ops.aten.select.int(clone_6, 0, 23);  clone_6 = None
+    return (view_140, select_171)
+    
+
+# CPU partition: submod_244
+
+
+
+def forward(self, clone_4, clone_5):
+    select_172 = torch.ops.aten.select.int(clone_4, 0, 24);  clone_4 = None
+    select_173 = torch.ops.aten.select.int(clone_5, 0, 24);  clone_5 = None
+    t_66 = torch.ops.aten.t.default(select_173);  select_173 = None
+    return (select_172, t_66)
+    
+
+# CPU partition: submod_246
+
+
+
+def forward(self, mm_122, b_layers_1_causal_mask, clone_6):
+    mul_71 = torch.ops.aten.mul.Tensor(mm_122, 0.08838834764831845);  mm_122 = None
+    view_141 = torch.ops.aten.view.default(mul_71, [1, 1024, 1024]);  mul_71 = None
+    add_65 = torch.ops.aten.add.Tensor(view_141, b_layers_1_causal_mask);  view_141 = b_layers_1_causal_mask = None
+    softmax_56 = torch.ops.aten.softmax.int(add_65, -1, torch.float32);  add_65 = None
+    view_142 = torch.ops.aten.view.default(softmax_56, [1024, 1024]);  softmax_56 = None
+    select_174 = torch.ops.aten.select.int(clone_6, 0, 24);  clone_6 = None
+    return (view_142, select_174)
+    
+
+# CPU partition: submod_248
+
+
+
+def forward(self, clone_4, clone_5):
+    select_175 = torch.ops.aten.select.int(clone_4, 0, 25);  clone_4 = None
+    select_176 = torch.ops.aten.select.int(clone_5, 0, 25);  clone_5 = None
+    t_67 = torch.ops.aten.t.default(select_176);  select_176 = None
+    return (select_175, t_67)
+    
+
+# CPU partition: submod_250
+
+
+
+def forward(self, mm_124, b_layers_1_causal_mask, clone_6):
+    mul_72 = torch.ops.aten.mul.Tensor(mm_124, 0.08838834764831845);  mm_124 = None
+    view_143 = torch.ops.aten.view.default(mul_72, [1, 1024, 1024]);  mul_72 = None
+    add_66 = torch.ops.aten.add.Tensor(view_143, b_layers_1_causal_mask);  view_143 = b_layers_1_causal_mask = None
+    softmax_57 = torch.ops.aten.softmax.int(add_66, -1, torch.float32);  add_66 = None
+    view_144 = torch.ops.aten.view.default(softmax_57, [1024, 1024]);  softmax_57 = None
+    select_177 = torch.ops.aten.select.int(clone_6, 0, 25);  clone_6 = None
+    return (view_144, select_177)
+    
+
+# CPU partition: submod_252
+
+
+
+def forward(self, clone_4, clone_5):
+    select_178 = torch.ops.aten.select.int(clone_4, 0, 26);  clone_4 = None
+    select_179 = torch.ops.aten.select.int(clone_5, 0, 26);  clone_5 = None
+    t_68 = torch.ops.aten.t.default(select_179);  select_179 = None
+    return (select_178, t_68)
+    
+
+# CPU partition: submod_254
+
+
+
+def forward(self, mm_126, b_layers_1_causal_mask, clone_6):
+    mul_73 = torch.ops.aten.mul.Tensor(mm_126, 0.08838834764831845);  mm_126 = None
+    view_145 = torch.ops.aten.view.default(mul_73, [1, 1024, 1024]);  mul_73 = None
+    add_67 = torch.ops.aten.add.Tensor(view_145, b_layers_1_causal_mask);  view_145 = b_layers_1_causal_mask = None
+    softmax_58 = torch.ops.aten.softmax.int(add_67, -1, torch.float32);  add_67 = None
+    view_146 = torch.ops.aten.view.default(softmax_58, [1024, 1024]);  softmax_58 = None
+    select_180 = torch.ops.aten.select.int(clone_6, 0, 26);  clone_6 = None
+    return (view_146, select_180)
+    
+
+# CPU partition: submod_256
+
+
+
+def forward(self, clone_4, clone_5):
+    select_181 = torch.ops.aten.select.int(clone_4, 0, 27);  clone_4 = None
+    select_182 = torch.ops.aten.select.int(clone_5, 0, 27);  clone_5 = None
+    t_69 = torch.ops.aten.t.default(select_182);  select_182 = None
+    return (select_181, t_69)
+    
+
+# CPU partition: submod_258
+
+
+
+def forward(self, mm_128, b_layers_1_causal_mask, clone_6):
+    mul_74 = torch.ops.aten.mul.Tensor(mm_128, 0.08838834764831845);  mm_128 = None
+    view_147 = torch.ops.aten.view.default(mul_74, [1, 1024, 1024]);  mul_74 = None
+    add_68 = torch.ops.aten.add.Tensor(view_147, b_layers_1_causal_mask);  view_147 = b_layers_1_causal_mask = None
+    softmax_59 = torch.ops.aten.softmax.int(add_68, -1, torch.float32);  add_68 = None
+    view_148 = torch.ops.aten.view.default(softmax_59, [1024, 1024]);  softmax_59 = None
+    select_183 = torch.ops.aten.select.int(clone_6, 0, 27);  clone_6 = None
+    return (view_148, select_183)
+    
+
+# CPU partition: submod_260
+
+
+
+def forward(self, clone_4, clone_5):
+    select_184 = torch.ops.aten.select.int(clone_4, 0, 28);  clone_4 = None
+    select_185 = torch.ops.aten.select.int(clone_5, 0, 28);  clone_5 = None
+    t_70 = torch.ops.aten.t.default(select_185);  select_185 = None
+    return (select_184, t_70)
+    
+
+# CPU partition: submod_262
+
+
+
+def forward(self, mm_130, b_layers_1_causal_mask, clone_6):
+    mul_75 = torch.ops.aten.mul.Tensor(mm_130, 0.08838834764831845);  mm_130 = None
+    view_149 = torch.ops.aten.view.default(mul_75, [1, 1024, 1024]);  mul_75 = None
+    add_69 = torch.ops.aten.add.Tensor(view_149, b_layers_1_causal_mask);  view_149 = b_layers_1_causal_mask = None
+    softmax_60 = torch.ops.aten.softmax.int(add_69, -1, torch.float32);  add_69 = None
+    view_150 = torch.ops.aten.view.default(softmax_60, [1024, 1024]);  softmax_60 = None
+    select_186 = torch.ops.aten.select.int(clone_6, 0, 28);  clone_6 = None
+    return (view_150, select_186)
+    
+
+# CPU partition: submod_264
+
+
+
+def forward(self, clone_4, clone_5):
+    select_187 = torch.ops.aten.select.int(clone_4, 0, 29);  clone_4 = None
+    select_188 = torch.ops.aten.select.int(clone_5, 0, 29);  clone_5 = None
+    t_71 = torch.ops.aten.t.default(select_188);  select_188 = None
+    return (select_187, t_71)
+    
+
+# CPU partition: submod_266
+
+
+
+def forward(self, mm_132, b_layers_1_causal_mask, clone_6):
+    mul_76 = torch.ops.aten.mul.Tensor(mm_132, 0.08838834764831845);  mm_132 = None
+    view_151 = torch.ops.aten.view.default(mul_76, [1, 1024, 1024]);  mul_76 = None
+    add_70 = torch.ops.aten.add.Tensor(view_151, b_layers_1_causal_mask);  view_151 = b_layers_1_causal_mask = None
+    softmax_61 = torch.ops.aten.softmax.int(add_70, -1, torch.float32);  add_70 = None
+    view_152 = torch.ops.aten.view.default(softmax_61, [1024, 1024]);  softmax_61 = None
+    select_189 = torch.ops.aten.select.int(clone_6, 0, 29);  clone_6 = None
+    return (view_152, select_189)
+    
+
+# CPU partition: submod_268
+
+
+
+def forward(self, clone_4, clone_5):
+    select_190 = torch.ops.aten.select.int(clone_4, 0, 30);  clone_4 = None
+    select_191 = torch.ops.aten.select.int(clone_5, 0, 30);  clone_5 = None
+    t_72 = torch.ops.aten.t.default(select_191);  select_191 = None
+    return (select_190, t_72)
+    
+
+# CPU partition: submod_270
+
+
+
+def forward(self, mm_134, b_layers_1_causal_mask, clone_6):
+    mul_77 = torch.ops.aten.mul.Tensor(mm_134, 0.08838834764831845);  mm_134 = None
+    view_153 = torch.ops.aten.view.default(mul_77, [1, 1024, 1024]);  mul_77 = None
+    add_71 = torch.ops.aten.add.Tensor(view_153, b_layers_1_causal_mask);  view_153 = b_layers_1_causal_mask = None
+    softmax_62 = torch.ops.aten.softmax.int(add_71, -1, torch.float32);  add_71 = None
+    view_154 = torch.ops.aten.view.default(softmax_62, [1024, 1024]);  softmax_62 = None
+    select_192 = torch.ops.aten.select.int(clone_6, 0, 30);  clone_6 = None
+    return (view_154, select_192)
+    
+
+# CPU partition: submod_272
+
+
+
+def forward(self, clone_4, clone_5):
+    select_193 = torch.ops.aten.select.int(clone_4, 0, 31);  clone_4 = None
+    select_194 = torch.ops.aten.select.int(clone_5, 0, 31);  clone_5 = None
+    t_73 = torch.ops.aten.t.default(select_194);  select_194 = None
+    return (select_193, t_73)
+    
+
+# CPU partition: submod_274
+
+
+
+def forward(self, mm_136, b_layers_1_causal_mask, clone_6):
+    mul_78 = torch.ops.aten.mul.Tensor(mm_136, 0.08838834764831845);  mm_136 = None
+    view_155 = torch.ops.aten.view.default(mul_78, [1, 1024, 1024]);  mul_78 = None
+    add_72 = torch.ops.aten.add.Tensor(view_155, b_layers_1_causal_mask);  view_155 = b_layers_1_causal_mask = None
+    softmax_63 = torch.ops.aten.softmax.int(add_72, -1, torch.float32);  add_72 = None
+    view_156 = torch.ops.aten.view.default(softmax_63, [1024, 1024]);  softmax_63 = None
+    select_195 = torch.ops.aten.select.int(clone_6, 0, 31);  clone_6 = None
+    return (view_156, select_195)
+    
+
+# CPU partition: submod_276
+
+
+
+def forward(self, mm_75, mm_77, mm_79, mm_81, mm_83, mm_85, mm_87, mm_89, mm_91, mm_93, mm_95, mm_97, mm_99, mm_101, mm_103, mm_105, mm_107, mm_109, mm_111, mm_113, mm_115, mm_117, mm_119, mm_121, mm_123, mm_125, mm_127, mm_129, mm_131, mm_133, mm_135, mm_137):
+    cat_5 = torch.ops.aten.cat.default([mm_75, mm_77, mm_79, mm_81, mm_83, mm_85, mm_87, mm_89, mm_91, mm_93, mm_95, mm_97, mm_99, mm_101, mm_103, mm_105, mm_107, mm_109, mm_111, mm_113, mm_115, mm_117, mm_119, mm_121, mm_123, mm_125, mm_127, mm_129, mm_131, mm_133, mm_135, mm_137]);  mm_75 = mm_77 = mm_79 = mm_81 = mm_83 = mm_85 = mm_87 = mm_89 = mm_91 = mm_93 = mm_95 = mm_97 = mm_99 = mm_101 = mm_103 = mm_105 = mm_107 = mm_109 = mm_111 = mm_113 = mm_115 = mm_117 = mm_119 = mm_121 = mm_123 = mm_125 = mm_127 = mm_129 = mm_131 = mm_133 = mm_135 = mm_137 = None
+    view_157 = torch.ops.aten.view.default(cat_5, [32, 1024, 128]);  cat_5 = None
+    transpose_7 = torch.ops.aten.transpose.int(view_157, 0, 1);  view_157 = None
+    clone_7 = torch.ops.aten.clone.default(transpose_7, memory_format = torch.contiguous_format);  transpose_7 = None
+    _unsafe_view_1 = torch.ops.aten._unsafe_view.default(clone_7, [1, 1024, 4096]);  clone_7 = None
+    view_158 = torch.ops.aten.view.default(_unsafe_view_1, [1024, 4096]);  _unsafe_view_1 = None
+    return view_158
+    
+
+# CPU partition: submod_278
+
+
+
+def forward(self, mm_138, add_37, p_layers_1_post_attention_layernorm_weight):
+    view_159 = torch.ops.aten.view.default(mm_138, [1, 1024, 4096]);  mm_138 = None
+    add_73 = torch.ops.aten.add.Tensor(add_37, view_159);  add_37 = view_159 = None
+    _assert_tensor_metadata_6 = torch.ops.aten._assert_tensor_metadata.default(add_73, None, None, torch.float32, device = device(type='cpu'), layout = torch.strided);  _assert_tensor_metadata_6 = None
+    pow_4 = torch.ops.aten.pow.Tensor_Scalar(add_73, 2)
+    mean_3 = torch.ops.aten.mean.dim(pow_4, [-1], True);  pow_4 = None
+    add_74 = torch.ops.aten.add.Tensor(mean_3, 1e-05);  mean_3 = None
+    rsqrt_3 = torch.ops.aten.rsqrt.default(add_74);  add_74 = None
+    mul_79 = torch.ops.aten.mul.Tensor(add_73, rsqrt_3);  rsqrt_3 = None
+    _assert_tensor_metadata_7 = torch.ops.aten._assert_tensor_metadata.default(mul_79, None, None, torch.float32, device = device(type='cpu'), layout = torch.strided);  _assert_tensor_metadata_7 = None
+    mul_80 = torch.ops.aten.mul.Tensor(p_layers_1_post_attention_layernorm_weight, mul_79);  p_layers_1_post_attention_layernorm_weight = mul_79 = None
+    view_160 = torch.ops.aten.view.default(mul_80, [1024, 4096])
+    return (view_160, mul_80, add_73)
+    
+
+# CPU partition: submod_280
+
+
+
+def forward(self, mm_139, mul_80):
+    view_161 = torch.ops.aten.view.default(mm_139, [1, 1024, 11008]);  mm_139 = None
+    silu_1 = torch.ops.aten.silu.default(view_161);  view_161 = None
+    view_162 = torch.ops.aten.view.default(mul_80, [1024, 4096]);  mul_80 = None
+    return (view_162, silu_1)
+    
+
+# CPU partition: submod_282
+
+
+
+def forward(self, mm_140, silu_1):
+    view_163 = torch.ops.aten.view.default(mm_140, [1, 1024, 11008]);  mm_140 = None
+    mul_81 = torch.ops.aten.mul.Tensor(silu_1, view_163);  silu_1 = view_163 = None
+    view_164 = torch.ops.aten.view.default(mul_81, [1024, 11008]);  mul_81 = None
+    return view_164
+    
+
+# CPU partition: submod_284
+
+
+
+def forward(self, mm_141, add_73):
+    view_165 = torch.ops.aten.view.default(mm_141, [1, 1024, 4096]);  mm_141 = None
+    add_75 = torch.ops.aten.add.Tensor(add_73, view_165);  add_73 = view_165 = None
+    return add_75
+    

@@ -1,7 +1,7 @@
 // The Common N-group upper bound may vary within its declared two-group bound.
 // Keep physical allocations, but reconstruct descriptors for this dynamic loop.
-// RUN: triton-shared-opt --mlir-print-op-generic --convert-pim-to-aimx %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --implicit-check-not="if (!_resident->ready)"
-// RUN: triton-shared-opt --mlir-print-op-generic --convert-pim-to-aimx %s | triton-shared-translate --aimx-to-descriptors | FileCheck %s --check-prefix=DESC --implicit-check-not=aimx_patch_
+// RUN: triton-shared-opt --mlir-print-op-generic --pim-form-host-plan --convert-pim-to-aimx %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --implicit-check-not="if (!_resident->ready)"
+// RUN: triton-shared-opt --mlir-print-op-generic --pim-form-host-plan --convert-pim-to-aimx %s | triton-shared-translate --aimx-to-descriptors | FileCheck %s --check-prefix=DESC --implicit-check-not=aimx_patch_
 // CHECK: aimx_resident_acquire(AIMX_KERNEL_KEY ":site0", _fpga,
 // CHECK: .idx = 0;
 // CHECK: for (int64_t {{.*}} < a3;

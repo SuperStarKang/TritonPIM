@@ -5,7 +5,7 @@
 // RUN: triton-shared-opt --pim-normalize-address -cse -loop-invariant-code-motion -canonicalize --pim-form-compute --convert-ttshared-to-pim --pim-build-logical-grid --pim-recover-access-origin --pim-set-target-profile='target=aimx num-units=1 banks-per-unit=256 cores-per-bank=1 lanes-per-core=16 bank-capacity-limit-bytes=268435456 local-capacity-limit-bytes=0' --pim-form-block-groups --pim-form-execution-tiles --pim-map-devices='p-m=1 p-n=1 p-k=1' --pim-place-data --pim-verify -cse %s -o %t.common
 // Serialize exactly as the AiMX backend does, retaining no_inline without the
 // pinned SCF custom printer's duplicate keyword/attribute representation.
-// RUN: triton-shared-opt --convert-pim-to-aimx -cse -canonicalize --mlir-print-op-generic %t.common -o %t.aimx
+// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx -cse -canonicalize --mlir-print-op-generic %t.common -o %t.aimx
 // RUN: FileCheck %s --check-prefix=SERIALIZED --input-file=%t.aimx --implicit-check-not='scf.execute_region no_inline'
 // Reparse and canonicalize before display to check that the boundary survives.
 // RUN: triton-shared-opt -canonicalize %t.aimx | FileCheck %s --check-prefix=IR --implicit-check-not=aimx.compute_template --implicit-check-not=linalg. --implicit-check-not='pim.access ' --implicit-check-not='pim.device '
@@ -13,7 +13,7 @@
 // RUN: triton-shared-translate --aimx-to-descriptors %t.aimx | FileCheck %s --check-prefix=DESC
 // Multiple M/K groups retain the same dynamic masks and Common traversal.
 // RUN: triton-shared-opt --pim-normalize-address -cse -loop-invariant-code-motion -canonicalize --pim-form-compute --convert-ttshared-to-pim --pim-build-logical-grid --pim-recover-access-origin --pim-set-target-profile='target=aimx num-units=1 banks-per-unit=256 cores-per-bank=1 lanes-per-core=16 bank-capacity-limit-bytes=268435456 local-capacity-limit-bytes=0' --pim-form-block-groups --pim-form-execution-tiles='tile-m=16 tile-n=1 tile-k=16' --pim-map-devices='p-m=1 p-n=1 p-k=1' --pim-place-data --pim-verify -cse %s -o %t.multi.common
-// RUN: triton-shared-opt --convert-pim-to-aimx -cse -canonicalize --mlir-print-op-generic %t.multi.common -o %t.multi.aimx
+// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx -cse -canonicalize --mlir-print-op-generic %t.multi.common -o %t.multi.aimx
 // RUN: triton-shared-opt -canonicalize %t.multi.aimx | FileCheck %s --check-prefix=IR --implicit-check-not=linalg. --implicit-check-not='pim.access ' --implicit-check-not='pim.device '
 // RUN: triton-shared-translate --aimx-to-runtime-stub %t.multi.aimx | FileCheck %s --check-prefix=STUB
 // RUN: triton-shared-translate --aimx-to-descriptors %t.multi.aimx | FileCheck %s --check-prefix=DESC

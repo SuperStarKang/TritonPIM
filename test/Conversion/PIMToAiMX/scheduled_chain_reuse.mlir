@@ -3,11 +3,11 @@
 // keep the original min(tileGroups, remainingGroups) loops, including zero trips.
 // Like the backend, leave constant allocation products and loop metadata in
 // Common IR: target-local scalar folding must suffice without canonicalizing it.
-// RUN: triton-shared-opt --mlir-print-op-generic --pim-map-devices='p-m=2 p-n=1 p-k=1' --pim-place-data --cse --convert-pim-to-aimx --cse --canonicalize %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=STUB --implicit-check-not=aimx_patch_
-// RUN: triton-shared-opt --mlir-print-op-generic --pim-map-devices='p-m=2 p-n=1 p-k=1' --pim-place-data --cse --canonicalize --convert-pim-to-aimx --cse --canonicalize %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=STUB --implicit-check-not=aimx_patch_
-// RUN: triton-shared-opt --mlir-print-op-generic --pim-map-devices='p-m=2 p-n=1 p-k=1' --pim-place-data --cse --canonicalize --convert-pim-to-aimx --cse --canonicalize %s | triton-shared-translate --aimx-to-descriptors | FileCheck %s --check-prefix=DESC --implicit-check-not=aimx_patch_
+// RUN: triton-shared-opt --mlir-print-op-generic --pim-map-devices='p-m=2 p-n=1 p-k=1' --pim-place-data --cse --pim-form-host-plan --convert-pim-to-aimx --cse --canonicalize %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=STUB --implicit-check-not=aimx_patch_
+// RUN: triton-shared-opt --mlir-print-op-generic --pim-map-devices='p-m=2 p-n=1 p-k=1' --pim-place-data --cse --canonicalize --pim-form-host-plan --convert-pim-to-aimx --cse --canonicalize %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=STUB --implicit-check-not=aimx_patch_
+// RUN: triton-shared-opt --mlir-print-op-generic --pim-map-devices='p-m=2 p-n=1 p-k=1' --pim-place-data --cse --canonicalize --pim-form-host-plan --convert-pim-to-aimx --cse --canonicalize %s | triton-shared-translate --aimx-to-descriptors | FileCheck %s --check-prefix=DESC --implicit-check-not=aimx_patch_
 // No persistent policy is forced onto the transient path.
-// RUN: triton-shared-opt --mlir-print-op-generic --pim-map-devices='p-m=2 p-n=1 p-k=1' --pim-place-data --cse --canonicalize --convert-pim-to-aimx=persistent=false --cse --canonicalize %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=TRANSIENT --implicit-check-not=_resident
+// RUN: triton-shared-opt --mlir-print-op-generic --pim-map-devices='p-m=2 p-n=1 p-k=1' --pim-place-data --cse --canonicalize --pim-form-host-plan --convert-pim-to-aimx=persistent=false --cse --canonicalize %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=TRANSIENT --implicit-check-not=_resident
 // STUB: extern "C" void scheduled_add
 // STUB: num_threads(2)
 // STUB: aimx_resident_acquire

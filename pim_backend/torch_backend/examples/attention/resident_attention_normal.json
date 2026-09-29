@@ -1,0 +1,510 @@
+{
+  "scope": "single-head QKV projection + scaled dot-product attention",
+  "shape": {
+    "sequence_length": 1024,
+    "kv_length": 1024,
+    "input_dimension": 4096,
+    "head_dimension": 4096,
+    "heads": 1
+  },
+  "dtype": "float32",
+  "mask": "none",
+  "bias": false,
+  "dropout": 0.0,
+  "qkv_fusion": false,
+  "output_projection": false,
+  "seed": 0,
+  "orientation": "normal",
+  "target": {
+    "common_profile": {
+      "target": "upmem",
+      "num_units": 2048,
+      "banks_per_unit": 1,
+      "cores_per_bank": 1,
+      "lanes_per_core": 16,
+      "bank_capacity_limit_bytes": 62914560,
+      "local_capacity_limit_bytes": 49152
+    },
+    "runtime_config": {
+      "nr_tasklets": 16,
+      "host_threads": 8
+    }
+  },
+  "versions": {
+    "torch": "2.12.0+cu130",
+    "triton": "3.4.0"
+  },
+  "cpu_threads": 48,
+  "environment": {
+    "UPMEM_BACKEND": "hw"
+  },
+  "gemms": [
+    {
+      "node": "linear",
+      "op": "aten.linear.default",
+      "mnk": [
+        1024,
+        4096,
+        4096
+      ],
+      "weight": "q.weight",
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 2,
+        "tile_n": 4,
+        "tile_k": 128,
+        "p_m": 32,
+        "p_n": 64,
+        "p_k": 1
+      }
+    },
+    {
+      "node": "linear_1",
+      "op": "aten.linear.default",
+      "mnk": [
+        1024,
+        4096,
+        4096
+      ],
+      "weight": "k.weight",
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 2,
+        "tile_n": 4,
+        "tile_k": 128,
+        "p_m": 32,
+        "p_n": 64,
+        "p_k": 1
+      }
+    },
+    {
+      "node": "linear_2",
+      "op": "aten.linear.default",
+      "mnk": [
+        1024,
+        4096,
+        4096
+      ],
+      "weight": "v.weight",
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 2,
+        "tile_n": 4,
+        "tile_k": 128,
+        "p_m": 32,
+        "p_n": 64,
+        "p_k": 1
+      }
+    },
+    {
+      "node": "mm",
+      "op": "aten.mm.default",
+      "mnk": [
+        1024,
+        1024,
+        4096
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 2,
+        "tile_n": 1,
+        "tile_k": 128,
+        "p_m": 32,
+        "p_n": 64,
+        "p_k": 1
+      }
+    },
+    {
+      "node": "mm_1",
+      "op": "aten.mm.default",
+      "mnk": [
+        1024,
+        4096,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 2,
+        "tile_n": 4,
+        "tile_k": 32,
+        "p_m": 32,
+        "p_n": 64,
+        "p_k": 1
+      }
+    }
+  ],
+  "preparation": {
+    "export_ms": 45.958729,
+    "prepare_ms": 30170.042566,
+    "weight_prepare_ms": 20359.102099000003,
+    "resident_capture_ms": 18986.140541000004,
+    "resident_upload_ms": 1086.913395,
+    "transfers": {
+      "weight_bytes": 6442450944,
+      "activation_bytes": 0,
+      "output_bytes": 0,
+      "metadata_bytes": 0,
+      "launches": 0,
+      "program_loads": 1,
+      "activation_hits": 0
+    },
+    "layout": [
+      {
+        "kernel": "linear",
+        "symbol": "triton_tem_fused_mm_0_mram_1",
+        "window": 0,
+        "offset": 0,
+        "bytes": 1048576,
+        "role": "weight"
+      },
+      {
+        "kernel": "linear_1",
+        "symbol": "triton_tem_fused_mm_0_mram_1",
+        "window": 0,
+        "offset": 1048576,
+        "bytes": 1048576,
+        "role": "weight"
+      },
+      {
+        "kernel": "linear_2",
+        "symbol": "triton_tem_fused_mm_0_mram_1",
+        "window": 0,
+        "offset": 2097152,
+        "bytes": 1048576,
+        "role": "weight"
+      },
+      {
+        "role": "input_scratch",
+        "offset": 3145728,
+        "bytes": 786432
+      },
+      {
+        "role": "output_scratch",
+        "offset": 3932160,
+        "bytes": 8192
+      }
+    ]
+  },
+  "warmups": [
+    {
+      "input": 0,
+      "wall_ms": 30319.749178
+    },
+    {
+      "input": 1,
+      "wall_ms": 20530.162935
+    },
+    {
+      "input": 0,
+      "wall_ms": 20087.396255
+    }
+  ],
+  "samples": [
+    {
+      "input": 0,
+      "wall_ms": 20332.436422,
+      "graph_ms": 20332.120001,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 3489660928,
+        "output_bytes": 71303168,
+        "metadata_bytes": 245760,
+        "launches": 5,
+        "program_loads": 5,
+        "activation_hits": 2
+      }
+    },
+    {
+      "input": 1,
+      "wall_ms": 20134.163308,
+      "graph_ms": 20133.862465,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 3489660928,
+        "output_bytes": 71303168,
+        "metadata_bytes": 245760,
+        "launches": 5,
+        "program_loads": 5,
+        "activation_hits": 2
+      }
+    },
+    {
+      "input": 0,
+      "wall_ms": 20388.713357,
+      "graph_ms": 20388.364199,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 3489660928,
+        "output_bytes": 71303168,
+        "metadata_bytes": 245760,
+        "launches": 5,
+        "program_loads": 5,
+        "activation_hits": 2
+      }
+    }
+  ],
+  "median_wall_ms": 20332.436422,
+  "median_graph_ms": 20332.120001,
+  "profile": {
+    "wall_ms": 20108.361101,
+    "outside_partitions_ms": 1.3729559999992489,
+    "pim_timing_version": 3,
+    "transfers": {
+      "weight_bytes": 0,
+      "activation_bytes": 3489660928,
+      "output_bytes": 71303168,
+      "metadata_bytes": 245760,
+      "launches": 5,
+      "program_loads": 5,
+      "activation_hits": 2
+    },
+    "partitions": [
+      {
+        "partition": "submod_0",
+        "where": "CPU",
+        "operators": [
+          "aten.view.default"
+        ],
+        "wall_ms": 0.320956
+      },
+      {
+        "partition": "submod_1",
+        "where": "CPU+UPMEM",
+        "operators": [
+          "linear"
+        ],
+        "wall_ms": 5750.967585,
+        "gemm": "linear",
+        "native_ms": {
+          "prepare": 0.6595540000000099,
+          "h2d": 532.959022,
+          "kernel": 5130.353866,
+          "d2h": 6.550269,
+          "reduction": 0.0,
+          "buffer_alloc": 0.02194,
+          "buffer_free": 4.330553999999999,
+          "acquire": 0.000817,
+          "buffer_init": 32.624773999999995,
+          "layout_a": 3.5052260000000013,
+          "layout_b": 11.517537,
+          "layout_other": 0.0,
+          "layout_c": 27.228936000000058
+        },
+        "transfers": {
+          "weight_bytes": 0,
+          "activation_bytes": 1073741824,
+          "output_bytes": 16777216,
+          "metadata_bytes": 49152,
+          "launches": 1,
+          "program_loads": 1,
+          "activation_hits": 0
+        },
+        "outside_native_stages_ms": 1.215089999999691
+      },
+      {
+        "partition": "submod_2",
+        "where": "CPU",
+        "operators": [
+          "aten.view.default",
+          "aten.view.default"
+        ],
+        "wall_ms": 0.26713
+      },
+      {
+        "partition": "submod_3",
+        "where": "CPU+UPMEM",
+        "operators": [
+          "linear_1"
+        ],
+        "wall_ms": 5431.670676,
+        "gemm": "linear_1",
+        "native_ms": {
+          "prepare": 0.410998000000008,
+          "h2d": 211.857335,
+          "kernel": 5131.083631,
+          "d2h": 5.795178,
+          "reduction": 0.0,
+          "buffer_alloc": 0.014015,
+          "buffer_free": 5.95358,
+          "acquire": 0.000916,
+          "buffer_init": 34.318895,
+          "layout_a": 3.416118,
+          "layout_b": 13.317372000000004,
+          "layout_other": 0.0,
+          "layout_c": 23.845236999999987
+        },
+        "transfers": {
+          "weight_bytes": 0,
+          "activation_bytes": 0,
+          "output_bytes": 16777216,
+          "metadata_bytes": 49152,
+          "launches": 1,
+          "program_loads": 1,
+          "activation_hits": 1
+        },
+        "outside_native_stages_ms": 1.6574009999994814
+      },
+      {
+        "partition": "submod_4",
+        "where": "CPU",
+        "operators": [
+          "aten.view.default",
+          "aten.view.default"
+        ],
+        "wall_ms": 0.624889
+      },
+      {
+        "partition": "submod_5",
+        "where": "CPU+UPMEM",
+        "operators": [
+          "linear_2"
+        ],
+        "wall_ms": 5445.243468,
+        "gemm": "linear_2",
+        "native_ms": {
+          "prepare": 0.45091700000000884,
+          "h2d": 215.996273,
+          "kernel": 5130.503024,
+          "d2h": 7.523949,
+          "reduction": 0.0,
+          "buffer_alloc": 0.010255,
+          "buffer_free": 4.31606,
+          "acquire": 0.000435,
+          "buffer_init": 34.353127,
+          "layout_a": 5.390490000000001,
+          "layout_b": 16.847239999999996,
+          "layout_other": 0.0,
+          "layout_c": 28.136505999999986
+        },
+        "transfers": {
+          "weight_bytes": 0,
+          "activation_bytes": 0,
+          "output_bytes": 16777216,
+          "metadata_bytes": 49152,
+          "launches": 1,
+          "program_loads": 1,
+          "activation_hits": 1
+        },
+        "outside_native_stages_ms": 1.7151919999996608
+      },
+      {
+        "partition": "submod_6",
+        "where": "CPU",
+        "operators": [
+          "aten.view.default",
+          "aten.t.default"
+        ],
+        "wall_ms": 0.583643
+      },
+      {
+        "partition": "submod_7",
+        "where": "CPU+UPMEM",
+        "operators": [
+          "mm"
+        ],
+        "wall_ms": 1815.416938,
+        "gemm": "mm",
+        "native_ms": {
+          "prepare": 0.4701070000000147,
+          "h2d": 473.475779,
+          "kernel": 1283.376817,
+          "d2h": 1.904243,
+          "reduction": 0.0,
+          "buffer_alloc": 0.002214,
+          "buffer_free": 0.002644,
+          "acquire": 0.000568,
+          "buffer_init": 21.901296000000002,
+          "layout_a": 3.364056999999999,
+          "layout_b": 4.322698999999999,
+          "layout_other": 0.0,
+          "layout_c": 10.694852999999995
+        },
+        "transfers": {
+          "weight_bytes": 0,
+          "activation_bytes": 1610612736,
+          "output_bytes": 4194304,
+          "metadata_bytes": 49152,
+          "launches": 1,
+          "program_loads": 1,
+          "activation_hits": 0
+        },
+        "outside_native_stages_ms": 15.901661000000104
+      },
+      {
+        "partition": "submod_8",
+        "where": "CPU",
+        "operators": [
+          "aten.div.Tensor",
+          "aten.softmax.int"
+        ],
+        "wall_ms": 12.265065
+      },
+      {
+        "partition": "submod_9",
+        "where": "CPU+UPMEM",
+        "operators": [
+          "mm_1"
+        ],
+        "wall_ms": 1649.627795,
+        "gemm": "mm_1",
+        "native_ms": {
+          "prepare": 0.5406889999999897,
+          "h2d": 315.866775,
+          "kernel": 1284.304497,
+          "d2h": 5.830013,
+          "reduction": 0.0,
+          "buffer_alloc": 0.001875,
+          "buffer_free": 0.002837,
+          "acquire": 0.000427,
+          "buffer_init": 2.970944999999998,
+          "layout_a": 0.674542,
+          "layout_b": 4.8859319999999995,
+          "layout_other": 0.0,
+          "layout_c": 33.103772
+        },
+        "transfers": {
+          "weight_bytes": 0,
+          "activation_bytes": 805306368,
+          "output_bytes": 16777216,
+          "metadata_bytes": 49152,
+          "launches": 1,
+          "program_loads": 1,
+          "activation_hits": 0
+        },
+        "outside_native_stages_ms": 1.4454909999999472
+      }
+    ]
+  },
+  "correctness": {
+    "status": "PASS",
+    "rtol": 0.0001,
+    "atol": 0.0001
+  }
+}

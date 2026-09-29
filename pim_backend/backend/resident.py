@@ -8,16 +8,14 @@ import struct
 import subprocess
 import tempfile
 import time
-from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
-from threading import RLock
 
 from triton.runtime.cache import get_cache_manager
 
+from .runtime import current_invocation, resident_lock
 
-current_invocation = ContextVar("upmem_resident_invocation", default=None)
-resident_lock = RLock()
+
 MRAM_BASE = 0x08000000
 WEIGHT = 1
 INPUT = 2
@@ -37,6 +35,15 @@ class TransferStats(ctypes.Structure):
         "launches", "program_loads", "activation_hits")]
 
 
+class TransferTimings(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_uint64) for name in (
+        "weight_h2d_ns", "activation_h2d_ns", "metadata_h2d_ns", "program_load_ns")]
+
+    def h2d_ms(self):
+        return {role: getattr(self, role + "_h2d_ns") / 1e6
+                for role in ("weight", "activation", "metadata")}
+
+
 def _artifact_bindings(target_ir, arguments, physical_inputs, weight_mask, units):
     acquire = re.findall(r"upmem\.acquire\s+(\d+)\s*,", target_ir)
     if acquire != [str(units)]:
@@ -51,10 +58,10 @@ def _artifact_bindings(target_ir, arguments, physical_inputs, weight_mask, units
     transfers = re.findall(r"upmem\.to_mram\s+%[\w.$]+\s*,\s*(%[\w.$]+)\s*,\s*@([\w.$]+)",
                            target_ir)
     sources = {symbol: stages[stage] for stage, symbol in transfers}
-    outputs = re.findall(r"upmem\.gather\s+%[\w.$]+\s*,\s*@([\w.$]+)\s+capacity",
+    outputs = re.findall(r"upmem\.gather\s+%[\w.$]+\s+assignment\s+%[\w.$]+\s*,\s*@([\w.$]+)\s+capacity",
                           target_ir)
     declarations = re.findall(
-        r"upmem\.mram\s+@([\w.$]+)\s*:\s*memref<(\d+)x(i8|i32)\s*,", target_ir)
+        r"upmem\.mram\s+@([\w.$]+)\s*:\s*memref<(\d+)x(i8|i32|f32)\s*,", target_ir)
     if len(declarations) != 3 or len(transfers) != 2 or len(outputs) != 1:
         raise ValueError("resident Torch GEMM requires two staged inputs and one gathered output")
     if {name for name, _, _ in declarations} != set(sources) | set(outputs):
@@ -73,7 +80,7 @@ def _artifact_bindings(target_ir, arguments, physical_inputs, weight_mask, units
             if len(roles) != 1:
                 raise ValueError(f"cannot associate {symbol} with the FX operand provenance")
             role = WEIGHT if roles.pop() else INPUT
-        size = int(count) * {"i8": 1, "i32": 4}[dtype]
+        size = int(count) * {"i8": 1, "i32": 4, "f32": 4}[dtype]
         if size % 8:
             raise ValueError(f"{symbol}: MRAM transfer size {size} is not aligned to 8 bytes")
         bindings.append(Binding(symbol, size, role))
@@ -163,6 +170,17 @@ def _build_program(bundle, addresses):
 
 
 class ResidentRuntime:
+    @staticmethod
+    def validate_config(config):
+        target = config.torch_config.spec
+        hierarchy = config.torch_config.config
+        if target.common_profile.target != "upmem":
+            raise ValueError("this resident runtime requires UPMEM")
+        lanes = target.runtime_config.nr_tasklets
+        if (lanes < 1 or lanes > target.common_profile.lanes_per_core
+                or hierarchy.block_m * hierarchy.group_m % lanes):
+            raise ValueError("nr_tasklets must divide the physical Block Group M extent")
+
     def __init__(self, units, capacity):
         from .driver import _build_upmem_runtime
 
@@ -189,6 +207,7 @@ class ResidentRuntime:
             "upload": ([pointer], None),
             "reset_inputs": ([pointer], None),
             "get_stats": ([pointer, ctypes.POINTER(TransferStats)], None),
+            "get_timings": ([pointer, ctypes.POINTER(TransferTimings)], None),
             "close": ([pointer], None),
         }
         for name, (arguments, returns) in signatures.items():
@@ -201,6 +220,7 @@ class ResidentRuntime:
         self.ready = False
         self.capture_ms = 0.0
         self.upload_ms = 0.0
+        self.upload_breakdown_ms = None
 
     def finalize(self):
         if self.ready or self.handle is None or not self.kernels:
@@ -245,12 +265,33 @@ class ResidentRuntime:
                     window = (self.library.upmem_resident_window(kernel.handle, round_index, index)
                               if binding.role == WEIGHT else 0)
                     addresses[binding.symbol] = kernel.addresses[index][window]
-                path = _build_program(kernel.bundle, addresses)
+                path = self.program_for(kernel, addresses)
                 self.library.upmem_resident_program(kernel.handle, round_index, path.encode())
         start = time.perf_counter_ns()
         self.library.upmem_resident_upload(self.handle)
         self.upload_ms = (time.perf_counter_ns() - start) / 1e6
+        transfer_timings = self.transfer_timings()
+        h2d_ms = sum(transfer_timings.h2d_ms().values())
+        program_load_ms = transfer_timings.program_load_ns / 1e6
+        resident_host_ms = self.upload_ms - h2d_ms - program_load_ms
+        if resident_host_ms < 0:
+            raise RuntimeError("resident upload timing intervals overlap or exceed upload wall time")
+        self.upload_breakdown_ms = {
+            "h2d": h2d_ms, "program_load": program_load_ms, "resident_host": resident_host_ms,
+        }
         self.ready = True
+
+    def library_for(self, name, bundle):
+        return ctypes.CDLL(_build_host(bundle, self.path))
+
+    def program_for(self, kernel, addresses):
+        return _build_program(kernel.bundle, addresses)
+
+    def invocation(self, kernel, physical_inputs, *, capture):
+        return ResidentInvocation(kernel, physical_inputs, capture)
+
+    def reset_inputs(self):
+        self.library.upmem_resident_reset_inputs(self.handle)
 
     def stats(self):
         if self.handle is None:
@@ -258,6 +299,13 @@ class ResidentRuntime:
         stats = TransferStats()
         self.library.upmem_resident_get_stats(self.handle, ctypes.byref(stats))
         return {name: getattr(stats, name) for name, _ in stats._fields_}
+
+    def transfer_timings(self):
+        if self.handle is None:
+            raise RuntimeError("ResidentBlock is closed")
+        timings = TransferTimings()
+        self.library.upmem_resident_get_timings(self.handle, ctypes.byref(timings))
+        return timings
 
     def close(self):
         if self.handle is not None:
@@ -289,6 +337,8 @@ class ResidentInvocation:
     def launch(self, launcher, bundle, entry, grid, arguments):
         from . import driver
 
+        if launcher.pim_target != "upmem":
+            raise ValueError("UPMEM invocation received a different target")
         self.calls += 1
         if self.calls != 1:
             raise RuntimeError("a resident GEMM must launch exactly one generated host function")
@@ -316,9 +366,23 @@ class ResidentInvocation:
         runtime.library.upmem_resident_end(artifact.handle)
         if self.capture:
             runtime.capture_ms += (time.perf_counter_ns() - start) / 1e6
-        driver.TIMING_STAGES = driver._STAGE_NAMES["upmem"]
-        driver.timing[:] = list((ctypes.c_double * len(driver.TIMING_STAGES)).in_dll(
+        host_stages = driver._STAGE_NAMES["upmem"]
+        host_timing = list((ctypes.c_double * len(host_stages)).in_dll(
             artifact.library, "pim_timing_ms"))
+        transfer_timings = runtime.transfer_timings()
+        h2d_by_role = transfer_timings.h2d_ms()
+        h2d_ms = sum(h2d_by_role.values())
+        program_load_ms = transfer_timings.program_load_ns / 1e6
+        h2d_index = host_stages.index("h2d")
+        # The generated v3 interval encloses SDK transfers and resident host work.
+        resident_host_ms = host_timing[h2d_index] - h2d_ms - program_load_ms
+        if resident_host_ms < 0:
+            raise RuntimeError("resident transfer timing intervals exceed the generated H2D interval")
+        host_timing[h2d_index] = h2d_ms
+        driver.TIMING_STAGES = driver.UPMEM_RESIDENT_TIMING_STAGES
+        driver.TIMING_VERSION = driver.UPMEM_RESIDENT_TIMING_VERSION
+        driver.timing[:] = host_timing + [program_load_ms, resident_host_ms]
+        driver.resident_h2d_timing = h2d_by_role
         driver.invokes = 0
 
 
@@ -330,7 +394,7 @@ class ResidentArtifact:
         self.bundle = bundle
         self.entry = entry
         self.bindings = bindings
-        self.library = ctypes.CDLL(_build_host(bundle, runtime.path))
+        self.library = runtime.library_for(name, bundle)
         version = ctypes.c_uint32.in_dll(self.library, "pim_timing_version").value
         if version != UPMEM_TIMING_VERSION:
             raise RuntimeError(f"UPMEM timing ABI mismatch: {version} != {UPMEM_TIMING_VERSION}")

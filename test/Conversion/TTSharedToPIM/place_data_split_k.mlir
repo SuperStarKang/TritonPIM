@@ -4,7 +4,7 @@
 
 // CHECK: pim.place %arg0
 // CHECK-SAME: allocation_shape
-// CHECK-SAME: replicated_over = ["n"]
+// CHECK-SAME: shared_over = ["n"]
 
 module attributes {pim.target_profile = #pim.target_profile<
     target = "upmem", num_units = 8,

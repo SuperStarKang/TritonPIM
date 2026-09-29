@@ -1,0 +1,471 @@
+graph():
+    %session : [num_users=65] = placeholder[target=session]
+    %input_ids : [num_users=1] = placeholder[target=input_ids]
+    %start : [num_users=1] = call_method[target=start](args = (%session,), kwargs = {})
+    %embedding : [num_users=1] = call_module[target=embedding](args = (%input_ids,), kwargs = {})
+    %load_layer_0_weights : [num_users=1] = call_module[target=load_layer_0_weights](args = (%session, %start), kwargs = {})
+    %run_layer_0 : [num_users=2] = call_module[target=run_layer_0](args = (%session, %embedding, %load_layer_0_weights), kwargs = {})
+    %getitem : [num_users=3] = call_function[target=operator.getitem](args = (%run_layer_0, 0), kwargs = {})
+    %getitem_1 : [num_users=1] = call_function[target=operator.getitem](args = (%run_layer_0, 1), kwargs = {})
+    %getitem_2 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem, 0), kwargs = {})
+    %getitem_3 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem, 1), kwargs = {})
+    %getitem_4 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem, 2), kwargs = {})
+    %load_layer_1_weights : [num_users=1] = call_module[target=load_layer_1_weights](args = (%session, %getitem_1), kwargs = {})
+    %run_layer_1 : [num_users=2] = call_module[target=run_layer_1](args = (%session, %getitem_2, %load_layer_1_weights), kwargs = {})
+    %getitem_5 : [num_users=3] = call_function[target=operator.getitem](args = (%run_layer_1, 0), kwargs = {})
+    %getitem_6 : [num_users=1] = call_function[target=operator.getitem](args = (%run_layer_1, 1), kwargs = {})
+    %getitem_7 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_5, 0), kwargs = {})
+    %getitem_8 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_5, 1), kwargs = {})
+    %getitem_9 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_5, 2), kwargs = {})
+    %load_layer_2_weights : [num_users=1] = call_module[target=load_layer_2_weights](args = (%session, %getitem_6), kwargs = {})
+    %run_layer_2 : [num_users=2] = call_module[target=run_layer_2](args = (%session, %getitem_7, %load_layer_2_weights), kwargs = {})
+    %getitem_10 : [num_users=3] = call_function[target=operator.getitem](args = (%run_layer_2, 0), kwargs = {})
+    %getitem_11 : [num_users=1] = call_function[target=operator.getitem](args = (%run_layer_2, 1), kwargs = {})
+    %getitem_12 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_10, 0), kwargs = {})
+    %getitem_13 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_10, 1), kwargs = {})
+    %getitem_14 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_10, 2), kwargs = {})
+    %load_layer_3_weights : [num_users=1] = call_module[target=load_layer_3_weights](args = (%session, %getitem_11), kwargs = {})
+    %run_layer_3 : [num_users=2] = call_module[target=run_layer_3](args = (%session, %getitem_12, %load_layer_3_weights), kwargs = {})
+    %getitem_15 : [num_users=3] = call_function[target=operator.getitem](args = (%run_layer_3, 0), kwargs = {})
+    %getitem_16 : [num_users=1] = call_function[target=operator.getitem](args = (%run_layer_3, 1), kwargs = {})
+    %getitem_17 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_15, 0), kwargs = {})
+    %getitem_18 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_15, 1), kwargs = {})
+    %getitem_19 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_15, 2), kwargs = {})
+    %load_layer_4_weights : [num_users=1] = call_module[target=load_layer_4_weights](args = (%session, %getitem_16), kwargs = {})
+    %run_layer_4 : [num_users=2] = call_module[target=run_layer_4](args = (%session, %getitem_17, %load_layer_4_weights), kwargs = {})
+    %getitem_20 : [num_users=3] = call_function[target=operator.getitem](args = (%run_layer_4, 0), kwargs = {})
+    %getitem_21 : [num_users=1] = call_function[target=operator.getitem](args = (%run_layer_4, 1), kwargs = {})
+    %getitem_22 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_20, 0), kwargs = {})
+    %getitem_23 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_20, 1), kwargs = {})
+    %getitem_24 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_20, 2), kwargs = {})
+    %load_layer_5_weights : [num_users=1] = call_module[target=load_layer_5_weights](args = (%session, %getitem_21), kwargs = {})
+    %run_layer_5 : [num_users=2] = call_module[target=run_layer_5](args = (%session, %getitem_22, %load_layer_5_weights), kwargs = {})
+    %getitem_25 : [num_users=3] = call_function[target=operator.getitem](args = (%run_layer_5, 0), kwargs = {})
+    %getitem_26 : [num_users=1] = call_function[target=operator.getitem](args = (%run_layer_5, 1), kwargs = {})
+    %getitem_27 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_25, 0), kwargs = {})
+    %getitem_28 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_25, 1), kwargs = {})
+    %getitem_29 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_25, 2), kwargs = {})
+    %load_layer_6_weights : [num_users=1] = call_module[target=load_layer_6_weights](args = (%session, %getitem_26), kwargs = {})
+    %run_layer_6 : [num_users=2] = call_module[target=run_layer_6](args = (%session, %getitem_27, %load_layer_6_weights), kwargs = {})
+    %getitem_30 : [num_users=3] = call_function[target=operator.getitem](args = (%run_layer_6, 0), kwargs = {})
+    %getitem_31 : [num_users=1] = call_function[target=operator.getitem](args = (%run_layer_6, 1), kwargs = {})
+    %getitem_32 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_30, 0), kwargs = {})
+    %getitem_33 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_30, 1), kwargs = {})
+    %getitem_34 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_30, 2), kwargs = {})
+    %load_layer_7_weights : [num_users=1] = call_module[target=load_layer_7_weights](args = (%session, %getitem_31), kwargs = {})
+    %run_layer_7 : [num_users=2] = call_module[target=run_layer_7](args = (%session, %getitem_32, %load_layer_7_weights), kwargs = {})
+    %getitem_35 : [num_users=3] = call_function[target=operator.getitem](args = (%run_layer_7, 0), kwargs = {})
+    %getitem_36 : [num_users=1] = call_function[target=operator.getitem](args = (%run_layer_7, 1), kwargs = {})
+    %getitem_37 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_35, 0), kwargs = {})
+    %getitem_38 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_35, 1), kwargs = {})
+    %getitem_39 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_35, 2), kwargs = {})
+    %load_layer_8_weights : [num_users=1] = call_module[target=load_layer_8_weights](args = (%session, %getitem_36), kwargs = {})
+    %run_layer_8 : [num_users=2] = call_module[target=run_layer_8](args = (%session, %getitem_37, %load_layer_8_weights), kwargs = {})
+    %getitem_40 : [num_users=3] = call_function[target=operator.getitem](args = (%run_layer_8, 0), kwargs = {})
+    %getitem_41 : [num_users=1] = call_function[target=operator.getitem](args = (%run_layer_8, 1), kwargs = {})
+    %getitem_42 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_40, 0), kwargs = {})
+    %getitem_43 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_40, 1), kwargs = {})
+    %getitem_44 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_40, 2), kwargs = {})
+    %load_layer_9_weights : [num_users=1] = call_module[target=load_layer_9_weights](args = (%session, %getitem_41), kwargs = {})
+    %run_layer_9 : [num_users=2] = call_module[target=run_layer_9](args = (%session, %getitem_42, %load_layer_9_weights), kwargs = {})
+    %getitem_45 : [num_users=3] = call_function[target=operator.getitem](args = (%run_layer_9, 0), kwargs = {})
+    %getitem_46 : [num_users=1] = call_function[target=operator.getitem](args = (%run_layer_9, 1), kwargs = {})
+    %getitem_47 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_45, 0), kwargs = {})
+    %getitem_48 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_45, 1), kwargs = {})
+    %getitem_49 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_45, 2), kwargs = {})
+    %load_layer_10_weights : [num_users=1] = call_module[target=load_layer_10_weights](args = (%session, %getitem_46), kwargs = {})
+    %run_layer_10 : [num_users=2] = call_module[target=run_layer_10](args = (%session, %getitem_47, %load_layer_10_weights), kwargs = {})
+    %getitem_50 : [num_users=3] = call_function[target=operator.getitem](args = (%run_layer_10, 0), kwargs = {})
+    %getitem_51 : [num_users=1] = call_function[target=operator.getitem](args = (%run_layer_10, 1), kwargs = {})
+    %getitem_52 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_50, 0), kwargs = {})
+    %getitem_53 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_50, 1), kwargs = {})
+    %getitem_54 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_50, 2), kwargs = {})
+    %load_layer_11_weights : [num_users=1] = call_module[target=load_layer_11_weights](args = (%session, %getitem_51), kwargs = {})
+    %run_layer_11 : [num_users=2] = call_module[target=run_layer_11](args = (%session, %getitem_52, %load_layer_11_weights), kwargs = {})
+    %getitem_55 : [num_users=3] = call_function[target=operator.getitem](args = (%run_layer_11, 0), kwargs = {})
+    %getitem_56 : [num_users=1] = call_function[target=operator.getitem](args = (%run_layer_11, 1), kwargs = {})
+    %getitem_57 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_55, 0), kwargs = {})
+    %getitem_58 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_55, 1), kwargs = {})
+    %getitem_59 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_55, 2), kwargs = {})
+    %load_layer_12_weights : [num_users=1] = call_module[target=load_layer_12_weights](args = (%session, %getitem_56), kwargs = {})
+    %run_layer_12 : [num_users=2] = call_module[target=run_layer_12](args = (%session, %getitem_57, %load_layer_12_weights), kwargs = {})
+    %getitem_60 : [num_users=3] = call_function[target=operator.getitem](args = (%run_layer_12, 0), kwargs = {})
+    %getitem_61 : [num_users=1] = call_function[target=operator.getitem](args = (%run_layer_12, 1), kwargs = {})
+    %getitem_62 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_60, 0), kwargs = {})
+    %getitem_63 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_60, 1), kwargs = {})
+    %getitem_64 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_60, 2), kwargs = {})
+    %load_layer_13_weights : [num_users=1] = call_module[target=load_layer_13_weights](args = (%session, %getitem_61), kwargs = {})
+    %run_layer_13 : [num_users=2] = call_module[target=run_layer_13](args = (%session, %getitem_62, %load_layer_13_weights), kwargs = {})
+    %getitem_65 : [num_users=3] = call_function[target=operator.getitem](args = (%run_layer_13, 0), kwargs = {})
+    %getitem_66 : [num_users=1] = call_function[target=operator.getitem](args = (%run_layer_13, 1), kwargs = {})
+    %getitem_67 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_65, 0), kwargs = {})
+    %getitem_68 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_65, 1), kwargs = {})
+    %getitem_69 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_65, 2), kwargs = {})
+    %load_layer_14_weights : [num_users=1] = call_module[target=load_layer_14_weights](args = (%session, %getitem_66), kwargs = {})
+    %run_layer_14 : [num_users=2] = call_module[target=run_layer_14](args = (%session, %getitem_67, %load_layer_14_weights), kwargs = {})
+    %getitem_70 : [num_users=3] = call_function[target=operator.getitem](args = (%run_layer_14, 0), kwargs = {})
+    %getitem_71 : [num_users=1] = call_function[target=operator.getitem](args = (%run_layer_14, 1), kwargs = {})
+    %getitem_72 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_70, 0), kwargs = {})
+    %getitem_73 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_70, 1), kwargs = {})
+    %getitem_74 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_70, 2), kwargs = {})
+    %load_layer_15_weights : [num_users=1] = call_module[target=load_layer_15_weights](args = (%session, %getitem_71), kwargs = {})
+    %run_layer_15 : [num_users=2] = call_module[target=run_layer_15](args = (%session, %getitem_72, %load_layer_15_weights), kwargs = {})
+    %getitem_75 : [num_users=3] = call_function[target=operator.getitem](args = (%run_layer_15, 0), kwargs = {})
+    %getitem_76 : [num_users=1] = call_function[target=operator.getitem](args = (%run_layer_15, 1), kwargs = {})
+    %getitem_77 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_75, 0), kwargs = {})
+    %getitem_78 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_75, 1), kwargs = {})
+    %getitem_79 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_75, 2), kwargs = {})
+    %load_layer_16_weights : [num_users=1] = call_module[target=load_layer_16_weights](args = (%session, %getitem_76), kwargs = {})
+    %run_layer_16 : [num_users=2] = call_module[target=run_layer_16](args = (%session, %getitem_77, %load_layer_16_weights), kwargs = {})
+    %getitem_80 : [num_users=3] = call_function[target=operator.getitem](args = (%run_layer_16, 0), kwargs = {})
+    %getitem_81 : [num_users=1] = call_function[target=operator.getitem](args = (%run_layer_16, 1), kwargs = {})
+    %getitem_82 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_80, 0), kwargs = {})
+    %getitem_83 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_80, 1), kwargs = {})
+    %getitem_84 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_80, 2), kwargs = {})
+    %load_layer_17_weights : [num_users=1] = call_module[target=load_layer_17_weights](args = (%session, %getitem_81), kwargs = {})
+    %run_layer_17 : [num_users=2] = call_module[target=run_layer_17](args = (%session, %getitem_82, %load_layer_17_weights), kwargs = {})
+    %getitem_85 : [num_users=3] = call_function[target=operator.getitem](args = (%run_layer_17, 0), kwargs = {})
+    %getitem_86 : [num_users=1] = call_function[target=operator.getitem](args = (%run_layer_17, 1), kwargs = {})
+    %getitem_87 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_85, 0), kwargs = {})
+    %getitem_88 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_85, 1), kwargs = {})
+    %getitem_89 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_85, 2), kwargs = {})
+    %load_layer_18_weights : [num_users=1] = call_module[target=load_layer_18_weights](args = (%session, %getitem_86), kwargs = {})
+    %run_layer_18 : [num_users=2] = call_module[target=run_layer_18](args = (%session, %getitem_87, %load_layer_18_weights), kwargs = {})
+    %getitem_90 : [num_users=3] = call_function[target=operator.getitem](args = (%run_layer_18, 0), kwargs = {})
+    %getitem_91 : [num_users=1] = call_function[target=operator.getitem](args = (%run_layer_18, 1), kwargs = {})
+    %getitem_92 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_90, 0), kwargs = {})
+    %getitem_93 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_90, 1), kwargs = {})
+    %getitem_94 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_90, 2), kwargs = {})
+    %load_layer_19_weights : [num_users=1] = call_module[target=load_layer_19_weights](args = (%session, %getitem_91), kwargs = {})
+    %run_layer_19 : [num_users=2] = call_module[target=run_layer_19](args = (%session, %getitem_92, %load_layer_19_weights), kwargs = {})
+    %getitem_95 : [num_users=3] = call_function[target=operator.getitem](args = (%run_layer_19, 0), kwargs = {})
+    %getitem_96 : [num_users=1] = call_function[target=operator.getitem](args = (%run_layer_19, 1), kwargs = {})
+    %getitem_97 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_95, 0), kwargs = {})
+    %getitem_98 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_95, 1), kwargs = {})
+    %getitem_99 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_95, 2), kwargs = {})
+    %load_layer_20_weights : [num_users=1] = call_module[target=load_layer_20_weights](args = (%session, %getitem_96), kwargs = {})
+    %run_layer_20 : [num_users=2] = call_module[target=run_layer_20](args = (%session, %getitem_97, %load_layer_20_weights), kwargs = {})
+    %getitem_100 : [num_users=3] = call_function[target=operator.getitem](args = (%run_layer_20, 0), kwargs = {})
+    %getitem_101 : [num_users=1] = call_function[target=operator.getitem](args = (%run_layer_20, 1), kwargs = {})
+    %getitem_102 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_100, 0), kwargs = {})
+    %getitem_103 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_100, 1), kwargs = {})
+    %getitem_104 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_100, 2), kwargs = {})
+    %load_layer_21_weights : [num_users=1] = call_module[target=load_layer_21_weights](args = (%session, %getitem_101), kwargs = {})
+    %run_layer_21 : [num_users=2] = call_module[target=run_layer_21](args = (%session, %getitem_102, %load_layer_21_weights), kwargs = {})
+    %getitem_105 : [num_users=3] = call_function[target=operator.getitem](args = (%run_layer_21, 0), kwargs = {})
+    %getitem_106 : [num_users=1] = call_function[target=operator.getitem](args = (%run_layer_21, 1), kwargs = {})
+    %getitem_107 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_105, 0), kwargs = {})
+    %getitem_108 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_105, 1), kwargs = {})
+    %getitem_109 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_105, 2), kwargs = {})
+    %load_layer_22_weights : [num_users=1] = call_module[target=load_layer_22_weights](args = (%session, %getitem_106), kwargs = {})
+    %run_layer_22 : [num_users=2] = call_module[target=run_layer_22](args = (%session, %getitem_107, %load_layer_22_weights), kwargs = {})
+    %getitem_110 : [num_users=3] = call_function[target=operator.getitem](args = (%run_layer_22, 0), kwargs = {})
+    %getitem_111 : [num_users=1] = call_function[target=operator.getitem](args = (%run_layer_22, 1), kwargs = {})
+    %getitem_112 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_110, 0), kwargs = {})
+    %getitem_113 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_110, 1), kwargs = {})
+    %getitem_114 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_110, 2), kwargs = {})
+    %load_layer_23_weights : [num_users=1] = call_module[target=load_layer_23_weights](args = (%session, %getitem_111), kwargs = {})
+    %run_layer_23 : [num_users=2] = call_module[target=run_layer_23](args = (%session, %getitem_112, %load_layer_23_weights), kwargs = {})
+    %getitem_115 : [num_users=3] = call_function[target=operator.getitem](args = (%run_layer_23, 0), kwargs = {})
+    %getitem_116 : [num_users=1] = call_function[target=operator.getitem](args = (%run_layer_23, 1), kwargs = {})
+    %getitem_117 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_115, 0), kwargs = {})
+    %getitem_118 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_115, 1), kwargs = {})
+    %getitem_119 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_115, 2), kwargs = {})
+    %load_layer_24_weights : [num_users=1] = call_module[target=load_layer_24_weights](args = (%session, %getitem_116), kwargs = {})
+    %run_layer_24 : [num_users=2] = call_module[target=run_layer_24](args = (%session, %getitem_117, %load_layer_24_weights), kwargs = {})
+    %getitem_120 : [num_users=3] = call_function[target=operator.getitem](args = (%run_layer_24, 0), kwargs = {})
+    %getitem_121 : [num_users=1] = call_function[target=operator.getitem](args = (%run_layer_24, 1), kwargs = {})
+    %getitem_122 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_120, 0), kwargs = {})
+    %getitem_123 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_120, 1), kwargs = {})
+    %getitem_124 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_120, 2), kwargs = {})
+    %load_layer_25_weights : [num_users=1] = call_module[target=load_layer_25_weights](args = (%session, %getitem_121), kwargs = {})
+    %run_layer_25 : [num_users=2] = call_module[target=run_layer_25](args = (%session, %getitem_122, %load_layer_25_weights), kwargs = {})
+    %getitem_125 : [num_users=3] = call_function[target=operator.getitem](args = (%run_layer_25, 0), kwargs = {})
+    %getitem_126 : [num_users=1] = call_function[target=operator.getitem](args = (%run_layer_25, 1), kwargs = {})
+    %getitem_127 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_125, 0), kwargs = {})
+    %getitem_128 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_125, 1), kwargs = {})
+    %getitem_129 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_125, 2), kwargs = {})
+    %load_layer_26_weights : [num_users=1] = call_module[target=load_layer_26_weights](args = (%session, %getitem_126), kwargs = {})
+    %run_layer_26 : [num_users=2] = call_module[target=run_layer_26](args = (%session, %getitem_127, %load_layer_26_weights), kwargs = {})
+    %getitem_130 : [num_users=3] = call_function[target=operator.getitem](args = (%run_layer_26, 0), kwargs = {})
+    %getitem_131 : [num_users=1] = call_function[target=operator.getitem](args = (%run_layer_26, 1), kwargs = {})
+    %getitem_132 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_130, 0), kwargs = {})
+    %getitem_133 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_130, 1), kwargs = {})
+    %getitem_134 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_130, 2), kwargs = {})
+    %load_layer_27_weights : [num_users=1] = call_module[target=load_layer_27_weights](args = (%session, %getitem_131), kwargs = {})
+    %run_layer_27 : [num_users=2] = call_module[target=run_layer_27](args = (%session, %getitem_132, %load_layer_27_weights), kwargs = {})
+    %getitem_135 : [num_users=3] = call_function[target=operator.getitem](args = (%run_layer_27, 0), kwargs = {})
+    %getitem_136 : [num_users=1] = call_function[target=operator.getitem](args = (%run_layer_27, 1), kwargs = {})
+    %getitem_137 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_135, 0), kwargs = {})
+    %getitem_138 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_135, 1), kwargs = {})
+    %getitem_139 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_135, 2), kwargs = {})
+    %load_layer_28_weights : [num_users=1] = call_module[target=load_layer_28_weights](args = (%session, %getitem_136), kwargs = {})
+    %run_layer_28 : [num_users=2] = call_module[target=run_layer_28](args = (%session, %getitem_137, %load_layer_28_weights), kwargs = {})
+    %getitem_140 : [num_users=3] = call_function[target=operator.getitem](args = (%run_layer_28, 0), kwargs = {})
+    %getitem_141 : [num_users=1] = call_function[target=operator.getitem](args = (%run_layer_28, 1), kwargs = {})
+    %getitem_142 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_140, 0), kwargs = {})
+    %getitem_143 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_140, 1), kwargs = {})
+    %getitem_144 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_140, 2), kwargs = {})
+    %load_layer_29_weights : [num_users=1] = call_module[target=load_layer_29_weights](args = (%session, %getitem_141), kwargs = {})
+    %run_layer_29 : [num_users=2] = call_module[target=run_layer_29](args = (%session, %getitem_142, %load_layer_29_weights), kwargs = {})
+    %getitem_145 : [num_users=3] = call_function[target=operator.getitem](args = (%run_layer_29, 0), kwargs = {})
+    %getitem_146 : [num_users=1] = call_function[target=operator.getitem](args = (%run_layer_29, 1), kwargs = {})
+    %getitem_147 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_145, 0), kwargs = {})
+    %getitem_148 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_145, 1), kwargs = {})
+    %getitem_149 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_145, 2), kwargs = {})
+    %load_layer_30_weights : [num_users=1] = call_module[target=load_layer_30_weights](args = (%session, %getitem_146), kwargs = {})
+    %run_layer_30 : [num_users=2] = call_module[target=run_layer_30](args = (%session, %getitem_147, %load_layer_30_weights), kwargs = {})
+    %getitem_150 : [num_users=3] = call_function[target=operator.getitem](args = (%run_layer_30, 0), kwargs = {})
+    %getitem_151 : [num_users=1] = call_function[target=operator.getitem](args = (%run_layer_30, 1), kwargs = {})
+    %getitem_152 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_150, 0), kwargs = {})
+    %getitem_153 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_150, 1), kwargs = {})
+    %getitem_154 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_150, 2), kwargs = {})
+    %load_layer_31_weights : [num_users=1] = call_module[target=load_layer_31_weights](args = (%session, %getitem_151), kwargs = {})
+    %run_layer_31 : [num_users=2] = call_module[target=run_layer_31](args = (%session, %getitem_152, %load_layer_31_weights), kwargs = {})
+    %getitem_155 : [num_users=3] = call_function[target=operator.getitem](args = (%run_layer_31, 0), kwargs = {})
+    %getitem_156 : [num_users=1] = call_function[target=operator.getitem](args = (%run_layer_31, 1), kwargs = {})
+    %getitem_157 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_155, 0), kwargs = {})
+    %getitem_158 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_155, 1), kwargs = {})
+    %getitem_159 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_155, 2), kwargs = {})
+    %getitem_160 : [num_users=1] = call_function[target=operator.getitem](args = (%getitem_157, (slice(None, None, None), -1, slice(None, None, None))), kwargs = {})
+    %norm : [num_users=1] = call_module[target=norm](args = (%getitem_160,), kwargs = {})
+    %lm_head : [num_users=2] = call_module[target=lm_head](args = (%norm,), kwargs = {})
+    %argmax : [num_users=1] = call_function[target=torch.argmax](args = (%lm_head,), kwargs = {dim: -1})
+    return (argmax, lm_head, ((getitem_3, getitem_4), (getitem_8, getitem_9), (getitem_13, getitem_14), (getitem_18, getitem_19), (getitem_23, getitem_24), (getitem_28, getitem_29), (getitem_33, getitem_34), (getitem_38, getitem_39), (getitem_43, getitem_44), (getitem_48, getitem_49), (getitem_53, getitem_54), (getitem_58, getitem_59), (getitem_63, getitem_64), (getitem_68, getitem_69), (getitem_73, getitem_74), (getitem_78, getitem_79), (getitem_83, getitem_84), (getitem_88, getitem_89), (getitem_93, getitem_94), (getitem_98, getitem_99), (getitem_103, getitem_104), (getitem_108, getitem_109), (getitem_113, getitem_114), (getitem_118, getitem_119), (getitem_123, getitem_124), (getitem_128, getitem_129), (getitem_133, getitem_134), (getitem_138, getitem_139), (getitem_143, getitem_144), (getitem_148, getitem_149), (getitem_153, getitem_154), (getitem_158, getitem_159)), getitem_156)
+
+
+
+
+def forward(self, session, input_ids):
+    start = session.start()
+    embedding = self.embedding(input_ids);  input_ids = None
+    load_layer_0_weights = self.load_layer_0_weights(session, start);  start = None
+    run_layer_0 = self.run_layer_0(session, embedding, load_layer_0_weights);  embedding = load_layer_0_weights = None
+    getitem = run_layer_0[0]
+    getitem_1 = run_layer_0[1];  run_layer_0 = None
+    getitem_2 = getitem[0]
+    getitem_3 = getitem[1]
+    getitem_4 = getitem[2];  getitem = None
+    load_layer_1_weights = self.load_layer_1_weights(session, getitem_1);  getitem_1 = None
+    run_layer_1 = self.run_layer_1(session, getitem_2, load_layer_1_weights);  getitem_2 = load_layer_1_weights = None
+    getitem_5 = run_layer_1[0]
+    getitem_6 = run_layer_1[1];  run_layer_1 = None
+    getitem_7 = getitem_5[0]
+    getitem_8 = getitem_5[1]
+    getitem_9 = getitem_5[2];  getitem_5 = None
+    load_layer_2_weights = self.load_layer_2_weights(session, getitem_6);  getitem_6 = None
+    run_layer_2 = self.run_layer_2(session, getitem_7, load_layer_2_weights);  getitem_7 = load_layer_2_weights = None
+    getitem_10 = run_layer_2[0]
+    getitem_11 = run_layer_2[1];  run_layer_2 = None
+    getitem_12 = getitem_10[0]
+    getitem_13 = getitem_10[1]
+    getitem_14 = getitem_10[2];  getitem_10 = None
+    load_layer_3_weights = self.load_layer_3_weights(session, getitem_11);  getitem_11 = None
+    run_layer_3 = self.run_layer_3(session, getitem_12, load_layer_3_weights);  getitem_12 = load_layer_3_weights = None
+    getitem_15 = run_layer_3[0]
+    getitem_16 = run_layer_3[1];  run_layer_3 = None
+    getitem_17 = getitem_15[0]
+    getitem_18 = getitem_15[1]
+    getitem_19 = getitem_15[2];  getitem_15 = None
+    load_layer_4_weights = self.load_layer_4_weights(session, getitem_16);  getitem_16 = None
+    run_layer_4 = self.run_layer_4(session, getitem_17, load_layer_4_weights);  getitem_17 = load_layer_4_weights = None
+    getitem_20 = run_layer_4[0]
+    getitem_21 = run_layer_4[1];  run_layer_4 = None
+    getitem_22 = getitem_20[0]
+    getitem_23 = getitem_20[1]
+    getitem_24 = getitem_20[2];  getitem_20 = None
+    load_layer_5_weights = self.load_layer_5_weights(session, getitem_21);  getitem_21 = None
+    run_layer_5 = self.run_layer_5(session, getitem_22, load_layer_5_weights);  getitem_22 = load_layer_5_weights = None
+    getitem_25 = run_layer_5[0]
+    getitem_26 = run_layer_5[1];  run_layer_5 = None
+    getitem_27 = getitem_25[0]
+    getitem_28 = getitem_25[1]
+    getitem_29 = getitem_25[2];  getitem_25 = None
+    load_layer_6_weights = self.load_layer_6_weights(session, getitem_26);  getitem_26 = None
+    run_layer_6 = self.run_layer_6(session, getitem_27, load_layer_6_weights);  getitem_27 = load_layer_6_weights = None
+    getitem_30 = run_layer_6[0]
+    getitem_31 = run_layer_6[1];  run_layer_6 = None
+    getitem_32 = getitem_30[0]
+    getitem_33 = getitem_30[1]
+    getitem_34 = getitem_30[2];  getitem_30 = None
+    load_layer_7_weights = self.load_layer_7_weights(session, getitem_31);  getitem_31 = None
+    run_layer_7 = self.run_layer_7(session, getitem_32, load_layer_7_weights);  getitem_32 = load_layer_7_weights = None
+    getitem_35 = run_layer_7[0]
+    getitem_36 = run_layer_7[1];  run_layer_7 = None
+    getitem_37 = getitem_35[0]
+    getitem_38 = getitem_35[1]
+    getitem_39 = getitem_35[2];  getitem_35 = None
+    load_layer_8_weights = self.load_layer_8_weights(session, getitem_36);  getitem_36 = None
+    run_layer_8 = self.run_layer_8(session, getitem_37, load_layer_8_weights);  getitem_37 = load_layer_8_weights = None
+    getitem_40 = run_layer_8[0]
+    getitem_41 = run_layer_8[1];  run_layer_8 = None
+    getitem_42 = getitem_40[0]
+    getitem_43 = getitem_40[1]
+    getitem_44 = getitem_40[2];  getitem_40 = None
+    load_layer_9_weights = self.load_layer_9_weights(session, getitem_41);  getitem_41 = None
+    run_layer_9 = self.run_layer_9(session, getitem_42, load_layer_9_weights);  getitem_42 = load_layer_9_weights = None
+    getitem_45 = run_layer_9[0]
+    getitem_46 = run_layer_9[1];  run_layer_9 = None
+    getitem_47 = getitem_45[0]
+    getitem_48 = getitem_45[1]
+    getitem_49 = getitem_45[2];  getitem_45 = None
+    load_layer_10_weights = self.load_layer_10_weights(session, getitem_46);  getitem_46 = None
+    run_layer_10 = self.run_layer_10(session, getitem_47, load_layer_10_weights);  getitem_47 = load_layer_10_weights = None
+    getitem_50 = run_layer_10[0]
+    getitem_51 = run_layer_10[1];  run_layer_10 = None
+    getitem_52 = getitem_50[0]
+    getitem_53 = getitem_50[1]
+    getitem_54 = getitem_50[2];  getitem_50 = None
+    load_layer_11_weights = self.load_layer_11_weights(session, getitem_51);  getitem_51 = None
+    run_layer_11 = self.run_layer_11(session, getitem_52, load_layer_11_weights);  getitem_52 = load_layer_11_weights = None
+    getitem_55 = run_layer_11[0]
+    getitem_56 = run_layer_11[1];  run_layer_11 = None
+    getitem_57 = getitem_55[0]
+    getitem_58 = getitem_55[1]
+    getitem_59 = getitem_55[2];  getitem_55 = None
+    load_layer_12_weights = self.load_layer_12_weights(session, getitem_56);  getitem_56 = None
+    run_layer_12 = self.run_layer_12(session, getitem_57, load_layer_12_weights);  getitem_57 = load_layer_12_weights = None
+    getitem_60 = run_layer_12[0]
+    getitem_61 = run_layer_12[1];  run_layer_12 = None
+    getitem_62 = getitem_60[0]
+    getitem_63 = getitem_60[1]
+    getitem_64 = getitem_60[2];  getitem_60 = None
+    load_layer_13_weights = self.load_layer_13_weights(session, getitem_61);  getitem_61 = None
+    run_layer_13 = self.run_layer_13(session, getitem_62, load_layer_13_weights);  getitem_62 = load_layer_13_weights = None
+    getitem_65 = run_layer_13[0]
+    getitem_66 = run_layer_13[1];  run_layer_13 = None
+    getitem_67 = getitem_65[0]
+    getitem_68 = getitem_65[1]
+    getitem_69 = getitem_65[2];  getitem_65 = None
+    load_layer_14_weights = self.load_layer_14_weights(session, getitem_66);  getitem_66 = None
+    run_layer_14 = self.run_layer_14(session, getitem_67, load_layer_14_weights);  getitem_67 = load_layer_14_weights = None
+    getitem_70 = run_layer_14[0]
+    getitem_71 = run_layer_14[1];  run_layer_14 = None
+    getitem_72 = getitem_70[0]
+    getitem_73 = getitem_70[1]
+    getitem_74 = getitem_70[2];  getitem_70 = None
+    load_layer_15_weights = self.load_layer_15_weights(session, getitem_71);  getitem_71 = None
+    run_layer_15 = self.run_layer_15(session, getitem_72, load_layer_15_weights);  getitem_72 = load_layer_15_weights = None
+    getitem_75 = run_layer_15[0]
+    getitem_76 = run_layer_15[1];  run_layer_15 = None
+    getitem_77 = getitem_75[0]
+    getitem_78 = getitem_75[1]
+    getitem_79 = getitem_75[2];  getitem_75 = None
+    load_layer_16_weights = self.load_layer_16_weights(session, getitem_76);  getitem_76 = None
+    run_layer_16 = self.run_layer_16(session, getitem_77, load_layer_16_weights);  getitem_77 = load_layer_16_weights = None
+    getitem_80 = run_layer_16[0]
+    getitem_81 = run_layer_16[1];  run_layer_16 = None
+    getitem_82 = getitem_80[0]
+    getitem_83 = getitem_80[1]
+    getitem_84 = getitem_80[2];  getitem_80 = None
+    load_layer_17_weights = self.load_layer_17_weights(session, getitem_81);  getitem_81 = None
+    run_layer_17 = self.run_layer_17(session, getitem_82, load_layer_17_weights);  getitem_82 = load_layer_17_weights = None
+    getitem_85 = run_layer_17[0]
+    getitem_86 = run_layer_17[1];  run_layer_17 = None
+    getitem_87 = getitem_85[0]
+    getitem_88 = getitem_85[1]
+    getitem_89 = getitem_85[2];  getitem_85 = None
+    load_layer_18_weights = self.load_layer_18_weights(session, getitem_86);  getitem_86 = None
+    run_layer_18 = self.run_layer_18(session, getitem_87, load_layer_18_weights);  getitem_87 = load_layer_18_weights = None
+    getitem_90 = run_layer_18[0]
+    getitem_91 = run_layer_18[1];  run_layer_18 = None
+    getitem_92 = getitem_90[0]
+    getitem_93 = getitem_90[1]
+    getitem_94 = getitem_90[2];  getitem_90 = None
+    load_layer_19_weights = self.load_layer_19_weights(session, getitem_91);  getitem_91 = None
+    run_layer_19 = self.run_layer_19(session, getitem_92, load_layer_19_weights);  getitem_92 = load_layer_19_weights = None
+    getitem_95 = run_layer_19[0]
+    getitem_96 = run_layer_19[1];  run_layer_19 = None
+    getitem_97 = getitem_95[0]
+    getitem_98 = getitem_95[1]
+    getitem_99 = getitem_95[2];  getitem_95 = None
+    load_layer_20_weights = self.load_layer_20_weights(session, getitem_96);  getitem_96 = None
+    run_layer_20 = self.run_layer_20(session, getitem_97, load_layer_20_weights);  getitem_97 = load_layer_20_weights = None
+    getitem_100 = run_layer_20[0]
+    getitem_101 = run_layer_20[1];  run_layer_20 = None
+    getitem_102 = getitem_100[0]
+    getitem_103 = getitem_100[1]
+    getitem_104 = getitem_100[2];  getitem_100 = None
+    load_layer_21_weights = self.load_layer_21_weights(session, getitem_101);  getitem_101 = None
+    run_layer_21 = self.run_layer_21(session, getitem_102, load_layer_21_weights);  getitem_102 = load_layer_21_weights = None
+    getitem_105 = run_layer_21[0]
+    getitem_106 = run_layer_21[1];  run_layer_21 = None
+    getitem_107 = getitem_105[0]
+    getitem_108 = getitem_105[1]
+    getitem_109 = getitem_105[2];  getitem_105 = None
+    load_layer_22_weights = self.load_layer_22_weights(session, getitem_106);  getitem_106 = None
+    run_layer_22 = self.run_layer_22(session, getitem_107, load_layer_22_weights);  getitem_107 = load_layer_22_weights = None
+    getitem_110 = run_layer_22[0]
+    getitem_111 = run_layer_22[1];  run_layer_22 = None
+    getitem_112 = getitem_110[0]
+    getitem_113 = getitem_110[1]
+    getitem_114 = getitem_110[2];  getitem_110 = None
+    load_layer_23_weights = self.load_layer_23_weights(session, getitem_111);  getitem_111 = None
+    run_layer_23 = self.run_layer_23(session, getitem_112, load_layer_23_weights);  getitem_112 = load_layer_23_weights = None
+    getitem_115 = run_layer_23[0]
+    getitem_116 = run_layer_23[1];  run_layer_23 = None
+    getitem_117 = getitem_115[0]
+    getitem_118 = getitem_115[1]
+    getitem_119 = getitem_115[2];  getitem_115 = None
+    load_layer_24_weights = self.load_layer_24_weights(session, getitem_116);  getitem_116 = None
+    run_layer_24 = self.run_layer_24(session, getitem_117, load_layer_24_weights);  getitem_117 = load_layer_24_weights = None
+    getitem_120 = run_layer_24[0]
+    getitem_121 = run_layer_24[1];  run_layer_24 = None
+    getitem_122 = getitem_120[0]
+    getitem_123 = getitem_120[1]
+    getitem_124 = getitem_120[2];  getitem_120 = None
+    load_layer_25_weights = self.load_layer_25_weights(session, getitem_121);  getitem_121 = None
+    run_layer_25 = self.run_layer_25(session, getitem_122, load_layer_25_weights);  getitem_122 = load_layer_25_weights = None
+    getitem_125 = run_layer_25[0]
+    getitem_126 = run_layer_25[1];  run_layer_25 = None
+    getitem_127 = getitem_125[0]
+    getitem_128 = getitem_125[1]
+    getitem_129 = getitem_125[2];  getitem_125 = None
+    load_layer_26_weights = self.load_layer_26_weights(session, getitem_126);  getitem_126 = None
+    run_layer_26 = self.run_layer_26(session, getitem_127, load_layer_26_weights);  getitem_127 = load_layer_26_weights = None
+    getitem_130 = run_layer_26[0]
+    getitem_131 = run_layer_26[1];  run_layer_26 = None
+    getitem_132 = getitem_130[0]
+    getitem_133 = getitem_130[1]
+    getitem_134 = getitem_130[2];  getitem_130 = None
+    load_layer_27_weights = self.load_layer_27_weights(session, getitem_131);  getitem_131 = None
+    run_layer_27 = self.run_layer_27(session, getitem_132, load_layer_27_weights);  getitem_132 = load_layer_27_weights = None
+    getitem_135 = run_layer_27[0]
+    getitem_136 = run_layer_27[1];  run_layer_27 = None
+    getitem_137 = getitem_135[0]
+    getitem_138 = getitem_135[1]
+    getitem_139 = getitem_135[2];  getitem_135 = None
+    load_layer_28_weights = self.load_layer_28_weights(session, getitem_136);  getitem_136 = None
+    run_layer_28 = self.run_layer_28(session, getitem_137, load_layer_28_weights);  getitem_137 = load_layer_28_weights = None
+    getitem_140 = run_layer_28[0]
+    getitem_141 = run_layer_28[1];  run_layer_28 = None
+    getitem_142 = getitem_140[0]
+    getitem_143 = getitem_140[1]
+    getitem_144 = getitem_140[2];  getitem_140 = None
+    load_layer_29_weights = self.load_layer_29_weights(session, getitem_141);  getitem_141 = None
+    run_layer_29 = self.run_layer_29(session, getitem_142, load_layer_29_weights);  getitem_142 = load_layer_29_weights = None
+    getitem_145 = run_layer_29[0]
+    getitem_146 = run_layer_29[1];  run_layer_29 = None
+    getitem_147 = getitem_145[0]
+    getitem_148 = getitem_145[1]
+    getitem_149 = getitem_145[2];  getitem_145 = None
+    load_layer_30_weights = self.load_layer_30_weights(session, getitem_146);  getitem_146 = None
+    run_layer_30 = self.run_layer_30(session, getitem_147, load_layer_30_weights);  getitem_147 = load_layer_30_weights = None
+    getitem_150 = run_layer_30[0]
+    getitem_151 = run_layer_30[1];  run_layer_30 = None
+    getitem_152 = getitem_150[0]
+    getitem_153 = getitem_150[1]
+    getitem_154 = getitem_150[2];  getitem_150 = None
+    load_layer_31_weights = self.load_layer_31_weights(session, getitem_151);  getitem_151 = None
+    run_layer_31 = self.run_layer_31(session, getitem_152, load_layer_31_weights);  session = getitem_152 = load_layer_31_weights = None
+    getitem_155 = run_layer_31[0]
+    getitem_156 = run_layer_31[1];  run_layer_31 = None
+    getitem_157 = getitem_155[0]
+    getitem_158 = getitem_155[1]
+    getitem_159 = getitem_155[2];  getitem_155 = None
+    getitem_160 = getitem_157[(slice(None, None, None), -1, slice(None, None, None))];  getitem_157 = None
+    norm = self.norm(getitem_160);  getitem_160 = None
+    lm_head = self.lm_head(norm);  norm = None
+    argmax = torch.argmax(lm_head, dim = -1)
+    return (argmax, lm_head, ((getitem_3, getitem_4), (getitem_8, getitem_9), (getitem_13, getitem_14), (getitem_18, getitem_19), (getitem_23, getitem_24), (getitem_28, getitem_29), (getitem_33, getitem_34), (getitem_38, getitem_39), (getitem_43, getitem_44), (getitem_48, getitem_49), (getitem_53, getitem_54), (getitem_58, getitem_59), (getitem_63, getitem_64), (getitem_68, getitem_69), (getitem_73, getitem_74), (getitem_78, getitem_79), (getitem_83, getitem_84), (getitem_88, getitem_89), (getitem_93, getitem_94), (getitem_98, getitem_99), (getitem_103, getitem_104), (getitem_108, getitem_109), (getitem_113, getitem_114), (getitem_118, getitem_119), (getitem_123, getitem_124), (getitem_128, getitem_129), (getitem_133, getitem_134), (getitem_138, getitem_139), (getitem_143, getitem_144), (getitem_148, getitem_149), (getitem_153, getitem_154), (getitem_158, getitem_159)), getitem_156)
+    

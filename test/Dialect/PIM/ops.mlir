@@ -61,11 +61,11 @@ func.func @device_place(%A: memref<*xi8>, %C: memref<*xi32>, %ex: index, %ey: in
  // CHECK: pim.device <partitions = [2, 4, 1]>
   pim.device #pim.device_mapping<partitions = [2, 4, 1]> {
   ^bb0(%px: index, %py: index, %device_k_unused: index):
-    // CHECK: pim.place %{{.*}} start[%{{.*}}, %{{.*}}] size[%{{.*}}, %{{.*}}] allocation_shape[%{{.*}}, %{{.*}}] strides[%{{.*}}, %{{.*}}] {{.*}}replicated_over = ["n"]
+    // CHECK: pim.place %{{.*}} start[%{{.*}}, %{{.*}}] size[%{{.*}}, %{{.*}}] allocation_shape[%{{.*}}, %{{.*}}] strides[%{{.*}}, %{{.*}}] {{.*}}shared_over = ["n"]
     pim.place %A start[%c0, %c0] size[%c32, %c32] allocation_shape[%c32, %c32]
         strides[%c32, %c1]
         {direction = "in", access = 0 : i64,
-         replicated_over = ["n"]} : memref<*xi8>
+         shared_over = ["n"]} : memref<*xi8>
     // CHECK: pim.place %{{.*}} start[%{{.*}}, %{{.*}}] size[%{{.*}}, %{{.*}}]
     pim.place %C start[%c0, %c0] size[%c32, %c32] allocation_shape[%c32, %c32]
         strides[%c32, %c1]

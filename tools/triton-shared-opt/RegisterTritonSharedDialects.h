@@ -55,6 +55,7 @@ inline void registerTritonSharedDialects(mlir::DialectRegistry &registry) {
   mlir::triton::registerPIMFormExecutionTilesPass();
   mlir::triton::registerPIMPlaceDataPass();
   mlir::triton::registerPIMReuseExecutionTileInputsPass();
+  mlir::triton::registerPIMFormHostPlanPass();
   mlir::triton::registerPIMVerifyPass();
   mlir::triton::registerConvertPIMToUPMEMPass();
   mlir::triton::registerConvertPIMToAiMXPass();

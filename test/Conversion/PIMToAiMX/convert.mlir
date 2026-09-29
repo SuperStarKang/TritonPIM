@@ -1,9 +1,21 @@
 // Common Block=[8,16,32], Group=[1,2,3], Execution Tile=[1,2,1].
 // Two M devices, two K scheduling rounds, and two local N groups.
-// RUN: triton-shared-opt --pim-verify --convert-pim-to-aimx %s | FileCheck %s --check-prefix=IR --implicit-check-not=aimx.compute_template --implicit-check-not=linalg. --implicit-check-not="pim.device "
-// RUN: triton-shared-opt --cse --convert-pim-to-aimx %s | FileCheck %s --check-prefix=IR
-// RUN: triton-shared-opt --mlir-print-op-generic --convert-pim-to-aimx --cse --canonicalize %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=STUB
-// RUN: triton-shared-opt --mlir-print-op-generic --convert-pim-to-aimx %s | triton-shared-translate --aimx-to-descriptors | FileCheck %s --check-prefix=DESC
+// RUN: triton-shared-opt --pim-verify --pim-form-host-plan --convert-pim-to-aimx %s | FileCheck %s --check-prefix=IR --implicit-check-not=aimx.compute_template --implicit-check-not=linalg. --implicit-check-not="pim.device "
+// RUN: triton-shared-opt --cse --pim-form-host-plan --convert-pim-to-aimx %s | FileCheck %s --check-prefix=IR
+// RUN: triton-shared-opt --mlir-print-op-generic --pim-form-host-plan --convert-pim-to-aimx --cse --canonicalize %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=STUB
+// RUN: triton-shared-opt --mlir-print-op-generic --pim-form-host-plan --convert-pim-to-aimx %s | triton-shared-translate --aimx-to-descriptors | FileCheck %s --check-prefix=DESC
+// A는 pim.scatter, B는 pim.broadcast(shared_over = ["m"])다. B만 공유 slot에서 한 번 변환한다.
+// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx %s | FileCheck %s --check-prefix=SHARED
+// RUN: triton-shared-opt --mlir-print-op-generic --pim-form-host-plan --convert-pim-to-aimx=persistent=false %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=BCAST
+// SHARED: aimx.stage {{[^{]*}}: memref<*xbf16>
+// SHARED: aimx.stage {{.*}}{shared_over = ["m"]} : memref<*xbf16>
+// BCAST: char *[[POOL:_pool[0-9]+]] = (char*)aimx_host_buffer((size_t)1 * {{[0-9]+}}ull);
+// BCAST-NEXT: std::once_flag [[ONCE:_once[0-9]+]][1];
+// BCAST-NEXT: #pragma omp parallel for
+// BCAST: std::call_once([[ONCE]][{{_key[0-9]+}}], [&] {
+// BCAST: });
+// BCAST-NEXT: aimx_require(datacopy_cpu2pim({{.*}}, _slot{{[0-9]+}},
+// BCAST: aimx_host_free([[POOL]], (size_t)1 * {{[0-9]+}}ull);
 // IR: aimx.descriptor_program @matmul_device0_matmul_{{[0-9]+}} batch 8
 // IR: len 512 opcode pim_mode|stride
 // IR: len 65536 opcode bc|tp
@@ -75,7 +87,7 @@ func.func @matmul(%A: memref<*xbf16>, %B: memref<*xbf16>, %C: memref<*xf32>)
           {direction = "in", access = 0 : i64} : memref<*xbf16>
       pim.place %B start[%kStart, %c0] size[%c96, %c64]
           allocation_shape[%c96, %c64] strides[%c64, %c1]
-          {direction = "in", access = 1 : i64, replicated_over = ["m"]}
+          {direction = "in", access = 1 : i64, shared_over = ["m"]}
           : memref<*xbf16>
       pim.place %C start[%mStart, %c0] size[%c8, %c64]
           allocation_shape[%c8, %c64] strides[%c64, %c1]

@@ -152,6 +152,14 @@ LogicalResult StageOp::verify() {
   if (failed(verifyGroup(*this, getGroupRowsAttr(), "group_rows")) ||
       failed(verifyGroup(*this, getGroupColsAttr(), "group_cols")))
     return failure();
+  if (auto shared = getSharedOverAttr()) {
+    auto foreach = dyn_cast<ForeachDeviceOp>((*this)->getParentOp());
+    if (!foreach)
+      return emitOpError("shared_over needs a directly enclosing aimx.foreach_device");
+    for (Attribute axis : shared)
+      if (!llvm::is_contained(foreach.getAxes(), axis))
+        return emitOpError("shared_over names an axis outside aimx.foreach_device");
+  }
   return success();
 }
 

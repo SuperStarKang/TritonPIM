@@ -7,6 +7,7 @@ add_triton_library(PIMIR
 
   LINK_LIBS PUBLIC
   MLIRIR
+  MLIRArithDialect
   MLIRLinalgDialect
   MLIRSCFDialect
   )

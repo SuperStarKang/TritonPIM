@@ -1,13 +1,13 @@
 // All loop bounds are fixed. %initial is 0 or 1, selecting forward/reverse
 // order over the same two N groups; addresses, not allocation sizes, change.
-// RUN: triton-shared-opt --mlir-print-op-generic --convert-pim-to-aimx %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=PATCH
-// RUN: triton-shared-opt --mlir-print-op-generic --convert-pim-to-aimx --cse --canonicalize %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=PATCH
-// RUN: triton-shared-opt --mlir-print-op-generic --convert-pim-to-aimx %s | triton-shared-translate --aimx-to-descriptors | FileCheck %s --check-prefix=DESC
+// RUN: triton-shared-opt --mlir-print-op-generic --pim-form-host-plan --convert-pim-to-aimx %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=PATCH
+// RUN: triton-shared-opt --mlir-print-op-generic --pim-form-host-plan --convert-pim-to-aimx --cse --canonicalize %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=PATCH
+// RUN: triton-shared-opt --mlir-print-op-generic --pim-form-host-plan --convert-pim-to-aimx %s | triton-shared-translate --aimx-to-descriptors | FileCheck %s --check-prefix=DESC
 // Depend on an external value through a device-root loop's yielded result.
 // Address arithmetic using that result must remain after the lowered loop.
-// RUN: sed '/^[[:space:]]*scf.for %gm/i\      %selected = scf.for %probe = %c0 to %c2 step %c1 iter_args(%state = %c0) -> index { scf.yield %initial : index } %selectedCursor = arith.subi %c1, %selected : index' %s | sed 's/%cursor = %initial/%cursor = %selectedCursor/' | triton-shared-opt --mlir-print-op-generic --convert-pim-to-aimx | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=PATCH
+// RUN: sed '/^[[:space:]]*scf.for %gm/i\      %selected = scf.for %probe = %c0 to %c2 step %c1 iter_args(%state = %c0) -> index { scf.yield %initial : index } %selectedCursor = arith.subi %c1, %selected : index' %s | sed 's/%cursor = %initial/%cursor = %selectedCursor/' | triton-shared-opt --mlir-print-op-generic --pim-form-host-plan --convert-pim-to-aimx | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=PATCH
 // An unused external argument must not disable reuse of a constant recurrence.
-// RUN: sed 's/%cursor = %initial/%cursor = %c0/' %s | triton-shared-opt --mlir-print-op-generic --convert-pim-to-aimx | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=FIXED
+// RUN: sed 's/%cursor = %initial/%cursor = %c0/' %s | triton-shared-opt --mlir-print-op-generic --pim-form-host-plan --convert-pim-to-aimx | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=FIXED
 // PATCH: aimx_resident_acquire(AIMX_KERNEL_KEY ":site0", _fpga,
 // PATCH: .idx = 0;
 // PATCH-NEXT: if (_resident->ready) {

@@ -1,7 +1,7 @@
 // One K scheduling round: MAC followed by a scalar multiply/add epilogue.
 // Target-only fixture: it does not ask Common normalization to invent fusion.
-// RUN: triton-shared-opt --convert-pim-to-aimx %s | FileCheck %s --check-prefix=IR --implicit-check-not=linalg. --implicit-check-not=aimx.compute_template
-// RUN: triton-shared-opt --mlir-print-op-generic --convert-pim-to-aimx --cse --canonicalize %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=STUB
+// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx %s | FileCheck %s --check-prefix=IR --implicit-check-not=linalg. --implicit-check-not=aimx.compute_template
+// RUN: triton-shared-opt --mlir-print-op-generic --pim-form-host-plan --convert-pim-to-aimx --cse --canonicalize %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=STUB
 // IR-LABEL: func.func @matmul_epilogue
 // IR: scf.execute_region no_inline
 // IR: aimx.build_descriptors @matmul_epilogue_device0_matmul_
@@ -49,7 +49,7 @@ func.func @matmul_epilogue(%A: memref<*xbf16>, %B: memref<*xbf16>, %C: memref<*x
           {direction = "in", access = 0 : i64} : memref<*xbf16>
       pim.place %B start[%kStart, %c0] size[%c96, %c64]
           allocation_shape[%c96, %c64] strides[%c64, %c1]
-          {direction = "in", access = 1 : i64, replicated_over = ["m"]}
+          {direction = "in", access = 1 : i64, shared_over = ["m"]}
           : memref<*xbf16>
       pim.place %C start[%mStart, %c0] size[%c8, %c64]
           allocation_shape[%c8, %c64] strides[%c64, %c1]

@@ -8,16 +8,17 @@ import time
 import torch
 from torch import fx
 from torch.export.graph_signature import InputKind, OutputKind
+from torch.fx.operator_schemas import normalize_function
 from torch.fx.passes.split_module import split_module
 from torch.utils import _pytree
 
-from triton.backends.pim.resident import (
-    ResidentInvocation, ResidentRuntime, resident_lock,
-)
+from triton.backends.pim.resident import ResidentRuntime
+from triton.backends.pim.runtime import current_session, resident_lock
 
 from ._autotuner import ConstraintEngine, PIMProblem
 from .backend import PIMInductorBackend
 from .config import PIMTorchConfig
+from .fx_normalization import normalize_fx_gemms
 
 
 @dataclass(frozen=True)
@@ -38,10 +39,6 @@ class ResidentGemmConfig:
             raise ValueError("resident GEMMs require an explicit target spec and PIMConfig")
         if self.torch_config.autotune_cache_path is not None:
             raise ValueError("resident GEMMs take explicit configs, not an autotune cache path")
-        if self.torch_config.spec.common_profile.target != "upmem":
-            raise ValueError("weight residency currently requires UPMEM")
-        if self.torch_config.spec.runtime_config.nr_tasklets < 1:
-            raise ValueError("resident GEMMs require an explicit positive nr_tasklets")
 
 
 def _tensor_signature(tensor):
@@ -130,55 +127,57 @@ def _freeze_graph(exported_program):
     return fx.GraphModule(root, graph), frozen, tuple(states)
 
 
-def _logical_shape(node):
-    left, right = (argument.meta["val"] for argument in node.args)
-    for tensor in (left, right):
-        if tensor.ndim != 2 or tensor.dtype != torch.int8 or tensor.device.type != "cpu":
-            raise ValueError(f"{node.name}: resident GEMM requires two CPU int8 matrices")
-        if any(type(size) is not int or size < 1 for size in tensor.shape):
-            raise ValueError(f"{node.name}: resident GEMM requires positive static dimensions")
-    if left.shape[1] != right.shape[0]:
-        raise ValueError(f"{node.name}: GEMM reduction dimensions disagree")
-    return (left.shape[0], right.shape[1], left.shape[1])
+def _gemm_operands(node):
+    arguments = normalize_function(
+        node.target, node.args, dict(node.kwargs),
+        normalize_to_only_use_kwargs=True,
+    )
+    if arguments is None:
+        raise ValueError(f"{node.name}: cannot resolve GEMM arguments")
+    return arguments.kwargs["input"], arguments.kwargs["mat2"]
 
 
-def _check_config(name, logical_shape, config, dpu_count):
-    if any(padded < logical for padded, logical in zip(config.padded_shape, logical_shape)):
+def _check_config(name, gemm, config, num_units):
+    if any(padded < logical for padded, logical in zip(config.padded_shape, gemm.mnk)):
         raise ValueError(f"{name}: padded_shape cannot shrink the logical GEMM")
     target = config.torch_config.spec
     hierarchy = config.torch_config.config
-    if (target.common_profile.num_units != dpu_count
-            or hierarchy.p_m * hierarchy.p_n * hierarchy.p_k != dpu_count):
-        raise ValueError(f"{name}: every GEMM must use the same full set of {dpu_count} DPUs")
+    if (target.common_profile.num_units != num_units
+            or hierarchy.p_m * hierarchy.p_n * hierarchy.p_k != num_units):
+        raise ValueError(f"{name}: every GEMM must use the same full set of {num_units} units")
     m, n, k = config.padded_shape
     if config.orientation == "dual":
         m, n = n, m
-    reason = ConstraintEngine(PIMProblem(m, n, k, "int8", "int32"), target).check(hierarchy)
+    problem = PIMProblem(
+        m, n, k,
+        input_dtype=str(gemm.left.dtype).removeprefix("torch."),
+        output_dtype=str(gemm.output_dtype).removeprefix("torch."),
+    )
+    reason = ConstraintEngine(problem, target).check(hierarchy)
     if reason is not None:
         raise ValueError(f"{name}: {reason}")
-    lanes = target.runtime_config.nr_tasklets
-    if lanes > target.common_profile.lanes_per_core or hierarchy.block_m * hierarchy.group_m % lanes:
-        raise ValueError(f"{name}: nr_tasklets must divide the physical Block Group M extent")
 
 
 class _ResidentGemm(torch.nn.Module):
-    def __init__(self, name, partition, logical_shape, weights, config, runtime):
+    def __init__(self, name, partition, gemm, weights, config, runtime):
         super().__init__()
         self.name = name
-        self.logical_shape = logical_shape
+        self.logical_shape = gemm.mnk
+        self.input_dtype = gemm.left.dtype
         self.config = config
         self.runtime = runtime
         self.artifact = None
         self.weights = weights
         placeholders = [node for node in partition.graph.nodes if node.op == "placeholder"]
         operation = next(node for node in partition.graph.nodes
-                         if node.op == "call_function" and node.target == torch.ops.aten._int_mm.default)
+                         if node.op == "call_function" and node.name == gemm.node)
+        self.operation = operation.target
         output = next(node for node in partition.graph.nodes if node.op == "output")
         if output.args[0] is not operation:
             raise ValueError(f"{name}: PIM partition must return its GEMM tensor directly")
         self.input_indices = tuple(
             placeholders.index(argument) if weight is None else None
-            for argument, weight in zip(operation.args, weights))
+            for argument, weight in zip(_gemm_operands(operation), weights))
         start = time.perf_counter_ns()
         self.physical_weights = tuple(
             self._layout(index, weight) if weight is not None else None
@@ -190,7 +189,7 @@ class _ResidentGemm(torch.nn.Module):
         graph = fx.Graph()
         left = graph.placeholder("left")
         right = graph.placeholder("right")
-        graph.output(graph.call_function(torch.ops.aten._int_mm.default, (left, right)))
+        graph.output(graph.call_function(operation.target, (left, right)))
         self.compiled = torch.compile(
             fx.GraphModule(torch.nn.Module(), graph),
             backend=PIMInductorBackend(config.torch_config), fullgraph=True, dynamic=False)
@@ -212,14 +211,17 @@ class _ResidentGemm(torch.nn.Module):
             for index, tensor in enumerate(inputs))
         return physical[::-1] if self.config.orientation == "dual" else physical
 
+    def preparation_inputs(self):
+        m, n, k = self.logical_shape
+        inputs = tuple(weight if weight is not None else torch.zeros(shape, dtype=self.input_dtype)
+                       for weight, shape in zip(self.weights, ((m, k), (k, n))))
+        return self._physical_inputs(inputs)
+
     def prepare(self):
         start = time.perf_counter_ns()
-        m, n, k = self.logical_shape
-        inputs = tuple(weight if weight is not None else torch.zeros(shape, dtype=torch.int8)
-                       for weight, shape in zip(self.weights, ((m, k), (k, n))))
-        physical = self._physical_inputs(inputs)
+        physical = self.preparation_inputs()
         self.weight_layout_ms += (time.perf_counter_ns() - start) / 1e6
-        with ResidentInvocation(self, physical, capture=True):
+        with self.runtime.invocation(self, physical, capture=True):
             self.compiled(*physical)
 
     def forward(self, *inputs):
@@ -229,10 +231,10 @@ class _ResidentGemm(torch.nn.Module):
                          for weight, index in zip(self.weights, self.input_indices))
         m, n, k = self.logical_shape
         for matrix, shape in zip(matrices, ((m, k), (k, n))):
-            if matrix.shape != shape or matrix.dtype != torch.int8 or matrix.device.type != "cpu":
+            if matrix.shape != shape or matrix.dtype != self.input_dtype or matrix.device.type != "cpu":
                 raise ValueError(f"{self.name}: GEMM input differs from its prepared shape/dtype/device")
         physical = self._physical_inputs(matrices)
-        with ResidentInvocation(self, physical, capture=False):
+        with self.runtime.invocation(self, physical, capture=False):
             output = self.compiled(*physical)
         if self.config.orientation == "dual":
             output = output.transpose(0, 1)
@@ -280,7 +282,7 @@ class ResidentBlock:
                 state.check()
             before = self.runtime.stats()
             start = time.perf_counter_ns()
-            self.runtime.library.upmem_resident_reset_inputs(self.runtime.handle)
+            self.runtime.reset_inputs()
             outputs = self.graph(*leaves)
             self.last_run_ms = (time.perf_counter_ns() - start) / 1e6
             after = self.runtime.stats()
@@ -302,29 +304,44 @@ class ResidentBlock:
 
 
 def prepare_block(exported_program, example_inputs, *, configs, dpu_count):
-    """Prepare immutable int8 weights for explicit plans keyed by FX GEMM name.
+    """Normalize exported GEMMs and prepare immutable INT8 or FP32 weights.
 
+    Configs are keyed by the original linear/addmm/mm/_int_mm node names.
+    Each normalized GEMM uses PIM; surrounding operations use CPU Inductor.
     Compilation, host staging capture, ELF linking and weight H2D happen here.
     DPU GEMM execution starts only when the returned block's run() is called.
     """
+    if current_session.get() is not None:
+        raise RuntimeError("prepare_block cannot be mixed with an active PIMSession")
     with resident_lock, torch.no_grad(), ExitStack() as cleanup:
         start = time.perf_counter_ns()
         leaves, specification = _pytree.tree_flatten((example_inputs, {}))
         if specification != exported_program.call_spec.in_spec:
             raise ValueError("example_inputs must match the exported positional input structure")
-        layout_start = time.perf_counter_ns()
-        graph, frozen, states = _freeze_graph(exported_program)
-        weight_layout_ms = (time.perf_counter_ns() - layout_start) / 1e6
-        gemms = [node for node in graph.graph.nodes
-                 if node.op == "call_function" and node.target == torch.ops.aten._int_mm.default]
-        if not gemms or set(configs) != {node.name for node in gemms}:
-            raise ValueError("configs must contain exactly one entry for every exported _int_mm node")
-        profile = configs[gemms[0].name].torch_config.spec.common_profile
+        normalized_program, mappings = normalize_fx_gemms(exported_program)
+        if set(configs) != {mapping.original.node for mapping in mappings}:
+            raise ValueError("configs must contain exactly one entry for every original FX GEMM node")
+        profile = configs[mappings[0].original.node].torch_config.spec.common_profile
         if any(config.torch_config.spec.common_profile != profile for config in configs.values()):
             raise ValueError("all resident GEMMs must use the same UPMEM hardware profile")
-        shapes = {node: _logical_shape(node) for node in gemms}
-        for node in gemms:
-            _check_config(node.name, shapes[node], configs[node.name], dpu_count)
+        layout_start = time.perf_counter_ns()
+        graph, frozen, states = _freeze_graph(normalized_program)
+        weight_layout_ms = (time.perf_counter_ns() - layout_start) / 1e6
+        nodes = {node.name: node for node in graph.graph.nodes}
+        gemms = {nodes[mapping.normalized.node]: mapping for mapping in mappings}
+        gemm_weights = {}
+        for node, mapping in gemms.items():
+            ResidentRuntime.validate_config(configs[mapping.original.node])
+            _check_config(mapping.original.node, mapping.normalized,
+                          configs[mapping.original.node], dpu_count)
+            gemm_weights[node] = tuple(
+                frozen[argument] if argument in frozen else None
+                for argument in _gemm_operands(node))
+            if tuple(weight is not None for weight in gemm_weights[node]) != tuple(
+                operand.weight_target is not None
+                for operand in (mapping.normalized.left, mapping.normalized.right)
+            ):
+                raise ValueError(f"{node.name}: frozen operands disagree with FX weight provenance")
 
         partitions = {}
         gemm_partitions = {}
@@ -332,7 +349,7 @@ def prepare_block(exported_program, example_inputs, *, configs, dpu_count):
         for node in graph.graph.nodes:
             if node.op in ("placeholder", "get_attr", "output"):
                 continue
-            if node in shapes:
+            if node in gemms:
                 partition += 1
                 partitions[node] = partition
                 gemm_partitions[partition] = node
@@ -347,9 +364,9 @@ def prepare_block(exported_program, example_inputs, *, configs, dpu_count):
             partition_id = int(name.removeprefix("submod_"))
             if partition_id in gemm_partitions:
                 node = gemm_partitions[partition_id]
-                weights = tuple(frozen[argument] if argument in frozen else None for argument in node.args)
-                resident = _ResidentGemm(node.name, module, shapes[node], weights,
-                                         configs[node.name], runtime)
+                mapping = gemms[node]
+                resident = _ResidentGemm(mapping.original.node, module, mapping.normalized,
+                                         gemm_weights[node], configs[mapping.original.node], runtime)
                 split.add_module(name, resident)
                 resident.prepare()
                 weight_layout_ms += resident.weight_layout_ms

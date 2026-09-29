@@ -1,7 +1,7 @@
 // Two linalg operations, with a multi-operation scalar epilogue.
-// RUN: triton-shared-opt --convert-pim-to-aimx %s | FileCheck %s --check-prefix=IR --implicit-check-not=linalg. --implicit-check-not=aimx.compute_template
-// RUN: triton-shared-opt --mlir-print-op-generic --convert-pim-to-aimx --cse --canonicalize %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=STUB
-// RUN: triton-shared-opt --convert-pim-to-aimx %s | FileCheck %s --check-prefix=REUSE
+// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx %s | FileCheck %s --check-prefix=IR --implicit-check-not=linalg. --implicit-check-not=aimx.compute_template
+// RUN: triton-shared-opt --mlir-print-op-generic --pim-form-host-plan --convert-pim-to-aimx --cse --canonicalize %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=STUB
+// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx %s | FileCheck %s --check-prefix=REUSE
 // IR-DAG: opcode descr_dst_mask|a_mask|add
 // IR-DAG: opcode a_mask|mul|pim_mode
 // IR-DAG: opcode descr_dst_mask|a_mask|sub

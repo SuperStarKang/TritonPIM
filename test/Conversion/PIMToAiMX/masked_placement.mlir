@@ -1,17 +1,17 @@
 // The masked row axis has one resident group; the unmasked column axis has two.
 // The exact valid value clips staging and drain, never changes descriptors.
-// RUN: triton-shared-opt --convert-pim-to-aimx %s | FileCheck %s --check-prefix=IR
-// RUN: triton-shared-opt --mlir-print-op-generic --convert-pim-to-aimx --cse --canonicalize %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=STUB --implicit-check-not=aimx_patch_
+// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx %s | FileCheck %s --check-prefix=IR
+// RUN: triton-shared-opt --mlir-print-op-generic --pim-form-host-plan --convert-pim-to-aimx --cse --canonicalize %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=STUB --implicit-check-not=aimx_patch_
 // A constant zero mask still stages zero padding and drains no output rows.
-// RUN: sed 's/valid\[%limit, %c8\]/valid[%c0, %c8]/g' %s | triton-shared-opt --convert-pim-to-aimx --cse --canonicalize | FileCheck %s --check-prefix=ZERO
+// RUN: sed 's/valid\[%limit, %c8\]/valid[%c0, %c8]/g' %s | triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx --cse --canonicalize | FileCheck %s --check-prefix=ZERO
 // An empty mask on the two-group axis is also representable without holes.
-// RUN: sed 's/valid\[%limit, %c8\]/valid[%limit, %c0]/g' %s | triton-shared-opt --convert-pim-to-aimx --cse --canonicalize | FileCheck %s --check-prefix=EMPTY-COLS
-// RUN: sed 's/0.0 : bf16/1.0 : bf16/' %s | not triton-shared-opt --convert-pim-to-aimx 2>&1 | FileCheck %s --check-prefix=PAD
-// RUN: sed -e 's/pim.place %C /pim.place %A /' -e 's/pim.access %C /pim.access %A /' %s | not triton-shared-opt --convert-pim-to-aimx 2>&1 | FileCheck %s --check-prefix=ALIAS
+// RUN: sed 's/valid\[%limit, %c8\]/valid[%limit, %c0]/g' %s | triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx --cse --canonicalize | FileCheck %s --check-prefix=EMPTY-COLS
+// RUN: sed 's/0.0 : bf16/1.0 : bf16/' %s | not triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx 2>&1 | FileCheck %s --check-prefix=PAD
+// RUN: sed -e 's/pim.place %C /pim.place %A /' -e 's/pim.access %C /pim.access %A /' %s | not triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx 2>&1 | FileCheck %s --check-prefix=ALIAS
 // Read-only views of the same host buffer with different masks need separate PAs.
-// RUN: sed -e 's/pim.place %B /pim.place %A /' -e 's/pim.access %B /pim.access %A /' -e '/id = 1 : i64/s/valid\[%limit, %c8\]/valid[%c2, %c8]/' %s | triton-shared-opt --convert-pim-to-aimx | FileCheck %s --check-prefix=INPUTS
+// RUN: sed -e 's/pim.place %B /pim.place %A /' -e 's/pim.access %B /pim.access %A /' -e '/id = 1 : i64/s/valid\[%limit, %c8\]/valid[%c2, %c8]/' %s | triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx | FileCheck %s --check-prefix=INPUTS
 // Mask changes along another multi-group axis cannot be evaluated just once.
-// RUN: sed '/scf.for %gn =/a\          %varying = arith.addi %limit, %gn : index' %s | sed 's/valid\[%limit, %c8\]/valid[%varying, %c8]/g' | not triton-shared-opt --convert-pim-to-aimx 2>&1 | FileCheck %s --check-prefix=VARYING
+// RUN: sed '/scf.for %gn =/a\          %varying = arith.addi %limit, %gn : index' %s | sed 's/valid\[%limit, %c8\]/valid[%varying, %c8]/g' | not triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx 2>&1 | FileCheck %s --check-prefix=VARYING
 // IR-LABEL: func.func @masked_pointwise
 // IR: %[[ROWS0:.*]] = arith.minsi {{.*}}%arg3{{.*}} : index
 // IR: %[[ROWS1:.*]] = arith.minsi {{.*}}%arg3{{.*}} : index

@@ -15,7 +15,8 @@ from torch._inductor.select_algorithm import (
 from torch._inductor.utils import sympy_str
 
 
-TORCH_INT_MM_TEMPLATE_VERSION = "torch-int-mm-semantic-k-v1"
+TORCH_GEMM_TEMPLATE_VERSION = "torch-gemm-semantic-k-v2"
+TORCH_INT_MM_TEMPLATE_VERSION = TORCH_GEMM_TEMPLATE_VERSION
 
 
 @SymbolicGridFn
@@ -74,7 +75,7 @@ PIM_GEMM_SOURCE = r"""
 
     a_ptrs = A + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
     b_ptrs = B + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
 
     for k in range(0, tl.cdiv(K, BLOCK_K)):
         k_remaining = K - k * BLOCK_K
@@ -88,7 +89,11 @@ PIM_GEMM_SOURCE = r"""
             mask=(offs_k[:, None] < k_remaining) & (offs_n[None, :] < N),
             other=0.0,
         )
+        {% if ACC_TYPE == "tl.int32" %}
         acc += tl.dot(a, b)
+        {% else %}
+        acc += tl.dot(a, b, input_precision="ieee", out_dtype=ACC_TYPE)
+        {% endif %}
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
 
