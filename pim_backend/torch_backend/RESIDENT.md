@@ -75,7 +75,7 @@ with prepare_block(exported, (activation,), configs=configs, dpu_count=2) as blo
 - Weight window는 같은 binding에서 모든 DPU의 packed byte가 같을 때만 하나로 저장한다. Hash 일치 후 byte 비교도 수행한다.
 - 각 round의 symbol을 `--defsym`으로 배치하고, 전송은 별도의 `{address,size}`로 수행한다.
 - ELF의 symbol 주소를 확인하고, loadable MRAM segment와 별도로 남은 MRAM section 할당을 거부한다.
-- Input scratch는 같은 block 호출 안에서 동일한 packed byte일 때 재사용한다. 다음 `run()`은 입력 재사용 상태를 비운다.
+- Input scratch 공간은 공유하지만 activation은 모든 GEMM에서 다시 전송한다. 입력 내용 비교와 검사용 host 복사본은 없으며 `activation_hits=0`이다.
 
 **예시**
 ```text
@@ -132,7 +132,7 @@ CPU 결과와 일치하는지, 준비 이후 weight H2D가 0인지 확인한다.
 구현 과정에서는 빌드·실행·검증을 수행하지 않았다.
 
 **근거**
-- 예제는 같은 activation을 사용하는 두 GEMM으로 공용 scratch 재사용도 관찰한다.
+- 예제의 두 GEMM은 같은 activation도 각각 전송하며 공용 MRAM scratch 공간을 사용한다.
 - `stats()`는 누적 전송량, `last_transfers`는 마지막 `run()`의 전송량을 반환한다.
 - 기존 compiler 산출물에 `target_ir`가 없으면 사용할 수 없으며, 새 산출물 생성이 필요하다.
 
@@ -169,7 +169,7 @@ python pim_backend/torch_backend/examples/torch_resident_fp32.py --orientation n
 python pim_backend/torch_backend/examples/torch_resident_fp32.py --orientation dual
 ```
 
-성공 시 각 방향에서 다음 두 줄을 출력한다. 중간에는 activation 전송량과 재사용 횟수도 표시한다.
+성공 시 각 방향에서 다음 두 줄을 출력한다. 중간에는 activation 전송량과 `activation_hits=0`도 표시한다.
 
 ```text
 step=0 correctness=PASS weight_h2d=0 ... launches=3
@@ -187,7 +187,7 @@ GEMM 다섯 개는 모두 같은 2048 DPU·16 tasklet을 사용하며, scale과 
 **근거**
 - FX 분석에서 `linear` 3개, `mm` 2개와 Wq/Wk/Wv 출처를 확인한다. QKV fusion은 하지 않는다.
 - 서로 다른 FP32 입력 두 개를 번갈아 사용하고, 모든 실행 결과를 CPU reference와 비교한다.
-- 준비 시 weight 영역은 세 개, 계산 launch는 0이어야 한다. 실행마다 weight H2D 0, launch 5, activation hit 2 이상을 확인한다.
+- 준비 시 weight 영역은 세 개, 계산 launch는 0이어야 한다. 실행마다 weight H2D 0, launch 5, activation hit 0을 확인한다.
 - 최적화된 설정을 탐색한 결과가 아니라, 각 GEMM을 한 scheduling round에 배치한 고정 기준 설정이다.
 
 **예시**
@@ -205,8 +205,8 @@ Dual은 M/N tile과 partition을 교환한다. Padding과 split-K는 사용하�
 현재 capture 구현은 upload 전까지 이 6 GiB의 packed weight를 host에도 보관한다. 다른 host buffer는 별도다.
 
 ```bash
-python pim_backend/torch_backend/examples/torch_resident_attention.py --orientation normal > resident_attention_normal.json
-python pim_backend/torch_backend/examples/torch_resident_attention.py --orientation dual > resident_attention_dual.json
+python pim_backend/torch_backend/examples/attention/torch_resident_attention.py --orientation normal > resident_attention_normal.json
+python pim_backend/torch_backend/examples/attention/torch_resident_attention.py --orientation dual > resident_attention_dual.json
 ```
 
 진행 로그는 stderr, 최종 JSON은 stdout으로 출력한다. 사용자가 직접 실행하며, 작성 과정에서는 실행하지 않았다.
@@ -240,15 +240,22 @@ partition_profile correctness=PASS PIM_partitions=5 (excluded from median)
 | `preparation.prepare_ms` | FX 정규화, 컴파일, DPU 확보, capture, 링크, weight upload |
 | `preparation.weight_prepare_ms` | 기존 resident API의 weight/layout/capture/upload 묶음; 순수 H2D 시간이 아님 |
 | `preparation.resident_upload_ms` | 최초 프로그램 적재, weight 전송, capture buffer 정리 |
+| `preparation.resident_upload_breakdown_ms` | upload 전체를 `h2d`, `program_load`, `resident_host`로 분리 |
 | `samples[*].wall_ms` / `median_wall_ms` | 계측 wrapper 없는 `block.run()` 전체 |
 | `samples[*].graph_ms` / `median_graph_ms` | 입력·state 검사 및 출력 pytree 복원 등을 제외한 내부 graph 실행 |
 | `profile.partitions[*].wall_ms` | CPU 또는 PIM partition 한 번의 호출 |
-| `profile.partitions[*].native_ms` | PIM host의 layout/H2D/kernel/D2H 등 기존 13개 단계 |
+| `profile.partitions[*].native_ms` | resident v4의 15개 단계; SDK H2D, `program_load`, `resident_host` 분리 |
+| `profile.partitions[*].h2d_ms` | weight/activation/metadata별 SDK 전송 시간; native H2D에 포함 |
 | `profile.partitions[*].outside_native_stages_ms` | partition 시간에서 native 단계 합을 뺀 값; Torch layout과 wrapper 등 포함 |
 | `profile.outside_partitions_ms` | partition 밖 작업과 계측 overhead 등 |
 
 `profile`의 시간은 별도의 한 호출에서 얻은 값이며 `median_wall_ms`와 합산하지 않는다.
-Resident 경로의 native H2D 구간에는 전송 생략 판정과 round 시작 시 프로그램 적재 비용도 들어갈 수 있다.
+Resident timing v4에서 H2D는 실제 SDK prepare+push 구간만 측정한다.
+프로그램 교체는 `program_load`, wrapper 등록·분기 등 기존 H2D 구간의
+나머지는 `resident_host`로 분리한다. `resident_host`는 기존 H2D 전체에서 SDK 전송과
+프로그램 교체 시간을 뺀 값이며 세 항목의 합은 원래 계측 구간과 같다.
+`h2d_ms`의 세 role 합은 `native_ms.h2d`와 같고, native 단계 합에 중복해서 더하지 않는다.
+기존 v3 JSON의 H2D는 프로그램 교체와 resident host 작업을 포함한 값으로 해석한다.
 Weight tile packing은 반복 실행에도 남아 있으며, weight H2D 0을 weight 관련 CPU 비용 0으로 해석하지 않는다.
 
 ## Single-head Transformer stack 실험
@@ -268,7 +275,7 @@ Normal orientation, 2048 DPU·16 tasklet을 고정하고, 기존 lowering과 res
 - GEMM은 block당 9개다. 원본 FX의 shape, op, layer 경로와 weight 출처를 확인하고,
   각 GEMM이 scheduling round 하나로 실행되는 설정인지 준비 전에 확인한다.
 - Q/K/V와 gate/up은 각각 같은 입력을 사용한다. 실행마다 weight H2D 0, launch `9 × layers`,
-  activation hit `3 × layers` 이상을 확인한다. 별도 profile에서는 K/V/up의 activation H2D 0도 확인한다.
+  activation hit 0을 확인한다. 별도 profile에서는 K/V/up도 activation을 전송하는지 확인한다.
 - Model은 최종 stack 출력 하나만 반환한다. 서로 다른 입력 두 개의 최종 출력을 CPU reference와
   `rtol=1e-4`, `atol=1e-4`로 비교하고 최대 절대 오차를 기록한다.
 
@@ -320,9 +327,9 @@ Down의 K는 논리 크기 11008이다. 세 계층 lowering 자체를 변경하�
 Repository root에서 사용자가 직접 실행한다. 진행 로그는 stderr, 최종 JSON은 stdout이다.
 
 ```bash
-python pim_backend/torch_backend/examples/torch_resident_transformer.py --layers 1 > resident_transformer_1.json
-python pim_backend/torch_backend/examples/torch_resident_transformer.py --layers 2 > resident_transformer_2.json
-python pim_backend/torch_backend/examples/torch_resident_transformer.py --layers 4 > resident_transformer_4.json
+python pim_backend/torch_backend/examples/transformer/torch_resident_transformer.py --layers 1 > resident_transformer_1.json
+python pim_backend/torch_backend/examples/transformer/torch_resident_transformer.py --layers 2 > resident_transformer_2.json
+python pim_backend/torch_backend/examples/transformer/torch_resident_transformer.py --layers 4 > resident_transformer_4.json
 ```
 
 각 실행은 준비 → warm-up 3회 → 일반 측정 3회 → 별도 partition profile 1회 순서다.
@@ -334,7 +341,7 @@ CPU partition은 원본 FX module, PIM partition은 논리 shape의 `torch.mm` �
 ```text
 # --layers 1
 preflight MRAM_bytes_per_DPU=14211072 captured_weight_host_bytes=26172456960 (other host buffers excluded)
-sample=0 correctness=PASS wall_ms=... weight_h2d=0 ... activation_hits=3 launches=9
+sample=0 correctness=PASS wall_ms=... weight_h2d=0 ... activation_hits=0 launches=9
 partition_profile correctness=PASS PIM_partitions=9 (excluded from median)
 
 # --layers 2 / --layers 4: launches=18 / launches=36
@@ -353,8 +360,9 @@ Profile 전체 시간에는 CPU reference 계산과 비교도 포함되며 `vali
   `ffn_gemm_ms`는 gate/up/down 세 GEMM partition의 시간 합이다. 양쪽 모두 layout·전송·출력 복원을 포함한다.
 - Layer별 합계에는 독립적인 CPU partition의 RMSNorm·RoPE·mask·softmax·residual·SiLU 등이 포함되지 않는다.
   `profile.cpu_partition_ms`와 `profile.partitions`에서 해당 시간을 확인한다.
-- `profile.layers[*].native_ms`는 DPU 실행과 host 단계를 구분한다. `h2d`에는 프로그램 로드와
-  activation 재사용 판정도 포함된다. Profile 전체 시간은 일반 측정 중앙값과 합산하지 않는다.
+- `profile.layers[*].native_ms`는 DPU 실행과 host 단계를 구분한다. v4의 `h2d`는 SDK
+  prepare+push이며 프로그램 교체는 `program_load`, 나머지 wrapper 처리는 `resident_host`다.
+  Activation 내용 비교는 수행하지 않는다. Profile 전체 시간은 일반 측정 중앙값과 합산하지 않는다.
 - Partition reference 계산과 비교는 `partitions[*].wall_ms`에서 제외한다. 진단을 위해 CPU 계산과
   tensor 수명이 추가되므로 이 profile의 wall time을 일반 실행 성능으로 사용하지 않는다.
   `outside_partitions_ms`에서는 partition 실행 시간과 `validation_ms`를 모두 뺀다.

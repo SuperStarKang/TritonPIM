@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 struct resident_window {
     uint64_t hash;
@@ -24,13 +25,6 @@ struct resident_round {
     char *program;
 };
 
-struct resident_scratch {
-    uint32_t address;
-    uint32_t bytes;
-    unsigned char *data;
-    int valid;
-};
-
 struct upmem_resident_kernel {
     struct upmem_resident_block *block;
     struct resident_binding bindings[3];
@@ -46,10 +40,10 @@ struct upmem_resident_block {
     struct dpu_set_t *dpus;
     uint32_t units;
     void **prepared;
-    struct resident_scratch scratch[2];
     struct upmem_resident_kernel *first;
     struct upmem_resident_kernel *last;
     struct upmem_resident_stats stats;
+    struct upmem_resident_timings timings;
     int uploaded;
 };
 
@@ -67,6 +61,20 @@ static void resident_require(int condition, const char *message) {
         fprintf(stderr, "UPMEM resident: %s\n", message);
         abort();
     }
+}
+
+static uint64_t resident_now_ns(void) {
+    struct timespec timestamp;
+    resident_require(clock_gettime(CLOCK_MONOTONIC, &timestamp) == 0, "clock_gettime failed");
+    return (uint64_t)timestamp.tv_sec * UINT64_C(1000000000) + (uint64_t)timestamp.tv_nsec;
+}
+
+static void resident_load_program(struct upmem_resident_block *block, const char *path) {
+    uint64_t start = resident_now_ns();
+    int loaded = upmem_runtime_load(path);
+    if (loaded)
+        block->timings.program_load_ns += resident_now_ns() - start;
+    block->stats.program_loads += loaded;
 }
 
 static void *resident_allocate(size_t bytes) {
@@ -146,6 +154,7 @@ void upmem_resident_begin(struct upmem_resident_kernel *kernel, int capture) {
     resident_seen = 0;
     resident_open = 0;
     resident_launched = 0;
+    memset(&kernel->block->timings, 0, sizeof(kernel->block->timings));
 }
 
 void upmem_resident_cancel(void) {
@@ -177,7 +186,7 @@ static void resident_start_round(void) {
     } else {
         resident_require(resident_round < kernel->count, "more scheduling rounds than captured");
         resident_require(kernel->rounds[resident_round].program != NULL, "round program is missing");
-        kernel->block->stats.program_loads += upmem_runtime_load(kernel->rounds[resident_round].program);
+        resident_load_program(kernel->block, kernel->rounds[resident_round].program);
     }
     resident_seen = 0;
     resident_launched = 0;
@@ -239,36 +248,12 @@ static void resident_prepare_sdk(void) {
 
 static void resident_send_input(struct resident_binding *binding) {
     struct upmem_resident_block *block = resident_active->block;
-    for (uint32_t i = 0; i < 2; ++i) {
-        struct resident_scratch *scratch = &block->scratch[i];
-        if (scratch->valid && scratch->address == binding->address && scratch->bytes == binding->bytes
-            && resident_equal(scratch->data, binding->bytes)) {
-            ++block->stats.activation_hits;
-            return;
-        }
-    }
-    for (uint32_t i = 0; i < 2; ++i) {
-        struct resident_scratch *scratch = &block->scratch[i];
-        if (scratch->valid && scratch->address < binding->address + binding->bytes
-            && binding->address < scratch->address + scratch->bytes)
-            scratch->valid = 0;
-    }
-    uint32_t slot = 0;
-    for (struct resident_binding *previous = resident_active->bindings;
-         previous < binding; ++previous)
-        if (previous->role == UPMEM_RESIDENT_INPUT)
-            ++slot;
-    struct resident_scratch *scratch = &block->scratch[slot];
-    scratch->data = realloc(scratch->data, (size_t)binding->bytes * block->units);
-    resident_require(scratch->data != NULL, "input scratch allocation failed");
-    resident_copy(scratch->data, binding->bytes);
-    scratch->address = binding->address;
-    scratch->bytes = binding->bytes;
-    resident_prepare_sdk();
     struct dpu_symbol_t symbol = {binding->address, binding->bytes};
+    uint64_t start = resident_now_ns();
+    resident_prepare_sdk();
     DPU_ASSERT(dpu_push_xfer_symbol(block->set, DPU_XFER_TO_DPU, symbol, 0,
                                   binding->bytes, DPU_XFER_DEFAULT));
-    scratch->valid = 1;
+    block->timings.activation_h2d_ns += resident_now_ns() - start;
     block->stats.activation_bytes += (uint64_t)binding->bytes * block->units;
 }
 
@@ -288,8 +273,10 @@ dpu_error_t upmem_resident_push_xfer(struct dpu_set_t set, dpu_xfer_t direction,
         resident_require(direction == DPU_XFER_TO_DPU && !resident_launched,
                          "unexpected metadata transfer");
         if (!resident_capture) {
+            uint64_t start = resident_now_ns();
             resident_prepare_sdk();
             DPU_ASSERT(dpu_push_xfer(set, direction, symbol, offset, length, flags));
+            block->timings.metadata_h2d_ns += resident_now_ns() - start;
             block->stats.metadata_bytes += (uint64_t)length * block->units;
         }
     } else {
@@ -384,7 +371,8 @@ void upmem_resident_upload(struct upmem_resident_block *block) {
                      "invalid weight upload lifecycle");
     resident_require(block->first != NULL && block->first->captured, "no captured GEMM");
     resident_require(block->first->rounds[0].program != NULL, "first round program is missing");
-    block->stats.program_loads += upmem_runtime_load(block->first->rounds[0].program);
+    memset(&block->timings, 0, sizeof(block->timings));
+    resident_load_program(block, block->first->rounds[0].program);
     for (struct upmem_resident_kernel *kernel = block->first; kernel != NULL; kernel = kernel->next) {
         resident_require(kernel->captured, "uncaptured kernel");
         for (uint32_t round = 0; round < kernel->count; ++round)
@@ -398,11 +386,13 @@ void upmem_resident_upload(struct upmem_resident_block *block) {
             for (uint32_t i = 0; i < slot->count; ++i) {
                 struct resident_window *window = &slot->windows[i];
                 resident_require(window->address != 0, "missing weight address");
+                struct dpu_symbol_t symbol = {window->address, slot->bytes};
+                uint64_t start = resident_now_ns();
                 for (uint32_t dpu = 0; dpu < block->units; ++dpu)
                     DPU_ASSERT(dpu_prepare_xfer(block->dpus[dpu], window->data + (size_t)dpu * slot->bytes));
-                struct dpu_symbol_t symbol = {window->address, slot->bytes};
                 DPU_ASSERT(dpu_push_xfer_symbol(block->set, DPU_XFER_TO_DPU, symbol, 0,
                                               slot->bytes, DPU_XFER_DEFAULT));
+                block->timings.weight_h2d_ns += resident_now_ns() - start;
                 block->stats.weight_bytes += (uint64_t)slot->bytes * block->units;
                 free(window->data);
                 window->data = NULL;
@@ -418,11 +408,16 @@ void upmem_resident_get_stats(struct upmem_resident_block *block,
     *stats = block->stats;
 }
 
+void upmem_resident_get_timings(struct upmem_resident_block *block,
+                                struct upmem_resident_timings *timings) {
+    resident_require(block == resident_owner && resident_active == NULL,
+                     "timings require a completed invocation or upload");
+    *timings = block->timings;
+}
+
 void upmem_resident_reset_inputs(struct upmem_resident_block *block) {
     resident_require(block == resident_owner && block->uploaded && resident_active == NULL,
                      "cannot start a block invocation in the current state");
-    for (uint32_t i = 0; i < 2; ++i)
-        block->scratch[i].valid = 0;
 }
 
 void upmem_resident_close(struct upmem_resident_block *block) {
@@ -443,8 +438,6 @@ void upmem_resident_close(struct upmem_resident_block *block) {
         free(kernel);
         kernel = next;
     }
-    for (uint32_t i = 0; i < 2; ++i)
-        free(block->scratch[i].data);
     free(block->prepared);
     free(block->dpus);
     free(block);

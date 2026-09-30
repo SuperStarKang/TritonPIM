@@ -12,7 +12,7 @@ from torch._inductor.codecache import PyCodeCache
 
 from autotuner import PIMConfig
 from torch_backend import PIMInductorBackend, PIMTorchConfig, target_spec
-from profile_attention import trace_kernels
+from attention.profile_attention import trace_kernels
 
 
 def fp32_mm(a, b):

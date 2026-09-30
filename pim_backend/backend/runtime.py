@@ -21,7 +21,9 @@ class RuntimeBackend(Protocol):
     perform transfers. load_layer replaces the previous placement on the same
     resources and returns timing fields in milliseconds. invocation returns a
     context manager; stats contains cumulative transfer bytes and launch counts
-    across layer replacements. close releases resources, including on errors.
+    across layer replacements. begin_run validates the loaded plan before each
+    execution. Activations are sent for every GEMM; weights remain resident.
+    close releases resources.
     """
 
     def validate_config(self, config): ...
@@ -29,6 +31,7 @@ class RuntimeBackend(Protocol):
     def finalize_plan(self, plan): ...
     def open(self): ...
     def load_layer(self, plan): ...
+    def begin_run(self, plan): ...
     def invocation(self, kernel, physical_inputs): ...
     def stats(self) -> dict: ...
     def close(self): ...
@@ -52,10 +55,11 @@ class ExecutionToken:
 
 
 class PIMSession:
-    """Own resources until close; each ready token permits one layer execution.
+    """Own resources until close; tokens order weight loads and layer executions.
 
     Compilation is performed separately by compile_layer. The runtime FX graph
     orders load_weights and run_layer through explicit completion tokens.
+    A completion token can also execute the same resident plan again.
     A session is synchronous and belongs to the thread that opened it.
     """
 
@@ -125,14 +129,15 @@ class PIMSession:
 
     def run_layer(self, plan, inputs, ready):
         self._check_owner()
-        if (self.phase != "ready" or ready is not self.token
-                or ready.completed or plan is not self.plan):
-            raise RuntimeError("layer execution requires its current weight-ready token")
+        if (self.phase not in ("ready", "idle") or self.plan is None
+                or ready is not self.token or plan is not self.plan):
+            raise RuntimeError("layer execution requires its latest token and resident plan")
         if current_layer.get() is not None:
             raise RuntimeError("nested layer execution is unsupported")
         self.phase = "running"
         before = self.backend.stats()
         start = time.perf_counter_ns()
+        self.backend.begin_run(plan)
         with ExitStack() as scope:
             scope.callback(current_layer.reset, current_layer.set((self, plan, ready)))
             outputs = plan.run(*inputs)

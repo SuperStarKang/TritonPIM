@@ -35,6 +35,15 @@ class TransferStats(ctypes.Structure):
         "launches", "program_loads", "activation_hits")]
 
 
+class TransferTimings(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_uint64) for name in (
+        "weight_h2d_ns", "activation_h2d_ns", "metadata_h2d_ns", "program_load_ns")]
+
+    def h2d_ms(self):
+        return {role: getattr(self, role + "_h2d_ns") / 1e6
+                for role in ("weight", "activation", "metadata")}
+
+
 def _artifact_bindings(target_ir, arguments, physical_inputs, weight_mask, units):
     acquire = re.findall(r"upmem\.acquire\s+(\d+)\s*,", target_ir)
     if acquire != [str(units)]:
@@ -198,6 +207,7 @@ class ResidentRuntime:
             "upload": ([pointer], None),
             "reset_inputs": ([pointer], None),
             "get_stats": ([pointer, ctypes.POINTER(TransferStats)], None),
+            "get_timings": ([pointer, ctypes.POINTER(TransferTimings)], None),
             "close": ([pointer], None),
         }
         for name, (arguments, returns) in signatures.items():
@@ -210,6 +220,7 @@ class ResidentRuntime:
         self.ready = False
         self.capture_ms = 0.0
         self.upload_ms = 0.0
+        self.upload_breakdown_ms = None
 
     def finalize(self):
         if self.ready or self.handle is None or not self.kernels:
@@ -259,6 +270,15 @@ class ResidentRuntime:
         start = time.perf_counter_ns()
         self.library.upmem_resident_upload(self.handle)
         self.upload_ms = (time.perf_counter_ns() - start) / 1e6
+        transfer_timings = self.transfer_timings()
+        h2d_ms = sum(transfer_timings.h2d_ms().values())
+        program_load_ms = transfer_timings.program_load_ns / 1e6
+        resident_host_ms = self.upload_ms - h2d_ms - program_load_ms
+        if resident_host_ms < 0:
+            raise RuntimeError("resident upload timing intervals overlap or exceed upload wall time")
+        self.upload_breakdown_ms = {
+            "h2d": h2d_ms, "program_load": program_load_ms, "resident_host": resident_host_ms,
+        }
         self.ready = True
 
     def library_for(self, name, bundle):
@@ -279,6 +299,13 @@ class ResidentRuntime:
         stats = TransferStats()
         self.library.upmem_resident_get_stats(self.handle, ctypes.byref(stats))
         return {name: getattr(stats, name) for name, _ in stats._fields_}
+
+    def transfer_timings(self):
+        if self.handle is None:
+            raise RuntimeError("ResidentBlock is closed")
+        timings = TransferTimings()
+        self.library.upmem_resident_get_timings(self.handle, ctypes.byref(timings))
+        return timings
 
     def close(self):
         if self.handle is not None:
@@ -339,9 +366,23 @@ class ResidentInvocation:
         runtime.library.upmem_resident_end(artifact.handle)
         if self.capture:
             runtime.capture_ms += (time.perf_counter_ns() - start) / 1e6
-        driver.TIMING_STAGES = driver._STAGE_NAMES["upmem"]
-        driver.timing[:] = list((ctypes.c_double * len(driver.TIMING_STAGES)).in_dll(
+        host_stages = driver._STAGE_NAMES["upmem"]
+        host_timing = list((ctypes.c_double * len(host_stages)).in_dll(
             artifact.library, "pim_timing_ms"))
+        transfer_timings = runtime.transfer_timings()
+        h2d_by_role = transfer_timings.h2d_ms()
+        h2d_ms = sum(h2d_by_role.values())
+        program_load_ms = transfer_timings.program_load_ns / 1e6
+        h2d_index = host_stages.index("h2d")
+        # The generated v3 interval encloses SDK transfers and resident host work.
+        resident_host_ms = host_timing[h2d_index] - h2d_ms - program_load_ms
+        if resident_host_ms < 0:
+            raise RuntimeError("resident transfer timing intervals exceed the generated H2D interval")
+        host_timing[h2d_index] = h2d_ms
+        driver.TIMING_STAGES = driver.UPMEM_RESIDENT_TIMING_STAGES
+        driver.TIMING_VERSION = driver.UPMEM_RESIDENT_TIMING_VERSION
+        driver.timing[:] = host_timing + [program_load_ms, resident_host_ms]
+        driver.resident_h2d_timing = h2d_by_role
         driver.invokes = 0
 
 

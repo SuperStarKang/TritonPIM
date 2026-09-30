@@ -206,7 +206,13 @@ class UPMEMAdapter:
                     raise ValueError(f"{kernel.name}: captured more than one weight window")
         self.runtime.finalize()
         self.runtime.reset_inputs()
-        return {"capture_ms": self.runtime.capture_ms, "upload_ms": self.runtime.upload_ms}
+        return {"capture_ms": self.runtime.capture_ms, "upload_ms": self.runtime.upload_ms,
+                "upload_breakdown_ms": dict(self.runtime.upload_breakdown_ms)}
+
+    def begin_run(self, plan):
+        if self.runtime is None or self.runtime.plan is not plan:
+            raise RuntimeError("UPMEM execution requires the currently loaded plan")
+        self.runtime.reset_inputs()
 
     def invocation(self, kernel, physical_inputs):
         binding = self.bindings[kernel.name]

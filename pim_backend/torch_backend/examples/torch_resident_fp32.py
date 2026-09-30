@@ -105,7 +105,7 @@ def main():
                 assert block.last_transfers["activation_bytes"] > 0
                 assert block.last_transfers["output_bytes"] > 0
                 assert block.last_transfers["launches"] == 3
-                assert block.last_transfers["activation_hits"] >= 1
+                assert block.last_transfers["activation_hits"] == 0
                 assert block.stats()["weight_bytes"] == prepared["weight_bytes"]
                 print(f"step={step} correctness=PASS "
                       f"weight_h2d={block.last_transfers['weight_bytes']} "

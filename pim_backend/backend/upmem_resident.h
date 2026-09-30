@@ -21,7 +21,15 @@ struct upmem_resident_stats {
     uint64_t metadata_bytes;
     uint64_t launches;
     uint64_t program_loads;
-    uint64_t activation_hits;
+    uint64_t activation_hits;  // Retained in the stats ABI; always zero.
+};
+
+// Reset for each captured/executed GEMM and for the initial weight upload.
+struct upmem_resident_timings {
+    uint64_t weight_h2d_ns;
+    uint64_t activation_h2d_ns;
+    uint64_t metadata_h2d_ns;
+    uint64_t program_load_ns;
 };
 
 int upmem_resident_owns_set(void);
@@ -42,9 +50,12 @@ void upmem_resident_address(struct upmem_resident_kernel *kernel,
 void upmem_resident_program(struct upmem_resident_kernel *kernel,
                             uint32_t round, const char *path);
 void upmem_resident_upload(struct upmem_resident_block *block);
+// Retained for callers' run-boundary validation; activations are always sent.
 void upmem_resident_reset_inputs(struct upmem_resident_block *block);
 void upmem_resident_get_stats(struct upmem_resident_block *block,
                               struct upmem_resident_stats *stats);
+void upmem_resident_get_timings(struct upmem_resident_block *block,
+                                struct upmem_resident_timings *timings);
 void upmem_resident_close(struct upmem_resident_block *block);
 
 dpu_error_t upmem_resident_prepare_xfer(struct dpu_set_t dpu, void *buffer);
