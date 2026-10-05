@@ -16,8 +16,7 @@ import triton
 import triton.backends.pim.driver as pim_driver
 
 from autotuner import PIMConfig
-from torch_backend import PIMSession, PIMTorchConfig, build_layer_plan, target_spec
-from torch_backend.fx_analysis import analyze_fx_gemms
+from torch_backend import PIMSession, PIMTorchConfig, target_spec
 from torch_backend.model import _LayerGemm
 
 from fx_utils import write_fx_graph
@@ -84,18 +83,14 @@ def benchmark_model(model, inputs, args, *, scope, heads, expected_gemms, expect
         raise ValueError("--warmup and --repeat must be at least 1")
     logging.basicConfig(level=logging.INFO)
     args.report_dir.mkdir(parents=True, exist_ok=True)
-    with torch.no_grad():
-        start = time.perf_counter_ns()
-        exported = torch.export.export(model, inputs)
-        gemms = analyze_fx_gemms(exported)
-        export_ms = (time.perf_counter_ns() - start) / 1e6
+    labels = {}
+
+    def configure(gemms, spec):
         if len(gemms) != expected_gemms:
             raise ValueError(f"expected {expected_gemms} FX GEMMs, found {len(gemms)}")
         if sum(gemm.right.weight_target is not None for gemm in gemms) != expected_weights:
             raise ValueError(f"expected {expected_weights} projection weights")
-        spec = target_spec("upmem", num_units=2048, nr_tasklets=16)
         configs = model_configs(gemms, spec, args.gemm_config)
-        labels = {}
         for gemm in gemms:
             if gemm.right.weight_target is not None:
                 operation = gemm.right.weight_target.removesuffix(".weight")
@@ -107,19 +102,19 @@ def benchmark_model(model, inputs, args, *, scope, heads, expected_gemms, expect
                 "padded_mnk": list(gemm.mnk), "weight": gemm.right.weight_target,
                 "config": asdict(configs[gemm.node].config),
             }
-        write_fx_graph(exported.graph_module, args.report_dir / "exported_fx", {
-            name: json.dumps(label) for name, label in labels.items()
-        })
-        start = time.perf_counter_ns()
-        plan = build_layer_plan(exported, inputs, configs=configs, index=0)
-        plan_ms = (time.perf_counter_ns() - start) / 1e6
-        print(f"scope={scope} heads={heads} gemm_config={args.gemm_config} "
-              f"logical_gemms={len(gemms)} planned_stages={len(plan.stages)}", flush=True)
-        session = PIMSession(spec)
+        return configs
+
+    with torch.no_grad():
+        session = PIMSession(target_spec("upmem", num_units=2048, nr_tasklets=16))
         with session:
             start = time.perf_counter_ns()
-            session.prepare([plan])
+            plan, = session.prepare([model], inputs, configure=configure)
             prepare_ms = (time.perf_counter_ns() - start) / 1e6
+            print(f"scope={scope} heads={heads} gemm_config={args.gemm_config} "
+                  f"logical_gemms={len(labels)} planned_stages={len(plan.stages)}", flush=True)
+            write_fx_graph(plan.exported_graph, args.report_dir / "exported_fx", {
+                name: json.dumps(label) for name, label in labels.items()
+            })
             stage_records = []
             for stage in plan.stages:
                 record = {
@@ -208,8 +203,8 @@ def benchmark_model(model, inputs, args, *, scope, heads, expected_gemms, expect
             "gemms": labels, "stages": stage_records, "expected_launches": expected_launches,
             "unique_device_artifacts": len({stage.program for stage in plan.stages}),
             "memory": plan.backend_plan,
-            "preparation": {"export_ms": export_ms, "plan_ms": plan_ms,
-                            "session_open_ms": session.open_ms, "prepare_ms": prepare_ms,
+            "preparation": {"session_open_ms": session.open_ms, "prepare_ms": prepare_ms,
+                            "prepare_scope": "FX export/analysis, config selection, CPU/PIM compilation and placement",
                             "weight_load": weight_load},
             "warmups": warmups, "samples": samples, "median_wall_ms": median_ms,
             "logical_gemm_operations": logical_operations,

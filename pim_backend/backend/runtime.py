@@ -17,8 +17,9 @@ resident_lock = RLock()
 class RuntimeBackend(Protocol):
     """Synchronous adapter contract for model and legacy layer execution.
 
-    open exposes the actual num_units. prepare_model binds the model's plans
-    to those resources and creates their shared weight/scratch address layout.
+    open exposes the actual num_units. begin_model creates the target execution
+    runtime. prepare_model places the planned layers on those resources and
+    finalizes their shared weight/scratch layout and native artifacts.
 
     Legacy compile_invocation/finalize_plan must not allocate device resources or
     perform transfers. load_layer replaces the previous placement on the same
@@ -34,7 +35,8 @@ class RuntimeBackend(Protocol):
     def finalize_plan(self, plan): ...
     def open(self): ...
     num_units: int
-    def prepare_model(self, plans, session): ...
+    def begin_model(self): ...
+    def prepare_model(self, plans): ...
     def load_layer(self, plan): ...
     def begin_run(self, plan): ...
     def invocation(self, kernel, physical_inputs): ...
@@ -62,7 +64,8 @@ class ExecutionToken:
 class PIMSession:
     """Own model resources, layer weights and KV storage until close.
 
-    prepare/run_model use session-bound LayerPlans without completion tokens.
+    prepare creates LayerPlans from Torch blocks after acquiring resources.
+    run_model executes those plans without completion tokens.
     start/load_weights/run_layer retain the legacy compiled-layer API.
     """
 
@@ -101,17 +104,40 @@ class PIMSession:
         self.open_ms = (time.perf_counter_ns() - start) / 1e6
         return self
 
-    def prepare(self, plans):
-        """Plan and compile all blocks after acquiring the model's physical units."""
+    def prepare(self, layers, example_inputs, *, configure):
+        """Export and prepare Torch blocks on the session's allocated resources.
+
+        configure(gemms, spec) maps original FX GEMM names to PIMTorchConfig.
+        CPU preparation outputs supply the next block's positional inputs.
+        """
+        import torch
+
+        from torch_backend.fx_analysis import analyze_fx_gemms
+        from torch_backend.model import build_layer_plan
+
         from .resident import WEIGHT
 
         self._check_owner()
-        self.layers = tuple(plans)
-        if not self.layers:
+        layers = tuple(layers)
+        if not layers:
             raise ValueError("a model requires at least one layer")
-        if len({plan.index for plan in self.layers}) != len(self.layers):
-            raise ValueError("model layer indices must be unique")
-        self.backend.prepare_model(self.layers, self)
+        self.backend.begin_model()
+        plans = []
+        with torch.no_grad():
+            for index, layer in enumerate(layers):
+                exported = torch.export.export(layer, example_inputs)
+                plan = build_layer_plan(
+                    exported, example_inputs,
+                    configs=configure(analyze_fx_gemms(exported, allow_bmm=True), self.spec),
+                    index=index,
+                )
+                plan.plan_model(self.spec, self.backend.model)
+                outputs = plan.compile_cpu()
+                plans.append(plan)
+                example_inputs = outputs if isinstance(outputs, tuple) else (outputs,)
+
+        self.layers = tuple(plans)
+        self.backend.prepare_model(self.layers)
         for plan in self.layers:
             for stage in plan.stages:
                 for binding in stage.bindings:
@@ -122,6 +148,7 @@ class PIMSession:
                             "bytes_per_unit": binding.size,
                             "mapping": stage.physical_mapping,
                         }
+        return self.layers
 
     @property
     def loaded_program(self):

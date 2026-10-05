@@ -12,9 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import torch
 
-from torch_backend import PIMSession, PIMTorchConfig, build_layer_plan, target_spec
+from torch_backend import PIMSession, PIMTorchConfig, target_spec
 from torch_backend._autotuner import PIMConfig
-from torch_backend.fx_analysis import analyze_fx_gemms
 
 
 class HeadBlock(torch.nn.Module):
@@ -34,20 +33,18 @@ def main():
     torch.manual_seed(42)
     blocks = [HeadBlock().eval(), HeadBlock().eval()]
     hidden = torch.randint(-3, 4, (5, 32, 32), dtype=torch.int8)
-    projection = PIMConfig(16, 16, 32, 1, 1, 1, 5, 1, 1, 2, 2, 1)
-    batched = PIMConfig(16, 16, 32, 1, 1, 1, 1, 1, 1, 2, 2, 1)
-    plans = []
-    example = hidden
-    for index, block in enumerate(blocks):
-        exported = torch.export.export(block, (example,))
-        configs = {gemm.node: PIMTorchConfig(config=projection if gemm.mnk[0] == 160 else batched)
-                   for gemm in analyze_fx_gemms(exported)}
-        plans.append(build_layer_plan(exported, (example,), configs=configs, index=index))
-        example = block(example)
+    configs = {
+        (160, 32, 32): PIMConfig(16, 16, 32, 1, 1, 1, 5, 1, 1, 2, 2, 1),
+        (32, 32, 32): PIMConfig(16, 16, 32, 1, 1, 1, 1, 1, 1, 2, 2, 1),
+    }
+
+    def configure(gemms, spec):
+        return {gemm.node: PIMTorchConfig(spec=spec, config=configs[gemm.mnk])
+                for gemm in gemms}
 
     with PIMSession(target_spec("upmem", num_units=8, nr_tasklets=16)) as session:
         start = time.perf_counter()
-        session.prepare(plans)
+        plans = session.prepare(blocks, (hidden,), configure=configure)
         print(f"prepare_ms={(time.perf_counter() - start) * 1000:.3f}")
         for plan in plans:
             print(f"layer={plan.index} stages=" + str([

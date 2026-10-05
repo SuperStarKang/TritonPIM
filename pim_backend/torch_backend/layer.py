@@ -54,17 +54,19 @@ class LayerPlan:
     stages: tuple = ()
     example_inputs: tuple = ()
     weight_bytes_per_unit: int = 0
+    exported_graph: fx.GraphModule | None = None
 
-    def plan_model(self, session):
+    def plan_model(self, spec, runtime):
+        self.spec = spec
         for stage in self.stages:
-            stage.prepare(session.spec, session.backend.model)
-        self.spec = session.spec
+            stage.prepare(spec, runtime)
 
     def compile_cpu(self):
         from .model import CompileModelCPU
 
         leaves, _ = _pytree.tree_flatten((self.example_inputs, {}))
-        CompileModelCPU(self.graph).run(*leaves)
+        outputs = CompileModelCPU(self.graph).run(*leaves)
+        return _pytree.tree_unflatten(list(outputs), self.output_spec)
 
     def run_model(self, *inputs):
         leaves, _ = _pytree.tree_flatten((inputs, {}))

@@ -110,6 +110,7 @@ class CompileModelCPU(fx.Interpreter):
 def build_layer_plan(exported_program, example_inputs, *, configs, index):
     """Analyze one exported block without compiling it or acquiring hardware.
 
+    PIMSession.prepare calls this after opening the device resources.
     configs maps original GEMM names to PIMTorchConfig. Independent activation
     GEMMs of the same shape/config are grouped; weight GEMMs remain stationary
     single-instance stages. aten.bmm uses its explicit operand batch dimension.
@@ -198,4 +199,5 @@ def build_layer_plan(exported_program, example_inputs, *, configs, index):
         tuple(_tensor_signature(value) if isinstance(value, torch.Tensor) else value for value in leaves),
         tuple(isinstance(value, torch.Tensor) for value in leaves),
         stages=tuple(stages), example_inputs=tuple(example_inputs),
+        exported_graph=exported_program.graph_module,
     )

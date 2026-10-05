@@ -229,7 +229,7 @@ calibration을 재현하지 않는다. PIMLLM의 warm-up 후 `gm.run()` 측정 �
 ## 새 LayerPlan: Attention과 Transformer 비교
 
 **내용**
-새 실험은 `build_layer_plan → PIMSession.prepare`로 준비하고 실제 UPMEM에서 실행한다.
+새 실험은 `PIMSession 진입 → prepare(Torch blocks) → LayerPlan 생성` 순서로 준비하고 실제 UPMEM에서 실행한다.
 기존 benchmark와 같은 seed, INT8 workload, 2048 DPUs, 16 tasklets를 사용한다.
 Weight를 한 번 적재한 뒤 Layer 실행만 반복 측정하며, 준비와 weight 적재 비용은 별도 기록한다.
 
@@ -310,7 +310,7 @@ Speedup은 `baseline median_wall_ms / model median_wall_ms`로 계산한다.
 
 **근거**
 - Warm-up과 별도 profile 실행은 sample median에서 제외한다.
-- Export, plan 분석, Session 준비, weight 적재, alloc/free 시간을 각각 기록한다.
+- Session 준비 시간에 FX export와 plan 분석을 포함하고, weight 적재와 alloc/free 시간은 별도로 기록한다.
 - 반복 실행에서 weight H2D=0, 추가 DPU ELF compile=0, 계획한 launch 수를 확인한다.
 - 저장된 baseline은 CPU thread 수가 48이다. 새 JSON의 `cpu_threads`, 실제 target, dtype, head 수를 함께 비교한다.
 
@@ -333,7 +333,8 @@ resource_opens=1 resource_closes=1 report=.../report.json
 | JSON 항목 | 해석 |
 |---|---|
 | `stages` | 선택한 config, instance 수, p_b, round, 실제 참여 unit 수 |
-| `preparation.prepare_ms` | Session 자원 확보 후 config/주소 확정과 PIM/CPU 컴파일 |
+| `preparation.prepare_ms` | Session 자원 확보 후 FX export/분석, config/주소 확정과 PIM/CPU 컴파일 전체 |
+| `preparation.prepare_scope` | 준비 시간에 포함된 단계 |
 | `preparation.weight_load` | 최초 weight packing/upload 시간과 전송량 |
 | `samples[].transfers` | 호출별 전송 bytes와 compile/load/launch 수 |
 | `profile.gemm_totals` | QK/PV는 instance 전체를 처리한 stage 시간 |
@@ -342,6 +343,9 @@ resource_opens=1 resource_closes=1 report=.../report.json
 | `session_totals.device_compiles` | Cache hit을 제외하고 이번 Session에서 새로 만든 ELF 수 |
 
 새 profile의 native 값은 각 stage library에서 직접 읽는다. 기존 driver의 마지막 실행 timing을 재사용하지 않는다.
+Session-first report에서는 기존 `preparation.export_ms`, `plan_ms`를 별도로 기록하지 않는다.
+이전 model report와 준비 비용을 비교할 때는 이전의 `export_ms + plan_ms + prepare_ms`와 새 `prepare_ms`를 비교한다.
+반복 실행의 `median_wall_ms` 측정 범위는 동일하게 weight 적재 이후의 Layer 실행이다.
 Generated model host의 `native_ms.kernel`에는 DPU 활성 metadata 전송이 포함되고,
 프로그램 load는 native timing 바깥의 partition wall time에 포함된다.
 따라서 기존 resident v4의 `kernel/program_load/resident_host` 필드와 동일한 경계로 해석하지 않는다.

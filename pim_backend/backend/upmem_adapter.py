@@ -239,18 +239,16 @@ class UPMEMAdapter:
                 totals[name] += value
         return totals
 
-    def prepare_model(self, plans, session):
+    def begin_model(self):
         from .upmem_model import UPMEMModelRuntime
 
         if self.runtime is not None or self.model is not None:
             raise RuntimeError("prepare one model per session; legacy resident layers cannot share it")
         self.model = UPMEMModelRuntime(self)
-        for plan in plans:
-            plan.plan_model(session)
-        self.model.place(plans, session.spec.common_profile.bank_capacity_limit_bytes,
-                         session.num_units)
-        for plan in plans:
-            plan.compile_cpu()
+
+    def prepare_model(self, plans):
+        self.model.place(plans, self.spec.common_profile.bank_capacity_limit_bytes,
+                         self.num_units)
 
     def close(self):
         if self.cleanup is not None:

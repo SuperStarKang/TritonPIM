@@ -24,28 +24,37 @@ Device는 모델 시작에 한 번 확보하고 Session 종료에 한 번 해제
 ## 준비 과정
 
 **내용**
-논리 분석은 자원 확보 전에 가능하다. Config는 Session이 실제 확보한 자원으로 선택한다.
-LayerPlan의 메모리 요구량으로 Session이 주소를 배정한 뒤 최종 device artifact를 준비한다.
+Session이 먼저 Device를 확보한 뒤 Torch block을 FX로 분석하고 LayerPlan을 생성한다.
+LayerPlan은 전달받은 실제 자원으로 config를 선택하고 CPU/PIM 구간을 준비한다.
+전체 Layer의 메모리 요구량을 모은 뒤 Session의 adapter가 주소와 최종 device artifact를 확정한다.
 컴파일과 고정 buffer 준비는 반복 실행 경로에서 수행하지 않는다.
 
 **근거**
 - Execution Tile 크기가 local layout과 MRAM 사용량을 정한다.
 - 모델 전체 저장 공간의 소유자는 Session이다.
+- Device 확보와 tensor 주소 배정은 별도 단계다. 공용 주소를 정하려면 전체 Layer의 요구량이 필요하다.
 
 **예시**
 
 ```text
-FX 분석 → LayerPlan 목록
-                 │
-PIMSession.open: Device alloc / 실제 자원 조회
-                 │
-Layer별 CPU/PIM 분할 / config / p_b / round 결정
-                 │
-Session의 Weight/KV/scratch 배치
-                 │
-Layer별 binding / CPU 및 PIM 컴파일
-                 │
-모델 반복 실행
+PIMSession 진입: Device alloc / 실제 자원 조회
+    │
+session.prepare(torch_blocks, example_inputs, configure=...)
+    │
+    ├─ adapter.begin_model: 타깃 실행 상태 생성
+    │
+    ├─ Layer별 준비
+    │    ├─ FX 분석 → LayerPlan 생성
+    │    ├─ CPU/PIM 분할 / config / Execution Tile / p_b / round
+    │    ├─ PIM 컴파일 준비: buffer 요구량 확보
+    │    └─ CPU 컴파일 준비 출력 → 다음 Layer의 예제 입력
+    │
+    └─ adapter.prepare_model
+         └─ 전체 Layer의 Weight/scratch 배치 / 최종 ELF / native binding
+    │
+session.run_model: 준비한 Layer들을 순서대로 실행
+    │
+Session 종료: Device free
 ```
 
 ## Execution Tile과 Batch GEMM
@@ -83,6 +92,8 @@ batch round
 첫 BMM은 p_k=1이다. p_k=1이어도 K가 Execution Tile보다 크면 K round가 필요하다.
 Physical DPU 번호를 head 내부 좌표로 직접 해석하지 않고 배정표를 사용한다.
 마지막 batch의 빈 배정은 device에서 계산하지 않으며 출력 복원에서 제외한다.
+DPU 하나는 해당 M/N/K round에 배정된 Execution Tile을 처리한다. Round가 여러 개이면
+같은 DPU가 다음 tile의 데이터를 받아 동일 프로그램으로 계산한다.
 
 ## Layer와 전체 모델 실행
 
@@ -207,8 +218,9 @@ MoE는 고정 expert placement, capacity 기반 token packing과 출력 복원�
 ## 추가한 API와 실행 규칙
 
 **내용**
-`build_layer_plan()`은 block 하나를 분석하며 device를 확보하거나 컴파일하지 않는다.
-`PIMSession.prepare()`에서 실제 DPU 수를 사용하여 모든 Layer를 준비한다.
+`PIMSession.prepare()`는 열린 Session 안에서 Torch block들을 받아 FX 분석과 LayerPlan 생성을 수행한다.
+내부 분석 함수 `build_layer_plan()`은 device를 확보하거나 컴파일하지 않는다.
+LayerPlan은 Session이 전달한 target spec과 runtime으로 config 및 batch 배정을 준비한다.
 `run_model()`은 준비된 Layer 목록을 순서대로 실행하며 tuple 출력은 다음 Layer의 positional 입력으로 전달한다.
 
 **근거**
@@ -219,34 +231,42 @@ MoE는 고정 expert placement, capacity 기반 token packing과 출력 복원�
 **예시**
 
 ```python
-import torch
+from torch_backend import PIMSession, PIMTorchConfig, target_spec
 
-from torch_backend import PIMSession, PIMTorchConfig, build_layer_plan, target_spec
-from torch_backend.fx_analysis import analyze_fx_gemms
 
-exported = torch.export.export(block, example_inputs)
-configs = {
-    gemm.node: PIMTorchConfig(config=gemm_configs[gemm.node])
-    for gemm in analyze_fx_gemms(exported, allow_bmm=True)
-}
-plan = build_layer_plan(exported, example_inputs, configs=configs, index=0)
+def configure(gemms, spec):
+    return {
+        gemm.node: PIMTorchConfig(spec=spec, config=gemm_configs[gemm.mnk])
+        for gemm in gemms
+    }
+
 
 with PIMSession(target_spec("upmem", num_units=512, nr_tasklets=16)) as session:
-    session.prepare([plan])
+    plans = session.prepare(blocks, example_inputs, configure=configure)
     output = session.run_model(*inputs)
 ```
+
+`blocks`는 실행 순서의 Torch module 목록이고 `example_inputs`는 첫 block의 입력 tuple이다.
+`configure`는 실제 확보한 spec을 받아 GEMM별 명시적 config 또는 autotune cache 설정을 제공한다.
+위 예제의 `gemm_configs`는 `(M, N, K)`별 config 사전이다. 후보 선택과 batch 배정은 LayerPlan에서 수행한다.
+반환값 `plans`는 `session.layers`와 같은 tuple이며 index는 입력 block 순서대로 부여한다.
 
 | 준비 또는 실행 단계 | 실제 동작 |
 |---|---|
 | Session 진입 | DPU alloc 1회, SDK의 실제 확보 수 조회 |
-| Layer 분석 | 독립적인 동일 shape/dtype/config GEMM을 같은 의존성 깊이에서 묶음 |
+| Layer 분석 | Session 안에서 FX export 후 독립적인 동일 shape/dtype/config GEMM을 같은 의존성 깊이에서 묶음 |
 | Config 선택 | 명시한 config 또는 기존 cache records 중 `batch_rounds × total_ms` 최소값 |
+| 다음 Layer 입력 | CPU 컴파일 준비에서 계산한 출력을 다음 block의 예제 입력으로 전달 |
 | 메모리 배치 | 모델에서 가장 큰 Layer weight 영역 + 공용 입력/output scratch |
 | 컴파일 | 기존 GEMM template/packing 사용, 모델용 host entry와 주소가 확정된 ELF 생성 |
 | Layer 진입 | 해당 Layer의 모든 PIM weight slot을 한 번씩 업로드 |
 | Layer 내부 | CPU Inductor 구간과 native GEMM 구간 실행, weight H2D 생략 |
 | Batch round | 동일 프로그램 유지, instance별 입력 전송과 결과 회수 |
 | Session 종료 | Host staging과 DPU 해제 |
+
+Session이 공통 준비 순서를 제어하고 adapter는 타깃 실행 상태와 물리 배치만 관리한다.
+LayerPlan은 Session 객체 내부를 조회하지 않고 전달받은 spec과 runtime을 사용한다.
+`LayerPlan.exported_graph`는 benchmark의 원본 FX 그림 출력에 사용하며, 실행에는 분할된 `graph`를 사용한다.
 
 ## 현재 구현 범위와 후속 작업
 
@@ -282,11 +302,11 @@ KV API는 exported graph에 append/read 연산을 자동 삽입하지 않는다.
 
 **내용**
 아래 명령은 사용자가 기존 TritonPIM 환경에서 실행한다. 이 변경 작성 과정에서는 빌드·테스트를 실행하지 않았다.
-Python 테스트는 FX 계획과 Session 수명을, mock SDK 테스트는 생성된 host 코드와 native 배정·전송을 검증한다.
-장비 예제는 두 Layer의 정수 GEMM 출력과 실제 launch 수를 확인한다.
+`test_layer_bmm.py`는 FX 계획을, `test_model_session.py`는 실제 UPMEM에서 Session 수명과 Layer 실행을 검증한다.
+Session 테스트와 장비 예제에는 설정된 SDK와 8개 이상의 사용 가능한 DPU가 필요하다.
 
 **근거**
-- Mock device는 벡터 덧셈만 수행하므로 실제 DPU GEMM 정확성은 장비 예제로 따로 확인해야 한다.
+- Session 테스트는 실제 backend를 사용하며 자원 확보 후 config 전달, 다음 Layer 입력 연결과 GEMM 결과를 확인한다.
 - Device compile/load/launch 횟수는 다른 사건이므로 `session.stats()`에서 구분한다.
 - 여러 M/N/K round의 GEMM 정확성과 2048-DPU 대규모 성능 측정은 별도 장비 검증이 남아 있다.
 
@@ -298,10 +318,9 @@ Python 테스트는 FX 계획과 Session 수명을, mock SDK 테스트는 생성
 cmake --build triton/build/cmake.linux-x86_64-cpython-3.12 \
   --target triton-shared-opt triton-shared-translate
 
-python -m pytest triton_shared/pim_backend/torch_backend/tests -q
+python -m pytest triton_shared/pim_backend/torch_backend/tests/test_layer_bmm.py -q
 
-cmake --build triton/build/cmake.linux-x86_64-cpython-3.12 \
-  --target check-triton-shared-lit-tests
+python -m pytest triton_shared/pim_backend/torch_backend/tests/test_model_session.py -q
 
 python triton_shared/pim_backend/torch_backend/examples/torch_model_session.py
 ```
@@ -309,8 +328,8 @@ python triton_shared/pim_backend/torch_backend/examples/torch_model_session.py
 | 검증 | 기대 결과 |
 |---|---|
 | Python planner | 2048/512 DPU 예제 배정, 후보 비용 비교, QK/PV 의존성 유지 |
-| Python Session | 실제 자원 수 사용, alloc/free 각 1회, 여러 Layer와 KV 보존 |
-| `model_host.mlir` | 전체/부분 DPU 집합, 마지막 batch, mapping 변경, 입력 변경, weight 유지 |
+| UPMEM Session | 실제 자원 수 사용, alloc/free 각 1회, 여러 Layer와 KV 보존 |
+| UPMEM Session | 준비 중 launch 없음, CPU tuple 출력의 다음 Layer 입력 연결 |
 | 장비 예제 | Layer마다 stage `(H,p_b,R_b) = (1,1,1), (5,2,3)` |
 | 장비 예제 | 모델 호출마다 `exact_match=True launches=8`, 동일 입력 buffer의 내용 변경 반영 |
 | 장비 예제 | 두 Layer의 weight H2D 합계 4096 bytes/call, Layer 내부 재전송 없음 |
@@ -325,4 +344,6 @@ resource_opens / resource_closes: DPU 집합 확보/해제 횟수
 ```
 
 `device_compiles`는 Torch/MLIR/host compiler 호출 전체를 세는 값이 아니다.
-장비 예제의 `prepare_ms`, `latency_ms`는 host wall time이며 성능 개선을 입증하는 benchmark 결과는 아직 없다.
+장비 예제의 `prepare_ms`, `latency_ms`는 host wall time이다.
+Session-first 경로의 `prepare_ms`에는 FX export와 LayerPlan 분석도 포함된다.
+새 준비 순서의 성능 영향은 별도 장비 측정으로 확인한다.
