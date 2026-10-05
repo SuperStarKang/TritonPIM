@@ -37,6 +37,29 @@ CPU float32 또는 int32 C[M,N]
 Tensor device는 계속 CPU다. PIM은 tensor device가 아니라 이 template의 compile 및
 execution backend다.
 
+## 모델 단위 Session 실행
+
+`build_layer_plan()`은 Transformer/MoE block 하나의 논리 그래프를 분석하고,
+`PIMSession.prepare()`는 실제 DPU 확보 후 config, batch 배정, 공통 주소와 컴파일을 확정한다.
+`run_model()`은 Layer 진입 시 weight를 올리고 준비한 CPU/PIM 구간을 순서대로 실행한다.
+동일 형태의 독립 activation GEMM과 FP32 `aten.bmm`은 하나의 native batch 실행으로 묶는다.
+
+```python
+plan = build_layer_plan(exported_block, example_inputs, configs=configs, index=0)
+with PIMSession(target_spec("upmem", num_units=512, nr_tasklets=16)) as session:
+    session.prepare([plan])
+    output = session.run_model(*inputs)
+```
+
+`configs`는 원본 FX GEMM 이름을 `PIMTorchConfig`에 연결한다. 새 모델 경로에서는 직접 지정한
+config 또는 실제 자원 수에 해당하는 autotune 측정 records가 필요하다.
+Activation/ready table은 만들지 않는다. Weight는 현재 Layer만 device에 상주하며,
+KV API는 우선 CPU 저장소를 제공한다. 정적 shape, UPMEM, `p_k=1`, 동기 실행을 지원한다.
+Resident weight GEMM은 단일 instance·단일 M/N/K round로 제한한다.
+
+설계·상세 범위·검증 명령은 [모델 runtime 설계](../../design/ModelRuntime_Design.md),
+실행 예제는 [torch_model_session.py](examples/torch_model_session.py)를 참고한다.
+
 FX graph 전체의 weight를 UPMEM에 유지하는 별도 실행 경로는
 [ResidentBlock 사용법](RESIDENT.md)을 참고한다. 기존 lowering을 유지하며,
 모든 weight가 같은 전체 DPU 집합과 공용 입력·출력 scratch를 사용한다.
@@ -58,7 +81,8 @@ Attention kernel, projection을 포함한 Attention layer, FFN을 포함한 Tran
 
 ## Common IR configuration
 
-Torch integration은 별도 실행 plan을 만들지 않는다.
+일반 GEMM lowering의 3계층 정보는 기존 Common IR config를 사용한다.
+모델 경로의 `LayerPlan`은 이 정보에 CPU/PIM 순서와 instance 배정을 연결한다.
 
 | 값 | 소유자 |
 |---|---|

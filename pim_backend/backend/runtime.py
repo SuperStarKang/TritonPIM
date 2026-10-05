@@ -2,7 +2,7 @@
 
 from contextlib import ExitStack
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from threading import RLock, get_ident
 import time
 from typing import Protocol
@@ -15,9 +15,12 @@ resident_lock = RLock()
 
 
 class RuntimeBackend(Protocol):
-    """Synchronous adapter contract.
+    """Synchronous adapter contract for model and legacy layer execution.
 
-    compile_invocation/finalize_plan must not allocate device resources or
+    open exposes the actual num_units. prepare_model binds the model's plans
+    to those resources and creates their shared weight/scratch address layout.
+
+    Legacy compile_invocation/finalize_plan must not allocate device resources or
     perform transfers. load_layer replaces the previous placement on the same
     resources and returns timing fields in milliseconds. invocation returns a
     context manager; stats contains cumulative transfer bytes and launch counts
@@ -30,6 +33,8 @@ class RuntimeBackend(Protocol):
     def compile_invocation(self, kernel, physical_inputs): ...
     def finalize_plan(self, plan): ...
     def open(self): ...
+    num_units: int
+    def prepare_model(self, plans, session): ...
     def load_layer(self, plan): ...
     def begin_run(self, plan): ...
     def invocation(self, kernel, physical_inputs): ...
@@ -55,12 +60,10 @@ class ExecutionToken:
 
 
 class PIMSession:
-    """Own resources until close; tokens order weight loads and layer executions.
+    """Own model resources, layer weights and KV storage until close.
 
-    Compilation is performed separately by compile_layer. The runtime FX graph
-    orders load_weights and run_layer through explicit completion tokens.
-    A completion token can also execute the same resident plan again.
-    A session is synchronous and belongs to the thread that opened it.
+    prepare/run_model use session-bound LayerPlans without completion tokens.
+    start/load_weights/run_layer retain the legacy compiled-layer API.
     """
 
     def __init__(self, spec):
@@ -73,6 +76,10 @@ class PIMSession:
         self.records = []
         self.open_ms = 0.0
         self.close_ms = 0.0
+        self.layers = ()
+        self.weight_table = {}
+        self.kv_table = {}
+        self.loaded_layer = None
 
     def __enter__(self):
         if self.phase != "new" or current_session.get() is not None:
@@ -86,9 +93,81 @@ class PIMSession:
             cleanup.callback(current_session.reset, token)
             self.cleanup = cleanup.pop_all()
         self.thread = get_ident()
+        self.num_units = self.backend.num_units
+        self.spec = replace(self.spec, common_profile=replace(
+            self.spec.common_profile, num_units=self.num_units))
+        self.backend.spec = self.spec
         self.phase = "idle"
         self.open_ms = (time.perf_counter_ns() - start) / 1e6
         return self
+
+    def prepare(self, plans):
+        """Plan and compile all blocks after acquiring the model's physical units."""
+        from .resident import WEIGHT
+
+        self._check_owner()
+        self.layers = tuple(plans)
+        if not self.layers:
+            raise ValueError("a model requires at least one layer")
+        if len({plan.index for plan in self.layers}) != len(self.layers):
+            raise ValueError("model layer indices must be unique")
+        self.backend.prepare_model(self.layers, self)
+        for plan in self.layers:
+            for stage in plan.stages:
+                for binding in stage.bindings:
+                    if binding.role == WEIGHT:
+                        self.weight_table[(plan.index, stage.name, binding.operand)] = {
+                            "tensor": stage.weights[binding.operand],
+                            "address": stage.addresses[binding.symbol],
+                            "bytes_per_unit": binding.size,
+                            "mapping": stage.physical_mapping,
+                        }
+
+    @property
+    def loaded_program(self):
+        return self.backend.model.loaded_program
+
+    def run_model(self, *inputs):
+        """Chain prepared blocks; tuple outputs become the next block's inputs."""
+        self._check_owner()
+        if not self.layers:
+            raise RuntimeError("prepare the model before running it")
+        for plan in self.layers:
+            self.backend.model.load_weights(plan)
+            self.loaded_layer = plan.index
+            outputs = plan.run_model(*inputs)
+            inputs = outputs if isinstance(outputs, tuple) else (outputs,)
+        return outputs
+
+    def reserve_kv(self, layer_id, shape, dtype):
+        """Reserve CPU KV storage once; sequence capacity is the penultimate axis."""
+        import torch
+
+        self._check_owner()
+        if len(shape) < 2 or min(shape) < 1:
+            raise ValueError("KV storage requires positive shape and sequence/feature axes")
+        if layer_id in self.kv_table:
+            raise ValueError("KV storage is already reserved for this layer")
+        self.kv_table[layer_id] = {
+            "key": torch.empty(shape, dtype=dtype),
+            "value": torch.empty(shape, dtype=dtype),
+            "capacity": shape[-2],
+            "length": 0,
+        }
+
+    def append_kv(self, layer_id, key, value):
+        cache = self.kv_table[layer_id]
+        end = cache["length"] + key.shape[-2]
+        if end > cache["capacity"]:
+            raise ValueError("KV append exceeds the reserved sequence capacity")
+        cache["key"][..., cache["length"]:end, :].copy_(key)
+        cache["value"][..., cache["length"]:end, :].copy_(value)
+        cache["length"] = end
+
+    def kv_view(self, layer_id):
+        cache = self.kv_table[layer_id]
+        return (cache["key"][..., :cache["length"], :],
+                cache["value"][..., :cache["length"], :])
 
     def _check_owner(self):
         if current_session.get() is not self or get_ident() != self.thread:
@@ -174,6 +253,9 @@ class PIMSession:
         self.close_ms = (time.perf_counter_ns() - start) / 1e6
         self.phase = "closed"
         self.plan = None
+        self.layers = ()
+        self.weight_table.clear()
+        self.kv_table.clear()
 
     def __exit__(self, exception_type, exception, traceback):
         self.close()

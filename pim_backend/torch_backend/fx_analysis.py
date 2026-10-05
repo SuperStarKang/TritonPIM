@@ -68,6 +68,10 @@ class GemmInfo:
     beta: int | float
     reads_additive_input: bool
 
+    @property
+    def instance_count(self):
+        return self.output_shape[0] if self.op == "aten.bmm.default" else 1
+
 
 def _tensor(node):
     if not isinstance(node, fx.Node):
@@ -119,6 +123,7 @@ def _analyze_gemm(node, weights):
 
     is_linear = node.target == aten.linear.default
     is_integer = node.target == aten._int_mm.default
+    is_bmm = node.target == aten.bmm.default
 
     if is_linear:
         left = _operand(arguments["input"], weights)
@@ -154,10 +159,18 @@ def _analyze_gemm(node, weights):
             f"{node.name}: inputs must be {input_dtype}, "
             f"got {left.dtype} and {right.dtype}"
         )
-    if len(right.shape) != 2:
-        raise ValueError(f"{node.name}: the right operand must have rank 2")
+    if len(right.shape) != (3 if is_bmm else 2):
+        raise ValueError(f"{node.name}: the right operand has an incompatible rank")
 
-    if is_linear:
+    if is_bmm:
+        if len(left.shape) != 3 or left.shape[0] != right.shape[0]:
+            raise ValueError(f"{node.name}: bmm requires matching rank-3 batches")
+        instances, m, k = left.shape
+        n = right.shape[2]
+        if right.shape[1] != k:
+            raise ValueError(f"{node.name}: bmm reduction dimensions disagree")
+        output_shape = (instances, m, n)
+    elif is_linear:
         if len(left.shape) < 1:
             raise ValueError(f"{node.name}: linear input must have rank >= 1")
         m = math.prod(left.shape[:-1])
@@ -210,7 +223,7 @@ def _analyze_gemm(node, weights):
     )
 
 
-def analyze_fx_gemms(exported_program):
+def analyze_fx_gemms(exported_program, *, allow_bmm=False):
     if not isinstance(exported_program, torch.export.ExportedProgram):
         raise TypeError("analyze_fx_gemms requires a torch.export.ExportedProgram")
 
@@ -262,7 +275,7 @@ def analyze_fx_gemms(exported_program):
             continue
         if node.target._schema.name not in _GEMM_SCHEMAS:
             continue
-        if node.target not in _SUPPORTED_GEMMS:
+        if node.target not in _SUPPORTED_GEMMS and not (allow_bmm and node.target == aten.bmm.default):
             raise ValueError(
                 f"{node.name}: unsupported GEMM {node.target}; "
                 "decompose it into supported operations first"

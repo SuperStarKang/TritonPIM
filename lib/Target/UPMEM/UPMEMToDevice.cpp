@@ -86,7 +86,8 @@ struct DeviceEmitter {
     if (bad.wasInterrupted())
       return failure();
 
-    os() << "\nint main() {\n";
+    os() << "\n__host uint32_t _pim_model_active = 1;\n";
+    os() << "\nint main() {\n  if (!_pim_model_active) return 0;\n";
     if (failed(emitBlock(dev.getBody().front(), 1)))
       return failure();
     os() << "  return 0;\n}\n";

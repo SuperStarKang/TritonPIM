@@ -27,6 +27,7 @@ from .scheduling import PIMCombinedScheduling
 from .template import pim_gemm_template
 from .resident import ResidentBlock, ResidentGemmConfig, benchmark_resident_plans, prepare_block
 from .layer import LayerPlan, LoadLayerWeights, RunLayer, compile_layer
+from .model import build_layer_plan
 from triton.backends.pim.runtime import PIMSession
 
 __all__ = [
@@ -51,4 +52,5 @@ __all__ = [
     "LoadLayerWeights",
     "RunLayer",
     "compile_layer",
+    "build_layer_plan",
 ]

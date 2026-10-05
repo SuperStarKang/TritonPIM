@@ -225,3 +225,124 @@ TTFT execution complete: resources=1/1 launches=2272 run_weight_h2d=0 activation
 calibration을 재현하지 않는다. PIMLLM의 warm-up 후 `gm.run()` 측정 및
 전체 sequence의 lm_head 계산과 현재 요청 TTFT / last-token lm_head는 범위가
 다르므로 전체 시간 비교에서는 이 경계도 맞춰야 한다.
+
+## 새 LayerPlan: Attention과 Transformer 비교
+
+**내용**
+새 실험은 `build_layer_plan → PIMSession.prepare`로 준비하고 실제 UPMEM에서 실행한다.
+기존 benchmark와 같은 seed, INT8 workload, 2048 DPUs, 16 tasklets를 사용한다.
+Weight를 한 번 적재한 뒤 Layer 실행만 반복 측정하며, 준비와 weight 적재 비용은 별도 기록한다.
+
+**근거**
+- 기존 baseline의 `median_wall_ms`도 이미 weight가 상주한 Layer 실행 범위다.
+- `session.run_model()`은 매 호출 weight를 다시 적재하므로, 이 실험에서는 Session의 weight loader를 한 번 호출하고 준비된 `plan.run_model()`을 반복한다.
+- Transformer의 Gate/Up은 기존과 동일하게 N=11264로 계산하고 11008열만 반환한다. 추가한 padding 열의 weight는 0이며 논리 FFN 크기는 변하지 않는다.
+- Mock 실행과 자동 CPU 대체 경로는 추가하지 않는다. 기존과 마찬가지로 수치 reference 검증은 수행하지 않고 `accuracy_checked=false`로 기록한다.
+
+**예시**
+
+| 파일 | 역할 |
+|---|---|
+| [model_benchmark_common.py](model_benchmark_common.py) | 새 Session 준비, 실행 측정, 실제 partition profile, JSON/FX 출력 |
+| [attention/benchmark_model_attention_kernel.py](attention/benchmark_model_attention_kernel.py) | 1/32-head Attention; 동일 workload의 legacy/model 선택 |
+| [transformer/benchmark_model_transformer_block.py](transformer/benchmark_model_transformer_block.py) | 7개 resident projection과 batched QK/PV를 포함한 Transformer |
+
+기존 baseline을 실행한 동일한 장비 환경에서, `examples/` 기준으로 실행한다.
+기본 반복은 warm-up 3회와 sample 10회다. 각 명령은 별도 프로세스로 실행한다.
+
+```bash
+# 이미 측정한 baseline_kernel_1head와 비교: 같은 head 수와 GEMM config
+python attention/benchmark_model_attention_kernel.py \
+  --heads 1 --gemm-config baseline --warmup 3 --repeat 10 \
+  --report-dir attention/model_kernel_1head
+
+# 이미 측정한 baseline_block과 비교: 32 heads를 묶는 config
+python transformer/benchmark_model_transformer_block.py \
+  --gemm-config batched --warmup 3 --repeat 10 \
+  --report-dir transformer/model_block_batched
+
+# Config 변경 효과를 분리하는 대조군: 새 runtime + 기존 GEMM config
+python transformer/benchmark_model_transformer_block.py \
+  --gemm-config baseline --warmup 3 --repeat 10 \
+  --report-dir transformer/model_block_same_config
+```
+
+`--gemm-config baseline`은 새 runtime에서도 head 하나에 2048 DPUs를 쓴다.
+`batched`는 head 하나에 64 DPUs를 배정하고 32 heads를 한 batch round에 처리한다.
+Projection config와 물리 padding은 두 설정에서 같다.
+
+## 32-head Attention batching 실험
+
+**내용**
+Head batching 효과는 32-head legacy와 32-head model을 비교한다.
+이미 측정한 1-head latency를 32-head latency와 직접 비교하지 않는다.
+`--runtime legacy`는 기존 실제 UPMEM benchmark 함수를 동일한 32-head 입력으로 호출한다.
+
+**근거**
+- 두 경로 모두 `AttentionKernel(32)`와 seed=0의 같은 입력을 사용한다.
+- 새 config는 QK와 PV 각각 하나의 batch round를 구성한다. 아래 후보는 최적값으로 측정된 설정이 아니다.
+
+**예시**
+
+```bash
+python attention/benchmark_model_attention_kernel.py \
+  --runtime legacy --heads 32 --gemm-config baseline \
+  --report-dir attention/baseline_kernel_32heads
+
+python attention/benchmark_model_attention_kernel.py \
+  --runtime model --heads 32 --gemm-config batched \
+  --report-dir attention/model_kernel_32heads
+```
+
+Block=(16,16,32), Group=(1,1,1), p=(8,8,1), p_b=32일 때:
+
+| Stage | Tile | Execution Tile | Launch 수 |
+|---|---|---|---:|
+| QK | (8,8,4) | (128,128,128) | 1 |
+| PV | (8,1,32) | (128,16,1024) | 1 |
+
+## 결과 비교와 검증 상태
+
+**내용**
+각 결과 디렉터리의 `report.json`에서 `median_wall_ms`를 비교한다.
+Speedup은 `baseline median_wall_ms / model median_wall_ms`로 계산한다.
+이 실험 코드 작성 과정에서는 빌드·실행을 하지 않았다. 아래 값은 실행 시 확인할 기대값이다.
+
+**근거**
+- Warm-up과 별도 profile 실행은 sample median에서 제외한다.
+- Export, plan 분석, Session 준비, weight 적재, alloc/free 시간을 각각 기록한다.
+- 반복 실행에서 weight H2D=0, 추가 DPU ELF compile=0, 계획한 launch 수를 확인한다.
+- 저장된 baseline은 CPU thread 수가 48이다. 새 JSON의 `cpu_threads`, 실제 target, dtype, head 수를 함께 비교한다.
+
+**예시**
+
+| 실험 | 실행당 기대 launch 수 | 비교할 baseline |
+|---|---:|---|
+| 새 runtime, 1-head, baseline config | 2 | `attention/baseline_kernel_1head/report.json` |
+| 새 runtime, Transformer, baseline config | 71 | `transformer/baseline_block/report.json` |
+| 새 runtime, Transformer, batched config | 9 | 같은 Transformer baseline |
+| Legacy 32-head Attention | 64 | 새로 측정 |
+| Model 32-head Attention, batched config | 2 | Legacy 32-head Attention |
+
+```text
+sample=0 wall_ms=... weight_h2d=0 activation_h2d=... launches=9 program_loads=...
+transformer_block: median_wall_ms=... launches=9 logical_GEMM_GOPS=...
+resource_opens=1 resource_closes=1 report=.../report.json
+```
+
+| JSON 항목 | 해석 |
+|---|---|
+| `stages` | 선택한 config, instance 수, p_b, round, 실제 참여 unit 수 |
+| `preparation.prepare_ms` | Session 자원 확보 후 config/주소 확정과 PIM/CPU 컴파일 |
+| `preparation.weight_load` | 최초 weight packing/upload 시간과 전송량 |
+| `samples[].transfers` | 호출별 전송 bytes와 compile/load/launch 수 |
+| `profile.gemm_totals` | QK/PV는 instance 전체를 처리한 stage 시간 |
+| `profile.partitions` | 실제 CPU/PIM partition별 wall time과 native timing |
+| `unique_device_artifacts` | 준비된 stage들이 사용하는 고유 ELF 경로 수 |
+| `session_totals.device_compiles` | Cache hit을 제외하고 이번 Session에서 새로 만든 ELF 수 |
+
+새 profile의 native 값은 각 stage library에서 직접 읽는다. 기존 driver의 마지막 실행 timing을 재사용하지 않는다.
+Generated model host의 `native_ms.kernel`에는 DPU 활성 metadata 전송이 포함되고,
+프로그램 load는 native timing 바깥의 partition wall time에 포함된다.
+따라서 기존 resident v4의 `kernel/program_load/resident_host` 필드와 동일한 경계로 해석하지 않는다.
+전체 효과는 우선 `median_wall_ms`, stage wall time, 전송 bytes로 비교한다.

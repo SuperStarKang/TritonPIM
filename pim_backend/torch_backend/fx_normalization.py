@@ -36,10 +36,10 @@ def _decompose_addmm(self, mat1, mat2, *, beta=1, alpha=1):
     return output + beta * self
 
 
-def normalize_fx_gemms(exported_program):
+def normalize_fx_gemms(exported_program, *, allow_bmm=False):
     originals = {
         gemm.node: gemm
-        for gemm in analyze_fx_gemms(exported_program)
+        for gemm in analyze_fx_gemms(exported_program, allow_bmm=allow_bmm)
     }
 
     graph = fx.Graph()
@@ -78,9 +78,9 @@ def normalize_fx_gemms(exported_program):
     mappings = []
     matched_sources = set()
 
-    for gemm in analyze_fx_gemms(normalized_program):
+    for gemm in analyze_fx_gemms(normalized_program, allow_bmm=allow_bmm):
         node = normalized_nodes[gemm.node]
-        if node.target not in (aten.mm.default, aten._int_mm.default):
+        if node.target not in (aten.mm.default, aten._int_mm.default, aten.bmm.default):
             raise ValueError(f"{node.name}: GEMM normalization was incomplete")
 
         if (
@@ -103,6 +103,7 @@ def normalize_fx_gemms(exported_program):
             or gemm.right.dtype != original.right.dtype
             or gemm.output_dtype != original.output_dtype
             or gemm.accumulator_dtype != original.accumulator_dtype
+            or gemm.instance_count != original.instance_count
         ):
             raise ValueError(
                 f"{source_name}: GEMM dimensions or dtype changed"
