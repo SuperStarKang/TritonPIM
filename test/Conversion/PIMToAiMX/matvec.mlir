@@ -9,9 +9,9 @@
 // IR: aimx.foreach_device {{.*}} counts [2, 1, 1]
 // IR: scf.execute_region no_inline
 // IR: aimx.build_descriptors @mv_device0_matvec_
-// IR: aimx.stage {{.*}} group_rows [96, 256] group_cols [1, 4096]
+// IR: aimx.stage {{.*}}group_layout = array<i64: 96, 1, 256, 512, 1, 1>
 // IR: aimx.invoke
-// IR: aimx.unstage {{.*}} group_cols [1, 4096]
+// IR: aimx.unstage {{.*}}group_layout = array<i64: 8, 1, 8, 512, 1, 1>
 // STUB: aimx_runtime_init(AIMX_BASE_FPGA, 2)
 // STUB: aimx_resident_acquire(AIMX_KERNEL_KEY ":site0", _fpga,
 // STUB: if (!_resident->ready) {

@@ -23,7 +23,7 @@
 // IR: scf.for
 // IR: aimx.build_descriptors
 // IR: aimx.stage %arg0 origin[%arg4, %arg5] sizes[%[[ROWS]], %[[COLS]]]
-// IR-SAME: group_cols [8, 4096]
+// IR-SAME: group_layout = array<i64: 2, 8, 2, 4096, 2, 2>
 // IR: aimx.invoke
 // IR: aimx.unstage {{.*}} sizes[%[[ROWS]], %[[COLS]]]
 // IR-NOT: aimx.invoke

@@ -284,6 +284,7 @@ class PIMBenchmarkResult:
     total_ms: float
     correctness: bool = True
     timings: tuple = ()
+    physical_allocations: tuple = ()
 
     @property
     def ok(self):

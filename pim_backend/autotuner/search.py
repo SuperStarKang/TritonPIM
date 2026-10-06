@@ -3,7 +3,7 @@
 import math
 import random
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -16,7 +16,7 @@ from .features import (
 from .forest import RandomForestClassifier
 from .space import axis_values, build_config_space, heuristic_seeds, make_config
 from .space import structured_valid_configs
-from .types import PIMBenchmarkResult, pim_hierarchy
+from .types import PIMBenchmarkResult, ceil_div, pim_hierarchy
 
 
 @dataclass
@@ -223,6 +223,11 @@ def tune(problem, target, benchmark_fn, *, space=None, cache=None,
         if hit is not None:
             config, result = hit
             features = extract_features(problem, target, config)
+            if result.physical_allocations:
+                features = replace(features, unit_memory_pressure=max(
+                    sum(ceil_div(size, 8192) * 32 for size in plan)
+                    for plan in result.physical_allocations
+                ) / target.common_profile.bank_capacity_limit_bytes)
             record = TuningRecord(config, features, result)
             if verbose:
                 print(
@@ -282,6 +287,11 @@ def tune(problem, target, benchmark_fn, *, space=None, cache=None,
         else:
             result = PIMBenchmarkResult(**stored)
             source = " (cache)"
+        if result.physical_allocations:
+            features = replace(features, unit_memory_pressure=max(
+                sum(ceil_div(size, 8192) * 32 for size in plan)
+                for plan in result.physical_allocations
+            ) / target.common_profile.bank_capacity_limit_bytes)
         record = TuningRecord(config, features, result)
         records.append(record)
         if verbose:

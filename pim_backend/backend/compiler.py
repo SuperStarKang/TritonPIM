@@ -236,9 +236,17 @@ def _aimx_to_artifact(aimx_ir: str, metadata, options) -> bytes:
     if not match:
         raise RuntimeError("generated AiMX stub에서 진입 함수를 찾지 못함")
     metadata["name"] = match.group(1)
+    allocations = [
+        [int(size.strip()) for size in sizes.split(",")]
+        for sizes in re.findall(r'aimx\.allocations\s*=\s*array<i64:\s*([^>]+)>', aimx_ir)
+    ]
+    if not allocations:
+        raise RuntimeError("AiMX target IR에 물리 allocation 계획이 없습니다")
+    metadata["aimx_allocations"] = allocations
     # base_fpga는 컴파일이 아니라 빌드 때 -D로 들어간다. launcher가 읽도록 번들에 싣는다.
     return json.dumps({"stub": stub_src, "descriptors": descriptors,
-                       "base_fpga": options.base_fpga}).encode("utf-8")
+                       "base_fpga": options.base_fpga,
+                       "allocations": allocations}).encode("utf-8")
 
 
 @dataclass(frozen=True)
@@ -390,8 +398,8 @@ class PIMBackend(BaseBackend):
 
     @functools.lru_cache()
     def hash(self):
-        # Regenerate artifacts when the Common/UPMEM execution plan changes.
-        return f"{self.target}-pim-common-ir-v9-device-mapping-host-pools-host-plan-shared-over-input-reuse-upmem-metadata-v2-rhs-row-major-v1-timing-v3"
+        # Regenerate artifacts when a target's execution or allocation plan changes.
+        return f"{self.target}-pim-common-ir-v9-device-mapping-host-pools-host-plan-shared-over-input-reuse-upmem-metadata-v2-rhs-row-major-v1-timing-v3-aimx-contiguous-groups-v2-vacc-reduction"
 
     def get_module_map(self) -> Dict[str, ModuleType]:
         return {}

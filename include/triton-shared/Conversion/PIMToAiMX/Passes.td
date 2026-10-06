@@ -11,9 +11,12 @@ def ConvertPIMToAiMX : Pass<"convert-pim-to-aimx", "mlir::ModuleOp"> {
     sequences in the same pass that places its buffers. There is no intermediate
     compute template, kernel-kind classification, or second lowering pass.
 
-    Tensor loop-carried state and intermediate results use physical buffers.
-    Matmul/matvec and identity-map parallel add/sub/mul graphs compose through
-    those buffers. Common operations without a target implementation fail;
+    Pure zero-initialized matmul reductions keep each output microtile in vACC
+    across all K groups of the same execution tile. All Arel panels are prepared
+    before MAC begins; C drains once per output microtile. Other loop-carried
+    state and intermediate results use physical buffers. Matmul/matvec and
+    identity-map parallel add/sub/mul graphs compose through those buffers.
+    Common operations without a target implementation fail;
     neither the translator nor the runtime executes Common computations.
 
     Rectangular valid masks on single-resident-group axes lower to staging

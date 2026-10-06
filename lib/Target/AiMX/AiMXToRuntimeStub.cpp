@@ -199,6 +199,12 @@ struct StubEmitter {
       return success();
     if (isa<aimx::AcquireOp>(op))
       return success(); // The acquired range is initialized once at entry.
+    if (auto require = dyn_cast<aimx::RequireOp>(op)) {
+      e.indent(depth);
+      os() << "aimx_require(" << e.name(require.getCondition()) << ", "
+           << require.getMessageAttr() << ");\n";
+      return success();
+    }
     if (auto global = dyn_cast<memref::GetGlobalOp>(op)) {
       e.bind(global.getResult(), ("(&aimx_data_" + global.getName() + ")").str());
       return success();
@@ -738,7 +744,69 @@ struct StubEmitter {
          << bytes << "u <= (size_t)" << b.bytes
          << "ull, \"the problem does not fit the PIM DRAM buffer "
          << "chosen at compile time — raise tile-k or tile-n\");\n";
-    if (!gRows && !gCols) {
+    if (auto packed = op.getGroupLayoutAttr()) {
+      auto shape = packed.asArrayRef();
+      int64_t ur = shape[0], uc = shape[1], pr = shape[2], pc = shape[3];
+      int64_t rowGroups = shape[4], colGroups = shape[5];
+      std::string gr = e.temp("_gr"), gc = e.temp("_gc");
+      std::string validRows = e.temp("_vr"), validCols = e.temp("_vc");
+      std::string panel = e.temp("_panel");
+      e.indent(pd + 1);
+      os() << "aimx_require(" << rows << " <= " << ur * rowGroups << "ll && "
+           << cols << " <= " << uc * colGroups << "ll && " << padRows << " == "
+           << pr * rowGroups << "ll && " << pitch << " == " << pc * colGroups
+           << "ll, \"stage does not match the contiguous group layout\");\n";
+      e.indent(pd + 1);
+      os() << "uint16_t *" << base << " = (uint16_t*)" << host << ";\n";
+      e.indent(pd + 1);
+      os() << "for (int64_t " << gr << " = 0; " << gr << " < " << rowGroups
+           << "ll; ++" << gr << ") {\n";
+      e.indent(pd + 2);
+      os() << "int64_t " << validRows << " = " << rows << " - " << gr << " * " << ur << "ll;\n";
+      e.indent(pd + 2);
+      os() << "if (" << validRows << " < 0) " << validRows << " = 0;\n";
+      e.indent(pd + 2);
+      os() << "if (" << validRows << " > " << ur << "ll) " << validRows << " = " << ur << "ll;\n";
+      e.indent(pd + 2);
+      os() << "for (int64_t " << gc << " = 0; " << gc << " < " << colGroups
+           << "ll; ++" << gc << ") {\n";
+      e.indent(pd + 3);
+      os() << "int64_t " << validCols << " = " << cols << " - " << gc << " * " << uc << "ll;\n";
+      e.indent(pd + 3);
+      os() << "if (" << validCols << " < 0) " << validCols << " = 0;\n";
+      e.indent(pd + 3);
+      os() << "if (" << validCols << " > " << uc << "ll) " << validCols << " = " << uc << "ll;\n";
+      e.indent(pd + 3);
+      os() << "uint16_t *" << panel << " = " << base << " + (" << gr << " * "
+           << colGroups << "ll + " << gc << ") * " << pr * pc << "ll;\n";
+      e.indent(pd + 3);
+      os() << "for (int64_t " << i << " = 0; " << i << " < " << validRows
+           << "; ++" << i << ") {\n";
+      e.indent(pd + 4);
+      os() << "const " << srcTy << " *" << sr << " = " << e.name(op.getSrc()) << " + "
+           << hostRow(op.getOrigin(), op.getStrides(),
+                      "(" + gr + " * " + std::to_string(ur) + "ll + " + i + ")") << ";\n";
+      e.indent(pd + 4);
+      os() << "uint16_t *" << dr << " = " << panel << " + " << i << " * " << pc << "ll;\n";
+      e.indent(pd + 4);
+      os() << "for (int64_t " << j << " = 0; " << j << " < " << validCols << "; ++" << j << ")\n";
+      e.indent(pd + 5);
+      os() << dr << "[" << j << "] = " << toBF16(srcElem, sr + "[(" + gc + " * " +
+          std::to_string(uc) + "ll + " + j + ") * " + e.name(op.getStrides()[rank - 1]) + "]") << ";\n";
+      e.indent(pd + 4);
+      os() << "memset(" << dr << " + " << validCols << ", 0, (size_t)(" << pc
+           << "ll - " << validCols << ") * " << bytes << "u);\n";
+      e.indent(pd + 3);
+      os() << "}\n";
+      e.indent(pd + 3);
+      os() << "memset(" << panel << " + " << validRows << " * " << pc
+           << "ll, 0, (size_t)(" << pr << "ll - " << validRows << ") * "
+           << pc * bytes << "ull);\n";
+      e.indent(pd + 2);
+      os() << "}\n";
+      e.indent(pd + 1);
+      os() << "}\n";
+    } else if (!gRows && !gCols) {
       // 아래 두 memset 의 길이가 여기서 음수가 아님을 확정한다. size_t 로 계산하므로
       // 어긋나면 조용히 buffer 밖을 지운다.
       e.indent(pd + 1);
@@ -915,6 +983,66 @@ struct StubEmitter {
     std::string rows = e.name(op.getSizes()[rank - 2]);
     std::string cols = e.name(op.getSizes()[rank - 1]);
     std::string pitch = e.name(op.getPitch());
+
+    if (auto packed = op.getGroupLayoutAttr()) {
+      auto shape = packed.asArrayRef();
+      int64_t ur = shape[0], uc = shape[1], pr = shape[2], pc = shape[3];
+      int64_t rowGroups = shape[4], colGroups = shape[5];
+      int64_t panelElements = pr * pc;
+      std::string j0 = e.temp("_g"), width = e.temp("_w");
+      e.indent(depth);
+      os() << "{  // aimx.unstage contiguous groups\n";
+      e.indent(depth + 1);
+      os() << "aimx_require(" << rows << " >= 0 && " << cols << " >= 0 && "
+           << rows << " <= " << ur * rowGroups << "ll && " << cols << " <= "
+           << uc * colGroups << "ll && " << pitch << " == " << pc * colGroups
+           << "ll && " << panelElements * rowGroups * colGroups * bytes << "ull <= "
+           << b.bytes << "ull, \"unstage does not match the contiguous group layout\");\n";
+      e.indent(depth + 1);
+      os() << "aimx_require(datacopy_pim2cpu(" << b.host << ", (void*)" << b.va
+           << ", " << panelElements * rowGroups * colGroups * bytes
+           << ", _fpga) >= 0, \"output download failed\");\n";
+      auto scatter = [&](unsigned d, bool accumulate) {
+        e.indent(d);
+        os() << "for (int64_t " << i << " = 0; " << i << " < " << rows << "; ++" << i << ") {\n";
+        e.indent(d + 1);
+        os() << dstTy << " *" << dr << " = " << e.name(op.getDst()) << " + "
+             << hostRow(op.getOrigin(), op.getStrides(), i) << ";\n";
+        e.indent(d + 1);
+        os() << "for (int64_t " << j0 << " = 0; " << j0 << " < " << cols
+             << "; " << j0 << " += " << uc << "ll) {\n";
+        e.indent(d + 2);
+        os() << "const uint16_t *" << sr << " = (const uint16_t*)" << b.host
+             << " + ((" << i << " / " << ur << "ll) * " << colGroups << "ll + "
+             << j0 << " / " << uc << "ll) * " << panelElements << "ll + ("
+             << i << " % " << ur << "ll) * " << pc << "ll;\n";
+        e.indent(d + 2);
+        os() << "int64_t " << width << " = " << cols << " - " << j0 << " < " << uc
+             << "ll ? " << cols << " - " << j0 << " : " << uc << "ll;\n";
+        std::string lhs = dr + "[(" + j0 + " + " + j + ") * " +
+                          e.name(op.getStrides()[rank - 1]) + "]";
+        std::string word = sr + "[" + j + "]";
+        e.indent(d + 2);
+        os() << "for (int64_t " << j << " = 0; " << j << " < " << width << "; ++" << j << ")\n";
+        e.indent(d + 3);
+        os() << lhs << " = " << (accumulate ? addBF16(dstElem, lhs, word) : fromBF16(dstElem, word)) << ";\n";
+        e.indent(d + 1);
+        os() << "}\n";
+        e.indent(d);
+        os() << "}\n";
+      };
+      e.indent(depth + 1);
+      os() << "if (" << e.name(op.getAccumulate()) << ") {\n";
+      scatter(depth + 2, true);
+      e.indent(depth + 1);
+      os() << "} else {\n";
+      scatter(depth + 2, false);
+      e.indent(depth + 1);
+      os() << "}\n";
+      e.indent(depth);
+      os() << "}\n";
+      return success();
+    }
 
     // group_rows 가 있으면 buffer 의 행이 block group 주기로 놓여 있다 — 유효 행 i 가
     // 물리 행 (i/useful)*phys + i%useful 이고, 각 phys 구간의 나머지 행은 padding 이라

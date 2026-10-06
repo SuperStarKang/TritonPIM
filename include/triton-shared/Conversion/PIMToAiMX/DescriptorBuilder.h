@@ -14,6 +14,8 @@ struct DescriptorSequence {
   int64_t groups;
 };
 
+// Copy/elementwise views are contiguous panels with rows*columns divisible by
+// kLanes. MAC views retain independent row pitches.
 DescriptorSequence buildCopy(ModuleOp module, StringRef name, int64_t rows,
                              int64_t columns);
 DescriptorSequence buildElementwise(ModuleOp module, StringRef name,
@@ -22,6 +24,14 @@ DescriptorSequence buildElementwise(ModuleOp module, StringRef name,
 DescriptorSequence buildMatmul(ModuleOp module, StringRef name, int64_t batch,
                                int64_t rows, int64_t reduction,
                                int64_t columns);
+// Arel stays resident for every K group until all output microtiles are drained.
+DescriptorSequence buildMatmulRelayout(ModuleOp module, StringRef name,
+                                       int64_t batch, int64_t rows,
+                                       int64_t reduction);
+DescriptorSequence buildMatmulAccumulate(ModuleOp module, StringRef name,
+                                         int64_t batch, int64_t reduction);
+DescriptorSequence buildMatmulDrain(ModuleOp module, StringRef name,
+                                    int64_t batch);
 
 } // namespace mlir::aimx
 #endif

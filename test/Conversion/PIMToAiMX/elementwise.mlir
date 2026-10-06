@@ -11,7 +11,7 @@
 // ADD: len 8192 opcode c_mask|add
 // ADD: scf.execute_region no_inline
 // ADD: aimx.build_descriptors @pointwise_device0_elementwise_
-// ADD: aimx.stage {{.*}} group_cols [8, 4096]
+// ADD: aimx.stage {{.*}}group_layout = array<i64: 2, 8, 2, 4096, 1, 2>
 // SUB: len 8192 opcode descr_dst_mask|a_mask|sub
 // SUB: len 8192 opcode b_mask|sub|pim_mode
 // SUB: len 8192 opcode c_mask|sub

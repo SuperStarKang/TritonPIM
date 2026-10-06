@@ -4,16 +4,18 @@
 // RUN: triton-shared-opt --mlir-print-op-generic --pim-form-host-plan --convert-pim-to-aimx --cse --canonicalize %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=STUB
 // IR-LABEL: func.func @matmul_epilogue
 // IR: scf.execute_region no_inline
-// IR: aimx.build_descriptors @matmul_epilogue_device0_matmul_
-// The MAC's source accumulator, then the two explicit epilogue operations.
-// IR: aimx.build_descriptors @matmul_epilogue_device0_elementwise_
+// IR: aimx.build_descriptors @matmul_epilogue_device0_matmul_relayout_
+// IR: aimx.build_descriptors @matmul_epilogue_device0_matmul_accumulate_
+// IR: aimx.build_descriptors @matmul_epilogue_device0_matmul_drain_
+// Only the two explicit epilogue operations remain.
 // IR: aimx.build_descriptors @matmul_epilogue_device0_elementwise_
 // IR: aimx.build_descriptors @matmul_epilogue_device0_elementwise_
 // IR: aimx.invoke
 // IR-NOT: aimx.invoke
 // STUB: if (!_resident->ready) {
-// STUB: aimx_prog_matmul_epilogue_device0_matmul_
-// STUB: aimx_prog_matmul_epilogue_device0_elementwise_
+// STUB: aimx_prog_matmul_epilogue_device0_matmul_relayout_
+// STUB: aimx_prog_matmul_epilogue_device0_matmul_accumulate_
+// STUB: aimx_prog_matmul_epilogue_device0_matmul_drain_
 // STUB: aimx_prog_matmul_epilogue_device0_elementwise_
 // STUB: aimx_prog_matmul_epilogue_device0_elementwise_
 // STUB: descriptor upload failed

@@ -13,7 +13,7 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 // PIM Common IR(pim.device + pim.place)을 AiMX 하드웨어에 맞춘 것이다. PIM IR이
 // 답하지 않는 것을 여기서 정한다:
 //   - 메모리 계층 (host DRAM → PIM DRAM 2단. core 안의 빠른 메모리가 없다)
-//   - PIM DRAM 안의 layout (행 pitch 로 규정된 2차원 배열. tile-major 가 아니다)
+//   - PIM DRAM 안의 group-major layout과 group 내부의 행 pitch
 //   - execution tile 과 padding
 //   - A 재배치 (vecA 가 reduction 방향으로 늘어선 A 를 원한다)
 //
@@ -39,6 +39,12 @@ def AiMX_Dialect : Dialect {
 
 class AiMX_Op<string mnemonic, list<Trait> traits = []>
     : Op<AiMX_Dialect, mnemonic, traits>;
+
+def AiMX_RequireOp : AiMX_Op<"require"> {
+  let summary = "Reject an invalid runtime layout before emitting descriptors";
+  let arguments = (ins I1:$condition, StrAttr:$message);
+  let assemblyFormat = "$condition `,` $message attr-dict";
+}
 
 class AiMX_Type<string name, string _mnemonic, list<Trait> traits = []>
     : TypeDef<AiMX_Dialect, name, traits> {
@@ -195,6 +201,10 @@ def AiMX_AllocOp : AiMX_Op<"alloc"> {
 // 단위를 딱 채우지 못할 때 그 어긋남이 이 0 이 된다 (#aimx.tile_group). padding 이
 // 없는 축은 attr 를 아예 싣지 않는다. sizes 와 origin 은 논리(유효) 단위이고
 // pad_to 와 pitch 는 물리 단위다.
+// group_layout selects contiguous groups instead of periodic row padding:
+// [useful_rows, useful_cols, physical_rows, physical_cols, row_groups, col_groups].
+// Groups are row-major in the group grid; each group is a pitched 2-D panel.
+// pad_to/pitch describe the allocation envelope, not a descriptor's panel pitch.
 //
 // shared_over 는 pim.broadcast 의 공유 축이다. 이 축의 좌표만 다른 device 들은 같은
 // 영역을 받으므로 host 변환은 공유 slot 마다 한 번만 하고, 전송은 device 마다 한다.
@@ -208,7 +218,8 @@ def AiMX_StageOp : AiMX_Op<"stage", [AttrSizedOperandSegments]> {
                        TypeAttr:$element_type, UnitAttr:$transpose,
                        OptionalAttr<DenseI64ArrayAttr>:$group_rows,
                        OptionalAttr<DenseI64ArrayAttr>:$group_cols,
-                       OptionalAttr<StrArrayAttr>:$shared_over);
+                       OptionalAttr<StrArrayAttr>:$shared_over,
+                       OptionalAttr<DenseI64ArrayAttr>:$group_layout);
   let assemblyFormat = [{
     $src `origin` `[` $origin `]` `sizes` `[` $sizes `]`
     `strides` `[` $strides `]` `pad_to` `[` $pad_to `]` `pitch` $pitch
@@ -247,7 +258,8 @@ def AiMX_UnstageOp : AiMX_Op<"unstage", [AttrSizedOperandSegments]> {
                        Index:$accumulate,
                        TypeAttr:$element_type, UnitAttr:$transpose,
                        OptionalAttr<DenseI64ArrayAttr>:$group_rows,
-                       OptionalAttr<DenseI64ArrayAttr>:$group_cols);
+                       OptionalAttr<DenseI64ArrayAttr>:$group_cols,
+                       OptionalAttr<DenseI64ArrayAttr>:$group_layout);
   let assemblyFormat = [{
     $src `into` $dst `origin` `[` $origin `]` `sizes` `[` $sizes `]`
     `strides` `[` $strides `]` `pitch` $pitch `accumulate` $accumulate

@@ -5,12 +5,12 @@
 // RUN: sed 's/bank_capacity_limit_bytes = 268435456/bank_capacity_limit_bytes = 1/' %S/convert.mlir | not triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx 2>&1 | FileCheck %s --check-prefix=CAPACITY
 // Source masks not represented by the whole placement cannot be discarded.
 // RUN: sed 's/origin\[%m, %n\]/origin[%m, %n] valid[%c2, %c1]/g' %S/elementwise.mlir | not triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx 2>&1 | FileCheck %s --check-prefix=MASK
-// PAD: aimx.descriptor_program @matmul_device0_matmul_{{[0-9]+}} batch 2
-// PAD: len 16384 opcode bc|tp
-// PAD: len 4096 opcode b_mask|matmul|pim_mode|stride
+// PAD-DAG: aimx.descriptor_program @matmul_device0_matmul_relayout_{{[0-9]+}} batch 2
+// PAD-DAG: len 16384 opcode bc|tp
+// PAD-DAG: len 4096 opcode b_mask|matmul|pim_mode|stride
 // PAD: aimx.foreach_device {{.*}} counts [2, 1, 1]
 // PAD: scf.execute_region no_inline
-// PAD: aimx.stage {{.*}} group_rows [96, 256] group_cols [32, 4096]
+// PAD: aimx.stage {{.*}}group_layout = array<i64: 96, 32, 256, 2048, 1, 2>
 // SPLITK: AiMX cross-device pim.combine is not implemented
 // EFFECT: AiMX has no lowering for this Common operation
 // CAPACITY: AiMX physical buffers and descriptors exceed per-bank capacity

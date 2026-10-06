@@ -26,6 +26,100 @@ Placed PIM Common IR을 AiMX FPGA의 CDMA descriptor stream으로 옮기는 계�
 
 현재 구현된 PIM Common IR은 **읽기만 하고 고치지 않는다**.
 
+## 현재 lowering의 Group 배치 계약
+
+아래의 과거 설계에서 whole-tile row-major 배치와 `#aimx.tiling`을 설명하는 부분은
+현재 구현과 구분한다. 현재 lowering은 Common의 SSA 계산, Group 반복, K 누적,
+mask와 host 전송 순서를 보존하며 AiMX의 물리 배치만 결정한다.
+이번 변경은 빌드·실기기 실행 전 상태다.
+
+논리 Group을 `(Gm, Gn, Gk)`, hardware batch를 `b`라 하면, 독립적인 GEMM의
+물리 Group 크기는 다음과 같다. 여러 연산 사이에서 tensor가 공유되면 해당 SSA
+연결에 필요한 정렬 조건을 함께 만족시킨다. 같은 tensor type이라는 이유만으로
+서로 다른 A/B/C의 배치를 합치지는 않는다.
+
+```text
+Mp = ceil(Gm / b) * b
+Np = ceil(Gn / (4096/b)) * (4096/b)
+Kp = ceil(Gk / 256) * 256
+Ap = ceil(Gk / 4096) * 4096
+
+A Group: Mp × Ap       (A gather용 4096 정렬 유지)
+B Group: Kp × Np       (N pitch의 4096 고정 제거)
+C Group: Mp × Np
+```
+
+Execution Tile은 각 Group을 독립적인 연속 panel로 저장한다. `tm/tn/tk`는
+Common이 정한 Group 개수이며 AiMX가 다시 정하지 않는다.
+
+```text
+A: [A(m0,k0)][A(m0,k1)] ... [A(m1,k0)][A(m1,k1)] ...
+B: [B(k0,n0)][B(k0,n1)] ... [B(k1,n0)][B(k1,n1)] ...
+C: [C(m0,n0)][C(m0,n1)] ... [C(m1,n0)][C(m1,n1)] ...
+
+panel byte offset = (row_group * column_groups + column_group)
+                    * physical_rows * physical_cols * 2
+```
+
+`aimx.stage/unstage`의 `group_layout`은
+`[useful_rows, useful_cols, physical_rows, physical_cols, row_groups, col_groups]`다.
+stage는 경계 밖 입력을 0으로 채우고, unstage는 유효한 행/열만 host에 쓴다.
+접근 시작점이 panel 경계와 맞지 않거나 상주 범위를 벗어나면 `aimx.require`가
+descriptor 실행 전에 오류를 보고한다. Copy와 elementwise는 panel을 4096개 원소씩
+순회하므로 B/C의 개별 행을 4096개 원소로 늘릴 필요가 없다.
+
+Group 반복은 기존 `aimx.descriptor_program`을 호출해 **전체 Tile chain에 펼쳐진다**.
+`pim_exec`는 Tile마다 한 번이며, 불변인 전체 chain의 기존 재사용을 유지한다.
+하나의 Group descriptor 본문을 device에서 반복 실행하는 기능은 구현하지 않았다.
+
+### Tile 내부 K-Group의 vACC 누적
+
+`pim.temporal_reduction`의 positive-zero 초기화와 직접 연결된
+`linalg.matmul` accumulator는 AiMX에서 다음 순서로 실행한다.
+Common의 Block/Group 크기, Tile 경계, 각 출력에 대한 K 순서는 바꾸지 않는다.
+
+```text
+각 M/N Group:
+  모든 K-Group의 A → Arel 재배치 (Group별 별도 슬롯)
+  각 batch × (4096/batch) 출력 영역:
+    모든 K-Group의 A/B MAC (중간 C drain/ADD 없음)
+    필요하면 마지막 K-Group 뒤에 zero MAC padding
+    vACC → BF16 결과 저장 한 번
+```
+
+`Arel`은 이 reduction site에서 `tile_k * Mp * Kp * 2 * 16` bytes를
+확보한다. 다음 M/N Group은 이전 출력이 모두 저장된 뒤 이 공간을 재사용한다.
+vACC가 전체 Tile 출력을 동시에 담는 것은 아니다. 비어 있는 K 반복은
+zero 결과를 유지하고 vACC drain을 생성하지 않는다.
+
+Arel/B의 저장 공간은 여전히 K를 256으로 정렬한다. MAC은 Group마다
+`ceil(Gk/(256/batch))`개의 A/B descriptor 쌍을 사용한다. Group K가 이 MAC
+단위의 배수이면 Group 사이의 저장용 padding은 실행하지 않는다. Tile의
+MAC 길이가 256의 배수가 아니면 마지막 Group의 zero 영역을 반복해서 읽어
+끝에서만 맞춘다. Group K가 MAC 단위보다 작거나 정렬되지 않은 경우에는
+Group 내부의 MAC padding이 남으므로, compact native matmul과 비트 동등성을
+주장하지 않는다. 부분 마지막 Group의 논리 범위를 넘는 입력은 staging의
+zero padding을 사용한다.
+
+중간 accumulator 사용, nonzero 초기값, K 반복 안의 추가 계산/부작용은
+진단을 내고 중단한다. 서로 다른 M/N 출력 영역에 단독으로 기여한다는 것을
+증명한 `pim.combine`은 ADD 대신 copy로 반영한다. 실제로 여러 기여가 같은
+출력에 모이면 ADD를 유지한다. K가 여러 Execution Tile로 나뉘면 Tile별 BF16
+결과의 기존 host FP32 합산을 유지하며, `pim_exec` 사이에 vACC를 보존하지 않는다.
+
+FPGA 검증은 `examples/compare_aimx_native_gemm.py`와
+`examples/aimx_native_grouped_gemm.cpp`에서 수행한다. 원본 libpim으로 Tile의
+전체 K를 한 번의 matmul에 넣고 동일한 Tile 간 host 합산을 적용한다.
+기존 `aimx_reference.cpp`/`compare_aimx_gemm.py`의 Group별 ADD 모델은 이 경로의
+검증 기준이 아니다. 이번 변경은 소스 검토만 했으며 빌드/실행 결과는 아직 없다.
+
+Lowering은 PMM, 상주 버퍼, scratch, 상수, 전체 descriptor chain을 모두 합산해
+bank 용량을 검사한다. `aimx.allocations`, `aimx.bank_bytes`,
+`aimx.descriptor_bytes`에 컴파일 시점의 할당 계획을 기록한다.
+Autotuner의 `constraints.py`는 컴파일 전 GEMM 하한 추정이며, 이 검사 통과가 전체
+IR의 용량 적합성을 보장하지 않는다. 최종 판단은 lowering이 하고, 측정 결과의
+`physical_allocations`는 해당 컴파일 결과의 할당 계획을 담는다.
+
 ---
 
 ## 0. 용어

@@ -77,10 +77,9 @@ struct ProgramBuilder {
 aimx::DescriptorSequence aimx::buildCopy(ModuleOp module, StringRef name,
                                         int64_t rows, int64_t columns) {
   ProgramBuilder p(module, name, 1, 2);
-  auto row = p.loop(rows);
-  auto col = p.loop(columns, kLanes);
-  p.desc(p.arg(0), p.at(0, row.getInductionVar(), col.getInductionVar()), {},
-         p.arg(3), p.at(1, row.getInductionVar(), col.getInductionVar()), {},
+  auto chunk = p.loop(rows * columns, kLanes);
+  p.desc(p.arg(0), p.at(0, p.c(0), chunk.getInductionVar()), {},
+         p.arg(3), p.at(1, p.c(0), chunk.getInductionVar()), {},
          kDeviceWidth, Opcode::copy);
   return p.finish();
 }
@@ -90,11 +89,10 @@ aimx::DescriptorSequence aimx::buildElementwise(
     int64_t columns) {
   ProgramBuilder p(module, name, 1, 3, 1);
   Value pmm = p.arg(9), vacc = p.c(kVACCOffset);
-  auto row = p.loop(rows);
-  auto col = p.loop(columns, kLanes);
-  Value a = p.at(0, row.getInductionVar(), col.getInductionVar());
-  Value b = p.at(1, row.getInductionVar(), col.getInductionVar());
-  Value c = p.at(2, row.getInductionVar(), col.getInductionVar());
+  auto chunk = p.loop(rows * columns, kLanes);
+  Value a = p.at(0, p.c(0), chunk.getInductionVar());
+  Value b = p.at(1, p.c(0), chunk.getInductionVar());
+  Value c = p.at(2, p.c(0), chunk.getInductionVar());
   bool multiply = opcode == Opcode::mul;
   p.desc(p.arg(0), a, {}, multiply ? Value() : pmm,
          multiply ? Value() : vacc, {}, kDeviceWidth,
@@ -148,5 +146,49 @@ aimx::DescriptorSequence aimx::buildMatmul(
   p.leave(macK);
   p.desc(pmm, p.c(kVACCOffset), p.c(blockBytes), p.arg(6), p.at(2, row, col),
          p.arg(8), blockBytes, Opcode::c_mask | Opcode::matmul | Opcode::stride);
+  return p.finish();
+}
+
+aimx::DescriptorSequence aimx::buildMatmulRelayout(
+    ModuleOp module, StringRef name, int64_t batch, int64_t rows,
+    int64_t reduction) {
+  ProgramBuilder p(module, name, batch, 2);
+  int64_t m = ((rows + batch - 1) / batch) * batch;
+  int64_t k = ((reduction + kRegSize - 1) / kRegSize) * kRegSize;
+  auto gatherM = p.loop(m, batch);
+  auto gatherK = p.loop(k, kRegSize);
+  Value row = gatherM.getInductionVar(), col = gatherK.getInductionVar();
+  p.desc(p.arg(0), p.at(0, row, col), p.arg(2), {}, {}, {}, kPIMWidth,
+         Opcode::pim_mode | Opcode::stride);
+  Value offset = p.add(p.arg(4),
+      p.add(p.mul(row, k * kTypeSize * kNumChannels),
+            p.mul(p.div(col, kRegSize), kDeviceWidth * batch)));
+  p.desc({}, {}, {}, p.arg(3), offset, {}, kDeviceWidth * batch,
+         Opcode::bc | Opcode::tp);
+  return p.finish();
+}
+
+aimx::DescriptorSequence aimx::buildMatmulAccumulate(
+    ModuleOp module, StringRef name, int64_t batch, int64_t reduction) {
+  ProgramBuilder p(module, name, batch, 2);
+  int64_t stepK = kRegSize / batch;
+  auto macK = p.loop(reduction, stepK);
+  Value k = macK.getInductionVar();
+  Value offset = p.add(p.arg(1), p.mul(p.div(k, stepK), kDeviceWidth));
+  p.desc(p.arg(0), offset, {}, {}, {}, {}, kDeviceWidth,
+         Opcode::a_mask | Opcode::matmul | Opcode::pim_mode);
+  p.desc(p.arg(3), p.at(1, k, p.c(0)), p.arg(5), {}, {}, {},
+         kDeviceWidth / batch,
+         Opcode::b_mask | Opcode::matmul | Opcode::pim_mode | Opcode::stride);
+  return p.finish();
+}
+
+aimx::DescriptorSequence aimx::buildMatmulDrain(
+    ModuleOp module, StringRef name, int64_t batch) {
+  ProgramBuilder p(module, name, batch, 1, 1);
+  int64_t bytes = kDeviceWidth / batch;
+  p.desc(p.arg(3), p.c(kVACCOffset), p.c(bytes),
+         p.arg(0), p.arg(1), p.arg(2), bytes,
+         Opcode::c_mask | Opcode::matmul | Opcode::stride);
   return p.finish();
 }

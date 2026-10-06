@@ -19,6 +19,8 @@
 #include "llvm/Support/MathExtras.h"
 #include <algorithm>
 #include <limits>
+#include <optional>
+#include <tuple>
 
 using namespace mlir;
 namespace mlir::triton {
@@ -91,8 +93,8 @@ public:
         aimx::AllocKindAttr::get(module.getContext(), aimx::AllocKind::Descriptor));
     chain = chainAllocation.getBuffer();
 
-    // The whole descriptor-construction boundary. Only arith, SCF and
-    // build_descriptors are emitted here, never retained linalg/PIM operations.
+    // The whole descriptor-construction boundary: index arithmetic, layout
+    // checks, SCF and build_descriptors, never retained linalg/PIM operations.
     auto construction = setup.create<scf::ExecuteRegionOp>(loc, TypeRange{});
     construction->setAttr("no_inline", setup.getUnitAttr());
     Block *constructionBody = code.createBlock(&construction.getRegion());
@@ -117,6 +119,11 @@ public:
     chainAllocation.setBytesAttr(setup.getI64IntegerAttr(chainBytes));
     if (bankBytes > profile.getBankCapacityLimitBytes())
       return device.emitError("AiMX physical buffers and descriptors exceed per-bank capacity");
+    SmallVector<int64_t> allocationBytes;
+    body->walk([&](aimx::AllocOp allocation) { allocationBytes.push_back(allocation.getBytes()); });
+    foreach->setAttr("aimx.allocations", setup.getDenseI64ArrayAttr(allocationBytes));
+    foreach->setAttr("aimx.bank_bytes", setup.getI64IntegerAttr(bankBytes));
+    foreach->setAttr("aimx.descriptor_bytes", setup.getI64IntegerAttr(chainBytes));
     host.setInsertionPointAfter(construction);
     // Common 전송 계획 순서 그대로: broadcast/scatter → launch → gather.
     // placement가 없는 access는 계산이 쓰지 않아 target 할당도 없다.
@@ -152,9 +159,12 @@ private:
   Location loc;
   Value deviceValue, pmm, chain;
   IRMapping indices;
-  llvm::DenseMap<Type, Layout> layouts;
+  llvm::DenseMap<Value, Layout> layouts;
+  llvm::DenseMap<Value, Value> layoutParents;
+  llvm::DenseMap<int64_t, Value> accessValues;
   llvm::DenseMap<Value, View> values;
   llvm::MapVector<int64_t, Placement> placements;
+  llvm::DenseSet<Operation *> assignedCombines;
   int64_t groups = 0, repetitions = 1, bankBytes = 0;
 
   std::string name(StringRef role) {
@@ -199,13 +209,6 @@ private:
                          product->getOperand(i));
     return code.create<arith::SubIOp>(loc, a, b);
   }
-  Value physicalIndex(Value logical, int64_t useful, int64_t physical) {
-    if (useful == physical) return logical;
-    Value extent = c(code, useful);
-    Value group = code.create<arith::DivSIOp>(loc, logical, extent);
-    Value within = code.create<arith::RemSIOp>(loc, logical, extent);
-    return add(mul(group, c(code, physical)), within);
-  }
   static bool isIndexOperation(Operation *op) {
     return op->getName().getDialectNamespace() == "arith" && op->getNumRegions() == 0 &&
            op->getNumResults() != 0 && llvm::all_of(op->getResultTypes(), [](Type t) {
@@ -224,65 +227,151 @@ private:
       clone->erase();
     }
   }
-  LogicalResult addLayout(Operation *op, RankedTensorType type) {
-    if (layouts.count(type)) return success();
+  LogicalResult addLayout(Operation *op, Value value) {
+    auto type = dyn_cast<RankedTensorType>(value.getType());
+    if (!type || layouts.count(value)) return success();
     if (!type.hasStaticShape() || (type.getRank() != 1 && type.getRank() != 2))
       return op->emitError("AiMX needs static rank-one or rank-two tensor tiles");
     Type element = type.getElementType();
     if (!element.isBF16() && !element.isF16() && !element.isF32())
       return op->emitError("AiMX tensor storage supports BF16/F16/F32 source types");
     int64_t rows = type.getDimSize(0), cols = type.getRank() == 1 ? 1 : type.getDimSize(1);
-    int64_t physicalCols;
-    if (rows <= 0 || !aimx::checkedRoundUp(cols, aimx::kLanes, physicalCols))
+    if (rows <= 0 || cols <= 0)
       return op->emitError("AiMX tensor extent cannot be represented");
-    // Shared elementwise-compatible row layout. This is physical padding, not
-    // a change to the number of Common blocks, groups or execution tiles.
-    layouts[type] = {rows, cols, rows, physicalCols};
+    layouts[value] = {rows, cols, rows, cols};
+    layoutParents[value] = value;
+    return success();
+  }
+  Value layoutRoot(Value value) {
+    while (layoutParents.lookup(value) != value)
+      value = layoutParents.lookup(value);
+    return value;
+  }
+  LogicalResult joinLayouts(Operation *op, Value lhs, Value rhs) {
+    if (!isa<RankedTensorType>(lhs.getType()) ||
+        !isa<RankedTensorType>(rhs.getType())) return success();
+    lhs = layoutRoot(lhs);
+    rhs = layoutRoot(rhs);
+    if (lhs == rhs) return success();
+    const Layout &a = layouts.lookup(lhs), &b = layouts.lookup(rhs);
+    if (a.usefulRows != b.usefulRows || a.usefulCols != b.usefulCols)
+      return op->emitError("AiMX connected tensor values need equal logical shapes");
+    layoutParents[rhs] = lhs;
     return success();
   }
   LogicalResult collectLayouts() {
     WalkResult result = device.walk([&](Operation *op) {
-      for (Type type : op->getOperandTypes())
-        if (auto tensor = dyn_cast<RankedTensorType>(type))
-          if (failed(addLayout(op, tensor))) return WalkResult::interrupt();
-      for (Type type : op->getResultTypes())
-        if (auto tensor = dyn_cast<RankedTensorType>(type))
-          if (failed(addLayout(op, tensor))) return WalkResult::interrupt();
+      for (Value value : op->getOperands())
+        if (failed(addLayout(op, value))) return WalkResult::interrupt();
+      for (Value value : op->getResults())
+        if (failed(addLayout(op, value))) return WalkResult::interrupt();
+      for (Region &region : op->getRegions())
+        for (Block &block : region)
+          for (BlockArgument argument : block.getArguments())
+            if (failed(addLayout(op, argument))) return WalkResult::interrupt();
       return WalkResult::advance();
     });
     if (result.wasInterrupted()) return failure();
+    // Layout compatibility follows SSA dependencies, not coincident tensor types.
+    WalkResult connected = device.walk([&](Operation *op) {
+      if (auto loop = dyn_cast<scf::ForOp>(op)) {
+        auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+        for (unsigned i = 0; i < loop.getNumRegionIterArgs(); ++i) {
+          Value init = loop.getInitArgs()[i];
+          if (failed(joinLayouts(op, init, loop.getRegionIterArgs()[i])) ||
+              failed(joinLayouts(op, init, loop.getResult(i))) ||
+              failed(joinLayouts(op, init, yield.getOperand(i))))
+            return WalkResult::interrupt();
+        }
+      } else if (isa<linalg::MatmulOp, linalg::MatvecOp>(op)) {
+        if (op->getNumResults() != 1 || op->getNumOperands() != 3 ||
+            !llvm::all_of(op->getOperandTypes(), [](Type type) {
+              return isa<RankedTensorType>(type);
+            })) {
+          op->emitError("AiMX MAC lowering expects tensor operands and one tensor result");
+          return WalkResult::interrupt();
+        }
+        if (failed(joinLayouts(op, op->getOperand(2), op->getResult(0))))
+          return WalkResult::interrupt();
+      } else if (isa<linalg::GenericOp, linalg::FillOp, tensor::CastOp,
+                     arith::AddFOp, arith::SubFOp, arith::MulFOp>(op)) {
+        Value first;
+        for (Value value : op->getOperands())
+          if (isa<RankedTensorType>(value.getType())) {
+            if (first && failed(joinLayouts(op, first, value)))
+              return WalkResult::interrupt();
+            first = value;
+          }
+        for (Value value : op->getResults())
+          if (isa<RankedTensorType>(value.getType())) {
+            if (first && failed(joinLayouts(op, first, value)))
+              return WalkResult::interrupt();
+            first = value;
+          }
+      }
+      pim::AccessOp access;
+      Value value;
+      if (auto load = dyn_cast<pim::LoadOp>(op)) {
+        access = load.getAccess().getDefiningOp<pim::AccessOp>();
+        value = load.getResult();
+      } else if (auto store = dyn_cast<pim::StoreOp>(op)) {
+        access = store.getAccess().getDefiningOp<pim::AccessOp>();
+        value = store.getValue();
+      } else if (auto combine = dyn_cast<pim::CombineOp>(op)) {
+        access = combine.getDestination().getDefiningOp<pim::AccessOp>();
+        value = combine.getPartial();
+      }
+      if (access) {
+        auto inserted = accessValues.try_emplace(access.getId(), value);
+        if (!inserted.second && failed(joinLayouts(op, inserted.first->second, value)))
+          return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
+    if (connected.wasInterrupted()) return failure();
+    for (auto place : device.getBody().front().getOps<pim::PlaceOp>())
+      for (auto other : device.getBody().front().getOps<pim::PlaceOp>())
+        if (place.getBuffer() == other.getBuffer() &&
+            llvm::equal(place.getStart(), other.getStart()) &&
+            llvm::equal(place.getSize(), other.getSize()) &&
+            llvm::equal(place.getStrides(), other.getStrides()) &&
+            accessValues.count(place.getAccess()) && accessValues.count(other.getAccess()))
+          if (failed(joinLayouts(place, accessValues.lookup(place.getAccess()),
+                                 accessValues.lookup(other.getAccess())))) return failure();
+
+    llvm::DenseSet<Value> macValues;
     WalkResult macLayouts = device.walk([&](Operation *op) {
       if (!isa<linalg::MatmulOp, linalg::MatvecOp>(op)) return WalkResult::advance();
-      if (op->getNumResults() != 1 || op->getNumOperands() != 3 ||
-          !llvm::all_of(op->getOperandTypes(), [](Type type) {
-            return isa<RankedTensorType>(type);
-          })) {
-        op->emitError("AiMX MAC lowering expects tensor operands and one tensor result");
-        return WalkResult::interrupt();
-      }
-      auto &a = layouts[op->getOperand(0).getType()];
-      auto &b = layouts[op->getOperand(1).getType()];
-      auto &acc = layouts[op->getOperand(2).getType()];
-      auto &out = layouts[op->getResult(0).getType()];
+      for (Value operand : op->getOperands()) macValues.insert(layoutRoot(operand));
+      auto &a = layouts[layoutRoot(op->getOperand(0))];
+      auto &b = layouts[layoutRoot(op->getOperand(1))];
+      auto &out = layouts[layoutRoot(op->getResult(0))];
       if (!aimx::checkedRoundUp(a.rows, batch, a.rows) ||
+          !aimx::checkedRoundUp(a.cols, aimx::kLanes, a.cols) ||
           !aimx::checkedRoundUp(b.rows, aimx::kRegSize, b.rows) ||
-          !aimx::checkedRoundUp(acc.rows, batch, acc.rows) ||
-          !aimx::checkedRoundUp(out.rows, batch, out.rows)) {
-        op->emitError("AiMX MAC physical row extent overflows");
+          !aimx::checkedRoundUp(b.cols, aimx::kLanes / batch, b.cols) ||
+          !aimx::checkedRoundUp(out.rows, batch, out.rows) ||
+          !aimx::checkedRoundUp(out.cols, aimx::kLanes / batch, out.cols)) {
+        op->emitError("AiMX MAC physical extent overflows");
         return WalkResult::interrupt();
       }
       return WalkResult::advance();
     });
     if (macLayouts.wasInterrupted()) return failure();
-    // Equal logical shapes must compose even when the source dtype differs.
-    // A result reused as a MAC input needs the same row padding as that input.
-    for (auto &entry : layouts)
-      for (auto &other : layouts)
-        if (cast<RankedTensorType>(entry.first).getShape() ==
-            cast<RankedTensorType>(other.first).getShape()) {
-          int64_t rows = std::max(entry.second.rows, other.second.rows);
-          entry.second.rows = other.second.rows = rows;
-        }
+    for (auto &entry : layouts) {
+      Value root = layoutRoot(entry.first);
+      auto &layout = layouts[root];
+      if (!macValues.contains(root) &&
+          !aimx::checkedRoundUp(layout.cols, aimx::kLanes, layout.cols))
+        return device.emitError("AiMX elementwise physical extent overflows");
+    }
+    for (auto &entry : layouts) {
+      entry.second = layouts.lookup(layoutRoot(entry.first));
+      int64_t elements;
+      if (!aimx::checkedProduct({entry.second.rows, entry.second.cols}, elements) ||
+          elements % aimx::kLanes != 0)
+        return device.emitError("AiMX contiguous groups need a representable multiple of 4096 elements");
+    }
     return success();
   }
   LogicalResult account(int64_t bytes) {
@@ -298,7 +387,7 @@ private:
     buffer = setup.create<aimx::AllocOp>(
         loc, aimx::BufferType::get(module.getContext()), deviceValue,
         setup.getI64IntegerAttr(bytes),
-        setup.getI64IntegerAttr(kind == aimx::AllocKind::PMM ? aimx::kPMMAlign : aimx::kPIMWidth),
+        setup.getI64IntegerAttr(kind == aimx::AllocKind::PMM ? aimx::kPMMAlign : aimx::kDeviceWidth),
         aimx::AllocKindAttr::get(module.getContext(), kind));
     return success();
   }
@@ -379,32 +468,20 @@ private:
     return lower && upper ? sub.getLhs() : Value();
   }
   LogicalResult createPlacements() {
-    llvm::DenseMap<int64_t, RankedTensorType> types;
     llvm::DenseMap<int64_t, pim::AccessOp> accesses;
     device.walk([&](pim::AccessOp access) { accesses[access.getId()] = access; });
-    device.walk([&](pim::LoadOp load) {
-      types[load.getAccess().getDefiningOp<pim::AccessOp>().getId()] =
-          cast<RankedTensorType>(load.getResult().getType());
-    });
-    device.walk([&](pim::StoreOp store) {
-      types[store.getAccess().getDefiningOp<pim::AccessOp>().getId()] =
-          cast<RankedTensorType>(store.getValue().getType());
-    });
-    device.walk([&](pim::CombineOp combine) {
-      types[combine.getDestination().getDefiningOp<pim::AccessOp>().getId()] =
-          cast<RankedTensorType>(combine.getPartial().getType());
-    });
     for (Operation &op : device.getBody().front()) {
       auto place = dyn_cast<pim::PlaceOp>(op);
       if (!place) continue;
-      auto type = types.lookup(place.getAccess());
-      if (!type) continue; // Unconsumed placement has no target allocation.
-      Layout layout = layouts.lookup(type);
+      auto value = accessValues.lookup(place.getAccess());
+      if (!value) continue; // Unconsumed placement has no target allocation.
+      auto type = cast<RankedTensorType>(value.getType());
+      Layout layout = layouts.lookup(value);
       auto rows = getConstantIntValue(mapped(place.getAllocationShape()[0]));
       auto cols = type.getRank() == 1 ? std::optional<int64_t>(1)
                                      : getConstantIntValue(mapped(place.getAllocationShape()[1]));
       int64_t physicalRows, physicalCols, bytes;
-      if (!rows || !cols ||
+      if (!rows || !cols || *rows % layout.usefulRows || *cols % layout.usefulCols ||
           !aimx::checkedProduct({*rows / layout.usefulRows, layout.rows}, physicalRows) ||
           !aimx::checkedProduct({*cols / layout.usefulCols, layout.cols}, physicalCols) ||
           !aimx::checkedProduct({physicalRows, physicalCols, aimx::kTypeSize}, bytes))
@@ -442,7 +519,7 @@ private:
       }
       if (failed(allocate(bytes, aimx::AllocKind::Data, placement.view.buffer))) return failure();
       placement.view.offset = c(setup, 0);
-      placement.view.pitch = c(setup, physicalCols * aimx::kTypeSize);
+      placement.view.pitch = c(setup, layout.cols * aimx::kTypeSize);
       placement.view.layout = layout;
       placements[place.getAccess()] = placement;
     }
@@ -571,15 +648,12 @@ private:
     });
     return failure(result.wasInterrupted());
   }
-  DenseI64ArrayAttr padding(OpBuilder &b, int64_t useful, int64_t physical) {
-    return useful == physical ? DenseI64ArrayAttr()
-                              : b.getDenseI64ArrayAttr({useful, physical});
-  }
   LogicalResult initializeCombines() {
     device.walk([&](pim::CombineOp combine) {
       auto access = combine.getDestination().getDefiningOp<pim::AccessOp>();
       auto found = placements.find(access.getId());
       if (found != placements.end()) found->second.combine = true;
+      if (canAssignMatmulCombine(combine)) assignedCombines.insert(combine);
     });
     for (auto &entry : placements) {
       Placement &placement = entry.second;
@@ -590,8 +664,11 @@ private:
           return placement.source.emitError("AiMX combine identity storage cannot alias a staged input");
       View zero;
       Layout extent{placement.rows, placement.cols, placement.rows, placement.cols};
+      View whole = placement.view;
+      whole.layout = extent;
+      whole.pitch = c(setup, extent.cols * aimx::kTypeSize);
       if (failed(constant(setup.getFloatAttr(setup.getBF16Type(), 0.0), extent, zero)) ||
-          failed(copy(zero, placement.view))) return failure();
+          failed(copy(zero, whole))) return failure();
     }
     return success();
   }
@@ -608,8 +685,9 @@ private:
         hostValues(b, placement.sizes, 1), hostValues(b, place.getStrides(), 0),
         ValueRange{c(b, placement.rows), c(b, placement.cols)}, c(b, placement.cols),
         placement.view.buffer, TypeAttr::get(b.getBF16Type()), UnitAttr(),
-        padding(b, layout.usefulRows, layout.rows), padding(b, layout.usefulCols, layout.cols),
-        sharedOver);
+        DenseI64ArrayAttr(), DenseI64ArrayAttr(), sharedOver, b.getDenseI64ArrayAttr({
+        layout.usefulRows, layout.usefulCols, layout.rows, layout.cols,
+        placement.rows / layout.rows, placement.cols / layout.cols}));
   }
   void unstage(OpBuilder &b, const Placement &placement) {
     Value accumulate = c(b, 0);
@@ -630,8 +708,10 @@ private:
         loc, placement.view.buffer, mapped(place.getBuffer()),
         hostValues(b, place.getStart(), 0), hostValues(b, placement.sizes, 1),
         hostValues(b, place.getStrides(), 0), c(b, placement.cols), accumulate,
-        TypeAttr::get(b.getBF16Type()), UnitAttr(), padding(b, layout.usefulRows, layout.rows),
-        padding(b, layout.usefulCols, layout.cols));
+        TypeAttr::get(b.getBF16Type()), UnitAttr(), DenseI64ArrayAttr(),
+        DenseI64ArrayAttr(), b.getDenseI64ArrayAttr({
+        layout.usefulRows, layout.usefulCols, layout.rows, layout.cols,
+        placement.rows / layout.rows, placement.cols / layout.cols}));
   }
   FailureOr<View> accessView(pim::AccessOp access) {
     auto found = placements.find(access.getId());
@@ -645,14 +725,29 @@ private:
     }
     // Origin/stride is Common's coordinate representation of its linear offset.
     // Translate these coordinates; do not reverse-engineer a kernel loop pattern.
-    Value row = physicalIndex(sub(mapped(access.getOrigin()[0]),
-                                  mapped(placement.source.getStart()[0])),
-                              view.layout.usefulRows, view.layout.rows);
+    Value row = sub(mapped(access.getOrigin()[0]), mapped(placement.source.getStart()[0]));
     Value col = c(code, 0);
     if (access.getOrigin().size() == 2)
-      col = physicalIndex(sub(mapped(access.getOrigin()[1]), mapped(placement.source.getStart()[1])),
-                           view.layout.usefulCols, view.layout.cols);
-    view.offset = add(mul(row, view.pitch), mul(col, c(code, aimx::kTypeSize)));
+      col = sub(mapped(access.getOrigin()[1]), mapped(placement.source.getStart()[1]));
+    Value rowGroup = code.create<arith::DivSIOp>(loc, row, c(code, view.layout.usefulRows));
+    Value colGroup = code.create<arith::DivSIOp>(loc, col, c(code, view.layout.usefulCols));
+    Value panel = add(mul(rowGroup, c(code, placement.cols / view.layout.cols)), colGroup);
+    Value innerRow = code.create<arith::RemSIOp>(loc, row, c(code, view.layout.usefulRows));
+    Value innerCol = code.create<arith::RemSIOp>(loc, col, c(code, view.layout.usefulCols));
+    for (auto [coordinate, remainder, extent] : {
+             std::tuple{row, innerRow, placement.rows / view.layout.rows * view.layout.usefulRows},
+             std::tuple{col, innerCol, placement.cols / view.layout.cols * view.layout.usefulCols}}) {
+      code.create<aimx::RequireOp>(loc,
+          code.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, remainder, c(code, 0)),
+          code.getStringAttr("AiMX access must start at a contiguous group boundary"));
+      code.create<aimx::RequireOp>(loc,
+          code.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sge, coordinate, c(code, 0)),
+          code.getStringAttr("AiMX access precedes its resident placement"));
+      code.create<aimx::RequireOp>(loc,
+          code.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, coordinate, c(code, extent)),
+          code.getStringAttr("AiMX access exceeds its resident placement"));
+    }
+    view.offset = mul(panel, c(code, view.layout.rows * view.layout.cols * aimx::kTypeSize));
     return view;
   }
   LogicalResult append(aimx::DescriptorSequence sequence, ArrayRef<View> views,
@@ -671,10 +766,15 @@ private:
   LogicalResult copy(const View &from, const View &to) {
     if (from.buffer == to.buffer && from.offset == to.offset && from.pitch == to.pitch)
       return success();
+    if (from.layout.rows != to.layout.rows || from.layout.cols != to.layout.cols)
+      return device.emitError("AiMX copy requires matching physical group layouts");
     return append(aimx::buildCopy(module, name("copy"), from.layout.rows, from.layout.cols),
                   {from, to});
   }
   LogicalResult binary(aimx::Opcode opcode, const View &a, const View &b, const View &out) {
+    if (a.layout.rows != out.layout.rows || a.layout.cols != out.layout.cols ||
+        b.layout.rows != out.layout.rows || b.layout.cols != out.layout.cols)
+      return device.emitError("AiMX elementwise operands need matching physical group layouts");
     return append(aimx::buildElementwise(module, name("elementwise"), opcode,
                                          out.layout.rows, out.layout.cols),
                   {a, b, out}, ValueRange{pmm});
@@ -700,7 +800,7 @@ private:
         ValueRange{c(setup, layout.usefulRows), c(setup, layout.usefulCols)},
         ValueRange{zero, zero}, ValueRange{c(setup, layout.rows), c(setup, layout.cols)},
         c(setup, layout.cols), view.buffer, TypeAttr::get(setup.getBF16Type()), UnitAttr(),
-        DenseI64ArrayAttr(), DenseI64ArrayAttr(), ArrayAttr());
+        DenseI64ArrayAttr(), DenseI64ArrayAttr(), ArrayAttr(), DenseI64ArrayAttr());
     return success();
   }
   FailureOr<View> valueView(Value value) {
@@ -708,7 +808,7 @@ private:
     if (found != values.end()) return found->second;
     if (value.getDefiningOp<tensor::EmptyOp>()) {
       View view;
-      if (failed(scratch(layouts.lookup(value.getType()), view))) return failure();
+      if (failed(scratch(layouts.lookup(value), view))) return failure();
       values[value] = view;
       return view;
     }
@@ -763,7 +863,7 @@ private:
         return generic.emitError("AiMX generic projected/transpose indexing maps are not implemented");
     if (generic->getNumResults() == 0)
       return generic.emitError("AiMX generic lowering expects tensor results");
-    Layout layout = layouts.lookup(generic->getResult(0).getType());
+    Layout layout = layouts.lookup(generic->getResult(0));
     for (auto [argument, operand] : llvm::zip(generic.getBody()->getArguments(), generic->getOperands())) {
       if (argument.use_empty()) continue;
       auto view = valueView(operand);
@@ -785,7 +885,7 @@ private:
     }
     return success();
   }
-  LogicalResult lowerMAC(Operation *op) {
+  LogicalResult validateMAC(Operation *op) {
     auto linalg = cast<linalg::LinalgOp>(op);
     bool vector = isa<linalg::MatvecOp>(op);
     Block &body = op->getRegion(0).front();
@@ -823,10 +923,15 @@ private:
     for (Operation &scalar : body)
       if (!matched.contains(&scalar) && !isOpTriviallyDead(&scalar))
         return scalar.emitError("AiMX MAC has an unlowered scalar operation");
+    return success();
+  }
+  LogicalResult lowerMAC(Operation *op) {
+    if (failed(validateMAC(op))) return failure();
+    bool vector = isa<linalg::MatvecOp>(op);
     auto a = valueView(op->getOperand(0)), b = valueView(op->getOperand(1));
     auto acc = valueView(op->getOperand(2));
     if (failed(a) || failed(b) || failed(acc)) return failure();
-    Layout layout = layouts.lookup(op->getResult(0).getType());
+    Layout layout = layouts.lookup(op->getResult(0));
     View partial, out, zero;
     if (failed(scratch(layout, partial)) || failed(scratch(layout, out)) ||
         failed(constant(setup.getFloatAttr(setup.getBF16Type(), 0.0), layout, zero)) ||
@@ -843,6 +948,85 @@ private:
         failed(binary(aimx::Opcode::add, *acc, partial, out))) return failure();
     values[op->getResult(0)] = out;
     return success();
+  }
+  static bool isMatmulReduction(scf::ForOp loop) {
+    if (!loop->hasAttr("pim.temporal_reduction")) return false;
+    bool matmul = false;
+    loop.walk([&](linalg::MatmulOp) { matmul = true; });
+    return matmul;
+  }
+  static std::optional<int64_t> coefficient(Value value, BlockArgument induction) {
+    if (value == induction) return 1;
+    Operation *owner = induction.getOwner()->getParentOp();
+    if (!owner->isAncestor(value.getParentBlock()->getParentOp())) return 0;
+    if (auto argument = dyn_cast<BlockArgument>(value))
+      if (isa<scf::ForOp>(argument.getOwner()->getParentOp()) && argument.getArgNumber() == 0)
+        return 0;
+    if (auto cast = value.getDefiningOp<arith::IndexCastOp>())
+      return coefficient(cast.getIn(), induction);
+    Operation *op = value.getDefiningOp();
+    if (!op || !isa<arith::AddIOp, arith::SubIOp, arith::MulIOp>(op)) {
+      if (getConstantIntValue(value)) return 0;
+      return std::nullopt;
+    }
+    auto lhs = coefficient(op->getOperand(0), induction);
+    auto rhs = coefficient(op->getOperand(1), induction);
+    if (!lhs || !rhs) return std::nullopt;
+    int64_t result;
+    if (isa<arith::AddIOp>(op)) {
+      if (llvm::AddOverflow(*lhs, *rhs, result)) return std::nullopt;
+    } else if (isa<arith::SubIOp>(op)) {
+      if (llvm::SubOverflow(*lhs, *rhs, result)) return std::nullopt;
+    } else {
+      if (*lhs == 0 && *rhs == 0) return 0;
+      auto scale = getConstantIntValue(op->getOperand(*lhs == 0 ? 0 : 1));
+      if (!scale || (*lhs != 0 && *rhs != 0) ||
+          llvm::MulOverflow(*scale, *lhs == 0 ? *rhs : *lhs, result))
+        return std::nullopt;
+    }
+    return result;
+  }
+  bool canAssignMatmulCombine(pim::CombineOp combine) {
+    auto reduction = combine.getPartial().getDefiningOp<scf::ForOp>();
+    if (combine.getKind() != "add" || !reduction || !isMatmulReduction(reduction))
+      return false;
+    auto access = combine.getDestination().getDefiningOp<pim::AccessOp>();
+    if (access.getOrigin().size() != 2) return false;
+    bool exclusive = true;
+    device.walk([&](Operation *op) {
+      Value destination;
+      if (auto other = dyn_cast<pim::CombineOp>(op)) {
+        if (other == combine) return;
+        destination = other.getDestination();
+      } else if (auto store = dyn_cast<pim::StoreOp>(op)) {
+        destination = store.getAccess();
+      } else if (auto load = dyn_cast<pim::LoadOp>(op)) {
+        destination = load.getAccess();
+      }
+      if (destination && destination.getDefiningOp<pim::AccessOp>().getBase() ==
+                             access.getBase()) exclusive = false;
+    });
+    if (!exclusive) return false;
+    bool seen[2] = {false, false};
+    for (Operation *parent = combine->getParentOp(); parent != device;
+         parent = parent->getParentOp()) {
+      if (isa<pim::LaunchOp>(parent)) continue;
+      auto loop = dyn_cast<scf::ForOp>(parent);
+      auto axis = loop ? loop->getAttrOfType<pim::AxisAttr>("pim.axis") : pim::AxisAttr();
+      if (!axis || (axis.getName().getValue() != "m" && axis.getName().getValue() != "n"))
+        return false;
+      unsigned dimension = axis.getName().getValue() == "m" ? 0 : 1;
+      if (seen[dimension]) return false;
+      seen[dimension] = true;
+      auto step = getConstantIntValue(loop.getStep());
+      auto stride = coefficient(access.getOrigin()[dimension], loop.getInductionVar());
+      auto other = coefficient(access.getOrigin()[1 - dimension], loop.getInductionVar());
+      int64_t distance;
+      if (!step || *step <= 0 || !stride || !other || *other != 0 ||
+          llvm::MulOverflow(*step, *stride, distance) || distance < access.getSizes()[dimension])
+        return false;
+    }
+    return true;
   }
   FailureOr<int64_t> loopCapacity(scf::ForOp loop) {
     auto lower = getConstantIntValue(mapped(loop.getLowerBound()));
@@ -892,6 +1076,7 @@ private:
     return failure();
   }
   LogicalResult lowerLoop(scf::ForOp loop) {
+    if (isMatmulReduction(loop)) return lowerMatmulReduction(loop);
     SmallVector<View> carried;
     SmallVector<Value> scalarInitial;
     for (auto [argument, init] : llvm::zip(loop.getRegionIterArgs(), loop.getInitArgs())) {
@@ -903,7 +1088,7 @@ private:
         return loop.emitError("AiMX loop-carried values must be tensor data or integer/index control values");
       View view;
       auto initial = valueView(init);
-      if (failed(initial) || failed(scratch(layouts.lookup(argument.getType()), view)) ||
+      if (failed(initial) || failed(scratch(layouts.lookup(argument), view)) ||
           failed(copy(*initial, view))) return failure();
       carried.push_back(view);
       values[argument] = view;
@@ -963,6 +1148,159 @@ private:
     }
     return success();
   }
+  LogicalResult lowerMatmulReduction(scf::ForOp loop) {
+    auto reduction = loop->getAttrOfType<StringAttr>("pim.reduction");
+    auto step = getConstantIntValue(mapped(loop.getStep()));
+    if (!reduction || reduction.getValue() != "add" ||
+        loop.getNumRegionIterArgs() != 1 || !step || *step <= 0 || loop.getUnsignedCmp())
+      return loop.emitError("AiMX vACC reduction needs one tensor accumulator and a positive constant signed step");
+    auto fill = loop.getInitArgs()[0].getDefiningOp<linalg::FillOp>();
+    Attribute initial;
+    if (!fill || !matchPattern(fill.getInputs()[0], m_Constant(&initial)) ||
+        !isa<FloatAttr>(initial) || !cast<FloatAttr>(initial).getValue().isZero() ||
+        cast<FloatAttr>(initial).getValue().isNegative())
+      return loop.emitError("AiMX vACC reduction requires a positive-zero accumulator");
+    auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+    auto matmul = yield.getOperand(0).getDefiningOp<linalg::MatmulOp>();
+    if (!matmul || matmul->getBlock() != loop.getBody() ||
+        matmul->getOperand(2) != loop.getRegionIterArgs()[0] ||
+        !loop.getRegionIterArgs()[0].hasOneUse() || !matmul.getResult(0).hasOneUse())
+      return loop.emitError("AiMX vACC reduction requires an unobserved matmul accumulator carried directly to the next K group");
+    if (failed(validateMAC(matmul))) return failure();
+    auto loadA = matmul->getOperand(0).getDefiningOp<pim::LoadOp>();
+    auto loadB = matmul->getOperand(1).getDefiningOp<pim::LoadOp>();
+    if (!loadA || !loadB || loadA->getBlock() != loop.getBody() ||
+        loadB->getBlock() != loop.getBody())
+      return loop.emitError("AiMX vACC reduction requires direct resident A/B loads in each K group");
+    for (Operation &op : *loop.getBody()) {
+      if (&op == matmul || &op == loadA || &op == loadB || &op == yield ||
+          isa<pim::AccessOp>(op) || isIndexOperation(&op)) continue;
+      if (auto constant = dyn_cast<arith::ConstantOp>(op))
+        if (isa<FloatAttr>(constant.getValue())) continue;
+      return op.emitError("AiMX vACC reduction cannot move this operation across K groups");
+    }
+    auto capacity = loopCapacity(loop);
+    if (failed(capacity)) return failure();
+    Layout layout = layouts.lookup(loop.getResult(0));
+    int64_t logicalK = layouts.lookup(loadA.getResult()).usefulCols;
+    int64_t physicalK, arelGroupBytes, arelBytes;
+    if (!aimx::checkedRoundUp(logicalK, aimx::kRegSize, physicalK) ||
+        !aimx::checkedProduct({layout.rows, physicalK, aimx::kTypeSize,
+                              aimx::kNumChannels}, arelGroupBytes) ||
+        !aimx::checkedProduct({std::max<int64_t>(*capacity, 1), arelGroupBytes}, arelBytes))
+      return loop.emitError("AiMX resident K-group relayout extent overflows");
+    View out;
+    auto zero = valueView(loop.getInitArgs()[0]);
+    Value arel;
+    if (failed(zero) || failed(scratch(layout, out)) || failed(copy(*zero, out)) ||
+        failed(allocate(arelBytes, aimx::AllocKind::Data, arel))) return failure();
+    values[loop.getResult(0)] = out;
+    Value lower = mapped(loop.getLowerBound()), upper = mapped(loop.getUpperBound());
+    Value stride = mapped(loop.getStep());
+    auto asIndex = [&](Value value) -> Value {
+      if (value.getType().isIndex()) return value;
+      return code.create<arith::IndexCastOp>(loc, code.getIndexType(), value);
+    };
+    Value count = code.create<arith::CeilDivSIOp>(loc,
+        code.create<arith::MaxSIOp>(loc, sub(asIndex(upper), asIndex(lower)), c(code, 0)),
+        c(code, *step));
+    code.create<aimx::RequireOp>(loc,
+        code.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sle, count, c(code, *capacity)),
+        code.getStringAttr("AiMX K-group count exceeds its resident Arel capacity"));
+    Value active = code.create<arith::SelectOp>(loc,
+        code.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt, count, c(code, 0)),
+        c(code, 1), c(code, 0));
+    auto nonempty = code.create<scf::ForOp>(loc, c(code, 0), active, c(code, 1));
+    code.setInsertionPoint(nonempty.getBody()->getTerminator());
+    IRMapping outerIndices = indices;
+    int64_t outer = repetitions;
+    auto mapGroup = [&](scf::ForOp lowered) -> View {
+      indices = outerIndices;
+      indices.map(loop.getInductionVar(), lowered.getInductionVar());
+      for (Operation &op : *loop.getBody())
+        if (isIndexOperation(&op)) cloneIndex(op, code);
+      Value slot = code.create<arith::DivSIOp>(loc,
+          sub(asIndex(lowered.getInductionVar()), asIndex(lower)), c(code, *step));
+      return {arel, mul(slot, c(code, arelGroupBytes)), c(code, 0), layout};
+    };
+    // Complete every transpose before starting a live vACC accumulation.
+    auto prepare = code.create<scf::ForOp>(loc, lower, upper, stride);
+    prepare->setAttrs(loop->getAttrs());
+    prepare->setAttr("aimx.matmul_phase", code.getStringAttr("relayout"));
+    code.setInsertionPoint(prepare.getBody()->getTerminator());
+    if (llvm::MulOverflow(outer, *capacity, repetitions))
+      return loop.emitError("AiMX descriptor loop extent overflows");
+    View relayout = mapGroup(prepare);
+    auto a = accessView(loadA.getAccess().getDefiningOp<pim::AccessOp>());
+    if (failed(a) || failed(append(aimx::buildMatmulRelayout(
+            module, name("matmul_relayout"), batch, layout.usefulRows, logicalK),
+            {*a, relayout}))) return failure();
+    code.setInsertionPointAfter(prepare);
+    repetitions = outer;
+    auto row = code.create<scf::ForOp>(loc, c(code, 0), c(code, layout.rows), c(code, batch));
+    code.setInsertionPoint(row.getBody()->getTerminator());
+    if (llvm::MulOverflow(repetitions, layout.rows / batch, repetitions))
+      return loop.emitError("AiMX output row extent overflows");
+    int64_t width = aimx::kLanes / batch;
+    auto col = code.create<scf::ForOp>(loc, c(code, 0), c(code, layout.cols), c(code, width));
+    code.setInsertionPoint(col.getBody()->getTerminator());
+    if (llvm::MulOverflow(repetitions, layout.cols / width, repetitions))
+      return loop.emitError("AiMX output column extent overflows");
+    int64_t outputRepetitions = repetitions;
+    auto accumulate = code.create<scf::ForOp>(loc, lower, upper, stride);
+    accumulate->setAttrs(loop->getAttrs());
+    accumulate->setAttr("aimx.matmul_phase", code.getStringAttr("accumulate"));
+    code.setInsertionPoint(accumulate.getBody()->getTerminator());
+    if (llvm::MulOverflow(repetitions, *capacity, repetitions))
+      return loop.emitError("AiMX MAC K-group extent overflows");
+    relayout = mapGroup(accumulate);
+    relayout.offset = add(relayout.offset, mul(row.getInductionVar(),
+        c(code, physicalK * aimx::kTypeSize * aimx::kNumChannels)));
+    auto b = accessView(loadB.getAccess().getDefiningOp<pim::AccessOp>());
+    if (failed(b)) return failure();
+    b->offset = add(b->offset, mul(col.getInductionVar(), c(code, aimx::kTypeSize)));
+    if (failed(append(aimx::buildMatmulAccumulate(
+            module, name("matmul_accumulate"), batch, logicalK), {relayout, *b})))
+      return failure();
+    int64_t stepK = aimx::kRegSize / batch;
+    int64_t macK = ((logicalK + stepK - 1) / stepK) * stepK;
+    if (macK % aimx::kRegSize != 0) {
+      // Only the last group pads the complete MAC stream to a native K block.
+      Value totalK = mul(count, c(code, macK));
+      Value paddedK = mul(code.create<arith::CeilDivSIOp>(
+          loc, totalK, c(code, aimx::kRegSize)), c(code, aimx::kRegSize));
+      Value paddingSteps = code.create<arith::DivSIOp>(
+          loc, sub(paddedK, totalK), c(code, stepK));
+      Value slot = code.create<arith::DivSIOp>(loc,
+          sub(asIndex(accumulate.getInductionVar()), asIndex(lower)), c(code, *step));
+      Value last = code.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
+                                             slot, sub(count, c(code, 1)));
+      Value paddingCount = code.create<arith::SelectOp>(loc, last, paddingSteps, c(code, 0));
+      auto padding = code.create<scf::ForOp>(loc, c(code, 0), paddingCount, c(code, 1));
+      code.setInsertionPoint(padding.getBody()->getTerminator());
+      View zeroA = relayout, zeroB = *b;
+      zeroA.offset = add(zeroA.offset, c(code, (macK / stepK) * aimx::kDeviceWidth));
+      zeroB.offset = add(zeroB.offset, mul(c(code, macK), zeroB.pitch));
+      // Each repeated pair reads the same known-zero portion of the last panel.
+      if (llvm::MulOverflow(outputRepetitions, batch - 1, repetitions))
+        return loop.emitError("AiMX final K padding extent overflows");
+      if (failed(append(aimx::buildMatmulAccumulate(
+              module, name("matmul_padding"), batch, stepK), {zeroA, zeroB})))
+        return failure();
+    }
+    code.setInsertionPointAfter(accumulate);
+    repetitions = outputRepetitions;
+    View output = out;
+    output.offset = add(out.offset,
+        add(mul(row.getInductionVar(), out.pitch),
+            mul(col.getInductionVar(), c(code, aimx::kTypeSize))));
+    if (failed(append(aimx::buildMatmulDrain(module, name("matmul_drain"), batch),
+                      {output}, ValueRange{pmm}))) return failure();
+    code.setInsertionPointAfter(nonempty);
+    indices = outerIndices;
+    repetitions = outer;
+    return success();
+  }
   LogicalResult lowerBlock(Block &body, bool root) {
     for (Operation &op : body) {
       if (isa<pim::PlaceOp, pim::AccessOp, scf::YieldOp>(op)) continue;
@@ -995,7 +1333,7 @@ private:
           return fill.emitError("AiMX dynamic fill operands are not implemented");
         for (Value result : fill->getResults()) {
           View view;
-          if (failed(constant(scalar, layouts.lookup(result.getType()), view))) return failure();
+          if (failed(constant(scalar, layouts.lookup(result), view))) return failure();
           values[result] = view;
         }
       } else if (auto generic = dyn_cast<linalg::GenericOp>(op)) {
@@ -1003,7 +1341,7 @@ private:
       } else if (isa<linalg::MatmulOp, linalg::MatvecOp>(op)) {
         if (failed(lowerMAC(&op))) return failure();
       } else if (isa<arith::AddFOp, arith::SubFOp, arith::MulFOp>(op)) {
-        if (failed(lowerBinary(&op, layouts.lookup(op.getResult(0).getType())))) return failure();
+        if (failed(lowerBinary(&op, layouts.lookup(op.getResult(0))))) return failure();
       } else if (auto cast = dyn_cast<tensor::CastOp>(op)) {
         auto view = valueView(cast.getSource());
         if (failed(view)) return failure();
@@ -1018,8 +1356,12 @@ private:
         auto access = combine.getDestination().getDefiningOp<pim::AccessOp>();
         auto source = valueView(combine.getPartial());
         auto destination = accessView(access);
-        if (failed(source) || failed(destination) ||
-            failed(binary(aimx::Opcode::add, *destination, *source, *destination))) return failure();
+        if (failed(source) || failed(destination)) return failure();
+        if (assignedCombines.contains(combine)) {
+          if (failed(copy(*source, *destination))) return failure();
+        } else if (failed(binary(aimx::Opcode::add, *destination, *source, *destination))) {
+          return failure();
+        }
       } else return op.emitError("AiMX has no lowering for this Common operation");
     }
     return success();

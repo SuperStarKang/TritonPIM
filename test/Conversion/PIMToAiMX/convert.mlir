@@ -7,8 +7,8 @@
 // A는 pim.scatter, B는 pim.broadcast(shared_over = ["m"])다. B만 공유 slot에서 한 번 변환한다.
 // RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx %s | FileCheck %s --check-prefix=SHARED
 // RUN: triton-shared-opt --mlir-print-op-generic --pim-form-host-plan --convert-pim-to-aimx=persistent=false %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=BCAST
-// SHARED: aimx.stage {{[^{]*}}: memref<*xbf16>
-// SHARED: aimx.stage {{.*}}{shared_over = ["m"]} : memref<*xbf16>
+// SHARED: aimx.stage {{.*}}group_layout = array<i64: 8, 96, 8, 4096, 1, 1>{{.*}} : memref<*xbf16>
+// SHARED: aimx.stage {{.*}}shared_over = ["m"]{{.*}} : memref<*xbf16>
 // BCAST: char *[[POOL:_pool[0-9]+]] = (char*)aimx_host_buffer((size_t)1 * {{[0-9]+}}ull);
 // BCAST-NEXT: std::once_flag [[ONCE:_once[0-9]+]][1];
 // BCAST-NEXT: #pragma omp parallel for
@@ -16,12 +16,14 @@
 // BCAST: });
 // BCAST-NEXT: aimx_require(datacopy_cpu2pim({{.*}}, _slot{{[0-9]+}},
 // BCAST: aimx_host_free([[POOL]], (size_t)1 * {{[0-9]+}}ull);
-// IR: aimx.descriptor_program @matmul_device0_matmul_{{[0-9]+}} batch 8
-// IR: len 512 opcode pim_mode|stride
-// IR: len 65536 opcode bc|tp
-// IR: len 8192 opcode a_mask|matmul|pim_mode
-// IR: len 1024 opcode b_mask|matmul|pim_mode|stride
-// IR: len 1024 opcode c_mask|matmul|stride
+// IR-DAG: aimx.descriptor_program @matmul_device0_matmul_drain_{{[0-9]+}} batch 8
+// IR-DAG: aimx.descriptor_program @matmul_device0_matmul_accumulate_{{[0-9]+}} batch 8
+// IR-DAG: aimx.descriptor_program @matmul_device0_matmul_relayout_{{[0-9]+}} batch 8
+// IR-DAG: len 512 opcode pim_mode|stride
+// IR-DAG: len 65536 opcode bc|tp
+// IR-DAG: len 8192 opcode a_mask|matmul|pim_mode
+// IR-DAG: len 1024 opcode b_mask|matmul|pim_mode|stride
+// IR-DAG: len 1024 opcode c_mask|matmul|stride
 // IR-LABEL: func.func @matmul
 // IR: aimx.acquire 2
 // IR: scf.for
@@ -30,27 +32,28 @@
 // IR: aimx.foreach_device {{.*}} counts [2, 1, 1]
 // IR: aimx.alloc {{.*}} bytes 196608
 // IR: scf.execute_region no_inline
-// Initial output identity, followed by the original M/N/K traversal.
-// IR: aimx.build_descriptors @matmul_device0_copy_
+// M/N traversal encloses preparation and one drain per output microtile.
 // IR: scf.for
 // IR: scf.for
 // IR: aimx.build_descriptors @matmul_device0_copy_
 // IR: scf.for
-// IR: aimx.build_descriptors @matmul_device0_matmul_
-// Accumulator addition, yield copy, then pim.combine addition.
-// IR: aimx.build_descriptors @matmul_device0_elementwise_
+// IR: aimx.build_descriptors @matmul_device0_matmul_relayout_
+// IR: aimx.build_descriptors @matmul_device0_matmul_accumulate_
+// IR: aimx.build_descriptors @matmul_device0_matmul_drain_
+// A unique contribution to this C group needs only a copy, not ADD(0, C).
 // IR: aimx.build_descriptors @matmul_device0_copy_
-// IR: aimx.build_descriptors @matmul_device0_elementwise_
-// IR: aimx.stage {{.*}} group_cols [96, 4096]
-// IR: aimx.stage {{.*}} group_rows [96, 256] group_cols [32, 4096]
+// IR: aimx.stage {{.*}}group_layout = array<i64: 8, 96, 8, 4096, 1, 1>
+// IR: aimx.stage {{.*}}group_layout = array<i64: 96, 32, 256, 512, 1, 2>
 // IR: aimx.invoke
 // IR: arith.cmpi ne, %[[ROUND]]
-// IR: aimx.unstage {{.*}} group_cols [32, 4096]
+// IR: aimx.unstage {{.*}}group_layout = array<i64: 8, 32, 8, 512, 1, 2>
 // STUB: extern "C" void matmul
 // STUB: #pragma omp parallel for collapse(3) num_threads(2)
 // STUB: int _fpga = AIMX_BASE_FPGA
 // STUB: if (!_resident->ready) {
-// STUB: aimx_prog_matmul_device0_matmul_
+// STUB: aimx_prog_matmul_device0_matmul_relayout_
+// STUB: aimx_prog_matmul_device0_matmul_accumulate_
+// STUB: aimx_prog_matmul_device0_matmul_drain_
 // STUB: descriptor upload failed
 // STUB: _resident->ready = true
 // STUB: pim_exec

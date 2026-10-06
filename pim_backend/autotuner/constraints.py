@@ -43,36 +43,36 @@ def unit_memory_footprint(problem, config):
 
 
 def aimx_runtime_allocations(problem, target, config):
-    """Allocation sizes produced by AiMX lowering for one Execution Tile."""
+    """Precompile lower bound for GEMM residency and its MAC chain.
+
+    Scratch, constants, copies and fused operations come from the compiled
+    Common IR. The target's allocation report and capacity check are final.
+    """
     runtime = target.runtime_config
     assert isinstance(runtime, AiMXRuntimeConfig)
     batch = runtime.batch
     useful_m, useful_n, useful_k = group_extent(config)
     physical_m = _round_up(useful_m, batch)
     physical_n = _round_up(useful_n, 4096 // batch)
-    physical_k = _round_up(useful_k, 256 // batch)
+    physical_k = _round_up(useful_k, 256)
+    padded_k = _round_up(useful_k, 4096)
 
-    t_m = config.tile_m * physical_m
-    t_n = config.tile_n * physical_n
-    t_k = _round_up(config.tile_k * physical_k, 256)
-    padded_k = _round_up(t_k, 4096)
-    padded_n = t_n
-
-    rows = t_m // batch
-    cols = padded_n * batch // 4096
-    steps = t_k * batch // 256
-    descriptor_groups = (
-        2 * (t_k // 256) * rows
-        + rows * cols * (2 * steps + 1)
+    rows = physical_m // batch
+    cols = physical_n * batch // 4096
+    steps = ceil_div(useful_k, 256 // batch)
+    tile_steps = _round_up(config.tile_k * steps, batch)
+    descriptor_groups = config.tile_m * config.tile_n * (
+        config.tile_k * 2 * (physical_k // 256) * rows
+        + rows * cols * (2 * tile_steps + 1)
     )
     # AiMX staging converts host values to BF16; host dtype is not DRAM dtype.
     input_bytes = output_bytes = 2
     return {
         "PMM": AIMX_PMM_BYTES,
-        "A": t_m * padded_k * input_bytes,
-        "Arel": t_m * t_k * input_bytes * 16,
-        "B": t_k * padded_n * input_bytes,
-        "C": t_m * padded_n * output_bytes,
+        "A": config.tile_m * config.tile_k * physical_m * padded_k * input_bytes,
+        "Arel": config.tile_k * physical_m * physical_k * input_bytes * 16,
+        "B": config.tile_k * config.tile_n * physical_k * physical_n * input_bytes,
+        "C": config.tile_m * config.tile_n * physical_m * physical_n * output_bytes,
         "descriptor chain": descriptor_groups * 512,
     }
 

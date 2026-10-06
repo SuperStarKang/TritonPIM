@@ -5,7 +5,7 @@
 // IR-LABEL: func.func @epilogue_liveness
 // Three 32768-byte placements are separate from these four 16384-byte buffers:
 // two load snapshots, the live sum, and the product/subtract output.
-// IR-COUNT-4: aimx.alloc {{.*}} bytes 16384 align 512 kind data
+// IR-COUNT-4: aimx.alloc {{.*}} bytes 16384 align 8192 kind data
 // IR-NOT: aimx.alloc
 // IR: scf.execute_region no_inline
 // IR: aimx.build_descriptors @epilogue_liveness_device0_elementwise_{{[0-9]+}}({{[^,]+}}, {{[^,]+}}, {{[^,]+}}, {{[^,]+}}, {{[^,]+}}, {{[^,]+}}, %[[SUM:[a-zA-Z0-9_]+]],

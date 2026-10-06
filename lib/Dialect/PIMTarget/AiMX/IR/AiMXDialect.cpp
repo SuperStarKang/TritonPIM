@@ -1,4 +1,5 @@
 #include "triton-shared/Dialect/PIMTarget/AiMX/IR/AiMXDialect.h"
+#include "triton-shared/Dialect/PIMTarget/AiMX/IR/AiMXFootprint.h"
 
 // 생성된 op builder / type-attr printer-parser가 사용하는 헤더들.
 #include "mlir/IR/Builders.h"
@@ -142,6 +143,24 @@ static LogicalResult verifyGroup(Operation *op, DenseI64ArrayAttr g,
   return success();
 }
 
+static LogicalResult verifyGroupLayout(Operation *op, DenseI64ArrayAttr layout,
+                                       DenseI64ArrayAttr rows, DenseI64ArrayAttr cols) {
+  if (!layout) return success();
+  auto shape = layout.asArrayRef();
+  int64_t elements;
+  if (rows || cols)
+    return op->emitOpError("group_layout cannot be combined with periodic group padding");
+  if (shape.size() != 6 || shape[0] <= 0 || shape[1] <= 0 ||
+      shape[2] < shape[0] || shape[3] < shape[1] ||
+      !checkedProduct({shape[2], shape[3], shape[4], shape[5]}, elements) ||
+      elements > kMaxRuntimeAllocationBytes / kTypeSize)
+    return op->emitOpError("group_layout needs representable [useful_rows, useful_cols, "
+                          "physical_rows, physical_cols, row_groups, col_groups]");
+  if ((shape[2] * shape[3]) % kLanes != 0)
+    return op->emitOpError("each contiguous group must contain a multiple of 4096 elements");
+  return success();
+}
+
 LogicalResult StageOp::verify() {
   if (failed(verifyPitched(*this, getOrigin().size(), getSizes().size(),
                            getStrides().size(), getElementType())))
@@ -150,7 +169,8 @@ LogicalResult StageOp::verify() {
     return emitOpError("pad_to describes the 2-D PIM layout and must have rank ")
            << kPitchedRank;
   if (failed(verifyGroup(*this, getGroupRowsAttr(), "group_rows")) ||
-      failed(verifyGroup(*this, getGroupColsAttr(), "group_cols")))
+      failed(verifyGroup(*this, getGroupColsAttr(), "group_cols")) ||
+      failed(verifyGroupLayout(*this, getGroupLayoutAttr(), getGroupRowsAttr(), getGroupColsAttr())))
     return failure();
   if (auto shared = getSharedOverAttr()) {
     auto foreach = dyn_cast<ForeachDeviceOp>((*this)->getParentOp());
@@ -167,7 +187,8 @@ LogicalResult UnstageOp::verify() {
   if (failed(verifyPitched(*this, getOrigin().size(), getSizes().size(),
                            getStrides().size(), getElementType())))
     return failure();
-  if (failed(verifyGroup(*this, getGroupRowsAttr(), "group_rows")))
+  if (failed(verifyGroup(*this, getGroupRowsAttr(), "group_rows")) ||
+      failed(verifyGroupLayout(*this, getGroupLayoutAttr(), getGroupRowsAttr(), getGroupColsAttr())))
     return failure();
   return verifyGroup(*this, getGroupColsAttr(), "group_cols");
 }

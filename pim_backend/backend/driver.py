@@ -59,6 +59,8 @@ resident_h2d_timing = None
 # throughput은 invoke 시간을 이 값으로 나눠야 나오는데, host에서 tile 산술을 다시 하면
 # device 분할 규칙이 바뀔 때마다 어긋난다.
 invokes = 0
+# Exact per-device allocation plans emitted from AiMX Common-IR lowering.
+aimx_allocations = ()
 
 
 def _upmem_host_flags():
@@ -282,6 +284,9 @@ class PIMLauncher(object):
                 launch_enter_hook, launch_exit_hook, *args):
         # cu_function = load_binary가 돌려준 소스 번들 bytes (PIMUtils.load_binary 참고).
         bundle = json.loads(bytes(cu_function).decode("utf-8"))
+        global aimx_allocations
+        aimx_allocations = (tuple(tuple(plan) for plan in bundle["allocations"])
+                            if self.pim_target == "aimx" else ())
         invocation = current_invocation.get()
         if invocation is not None:
             if launch_enter_hook is not None:
