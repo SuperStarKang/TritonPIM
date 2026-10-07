@@ -24,6 +24,7 @@ examples/
 ├── attention/
 │   ├── benchmark_attention_kernel.py
 │   ├── benchmark_attention_layer.py
+│   ├── benchmark_model_attention_layer.py # Q/K/V/O projection + batched QK/PV
 │   ├── int8_workloads.py
 │   ├── torch_attention.py           # 기존 INT8 예제
 │   ├── torch_attention_layer.py     # 기존 KV-group 예제
@@ -39,6 +40,7 @@ examples/
 │   └── resident_transformer_*.json
 ├── e2e/
 │   ├── torch_llama_ttft.py          # checkpoint 기반 INT8 layer GEMM TTFT
+│   ├── benchmark_model_llama_ttft.py # Session-first checkpoint TTFT, baseline/batched 비교
 │   ├── prompt.txt
 │   └── llama_int8_ttft_report/      # INT8 TTFT 보고서와 FX graph
 ├── llama_ttft_report/              # 기존 결과: 폴더 이동 권한 오류로 유지
@@ -226,6 +228,95 @@ calibration을 재현하지 않는다. PIMLLM의 warm-up 후 `gm.run()` 측정 �
 전체 sequence의 lm_head 계산과 현재 요청 TTFT / last-token lm_head는 범위가
 다르므로 전체 시간 비교에서는 이 경계도 맞춰야 한다.
 
+## 새 LayerPlan: checkpoint E2E 비교
+
+**내용**
+[e2e/benchmark_model_llama_ttft.py](e2e/benchmark_model_llama_ttft.py)는 실제 Llama-2-7b-hf
+checkpoint와 기존 E2E의 양자화 연산을 사용한다. Batch 1, prompt 1024 tokens, 32 layers,
+32 heads, 2048 DPUs, 16 tasklets로 첫 greedy token까지 요청 한 번을 측정한다.
+같은 model runtime에서 `baseline`과 `batched` GEMM config를 비교한다.
+
+**근거**
+- `PIMSession`이 먼저 DPU를 확보하고 `prepare()`가 32개 LayerPlan을 만든다.
+- `model_configs()`와 Transformer benchmark의 Gate/Up zero padding을 재사용한다.
+  Gate/Up은 물리 N=11264로 계산한 뒤 논리 크기 11008열을 반환한다.
+- 각 block은 `(hidden, 누적 KV)`를 받아 갱신된 hidden과 KV tuple을 반환한다.
+  기존 KV tensor는 참조로 전달하며, 모델 실행 후 Session table에 등록한다.
+- `run_model()`은 layer 진입마다 weight를 전송한다. 전체 모델의 weight가 동시에
+  device에 상주하지 않으며 요청의 `weight_bytes`는 0이 아니다.
+- 준비 중 CPU 계산은 partition 컴파일을 위한 것이고 요청 GEMM은 PIM에서 실행한다.
+  Mock, calibration, CPU reference 정확도 비교는 사용하지 않는다.
+
+**예시**
+
+기존 PIM 실행 환경에서 checkpoint 경로를 지정한다. Prompt는 special token을 포함해
+최소 1024 tokens여야 한다. 두 명령은 별도 프로세스로 실행하며 결과 경로를 구분한다.
+
+```bash
+cd /home/dlrkdals/TritonPIM/triton_shared/pim_backend/torch_backend/examples/e2e
+
+../cmd.sh benchmark_model_llama_ttft.py \
+  --checkpoint /home/dlrkdals/.cache/huggingface/hub/models--meta-llama--Llama-2-7b-hf/snapshots/01c7f73d771dfac7d292323805ebc428287df4f9 \
+  --prompt-file prompt.txt \
+  --gemm-config baseline \
+  --report-dir model_e2e_baseline
+
+../cmd.sh benchmark_model_llama_ttft.py \
+  --checkpoint /home/dlrkdals/.cache/huggingface/hub/models--meta-llama--Llama-2-7b-hf/snapshots/01c7f73d771dfac7d292323805ebc428287df4f9 \
+  --prompt-file prompt.txt \
+  --gemm-config batched \
+  --report-dir model_e2e_batched
+```
+
+```text
+요청 전
+  checkpoint 로드 / projection weight INT8 양자화
+    → PIMSession.open: DPU 할당 1회
+    → prepare: FX 분석 / config·batch 배정 / CPU·PIM 컴파일 / 공통 메모리 배치
+
+요청: TTFT 측정
+  tokenize → CPU embedding
+    → [layer weight upload → 준비된 CPU/PIM partition 실행 → hidden/KV 반환] × 32
+    → CPU KV를 Session table에 등록
+    → CPU last-token norm / lm_head / argmax → 첫 token ID
+
+요청 후
+  PIMSession.close: DPU 해제 1회 → JSON / layer별 FX text·DOT 저장
+```
+
+| 설정 | Layer stage 수 | QK/PV의 p_b | Layer당 launch | 전체 launch |
+|---|---:|---:|---:|---:|
+| model + baseline config | 9 | 1 | 71 | 2272 |
+| model + batched config | 9 | 32 | 9 | 288 |
+
+```text
+gemm_config=batched prepare_ms=... expected_launches=288
+TTFT_ms=... first_token_id=... launches=288 weight_bytes=... resources=1/1
+```
+
+`request_transfers.device_compiles=0`, `activation_hits=0`, alloc/free 각각 1회,
+KV 32쌍과 총 `1073741824` bytes, 계획한 launch 수 및 layer weight 전송량을 확인한다.
+시간과 token ID는 실측값이며 `accuracy_checked=false`다. Warm-up/repeat/median은 없고
+프로세스마다 요청 한 번이다. 코드 작성 시 빌드나 하드웨어 실행은 수행하지 않았다.
+
+| JSON 항목 | 측정 범위 |
+|---|---|
+| `prepare_ms` | 자원 확보 후 Session의 FX 분석·CPU/PIM 컴파일·배치 준비 |
+| `preparation_ms` | checkpoint/tokenizer 로드 시작부터 준비 완료까지, 자원 할당 포함 |
+| `ttft_ms` | 준비된 Session에서 tokenize부터 첫 token까지, 32개 layer weight upload 포함 |
+| `model_to_token_ms` | tokenization 완료부터 첫 token까지 |
+| `setup_to_token_ms` | checkpoint/tokenizer 로드 시작부터 첫 token까지 |
+| `resource_open_ms`, `resource_close_ms` | 자원 할당·해제, `ttft_ms`에서 제외 |
+| `request_transfers` | 해당 요청의 weight/activation/output bytes, compile/load/launch 수 |
+| `preparation_transfers`, `session_totals` | 준비 완료 시점 및 Session 종료 시점 누적 counter |
+| `layer_plans` | layer별 config, instance/p_b/round, Execution Tile, 메모리, 예상 launch |
+
+두 새 실험의 `ttft_ms`를 먼저 비교한다. 기존 `torch_llama_ttft.py`의 TTFT에는
+자원 할당과 요청 중 weight capture가 포함된다. 새 경로는 자원 할당과 실행 준비를
+요청 전에 완료하므로 기존 TTFT와 직접 나눈 값을 batching만의 효과로 해석하지 않는다.
+기존 Transformer 단독 benchmark의 `median_wall_ms`는 weight가 이미 상주한 한 Layer의
+실행 시간이며, 이번 모델 전체 TTFT와 측정 범위가 다르다.
+
 ## 새 LayerPlan: Attention과 Transformer 비교
 
 **내용**
@@ -245,6 +336,7 @@ Weight를 한 번 적재한 뒤 Layer 실행만 반복 측정하며, 준비와 w
 |---|---|
 | [model_benchmark_common.py](model_benchmark_common.py) | 새 Session 준비, 실행 측정, 실제 partition profile, JSON/FX 출력 |
 | [attention/benchmark_model_attention_kernel.py](attention/benchmark_model_attention_kernel.py) | 1/32-head Attention; 동일 workload의 legacy/model 선택 |
+| [attention/benchmark_model_attention_layer.py](attention/benchmark_model_attention_layer.py) | Q/K/V/O projection과 32-head batched QK/PV를 포함한 Attention Layer |
 | [transformer/benchmark_model_transformer_block.py](transformer/benchmark_model_transformer_block.py) | 7개 resident projection과 batched QK/PV를 포함한 Transformer |
 
 기존 baseline을 실행한 동일한 장비 환경에서, `examples/` 기준으로 실행한다.
@@ -300,6 +392,89 @@ Block=(16,16,32), Group=(1,1,1), p=(8,8,1), p_b=32일 때:
 |---|---|---|---:|
 | QK | (8,8,4) | (128,128,128) | 1 |
 | PV | (8,1,32) | (128,16,1024) | 1 |
+
+## Projection을 포함한 32-head Attention Layer
+
+**내용**
+`benchmark_model_attention_layer.py`는 Q/K/V projection, RoPE, QK/softmax/PV,
+O projection을 포함한다. 기존 `benchmark_attention_layer.py`와 동일한
+`AttentionLayer`, seed=0, 합성 INT8 weight 및 FP32 입력을 사용하고 실제 UPMEM에서 실행한다.
+Batch=1, sequence=1024, hidden=4096, heads=32, head_dim=128로 고정한다.
+
+**근거**
+- `benchmark_model_attention_kernel.py`는 이미 계산된 Q/K/V를 입력받으므로 projection을 포함하지 않는다.
+- 새 실험은 기존 Attention Layer 범위에 맞춰 O projection도 포함한다. Norm, FFN, residual은 이 Layer 범위에 없다.
+- Q/K/V/O weight 네 개는 준비 후 한 번 적재하고 반복 실행에서 유지한다.
+  네 projection의 GEMM 시간은 sample에 포함되며 최초 weight upload는 별도로 기록한다.
+- Q/K/V projection은 각각 실행한다. QK 32개와 PV 32개만 독립 instance로 묶는다.
+- 각 projection은 전체 2048 DPUs를 사용한다. Batched QK/PV는 head당 64 DPUs로 32 heads를 동시에 처리한다.
+- Checkpoint/tokenizer는 사용하지 않는다. 수치 정확도 비교와 mock 실행은 수행하지 않는다.
+
+**예시**
+
+```text
+FP32 hidden [1,1024,4096]
+  → CPU quantize
+  → PIM Q / K / V projection                 3 launches
+  → CPU dequantize / reshape / RoPE / quantize
+  → PIM QK: 32 heads, p_b=32                 1 launch
+  → CPU scale / causal mask / softmax / quantize
+  → PIM PV: 32 heads, p_b=32                 1 launch
+  → CPU dequantize / head 결합 / quantize
+  → PIM O projection                        1 launch
+  → CPU dequantize → FP32 [1,1024,4096]
+```
+
+`attention/`에서 각 명령을 별도 프로세스로 실행한다. Head 수는 32로 고정되어
+`--heads` 인자는 사용하지 않는다. 세 실험의 warm-up/sample 횟수를 동일하게 지정한다.
+
+```bash
+cd /home/dlrkdals/TritonPIM/triton_shared/pim_backend/torch_backend/examples/attention
+
+# 새 runtime + batched QK/PV + Q/K/V/O projection
+../cmd.sh benchmark_model_attention_layer.py \
+  --gemm-config batched --warmup 3 --repeat 10 \
+  --report-dir model_attention_layer_batched
+
+# 같은 새 runtime에서 config 변경 효과를 비교
+../cmd.sh benchmark_model_attention_layer.py \
+  --gemm-config baseline --warmup 3 --repeat 10 \
+  --report-dir model_attention_layer_baseline
+
+# 기존 runtime의 같은 Attention Layer 범위
+../cmd.sh benchmark_attention_layer.py \
+  --warmup 3 --repeat 10 \
+  --report-dir legacy_attention_layer_32heads
+```
+
+| 측정 범위 | 논리 GEMM 수 | 새 runtime stage 수 | 호출당 launch 수 |
+|---|---:|---:|---:|
+| Attention kernel, 32 heads, batched | 64 | 2 | 2 |
+| Attention Layer, baseline config | 68 | 6 | 68 |
+| Attention Layer, batched config | 68 | 6 | 6 |
+| 기존 Attention Layer | 68 | 해당 없음 | 68 |
+
+```text
+scope=attention_layer heads=32 gemm_config=batched logical_gemms=68 planned_stages=6
+sample=0 wall_ms=... weight_h2d=0 activation_h2d=... launches=6 program_loads=...
+attention_layer: median_wall_ms=... launches=6 logical_GEMM_GOPS=...
+  q_proj: calls=1 instances=1 wall_ms=...
+  k_proj: calls=1 instances=1 wall_ms=...
+  v_proj: calls=1 instances=1 wall_ms=...
+  QK^T: calls=1 instances=32 wall_ms=...
+  PV: calls=1 instances=32 wall_ms=...
+  o_proj: calls=1 instances=1 wall_ms=...
+resource_opens=1 resource_closes=1
+```
+
+결과는 각 디렉터리의 `report.json`, `exported_fx.*`, `partitioned_fx.*`에 저장한다.
+`median_wall_ms`로 같은 Attention Layer 범위를 비교하고,
+`profile.gemm_totals`에서 projection과 QK/PV 시간을 구분한다.
+Profile 시간은 sample median과 별도로 측정한 값이다. 기존 kernel-only 결과와
+전체 Layer 시간을 직접 나눈 값을 speedup으로 해석하지 않는다.
+실행 시 `resident_weights=4`, `hidden_dim=4096`, `ffn_dim=null`, sample의
+`weight_bytes=0`, `device_compiles=0`, 계획한 launch 수와 alloc/free 1/1을 확인한다.
+코드 작성 시 빌드나 하드웨어 실행은 수행하지 않았다.
 
 ## 결과 비교와 검증 상태
 

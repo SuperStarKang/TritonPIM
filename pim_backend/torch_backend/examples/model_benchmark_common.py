@@ -186,7 +186,7 @@ def benchmark_model(model, inputs, args, *, scope, heads, expected_gemms, expect
         report = {
             "scope": scope, "runtime": "model", "gemm_config": args.gemm_config,
             "batch": 1, "sequence": 1024, "heads": heads, "head_dim": 128,
-            "hidden_dim": 4096 if scope == "transformer_block" else None,
+            "hidden_dim": 4096 if scope in ("attention_layer", "transformer_block") else None,
             "ffn_dim": 11008 if scope == "transformer_block" else None,
             "inputs": [{"shape": list(tensor.shape), "dtype": str(tensor.dtype)} for tensor in inputs],
             "output": {"shape": list(profile_output.shape), "dtype": str(profile_output.dtype)},
