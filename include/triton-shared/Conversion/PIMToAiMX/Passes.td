@@ -11,7 +11,7 @@ def ConvertPIMToAiMX : Pass<"convert-pim-to-aimx", "mlir::ModuleOp"> {
     sequences in the same pass that places its buffers. There is no intermediate
     compute template, kernel-kind classification, or second lowering pass.
 
-    Pure zero-initialized matmul reductions keep each output microtile in vACC
+    Pure zero-initialized matmul/matvec reductions keep each output microtile in vACC
     across all K groups of the same execution tile. All Arel panels are prepared
     before MAC begins; C drains once per output microtile. Other loop-carried
     state and intermediate results use physical buffers. Matmul/matvec and
@@ -31,11 +31,19 @@ def ConvertPIMToAiMX : Pass<"convert-pim-to-aimx", "mlir::ModuleOp"> {
     Common cross-device K reduction is not implemented. AiMX uses BF16 physical
     storage and native arithmetic; this pass does not promise IEEE-equivalent
     source floating-point results.
+
+    Matvec defaults to 4096-element B/C storage rows and one 4096/batch-column
+    MAC/drain microtile per output row batch. Storage pitch and compute extent
+    are independent; diagnostic options can select the previous layouts.
   }];
   let constructor = "mlir::triton::createConvertPIMToAiMXPass()";
   let options = [
     Option<"batch", "batch", "int64_t", "8",
            "AiMX matmul batch. 1, 2, 4, 8 중 하나.">,
+    Option<"matvecRowAlignment", "matvec-row-alignment", "int64_t", "4096",
+           "Matvec B/C row alignment in BF16 elements; defaults to 4096. Diagnostic 0 uses 4096/batch.">,
+    Option<"matvecFirstNOnly", "matvec-first-n-only", "bool", "true",
+           "Matvec vACC reduction computes the first 4096/batch columns; false also computes padded N microtiles for diagnostics.">,
     Option<"persistent", "persistent", "bool", "true",
            "Retain fixed per-FPGA buffers and descriptor chains across rounds and calls.">,
   ];

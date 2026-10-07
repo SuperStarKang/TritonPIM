@@ -51,7 +51,7 @@
 // EMPTY-LABEL: func.func @vacc_groups
 // EMPTY-NOT: aimx.build_descriptors @vacc_groups_device0_matmul_
 // EMPTY: aimx.invoke
-// OBSERVED: AiMX vACC reduction requires an unobserved matmul accumulator
+// OBSERVED: AiMX vACC reduction requires an unobserved MAC accumulator
 // NONZERO: AiMX vACC reduction requires a positive-zero accumulator
 // COMBINE-LABEL: func.func @vacc_groups
 // COMBINE: aimx.build_descriptors @vacc_groups_device0_matmul_drain_

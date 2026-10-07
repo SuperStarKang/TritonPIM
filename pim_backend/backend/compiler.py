@@ -215,7 +215,9 @@ def _aimx_passes(options):
     # execution tile 상한은 #pim.execution_tile로 전달된다. batch는 PIM profile에
     # 넣지 않고 AiMX target option으로만 전달한다.
     tile = (f"--convert-pim-to-aimx=batch={options.batch} "
-            f"persistent={str(options.aimx_persistent).lower()}")
+            f"persistent={str(options.aimx_persistent).lower()} "
+            f"matvec-row-alignment={options.aimx_matvec_row_alignment} "
+            f"matvec-first-n-only={str(options.aimx_matvec_first_n_only).lower()}")
     return [tile, "-cse", "-canonicalize"]
 
 
@@ -318,6 +320,11 @@ class PIMOptions:
     batch: int = 8
     # AiMX-only policy, not a change to Common IR arithmetic semantics.
     aimx_persistent: bool = True
+    # Matvec storage pitch is independent of the 4096/batch-column MAC microtile.
+    # Explicit 0/512 alignments retain the narrow-layout diagnostic paths.
+    aimx_matvec_row_alignment: int = 4096
+    # False retains the padded-N diagnostic; GEMM traversal is unaffected.
+    aimx_matvec_first_n_only: bool = True
     def __post_init__(self):
         # target 없이 PIM을 쓰는 것은 의도된 사용이 아니므로 기본값으로 때우지 않고 바로 터뜨린다.
         if self.pim_target is None:
@@ -399,7 +406,7 @@ class PIMBackend(BaseBackend):
     @functools.lru_cache()
     def hash(self):
         # Regenerate artifacts when a target's execution or allocation plan changes.
-        return f"{self.target}-pim-common-ir-v9-device-mapping-host-pools-host-plan-shared-over-input-reuse-upmem-metadata-v2-rhs-row-major-v1-timing-v3-aimx-contiguous-groups-v2-vacc-reduction"
+        return f"{self.target}-pim-common-ir-v9-device-mapping-host-pools-host-plan-shared-over-input-reuse-upmem-metadata-v2-rhs-row-major-v1-timing-v3-aimx-contiguous-groups-v2-vacc-reduction-v2"
 
     def get_module_map(self) -> Dict[str, ModuleType]:
         return {}

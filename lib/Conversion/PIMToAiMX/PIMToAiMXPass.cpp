@@ -49,10 +49,12 @@ struct Placement {
 class DeviceLowering {
 public:
   DeviceLowering(ModuleOp module, pim::PartitionOp device,
-                 pim::TargetProfileAttr profile, int64_t batch, bool persistent,
-                 unsigned site)
+                 pim::TargetProfileAttr profile, int64_t batch,
+                 int64_t matvecRowAlignment, bool matvecFirstNOnly,
+                 bool persistent, unsigned site)
       : module(module), device(device), profile(profile), batch(batch),
-        persistent(persistent),
+        matvecRowAlignment(matvecRowAlignment),
+        matvecFirstNOnly(matvecFirstNOnly), persistent(persistent),
         prefix((device->getParentOfType<func::FuncOp>().getName() +
                 "_device" + Twine(site)).str()),
         setup(module.getContext()), code(module.getContext()), loc(device.getLoc()) {}
@@ -152,6 +154,8 @@ private:
   pim::PartitionOp device;
   pim::TargetProfileAttr profile;
   int64_t batch;
+  int64_t matvecRowAlignment;
+  bool matvecFirstNOnly;
   bool persistent;
   std::string prefix;
   unsigned symbol = 0;
@@ -346,12 +350,16 @@ private:
       auto &a = layouts[layoutRoot(op->getOperand(0))];
       auto &b = layouts[layoutRoot(op->getOperand(1))];
       auto &out = layouts[layoutRoot(op->getResult(0))];
+      int64_t columnAlignment = aimx::kLanes / batch;
+      // Matvec storage defaults to 4096 elements, independently of MAC width.
+      if (isa<linalg::MatvecOp>(op) && matvecRowAlignment != 0)
+        columnAlignment = matvecRowAlignment;
       if (!aimx::checkedRoundUp(a.rows, batch, a.rows) ||
           !aimx::checkedRoundUp(a.cols, aimx::kLanes, a.cols) ||
           !aimx::checkedRoundUp(b.rows, aimx::kRegSize, b.rows) ||
-          !aimx::checkedRoundUp(b.cols, aimx::kLanes / batch, b.cols) ||
+          !aimx::checkedRoundUp(b.cols, columnAlignment, b.cols) ||
           !aimx::checkedRoundUp(out.rows, batch, out.rows) ||
-          !aimx::checkedRoundUp(out.cols, aimx::kLanes / batch, out.cols)) {
+          !aimx::checkedRoundUp(out.cols, columnAlignment, out.cols)) {
         op->emitError("AiMX MAC physical extent overflows");
         return WalkResult::interrupt();
       }
@@ -653,7 +661,7 @@ private:
       auto access = combine.getDestination().getDefiningOp<pim::AccessOp>();
       auto found = placements.find(access.getId());
       if (found != placements.end()) found->second.combine = true;
-      if (canAssignMatmulCombine(combine)) assignedCombines.insert(combine);
+      if (canAssignMACCombine(combine)) assignedCombines.insert(combine);
     });
     for (auto &entry : placements) {
       Placement &placement = entry.second;
@@ -949,11 +957,13 @@ private:
     values[op->getResult(0)] = out;
     return success();
   }
-  static bool isMatmulReduction(scf::ForOp loop) {
+  static bool isMACReduction(scf::ForOp loop) {
     if (!loop->hasAttr("pim.temporal_reduction")) return false;
-    bool matmul = false;
-    loop.walk([&](linalg::MatmulOp) { matmul = true; });
-    return matmul;
+    bool hasMAC = false;
+    loop.walk([&](Operation *op) {
+      if (isa<linalg::MatmulOp, linalg::MatvecOp>(op)) hasMAC = true;
+    });
+    return hasMAC;
   }
   static std::optional<int64_t> coefficient(Value value, BlockArgument induction) {
     if (value == induction) return 1;
@@ -986,12 +996,13 @@ private:
     }
     return result;
   }
-  bool canAssignMatmulCombine(pim::CombineOp combine) {
+  bool canAssignMACCombine(pim::CombineOp combine) {
     auto reduction = combine.getPartial().getDefiningOp<scf::ForOp>();
-    if (combine.getKind() != "add" || !reduction || !isMatmulReduction(reduction))
+    if (combine.getKind() != "add" || !reduction || !isMACReduction(reduction))
       return false;
     auto access = combine.getDestination().getDefiningOp<pim::AccessOp>();
-    if (access.getOrigin().size() != 2) return false;
+    if (access.getOrigin().size() != 1 && access.getOrigin().size() != 2)
+      return false;
     bool exclusive = true;
     device.walk([&](Operation *op) {
       Value destination;
@@ -1016,15 +1027,20 @@ private:
       if (!axis || (axis.getName().getValue() != "m" && axis.getName().getValue() != "n"))
         return false;
       unsigned dimension = axis.getName().getValue() == "m" ? 0 : 1;
-      if (seen[dimension]) return false;
+      if (dimension >= access.getOrigin().size() || seen[dimension]) return false;
       seen[dimension] = true;
       auto step = getConstantIntValue(loop.getStep());
-      auto stride = coefficient(access.getOrigin()[dimension], loop.getInductionVar());
-      auto other = coefficient(access.getOrigin()[1 - dimension], loop.getInductionVar());
+      auto induction = llvm::cast<BlockArgument>(loop.getInductionVar());
+      auto stride = coefficient(access.getOrigin()[dimension], induction);
       int64_t distance;
-      if (!step || *step <= 0 || !stride || !other || *other != 0 ||
+      if (!step || *step <= 0 || !stride ||
           llvm::MulOverflow(*step, *stride, distance) || distance < access.getSizes()[dimension])
         return false;
+      for (unsigned axis = 0; axis < access.getOrigin().size(); ++axis) {
+        if (axis == dimension) continue;
+        auto other = coefficient(access.getOrigin()[axis], induction);
+        if (!other || *other != 0) return false;
+      }
     }
     return true;
   }
@@ -1076,7 +1092,7 @@ private:
     return failure();
   }
   LogicalResult lowerLoop(scf::ForOp loop) {
-    if (isMatmulReduction(loop)) return lowerMatmulReduction(loop);
+    if (isMACReduction(loop)) return lowerMACReduction(loop);
     SmallVector<View> carried;
     SmallVector<Value> scalarInitial;
     for (auto [argument, init] : llvm::zip(loop.getRegionIterArgs(), loop.getInitArgs())) {
@@ -1148,7 +1164,7 @@ private:
     }
     return success();
   }
-  LogicalResult lowerMatmulReduction(scf::ForOp loop) {
+  LogicalResult lowerMACReduction(scf::ForOp loop) {
     auto reduction = loop->getAttrOfType<StringAttr>("pim.reduction");
     auto step = getConstantIntValue(mapped(loop.getStep()));
     if (!reduction || reduction.getValue() != "add" ||
@@ -1161,19 +1177,20 @@ private:
         cast<FloatAttr>(initial).getValue().isNegative())
       return loop.emitError("AiMX vACC reduction requires a positive-zero accumulator");
     auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
-    auto matmul = yield.getOperand(0).getDefiningOp<linalg::MatmulOp>();
-    if (!matmul || matmul->getBlock() != loop.getBody() ||
-        matmul->getOperand(2) != loop.getRegionIterArgs()[0] ||
-        !loop.getRegionIterArgs()[0].hasOneUse() || !matmul.getResult(0).hasOneUse())
-      return loop.emitError("AiMX vACC reduction requires an unobserved matmul accumulator carried directly to the next K group");
-    if (failed(validateMAC(matmul))) return failure();
-    auto loadA = matmul->getOperand(0).getDefiningOp<pim::LoadOp>();
-    auto loadB = matmul->getOperand(1).getDefiningOp<pim::LoadOp>();
+    Operation *mac = yield.getOperand(0).getDefiningOp();
+    if (!mac || !isa<linalg::MatmulOp, linalg::MatvecOp>(mac) ||
+        mac->getBlock() != loop.getBody() ||
+        mac->getOperand(2) != loop.getRegionIterArgs()[0] ||
+        !loop.getRegionIterArgs()[0].hasOneUse() || !mac->getResult(0).hasOneUse())
+      return loop.emitError("AiMX vACC reduction requires an unobserved MAC accumulator carried directly to the next K group");
+    if (failed(validateMAC(mac))) return failure();
+    auto loadA = mac->getOperand(0).getDefiningOp<pim::LoadOp>();
+    auto loadB = mac->getOperand(1).getDefiningOp<pim::LoadOp>();
     if (!loadA || !loadB || loadA->getBlock() != loop.getBody() ||
         loadB->getBlock() != loop.getBody())
       return loop.emitError("AiMX vACC reduction requires direct resident A/B loads in each K group");
     for (Operation &op : *loop.getBody()) {
-      if (&op == matmul || &op == loadA || &op == loadB || &op == yield ||
+      if (&op == mac || &op == loadA || &op == loadB || &op == yield ||
           isa<pim::AccessOp>(op) || isIndexOperation(&op)) continue;
       if (auto constant = dyn_cast<arith::ConstantOp>(op))
         if (isa<FloatAttr>(constant.getValue())) continue;
@@ -1242,9 +1259,12 @@ private:
     if (llvm::MulOverflow(repetitions, layout.rows / batch, repetitions))
       return loop.emitError("AiMX output row extent overflows");
     int64_t width = aimx::kLanes / batch;
-    auto col = code.create<scf::ForOp>(loc, c(code, 0), c(code, layout.cols), c(code, width));
+    // N=1 matvec needs one MAC/drain microtile even with wider storage rows.
+    int64_t columns = matvecFirstNOnly && isa<linalg::MatvecOp>(mac)
+                          ? width : layout.cols;
+    auto col = code.create<scf::ForOp>(loc, c(code, 0), c(code, columns), c(code, width));
     code.setInsertionPoint(col.getBody()->getTerminator());
-    if (llvm::MulOverflow(repetitions, layout.cols / width, repetitions))
+    if (llvm::MulOverflow(repetitions, columns / width, repetitions))
       return loop.emitError("AiMX output column extent overflows");
     int64_t outputRepetitions = repetitions;
     auto accumulate = code.create<scf::ForOp>(loc, lower, upper, stride);
@@ -1384,6 +1404,11 @@ struct ConvertPIMToAiMXPass
       module.emitError("AiMX batch must be 1, 2, 4, or 8");
       return signalPassFailure();
     }
+    if (matvecRowAlignment < 0 ||
+        matvecRowAlignment % (aimx::kLanes / batch) != 0) {
+      module.emitError("AiMX matvec row alignment must be zero or a positive multiple of 4096/batch");
+      return signalPassFailure();
+    }
     WalkResult unplanned = module.walk([&](pim::DeviceOp device) {
       device.emitOpError("requires pim-form-host-plan before AiMX lowering");
       return WalkResult::interrupt();
@@ -1394,8 +1419,8 @@ struct ConvertPIMToAiMXPass
     module.walk([&](pim::PartitionOp device) { devices.push_back(device); });
     unsigned site = 0;
     for (pim::PartitionOp device : devices)
-      if (failed(DeviceLowering(module, device, profile, batch, persistent,
-                                site++).run()))
+      if (failed(DeviceLowering(module, device, profile, batch, matvecRowAlignment,
+                                matvecFirstNOnly, persistent, site++).run()))
         return signalPassFailure();
     module->removeAttr("pim.target_profile");
     module.walk([](func::FuncOp function) {
