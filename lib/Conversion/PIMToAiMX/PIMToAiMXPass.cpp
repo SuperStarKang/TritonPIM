@@ -51,10 +51,13 @@ public:
   DeviceLowering(ModuleOp module, pim::PartitionOp device,
                  pim::TargetProfileAttr profile, int64_t batch,
                  int64_t matvecRowAlignment, bool matvecFirstNOnly,
+                 int64_t matmulRowAlignment, bool matmulUsefulNOnly,
                  bool persistent, unsigned site)
       : module(module), device(device), profile(profile), batch(batch),
         matvecRowAlignment(matvecRowAlignment),
-        matvecFirstNOnly(matvecFirstNOnly), persistent(persistent),
+        matvecFirstNOnly(matvecFirstNOnly),
+        matmulRowAlignment(matmulRowAlignment),
+        matmulUsefulNOnly(matmulUsefulNOnly), persistent(persistent),
         prefix((device->getParentOfType<func::FuncOp>().getName() +
                 "_device" + Twine(site)).str()),
         setup(module.getContext()), code(module.getContext()), loc(device.getLoc()) {}
@@ -156,6 +159,8 @@ private:
   int64_t batch;
   int64_t matvecRowAlignment;
   bool matvecFirstNOnly;
+  int64_t matmulRowAlignment;
+  bool matmulUsefulNOnly;
   bool persistent;
   std::string prefix;
   unsigned symbol = 0;
@@ -354,6 +359,8 @@ private:
       // Matvec storage defaults to 4096 elements, independently of MAC width.
       if (isa<linalg::MatvecOp>(op) && matvecRowAlignment != 0)
         columnAlignment = matvecRowAlignment;
+      if (isa<linalg::MatmulOp>(op) && matmulRowAlignment != 0)
+        columnAlignment = matmulRowAlignment;
       if (!aimx::checkedRoundUp(a.rows, batch, a.rows) ||
           !aimx::checkedRoundUp(a.cols, aimx::kLanes, a.cols) ||
           !aimx::checkedRoundUp(b.rows, aimx::kRegSize, b.rows) ||
@@ -950,9 +957,11 @@ private:
       return op->emitError("AiMX MAC relayout extent overflows");
     Value arel;
     if (failed(allocate(arelBytes, aimx::AllocKind::Data, arel))) return failure();
+    int64_t columns = layout.usefulCols;
+    if (!vector && !matmulUsefulNOnly) columns = layout.cols;
     if (failed(append(aimx::buildMatmul(module, name(vector ? "matvec" : "matmul"),
                                        batch, layout.usefulRows, a->layout.usefulCols,
-                                       layout.usefulCols), {*a, *b, partial}, ValueRange{arel, pmm})) ||
+                                       columns), {*a, *b, partial}, ValueRange{arel, pmm})) ||
         failed(binary(aimx::Opcode::add, *acc, partial, out))) return failure();
     values[op->getResult(0)] = out;
     return success();
@@ -1262,6 +1271,9 @@ private:
     // N=1 matvec needs one MAC/drain microtile even with wider storage rows.
     int64_t columns = matvecFirstNOnly && isa<linalg::MatvecOp>(mac)
                           ? width : layout.cols;
+    if (isa<linalg::MatmulOp>(mac) && matmulUsefulNOnly &&
+        !aimx::checkedRoundUp(layout.usefulCols, width, columns))
+      return loop.emitError("AiMX useful GEMM N extent overflows");
     auto col = code.create<scf::ForOp>(loc, c(code, 0), c(code, columns), c(code, width));
     code.setInsertionPoint(col.getBody()->getTerminator());
     if (llvm::MulOverflow(repetitions, columns / width, repetitions))
@@ -1409,6 +1421,11 @@ struct ConvertPIMToAiMXPass
       module.emitError("AiMX matvec row alignment must be zero or a positive multiple of 4096/batch");
       return signalPassFailure();
     }
+    if (matmulRowAlignment < 0 ||
+        matmulRowAlignment % (aimx::kLanes / batch) != 0) {
+      module.emitError("AiMX matmul row alignment must be zero or a positive multiple of 4096/batch");
+      return signalPassFailure();
+    }
     WalkResult unplanned = module.walk([&](pim::DeviceOp device) {
       device.emitOpError("requires pim-form-host-plan before AiMX lowering");
       return WalkResult::interrupt();
@@ -1420,7 +1437,8 @@ struct ConvertPIMToAiMXPass
     unsigned site = 0;
     for (pim::PartitionOp device : devices)
       if (failed(DeviceLowering(module, device, profile, batch, matvecRowAlignment,
-                                matvecFirstNOnly, persistent, site++).run()))
+                                matvecFirstNOnly, matmulRowAlignment,
+                                matmulUsefulNOnly, persistent, site++).run()))
         return signalPassFailure();
     module->removeAttr("pim.target_profile");
     module.walk([](func::FuncOp function) {
