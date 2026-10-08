@@ -44,6 +44,10 @@ def ConvertPIMToAiMX : Pass<"convert-pim-to-aimx", "mlir::ModuleOp"> {
            "Matvec B/C row alignment in BF16 elements; defaults to 4096. Diagnostic 0 uses 4096/batch.">,
     Option<"matvecFirstNOnly", "matvec-first-n-only", "bool", "true",
            "Matvec vACC reduction computes the first 4096/batch columns; false also computes padded N microtiles for diagnostics.">,
+    Option<"matmulRowAlignment", "matmul-row-alignment", "int64_t", "0",
+           "GEMM B/C row alignment in BF16 elements; 0 preserves 4096/batch alignment. Used for layout comparisons.">,
+    Option<"matmulUsefulNOnly", "matmul-useful-n-only", "bool", "false",
+           "GEMM computes useful N rounded to 4096/batch independently of storage pitch; false traverses the padded N extent.">,
     Option<"persistent", "persistent", "bool", "true",
            "Retain fixed per-FPGA buffers and descriptor chains across rounds and calls.">,
   ];
