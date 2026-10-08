@@ -217,7 +217,9 @@ def _aimx_passes(options):
     tile = (f"--convert-pim-to-aimx=batch={options.batch} "
             f"persistent={str(options.aimx_persistent).lower()} "
             f"matvec-row-alignment={options.aimx_matvec_row_alignment} "
-            f"matvec-first-n-only={str(options.aimx_matvec_first_n_only).lower()}")
+            f"matvec-first-n-only={str(options.aimx_matvec_first_n_only).lower()} "
+            f"matmul-row-alignment={options.aimx_matmul_row_alignment} "
+            f"matmul-useful-n-only={str(options.aimx_matmul_useful_n_only).lower()}")
     return [tile, "-cse", "-canonicalize"]
 
 
@@ -325,6 +327,11 @@ class PIMOptions:
     aimx_matvec_row_alignment: int = 4096
     # False retains the padded-N diagnostic; GEMM traversal is unaffected.
     aimx_matvec_first_n_only: bool = True
+    # GEMM B/C Group panel rows use the 4096-element all-bank width like matvec;
+    # 512-element rows gave run-dependent FPGA results. 0 keeps the 4096/batch diagnostic.
+    aimx_matmul_row_alignment: int = 4096
+    # Compute only useful N microtiles of the 4096-element storage rows.
+    aimx_matmul_useful_n_only: bool = True
     def __post_init__(self):
         # target 없이 PIM을 쓰는 것은 의도된 사용이 아니므로 기본값으로 때우지 않고 바로 터뜨린다.
         if self.pim_target is None:

@@ -53,12 +53,15 @@ def aimx_runtime_allocations(problem, target, config):
     batch = runtime.batch
     useful_m, useful_n, useful_k = group_extent(config)
     physical_m = _round_up(useful_m, batch)
-    physical_n = _round_up(useful_n, 4096 // batch)
+    # B/C Group panel rows are stored 4096 elements wide (aimx_matmul_row_alignment),
+    # while MAC/drain covers only useful N in 4096/batch microtiles.
+    physical_n = _round_up(useful_n, 4096)
+    computed_n = _round_up(useful_n, 4096 // batch)
     physical_k = _round_up(useful_k, 256)
     padded_k = _round_up(useful_k, 4096)
 
     rows = physical_m // batch
-    cols = physical_n * batch // 4096
+    cols = computed_n * batch // 4096
     steps = ceil_div(useful_k, 256 // batch)
     tile_steps = _round_up(config.tile_k * steps, batch)
     descriptor_groups = config.tile_m * config.tile_n * (

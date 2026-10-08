@@ -161,10 +161,11 @@ Fused operator와 gather/scatter는 PIM Common IR에서 unique `pim.place`마다
 구분한다. Feature의 byte 수는 placement allocation 범위를 사용하고, 최종 선택은
 항상 실제 target 실행시간으로 결정한다.
 
-UPMEM 직접 예제는 실제 장비 크기를 명시할 수 있다.
+UPMEM 직접 예제는 실제 장비 크기를 명시할 수 있다. `autotune_gemm.py`는 저장소에 포함되지
+않는 로컬 예제다.
 
 ```bash
-python examples/autotune_gemm.py --m 256 --n 256 --k 256 \
+python examples/silent_pim/autotune_gemm.py --m 256 --n 256 --k 256 \
   --num-units 256 --lanes-per-core 16 --nr-tasklets 16
 ```
 

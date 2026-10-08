@@ -107,11 +107,8 @@ zero padding을 사용한다.
 출력에 모이면 ADD를 유지한다. K가 여러 Execution Tile로 나뉘면 Tile별 BF16
 결과의 기존 host FP32 합산을 유지하며, `pim_exec` 사이에 vACC를 보존하지 않는다.
 
-FPGA 검증은 `examples/compare_aimx_native_gemm.py`와
-`examples/aimx_native_grouped_gemm.cpp`에서 수행한다. 원본 libpim으로 Tile의
-전체 K를 한 번의 matmul에 넣고 동일한 Tile 간 host 합산을 적용한다.
-기존 `aimx_reference.cpp`/`compare_aimx_gemm.py`의 Group별 ADD 모델은 이 경로의
-검증 기준이 아니다. 이번 변경은 소스 검토만 했으며 빌드/실행 결과는 아직 없다.
+FPGA 검증과 정확도 결과는 §18에 있다. 이 경로의 출력은 Python MAC 모델(Tile 안 vACC
+누산 + Tile 사이 host FP32 합산)과 bit 단위로 일치한다.
 
 Lowering은 PMM, 상주 버퍼, scratch, 상수, 전체 descriptor chain을 모두 합산해
 bank 용량을 검사한다. `aimx.allocations`, `aimx.bank_bytes`,
@@ -2615,7 +2612,7 @@ bit 단위로 일치하는 모델로 설명된다.**
 | `k_t` | vACC가 drain 없이 한 번에 누산하는 K 길이 = `BLOCK_K × group_k × tile_k` (Execution Tile의 K 크기) |
 | 그룹 지수 `G` | vACC lane이 저장하는 5 bit 지수 = 곱 지수의 상위 5 bit (`exp_compare = mul_exp >> 3`, §11.1). 한 칸이 8 binade |
 | vendor MAC 시뮬레이터 | `pim_aimx_sw/ubench/*/pim_mac_simul.cpp`의 `#else` 경로. vendor ubench의 정답 생성기 |
-| Python MAC 모델 | 위 시뮬레이터를 Python으로 옮긴 것. `examples/silent_pim/*.py`의 `multiply`/`accumulate`/`normalize`/`simulate` |
+| Python MAC 모델 | 위 시뮬레이터를 Python으로 옮긴 것(`multiply`/`accumulate`/`normalize`/`simulate`). §18.6의 실험 스크립트에 들어 있었다 |
 | 0-상쇄 | 반대 부호 곱이 더해져 vACC 가수가 정확히 0이 되는 것 |
 
 ### 18.2 하드웨어 구조와 vACC lane 형식
@@ -2706,13 +2703,15 @@ FP32 합산이 늘어나며, 그 성능 비용은 아직 재지 않았다. 참�
 
 ### 18.6 검증 도구
 
-| 파일 (`pim_backend/examples/silent_pim/`) | 내용 |
-| --- | --- |
-| `sweep_aimx_k_accuracy.py` | M=128, N=512 고정. A: K 증가(k_t=K), B: K=4096에서 k_t 감소, C: k_t 고정 분배 대조. FP64 오차와 Python MAC 모델 bit 비교 |
-| `check_aimx_row_alignment.py` | 행 pitch 512/4096 비교와 재현성 확인 |
+이 절의 수치는 두 로컬 실험 스크립트로 얻었다. 스크립트는 저장소에 남기지 않았다.
 
-Python MAC 모델의 `accumulate()`는 §18.3 규칙("가수가 0이면 들어온 곱의 부호")을 넣어야
-FPGA와 완전히 일치한다.
+| 실험 | 내용 |
+| --- | --- |
+| K sweep | M=128, N=512, BLOCK (32, 512, 64), batch=8, FPGA 1개. A: K 증가(k_t=K), B: K=4096에서 k_t 감소, C: k_t 고정 분배 대조. 분포 4개. FP64 오차와 Python MAC 모델 bit 비교. case마다 새 프로세스 |
+| 행 pitch 비교 | 같은 config를 `aimx_matmul_row_alignment` 0(512)과 4096으로 실행, 같은 config 2회 실행으로 재현성 확인 |
+
+Python MAC 모델을 다시 만들 때는 `accumulate()`에 §18.3 규칙("가수가 0이면 들어온 곱의
+부호")을 넣어야 FPGA와 완전히 일치한다.
 
 ### 18.7 확인하지 않은 범위
 

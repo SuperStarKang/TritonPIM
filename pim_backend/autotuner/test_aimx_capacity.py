@@ -16,8 +16,8 @@ class AiMXCapacityTest(unittest.TestCase):
             "PMM": 196608,
             "A": 262144,
             "Arel": 131072,
-            "B": 1048576,
-            "C": 32768,
+            "B": 8388608,
+            "C": 262144,
             "descriptor chain": 43008,
         })
         self.assertIsNone(ConstraintEngine(problem, target).check(config))
@@ -28,7 +28,7 @@ class AiMXCapacityTest(unittest.TestCase):
         config = PIMConfig(8, 512, 32, 1, 1, 1, 1, 1, 8, 1, 1, 1)
         allocations = aimx_runtime_allocations(problem, target, config)
 
-        self.assertEqual(allocations["B"], 2097152)
+        self.assertEqual(allocations["B"], 16777216)
         self.assertEqual(allocations["Arel"], 524288)
         self.assertEqual(allocations["descriptor chain"], 16896)
 
@@ -49,11 +49,11 @@ class AiMXCapacityTest(unittest.TestCase):
         allocations = aimx_runtime_allocations(problem, target, config)
         features = extract_features(problem, target, config)
 
-        self.assertEqual(allocations["B"], 2097152)
-        self.assertEqual(allocations["C"], 65536)
+        self.assertEqual(allocations["B"], 8388608)
+        self.assertEqual(allocations["C"], 262144)
         self.assertEqual(allocations["descriptor chain"], 143360)
-        self.assertEqual(features.h2d_bytes, 2228224)
-        self.assertEqual(features.d2h_bytes, 65536)
+        self.assertEqual(features.h2d_bytes, 8519680)
+        self.assertEqual(features.d2h_bytes, 262144)
         self.assertEqual(features.padding_ratio, 0)
 
     def test_lower_bound_already_exceeding_capacity_is_rejected(self):

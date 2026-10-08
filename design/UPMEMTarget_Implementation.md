@@ -399,7 +399,7 @@ pk=0..7 partial을 더한다.
 A payload는 4 MiB이고 x payload는 복제분 포함 32 KiB다. 입력 공유 모델이 개선되어도
 A가 대부분이므로 GEMM에서 큰 입력을 공유할 때와 같은 시간 감소를 보장하지 않는다.
 
-현재 `examples/gemv.py`의 INT8 broadcast 오류는 이 물리 배정이 실행되기 전의 계산
+현재 `gemv.py` 예제(저장소에 포함되지 않는 로컬 예제)의 INT8 broadcast 오류는 이 물리 배정이 실행되기 전의 계산
 정규화 문제다. 곱셈 후 INT32 확장이 끼는 패턴과 의미 차이는
 [Common 설계 5절](PIMCommonIR_Design.md#5-계산-패턴을-어떻게-찾는가)에 설명했다.
 

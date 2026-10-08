@@ -13,6 +13,12 @@
 // RUN: sed 's/0.0 : f32/1.0 : f32/' %s | not triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx 2>&1 | FileCheck %s --check-prefix=NONZERO
 // Two contributions to one output must still use real ADDs.
 // RUN: sed '/^        pim.combine /p' %s | triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx | FileCheck %s --check-prefix=COMBINE
+// GEMM storage pitch and computed N can be varied without changing Common groups.
+// RUN: triton-shared-opt --pim-form-host-plan "--convert-pim-to-aimx=matmul-row-alignment=4096" %s | FileCheck %s --check-prefix=WIDE --implicit-check-not=elementwise_
+// RUN: triton-shared-opt --pim-form-host-plan "--convert-pim-to-aimx=matmul-row-alignment=4096 matmul-useful-n-only=true" %s | FileCheck %s --check-prefix=USEFUL --implicit-check-not=elementwise_
+// Two useful N microtiles must survive; this option is not GEMV's first-N-only rule.
+// RUN: sed 's/1024/2048/g; s/512/1024/g' %s | triton-shared-opt --pim-form-host-plan "--convert-pim-to-aimx=matmul-row-alignment=4096 matmul-useful-n-only=true" | FileCheck %s --check-prefix=USEFUL1024 --implicit-check-not=elementwise_
+// RUN: not triton-shared-opt --pim-form-host-plan "--convert-pim-to-aimx=matmul-row-alignment=513" %s 2>&1 | FileCheck %s --check-prefix=BAD-ALIGN
 // IR-LABEL: func.func @vacc_groups
 // Arel holds both K groups at once: 2 * 8 * 256 * 2 * 16 bytes.
 // IR: aimx.alloc {{.*}} bytes 131072 align 8192 kind data
@@ -28,6 +34,7 @@
 // IR: aimx.matmul_phase = "accumulate"
 // IR: aimx.build_descriptors @vacc_groups_device0_matmul_drain_
 // IR-NOT: aimx.build_descriptors {{.*}}matmul_
+// IR: aimx.stage {{.*}}group_layout = array<i64: 128, 512, 256, 512, 2, 2>
 // IR: aimx.invoke
 // IR-NOT: aimx.invoke
 // IR: aimx.unstage
@@ -56,6 +63,42 @@
 // COMBINE-LABEL: func.func @vacc_groups
 // COMBINE: aimx.build_descriptors @vacc_groups_device0_matmul_drain_
 // COMBINE-COUNT-2: aimx.build_descriptors @vacc_groups_device0_elementwise_
+// WIDE-LABEL: func.func @vacc_groups
+// WIDE: aimx.matmul_phase = "relayout"
+// WIDE: scf.for
+// WIDE: %[[COLUMNS:.*]] = arith.constant 4096 : index
+// WIDE: scf.for {{.*}} to %[[COLUMNS]] step {{.*}} {
+// WIDE: aimx.build_descriptors @vacc_groups_device0_matmul_accumulate_
+// WIDE-NOT: matmul_drain_
+// WIDE: aimx.matmul_phase = "accumulate"
+// WIDE: aimx.build_descriptors @vacc_groups_device0_matmul_drain_
+// WIDE: aimx.stage {{.*}}group_layout = array<i64: 128, 512, 256, 4096, 2, 2>
+// WIDE: aimx.unstage {{.*}}group_layout = array<i64: 8, 512, 8, 4096, 2, 2>
+// USEFUL-LABEL: func.func @vacc_groups
+// USEFUL: aimx.matmul_phase = "relayout"
+// USEFUL: scf.for
+// USEFUL-NOT: arith.constant 4096 : index
+// USEFUL: arith.constant 512 : index
+// USEFUL-NOT: arith.constant 4096 : index
+// USEFUL: scf.for
+// USEFUL: aimx.build_descriptors @vacc_groups_device0_matmul_accumulate_
+// USEFUL-NOT: matmul_drain_
+// USEFUL: aimx.matmul_phase = "accumulate"
+// USEFUL: aimx.build_descriptors @vacc_groups_device0_matmul_drain_
+// USEFUL: aimx.stage {{.*}}group_layout = array<i64: 128, 512, 256, 4096, 2, 2>
+// USEFUL: aimx.unstage {{.*}}group_layout = array<i64: 8, 512, 8, 4096, 2, 2>
+// USEFUL1024-LABEL: func.func @vacc_groups
+// USEFUL1024: aimx.matmul_phase = "relayout"
+// USEFUL1024: scf.for
+// USEFUL1024: %[[COLUMNS:.*]] = arith.constant 1024 : index
+// USEFUL1024: scf.for {{.*}} to %[[COLUMNS]] step {{.*}} {
+// USEFUL1024: aimx.build_descriptors @vacc_groups_device0_matmul_accumulate_
+// USEFUL1024-NOT: matmul_drain_
+// USEFUL1024: aimx.matmul_phase = "accumulate"
+// USEFUL1024: aimx.build_descriptors @vacc_groups_device0_matmul_drain_
+// USEFUL1024: aimx.stage {{.*}}group_layout = array<i64: 128, 1024, 256, 4096, 2, 2>
+// USEFUL1024: aimx.unstage {{.*}}group_layout = array<i64: 8, 1024, 8, 4096, 2, 2>
+// BAD-ALIGN: AiMX matmul row alignment must be zero or a positive multiple of 4096/batch
 
 module attributes {pim.target_profile = #pim.target_profile<target = "aimx",
     num_units = 1, banks_per_unit = 256, cores_per_bank = 1, lanes_per_core = 16,
