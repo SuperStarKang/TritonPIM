@@ -2596,3 +2596,127 @@ host 원소 타입도 여기서 흡수한다. PIM DRAM은 언제나 bfloat16이�
 
 **f16을 16 bit 그대로 옮기면 안 된다** — 지수 폭이 5 bit와 8 bit로 다르다. `aimx_from_fp16`은
 IEEE half 65,536개 전부에 대해 bit 단위로 대조했다.
+
+---
+
+## 18. 정확도 — vACC 수치 특성과 GEMM 행 pitch (2026-10-08 FPGA 실측)
+
+이 절은 GEMM/GEMV 정확도 조사 결과를 정리한다. 결론은 둘이다. **(1) GEMM B/C의 행
+pitch가 512 원소이면 결과가 config와 실행 시점에 따라 틀린다 — 기본값을 4096으로 바꿔
+해결했다. (2) 나머지 오차는 lowering이 아니라 vACC 누산기의 수치 특성이며, FPGA 결과와
+bit 단위로 일치하는 모델로 설명된다.**
+
+### 18.1 용어
+
+| 용어 | 뜻 |
+| --- | --- |
+| 행 pitch | 2차원 배열을 저장할 때 한 행의 시작에서 다음 행의 시작까지의 거리 (원소 또는 byte). §1의 `padded_n`이 B/C의 행 pitch다 |
+| Group panel | Execution Tile 안에서 Group 하나가 차지하는 연속 저장 영역. `group_layout`의 `physical_cols`가 panel의 행 pitch다 |
+| `k_t` | vACC가 drain 없이 한 번에 누산하는 K 길이 = `BLOCK_K × group_k × tile_k` (Execution Tile의 K 크기) |
+| 그룹 지수 `G` | vACC lane이 저장하는 5 bit 지수 = 곱 지수의 상위 5 bit (`exp_compare = mul_exp >> 3`, §11.1). 한 칸이 8 binade |
+| vendor MAC 시뮬레이터 | `pim_aimx_sw/ubench/*/pim_mac_simul.cpp`의 `#else` 경로. vendor ubench의 정답 생성기 |
+| Python MAC 모델 | 위 시뮬레이터를 Python으로 옮긴 것. `examples/silent_pim/*.py`의 `multiply`/`accumulate`/`normalize`/`simulate` |
+| 0-상쇄 | 반대 부호 곱이 더해져 vACC 가수가 정확히 0이 되는 것 |
+
+### 18.2 하드웨어 구조와 vACC lane 형식
+
+device 하나 = chip 8개 × chip당 channel 2개 = channel 16개, channel당 bank 16개, bank당
+ALU 16개. all-bank로 동시에 동작하므로 출력 폭이 `16 × 16 × 16 = 4096` lane이다
+(`kLanes`, `NUM_CHANNELS`, `NUM_BANKS`, `ALU_SIZE`와 일치).
+
+vACC lane 하나는 **부호 1 bit + 그룹 지수 G 5 bit + 가수 16 bit = 22 bit**이고 값은
+`±가수 × 2^(8G−134)`이다. 같은 G 안에서는 고정소수점 정수 덧셈이다.
+
+| G | \|acc\| 범위 | LSB | 이 acc에 더할 때 버려지는 곱 |
+| --- | --- | --- | --- |
+| 15 | < 4 | 2⁻¹⁴ | \|p\| < 2⁻¹⁵ |
+| 16 | 4 ~ 1024 | 2⁻⁶ = 1/64 | \|p\| < 2⁻⁷ |
+| 17 | 1024 ~ 262144 | 4 | \|p\| < 2 |
+
+- 그룹 차 −1인 곱은 8 bit 밀리고, 버린 8 bit가 `0x0F`를 넘으면 올림된다.
+- 그룹 차 ≤ −2인 곱은 버려진다. 그룹 차 ≥ 2이면 acc가 버려진다.
+- **G는 커지기만 한다.** 상쇄로 값이 작아져도 LSB는 그대로다.
+- drain(`normalize`)은 반올림이 아니라 절사다. 가수가 0이면 0.0이 아니라
+  `±2^(8G−127)`을 낸다 (G=16이면 ±2.0, G=15이면 ±2⁻⁷).
+
+### 18.3 0-상쇄 부호 규칙 — vendor MAC 시뮬레이터와 하드웨어의 유일한 차이
+
+**하드웨어: vACC 가수가 0이면 부호는 그 단계에서 들어온 곱의 부호다.** 그룹 차가 0이든
+−1이든 같고, 가수가 0인 상태에서 버려지는 곱(0 곱 포함, 0 곱의 부호는 +)이 와도 부호가
+그 곱의 부호로 바뀐다. vendor MAC 시뮬레이터는 반대 부호 상쇄를 항상 `+`로 두고, 버려지는
+곱에는 acc 부호를 유지한다.
+
+```
+1×3 + 1×(−3) + 0×… (cancel probe)
+  k=1: 가수 0 → 부호 −(곱)   k=2…: 0 곱(+) 버려짐 → 부호 +   drain → +2.0 (실측)
+acc = +7·2⁻⁶ (G16), 곱 = −0.108826 (G15 → 올림 후 7)
+  가수 0 → 부호 −(곱) → drain −2.0 (실측). 시뮬레이터는 +2.0
+```
+
+근거: k sweep 44 case(출력 2,883,584개)에서 시뮬레이터 규칙은 461개 불일치(전부 차이가
+정확히 4.0 또는 0.015625), 위 규칙은 **0개**. 이 규칙은 검증 모델의 문제이며 lowering은
+산술을 계산하지 않으므로 반영할 것이 없다. ±2.0 출력 자체는 하드웨어 동작이라 lowering으로
+없앨 수 없다.
+
+### 18.4 GEMM B/C 행 pitch 512 오류와 수정
+
+`--convert-pim-to-aimx`의 `matmul-row-alignment` 기본값 0은 B/C Group panel의 행 pitch를
+`4096/batch`(batch=8이면 512 원소)로 둔다. 이 배치에서 FPGA 결과는 config에 따라 틀렸고,
+같은 입력을 두 번 실행해도 결과가 달랐다. vendor `gemm.cpp`/`matmul.c`는 N을
+`CHUNK = 4096`의 배수로 padding해 언제나 4096 원소 pitch를 쓴다.
+
+| case (M=128, N=512, K, (group_k, tile_k)) | 행 pitch | relative_l2 | 모델 불일치 |
+| --- | --- | --- | --- |
+| K=256, (4, 1) 1회차 / 2회차 | 512 | 108% / 109% (두 실행 결과 49,580개 다름) | 65,436 / 65,413 |
+| K=256, (4, 1) | 4096 | 0.80% | 0-상쇄만 |
+| K=512, (4, 2) | 512 / 4096 | 121% / 0.78% | 65,460 / 0-상쇄만 |
+| K=1024, (4, 4) | 512 / 4096 | 0.77% / 0.77% (bit 동일) | 0-상쇄만 |
+
+**수정:** `pim_backend/backend/compiler.py`의 기본값을 `aimx_matmul_row_alignment = 4096`,
+`aimx_matmul_useful_n_only = True`로 바꿨다. padding은 **Group panel의 각 행**에 붙는다
+(Tile 단위 padding은 없다). 계산은 `useful_n_only`로 유효 N을 `4096/batch` 단위로 올린
+microtile만 한다. 저장은 늘어난다 — N=512이면 B/C가 8배다. pass 옵션 기본값 0은 lit test와
+layout 비교용으로 남겼다. 수정 후 k sweep 44 case가 모두 모델과 일치했다(0-상쇄 부호 제외).
+
+### 18.5 남는 수치 오차와 `k_t`
+
+정확도를 정하는 것은 `k_t`와 데이터 분포다. `k_t`가 같으면 `group_k`/`tile_k` 분배는 결과를
+bit 단위로 바꾸지 않는다 (K=4096에서 (4, 16)과 (1, 64), 4개 분포 모두 동일). M/N 방향
+Block/Group/Tile은 출력 lane이 독립이라 수치에 영향이 없다.
+
+FPGA 실측, M=128, N=512, K=4096, 같은 입력, relative_l2 (FP64 대비):
+
+| 분포 | k_t=256 | 512 | 1024 | 2048 | 4096 |
+| --- | --- | --- | --- | --- | --- |
+| signed: N(0,1)·N(0,1) | 0.799% | 0.786% | 0.780% | 0.777% | 0.777% |
+| positive: \|N(0,1)\|·\|N(0,1)\| | 0.607% | 0.622% | 0.633% | **17.2%** | **48.5%** |
+| llm: N(0,1)·N(0,0.02) | 0.404% | 0.406% | 0.407% | 0.409% | 0.789% |
+| llm_outlier: llm + 채널 하나 x=60 | 1.27% | 1.77% | 2.50% | 3.58% | 5.14% |
+
+| 현상 | 원인 | `k_t`로 조절 |
+| --- | --- | --- |
+| 1024 포화 | 같은 부호 부분합이 1024를 넘어 G=17, \|p\|<2인 곱이 버려짐 | `k_t ≤ 1024`이면 사라짐 |
+| G=16 갇힘 | outlier 곱 또는 부분합이 4를 넘은 뒤 작은 곱이 1/64로 올림/버림 | 작을수록 좋아짐 |
+| 0-상쇄 이상치 | 정답 ≈ 0인 출력이 ±2^(8G−127) | Tile 수에 비례해 늘어남 (K=4096 signed: k_t 4096 → 6개, 256 → 177개 / 65,536) |
+| 양자화 바닥 | 1/64 LSB와 drain 절사 | 없앨 수 없음 (signed 약 0.78%, llm 약 0.40%) |
+
+네 분포 모두에서 무난한 범위는 `k_t = 256 ~ 1024`다. `k_t`를 줄이면 `pim_exec` 횟수와 host
+FP32 합산이 늘어나며, 그 성능 비용은 아직 재지 않았다. 참고로 같은 입력의 GPU식 연산(bf16
+입력, FP32 누산)은 약 0.15%로 추정된다(모델 시뮬레이션).
+
+### 18.6 검증 도구
+
+| 파일 (`pim_backend/examples/silent_pim/`) | 내용 |
+| --- | --- |
+| `sweep_aimx_k_accuracy.py` | M=128, N=512 고정. A: K 증가(k_t=K), B: K=4096에서 k_t 감소, C: k_t 고정 분배 대조. FP64 오차와 Python MAC 모델 bit 비교 |
+| `check_aimx_row_alignment.py` | 행 pitch 512/4096 비교와 재현성 확인 |
+
+Python MAC 모델의 `accumulate()`는 §18.3 규칙("가수가 0이면 들어온 곱의 부호")을 넣어야
+FPGA와 완전히 일치한다.
+
+### 18.7 확인하지 않은 범위
+
+N > 512(panel 하나에 microtile 여러 개), K가 256의 배수가 아닌 경우(`matmul_padding`),
+M/N tail(mask), `num_units > 1`, `batch ≠ 8`, K > 4096인 GEMV는 FPGA로 확인하지 않았다.
+autotuner의 용량 하한(`autotuner/constraints.py`의 `aimx_runtime_allocations`)은 아직 B/C
+행을 `4096/batch`로 계산한다.
