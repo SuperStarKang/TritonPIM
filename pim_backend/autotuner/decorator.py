@@ -106,13 +106,16 @@ def pim_autotune(target=None, spec=None, cache_path=DEFAULT_CACHE_PATH,
                  budget=None, space_overrides=None, ref_fn=None, reps=3,
                  seed=0, search=True, retune=False, verbose=True,
                  rtol=0.0, atol=0.0,
-                 template_version="pim-common-ir-semantic-schedule-v1"):
+                 template_version="pim-common-ir-semantic-schedule-v1",
+                 check_correctness=True):
     """Autotune ``fn(a, b, *, config)`` with Common IR configurations."""
     selected_target = spec if spec is not None else target_spec(target)
     overrides = space_overrides if space_overrides is not None else {}
 
     def decorate(fn):
         verify_kind = "custom" if ref_fn is not None else "sampled"
+        if not check_correctness:
+            verify_kind = "disabled"
         cache = PIMConfigCache(
             cache_path,
             template_version=(
@@ -123,6 +126,11 @@ def pim_autotune(target=None, spec=None, cache_path=DEFAULT_CACHE_PATH,
         @functools.wraps(fn)
         def wrapper(a, b):
             problem = problem_from_tensors(a, b)
+            if verbose and not check_correctness:
+                print(
+                    "[autotuner] correctness=None: verification SKIPPED",
+                    flush=True,
+                )
             do_search = _env_flag("PIM_AUTOTUNE", search)
             do_retune = _env_flag("PIM_RETUNE", retune)
 
@@ -147,7 +155,10 @@ def pim_autotune(target=None, spec=None, cache_path=DEFAULT_CACHE_PATH,
                 return fn(a, b, config=config)
 
             out_dtype = getattr(torch, problem.output_dtype)
-            if ref_fn is not None:
+            if not check_correctness:
+                def verify(out):
+                    return None
+            elif ref_fn is not None:
                 reference = ref_fn(a, b)
 
                 def verify(out):

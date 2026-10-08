@@ -299,7 +299,7 @@ def tune(problem, target, benchmark_fn, *, space=None, cache=None,
                 f" {name}={milliseconds:.2f}"
                 for name, milliseconds in result.timings)
             print(
-                f" -> {result.total_ms:.2f} ms (ok={result.ok})"
+                f" -> {result.total_ms:.2f} ms (correctness={result.correctness})"
                 f"{stages}{source}")
         return record
 
