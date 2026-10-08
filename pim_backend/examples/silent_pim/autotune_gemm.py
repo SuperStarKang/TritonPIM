@@ -2,6 +2,7 @@
 #
 # 실행:
 #   python autotune_gemm.py --m 1024 --n 8192 --k 28672 --max-benchmarks 30
+#   정확성 검사는 기본 OFF이며 --check-correctness로 켠다.
 #   retune=True로 매번 탐색하고 선택된 config를 cache에 저장한다.
 #
 # 같은 target spec을 autotuner와 kernel launch에 전달한다.
@@ -41,6 +42,9 @@ def main():
     parser.add_argument("--max-benchmarks", type=int, default=30)
     parser.add_argument("--max-seconds", type=float, default=None)
     parser.add_argument("--cache", type=str, default=DEFAULT_CACHE_PATH)
+    parser.add_argument("--check-correctness",
+                        action=argparse.BooleanOptionalAction, default=False,
+                        help="정확성 검사 ON/OFF (기본 OFF)")
     parser.add_argument("--rtol", type=float, default=5e-2,
                         help="BF16 correctness 상대 허용 오차")
     parser.add_argument("--atol", type=float, default=5e-2,
@@ -60,6 +64,7 @@ def main():
     @pim_autotune(spec=hardware, cache_path=args.cache, budget=budget,
                   reps=args.reps, seed=args.seed,
                   rtol=args.rtol, atol=args.atol,
+                  check_correctness=args.check_correctness,
                   retune=True)
     def gemm(a, b, *, config):
         M, K = a.shape
@@ -86,9 +91,10 @@ def main():
     out = gemm(a, b)
     wall_ms = (time.perf_counter_ns() - start_ns) / 1e6
 
-    ref = torch.matmul(a.to(torch.float32), b.to(torch.float32))
     print(f"\nwall  : {wall_ms:.2f} ms (탐색이 돌았다면 그 시간을 포함한다)")
-    print(f"오차  : {(ref - out).abs().max().item()}")
+    if args.check_correctness:
+        ref = torch.matmul(a.to(torch.float32), b.to(torch.float32))
+        print(f"오차  : {(ref - out).abs().max().item()}")
 
 
 if __name__ == "__main__":
