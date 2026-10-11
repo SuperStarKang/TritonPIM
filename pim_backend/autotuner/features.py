@@ -3,8 +3,10 @@
 from dataclasses import dataclass
 import math
 
-from .constraints import local_memory_footprint, unit_memory_footprint
-from .types import AXES, pim_hierarchy
+from .constraints import (
+    aimx_runtime_allocations, local_memory_footprint, unit_memory_footprint,
+)
+from .types import AXES, ceil_div, pim_hierarchy
 
 
 @dataclass(frozen=True)
@@ -38,6 +40,16 @@ def extract_features(problem, target, config):
     execution_tile_bytes = unit_memory_footprint(problem, config)
     block_group_compute = math.prod(hierarchy.block_group_extent)
     execution_tile_compute = math.prod(config.execution_extent)
+    aimx_allocations = None
+    if profile.target == "aimx" and problem.uses_aimx_matmul_primitive:
+        aimx_allocations = aimx_runtime_allocations(problem, target, config)
+        execution_tile_bytes = sum(aimx_allocations.values())
+        block_group_bytes = (
+            aimx_allocations["A"] // (config.tile_m * config.tile_k)
+            + aimx_allocations["B"] // (config.tile_k * config.tile_n)
+            + aimx_allocations["C"] // (config.tile_m * config.tile_n)
+            + aimx_allocations["Arel"] // config.tile_k
+        )
 
     # Host staging은 pim.place.shared_over 축의 같은 buffer를 공유한다.
     # H2D는 그 buffer를 공유하더라도 모든 active device의 MRAM으로 전송한다.
@@ -46,6 +58,10 @@ def extract_features(problem, target, config):
     for access in problem.input_accesses:
         tile_bytes = (
             access.elements(config.execution_extent) * access.element_bytes)
+        if aimx_allocations is not None:
+            tile_bytes = aimx_allocations[{
+                ("m", "k"): "A", ("k", "n"): "B", ("m", "n"): "C",
+            }[access.axes]]
         distinct_per_round = math.prod(
             partitions[axis]
             for axis, name in enumerate(AXES)
@@ -58,6 +74,8 @@ def extract_features(problem, target, config):
         access.elements(config.execution_extent) * access.element_bytes
         for access in problem.output_accesses)
     d2h_bytes = scheduling_rounds * active_units * output_tile_bytes
+    if aimx_allocations is not None:
+        d2h_bytes = scheduling_rounds * active_units * aimx_allocations["C"]
 
     final_output_bytes = sum(
         access.elements(problem.axis_extents) * access.element_bytes
@@ -67,6 +85,15 @@ def extract_features(problem, target, config):
     reduction_bytes = final_output_bytes * (k_contributions - 1)
 
     scheduled_compute = scheduled_tiles * execution_tile_compute
+    if aimx_allocations is not None:
+        batch = target.runtime_config.batch
+        gm, gn, gk = hierarchy.block_group_extent
+        mac_k = ceil_div(gk, 256 // batch) * (256 // batch)
+        scheduled_compute = scheduled_tiles * config.tile_m * config.tile_n * (
+            ceil_div(gm, batch) * batch
+            * ceil_div(gn, 4096 // batch) * (4096 // batch)
+            * ceil_div(config.tile_k * mac_k, 256) * 256
+        )
     useful_compute = math.prod(problem.axis_extents)
     padding_ratio = (scheduled_compute - useful_compute) / scheduled_compute
 

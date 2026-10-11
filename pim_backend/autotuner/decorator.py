@@ -106,13 +106,16 @@ def pim_autotune(target=None, spec=None, cache_path=DEFAULT_CACHE_PATH,
                  budget=None, space_overrides=None, ref_fn=None, reps=3,
                  seed=0, search=True, retune=False, verbose=True,
                  rtol=0.0, atol=0.0,
-                 template_version="pim-common-ir-semantic-schedule-v1"):
+                 template_version="pim-common-ir-semantic-schedule-v1",
+                 check_correctness=True):
     """Autotune ``fn(a, b, *, config)`` with Common IR configurations."""
     selected_target = spec if spec is not None else target_spec(target)
     overrides = space_overrides if space_overrides is not None else {}
 
     def decorate(fn):
         verify_kind = "custom" if ref_fn is not None else "sampled"
+        if not check_correctness:
+            verify_kind = "disabled"
         cache = PIMConfigCache(
             cache_path,
             template_version=(
@@ -123,6 +126,11 @@ def pim_autotune(target=None, spec=None, cache_path=DEFAULT_CACHE_PATH,
         @functools.wraps(fn)
         def wrapper(a, b):
             problem = problem_from_tensors(a, b)
+            if verbose and not check_correctness:
+                print(
+                    "[autotuner] correctness=None: verification SKIPPED",
+                    flush=True,
+                )
             do_search = _env_flag("PIM_AUTOTUNE", search)
             do_retune = _env_flag("PIM_RETUNE", retune)
 
@@ -147,7 +155,10 @@ def pim_autotune(target=None, spec=None, cache_path=DEFAULT_CACHE_PATH,
                 return fn(a, b, config=config)
 
             out_dtype = getattr(torch, problem.output_dtype)
-            if ref_fn is not None:
+            if not check_correctness:
+                def verify(out):
+                    return None
+            elif ref_fn is not None:
                 reference = ref_fn(a, b)
 
                 def verify(out):
@@ -160,11 +171,60 @@ def pim_autotune(target=None, spec=None, cache_path=DEFAULT_CACHE_PATH,
                     a.index_select(0, rows).to(out_dtype)
                     @ b.index_select(1, cols).to(out_dtype)
                 )
+                if verbose and isinstance(
+                        selected_target.runtime_config, AiMXRuntimeConfig):
+                    # 입력 반올림만 분리하며 AiMX 내부 누산을 재현하지 않는다.
+                    ref_bf16_block = (
+                        a.index_select(0, rows).to(torch.bfloat16).float()
+                        @ b.index_select(1, cols).to(torch.bfloat16).float()
+                    )
+                    input_rounding_error = (ref_bf16_block - ref_block).abs()
+                    print(
+                        "[verify-reference] BF16 inputs, FP32 matmul: "
+                        f"input_rounding_max_abs={input_rounding_error.max().item():.6g} "
+                        f"input_rounding_mean_abs={input_rounding_error.mean().item():.6g}",
+                        flush=True,
+                    )
 
                 def verify(out):
                     got = out.index_select(0, rows).index_select(1, cols)
-                    return bool(torch.allclose(
+                    ok = bool(torch.allclose(
                         got, ref_block, rtol=rtol, atol=atol))
+                    if verbose and isinstance(
+                            selected_target.runtime_config, AiMXRuntimeConfig):
+                        error = (got - ref_block).abs()
+                        bf16_error = (got - ref_bf16_block).abs()
+                        failed = ~torch.isclose(
+                            got, ref_block, rtol=rtol, atol=atol)
+                        print(
+                            f"\n[verify] ok={ok} "
+                            f"sampled={got.numel()}/{out.numel()} "
+                            f"failed={failed.sum().item()}/{got.numel()} "
+                            f"rtol={rtol:g} atol={atol:g} "
+                            f"max_abs={error.max().item():.6g} "
+                            f"mean_abs={error.mean().item():.6g}",
+                            flush=True,
+                        )
+                        print(
+                            f"[verify] sampled_nan={torch.isnan(got).sum().item()} "
+                            f"sampled_inf={torch.isinf(got).sum().item()} "
+                            f"reference_nonfinite={(~torch.isfinite(ref_block)).sum().item()} "
+                            f"vs_bf16_input_ref_max_abs={bf16_error.max().item():.6g} "
+                            f"vs_bf16_input_ref_mean_abs={bf16_error.mean().item():.6g}",
+                            flush=True,
+                        )
+                        for i, j in failed.nonzero()[:5].tolist():
+                            print(
+                                f"[verify] C[{rows[i].item()},{cols[j].item()}] "
+                                f"got={got[i, j].item():.9g} "
+                                f"ref={ref_block[i, j].item():.9g} "
+                                f"abs_error={error[i, j].item():.6g} "
+                                f"allowed={(atol + rtol * ref_block[i, j].abs()).item():.6g} "
+                                f"bf16_input_ref={ref_bf16_block[i, j].item():.9g} "
+                                f"abs_error_vs_bf16={bf16_error[i, j].item():.6g}",
+                                flush=True,
+                            )
+                    return ok
 
             def benchmark_fn(problem, target, config):
                 out = fn(a, b, config=config)
@@ -185,6 +245,7 @@ def pim_autotune(target=None, spec=None, cache_path=DEFAULT_CACHE_PATH,
                     total_ms=statistics.median(samples),
                     correctness=verify(out),
                     timings=timings,
+                    physical_allocations=pim_driver.aimx_allocations,
                 )
 
             result = tune(

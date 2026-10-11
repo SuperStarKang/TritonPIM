@@ -194,7 +194,7 @@ A/y의 행 분할과 x 공유를 읽을 수 있다. 이미 named matvec이면 �
 
 ### 5.3 현재 INT8 gemv.py가 실패하는 이유
 
-[gemv.py](../pim_backend/examples/gemv.py)는 다음 식을 사용한다.
+`gemv.py` 예제(저장소에 포함되지 않는 로컬 예제)는 다음 식을 사용한다.
 
 ```python
 acc += tl.sum(a * x[None, :], axis=1)

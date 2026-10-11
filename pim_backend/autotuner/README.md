@@ -94,6 +94,29 @@ UPMEM timing v3는 입력 layout, 버퍼 할당·초기화, 출력 layout과 `re
 중단되더라도 기존 cache를 먼저 비우지 않는다. 0-byte 파일은 빈 cache로 취급하고
 내용이 있는 잘못된 JSON은 해당 경로를 포함한 오류로 보고한다.
 
+AiMX의 컴파일 전 용량 검사는 Group마다 적용되는 물리 padding을 계산한다.
+`batch=b`일 때 M은 `b`, N은 `4096/b`, K는 `256`의 배수로 올림하며,
+A의 입력 pitch만 `4096` 원소 정렬을 유지한다. Execution Tile의 resident
+A/B/C는 Group 개수의 곱으로 계산한다. 순수 GEMM의 Arel은 현재 M/N Group에
+속한 모든 K-Group을 유지하므로 `tile_k`배가 필요하다. MAC은 K-Group 경계에서
+누적을 끊지 않고, 출력 microtile마다 마지막에 한 번만 저장한다.
+descriptor 추정은 Group별 Arel 준비, `256/batch` 단위 MAC, 마지막 K padding,
+출력 microtile별 drain을 각각 센다. 저장용 K padding과 MAC padding은 다르다.
+
+이 값은 GEMM의 **하한 추정**이다. Common IR의 scratch, 상수, copy/add,
+fusion에 필요한 전체 descriptor는 lowering에서 모두 합산해 최종 용량을 검사한다.
+따라서 static constraint를 통과해도 lowering이 용량 초과 오류를 낼 수 있으며,
+그 오류를 무시하거나 다른 config로 대체하지 않는다.
+측정 결과의 `physical_allocations`에는 lowering이 생성한 device별 전체 할당 목록을
+기록하고, 측정된 후보의 `unit_memory_pressure`에는 이 목록을 사용한다.
+배치가 달라졌으므로 이전 버전의 컴파일·autotuning cache는 새 키로 구분한다.
+
+관련 Python 회귀 테스트는 저장소 루트에서 다음과 같이 실행한다.
+
+```sh
+python -m unittest pim_backend.autotuner.test_aimx_capacity
+```
+
 `PIMProblem`은 연산별 policy를 갖지 않는다. `compute_kind`는 PIM compute op의
 종류를 식별하는 의미 값이고, 각 `PIMAccess`는 unique buffer의 direction, dtype,
 logical axis dependency를 나타낸다. 입력 access가 사용하지 않는 축은 Common IR의
@@ -138,10 +161,11 @@ Fused operator와 gather/scatter는 PIM Common IR에서 unique `pim.place`마다
 구분한다. Feature의 byte 수는 placement allocation 범위를 사용하고, 최종 선택은
 항상 실제 target 실행시간으로 결정한다.
 
-UPMEM 직접 예제는 실제 장비 크기를 명시할 수 있다.
+UPMEM 직접 예제는 실제 장비 크기를 명시할 수 있다. `autotune_gemm.py`는 저장소에 포함되지
+않는 로컬 예제다.
 
 ```bash
-python examples/autotune_gemm.py --m 256 --n 256 --k 256 \
+python examples/silent_pim/autotune_gemm.py --m 256 --n 256 --k 256 \
   --num-units 256 --lanes-per-core 16 --nr-tasklets 16
 ```
 

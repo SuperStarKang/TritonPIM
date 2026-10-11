@@ -43,36 +43,39 @@ def unit_memory_footprint(problem, config):
 
 
 def aimx_runtime_allocations(problem, target, config):
-    """Allocation sizes produced by AiMX lowering for one Execution Tile."""
+    """Precompile lower bound for GEMM residency and its MAC chain.
+
+    Scratch, constants, copies and fused operations come from the compiled
+    Common IR. The target's allocation report and capacity check are final.
+    """
     runtime = target.runtime_config
     assert isinstance(runtime, AiMXRuntimeConfig)
     batch = runtime.batch
     useful_m, useful_n, useful_k = group_extent(config)
     physical_m = _round_up(useful_m, batch)
-    physical_n = _round_up(useful_n, 4096 // batch)
-    physical_k = _round_up(useful_k, 256 // batch)
+    # B/C Group panel rows are stored 4096 elements wide (aimx_matmul_row_alignment),
+    # while MAC/drain covers only useful N in 4096/batch microtiles.
+    physical_n = _round_up(useful_n, 4096)
+    computed_n = _round_up(useful_n, 4096 // batch)
+    physical_k = _round_up(useful_k, 256)
+    padded_k = _round_up(useful_k, 4096)
 
-    t_m = config.tile_m * physical_m
-    t_n = config.tile_n * physical_n
-    t_k = _round_up(config.tile_k * physical_k, 256)
-    padded_k = _round_up(t_k, 4096)
-    padded_n = _round_up(t_n, 4096)
-
-    rows = t_m // batch
-    cols = padded_n * batch // 4096
-    steps = t_k * batch // 256
-    descriptor_groups = (
-        2 * (t_k // 256) * rows
-        + rows * cols * (2 * steps + 1)
+    rows = physical_m // batch
+    cols = computed_n * batch // 4096
+    steps = ceil_div(useful_k, 256 // batch)
+    tile_steps = _round_up(config.tile_k * steps, batch)
+    descriptor_groups = config.tile_m * config.tile_n * (
+        config.tile_k * 2 * (physical_k // 256) * rows
+        + rows * cols * (2 * tile_steps + 1)
     )
-    input_bytes = problem.input_bytes
-    output_bytes = problem.output_bytes
+    # AiMX staging converts host values to BF16; host dtype is not DRAM dtype.
+    input_bytes = output_bytes = 2
     return {
         "PMM": AIMX_PMM_BYTES,
-        "A": t_m * padded_k * input_bytes,
-        "Arel": t_m * t_k * input_bytes * 16,
-        "B": t_k * padded_n * input_bytes,
-        "C": t_m * padded_n * output_bytes,
+        "A": config.tile_m * config.tile_k * physical_m * padded_k * input_bytes,
+        "Arel": config.tile_k * physical_m * physical_k * input_bytes * 16,
+        "B": config.tile_k * config.tile_n * physical_k * physical_n * input_bytes,
+        "C": config.tile_m * config.tile_n * physical_m * physical_n * output_bytes,
         "descriptor chain": descriptor_groups * 512,
     }
 
@@ -90,6 +93,14 @@ class ConstraintEngine:
             return "Block, Group, Tile, partition 값은 모두 1 이상이어야 한다"
         if min(problem.axis_extents) < 1:
             return "m/n/k axis extent는 모두 1 이상이어야 한다"
+        if profile.target == "aimx":
+            if problem.compute_kind != "matmul":
+                return "현재 AiMX lowering은 matmul만 지원한다"
+            if config.p_k != 1:
+                return "AiMX cross-device combine은 미구현이므로 p_k=1이어야 한다"
+            if any(access.dtype not in ("bfloat16", "float16", "float32")
+                   for access in problem.accesses):
+                return "AiMX host buffer는 bfloat16/float16/float32여야 한다"
         if not problem.output_accesses:
             return "PIM problem에는 output access가 하나 이상 필요하다"
         for access in problem.accesses:

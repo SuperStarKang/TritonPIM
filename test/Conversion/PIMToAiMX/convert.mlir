@@ -1,175 +1,141 @@
-// PIM Common IR이 AiMX level 1 IR로 바뀌고, 고정 execution-tile 모양에서 descriptor
-// program이 한 번 펼쳐지는지 확인한다. tail의 유효 크기는 stage/unstage만 바꾼다.
-// RUN: not triton-shared-opt --convert-pim-to-aimx %s 2>&1 | FileCheck %s --check-prefix=UNPLANNED
-// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx %s | FileCheck %s
-// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx --aimx-lower-matmul %s | FileCheck %s --check-prefix=PROGRAM
-// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx --aimx-lower-matmul %s | FileCheck %s --check-prefix=PIM-CLEAN
-// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx --aimx-lower-matmul %s | triton-shared-translate --aimx-to-runtime-stub > /dev/null
-// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx --aimx-lower-matmul %s | triton-shared-translate --aimx-to-descriptors > /dev/null
-
-// UNPLANNED: requires pim-form-host-plan before AiMX lowering
-// PIM-CLEAN-LABEL: module
-// PIM-CLEAN-NOT: #pim.target_profile
-// PIM-CLEAN-NOT: #pim.block
-// PIM-CLEAN-NOT: #pim.block_group
-// PIM-CLEAN-NOT: #pim.execution_tile
-// PIM-CLEAN-NOT: pim.partition
-// PIM-CLEAN-NOT: pim.broadcast
-// PIM-CLEAN-NOT: pim.scatter
-// PIM-CLEAN-NOT: pim.launch
-// PIM-CLEAN-NOT: pim.gather
-
-// 이 attribute는 할당된 buffer와 재사용 descriptor chain의 고정 모양이다.
-// 계층은 Triton block → block group → execution tile이고 전부 공통 IR이 정했다 —
-// logical Block Group은 Block 하나이고 batch=8은 AiMX target option에서 온다.
-// N Group 32는 target 실행 단위 512로 padding된다. 입력 Common IR의 명시적
-// Execution Tile [1, 8, 3248]에서 n_max=4096, k_max=103936이 파생된다.
-// CHECK-LABEL: func.func @matmul
-// CHECK-SAME:    aimx.tile_group = #aimx.tile_group<block = [32, 32, 32], group = [1, 1, 1], execution = [32, 512, 32]>
-// CHECK-SAME:    aimx.tiling = #aimx.tiling<batch = 8, t_m = 32, t_n = 4096, t_k = 103936, padded_k = 106496, padded_n = 4096, transposed = false>
-
-// FPGA 하나를 확보하고 그 안에서 buffer를 잡는다.
-// CHECK: aimx.acquire 1 : !aimx.device_set
-// CHECK: aimx.foreach_device %{{.*}} : !aimx.device_set axes ["m", "n", "k"] counts [1, 1, 1]
-
-// PMM이 가장 먼저다 — pim_private_malloc이 pim_malloc이 이미 내준 주소를 돌려줄 수 있다.
-// 그다음이 A(32*106496*2), Arel(32*103936*32), B(103936*4096*2), C(32*4096*2),
-// descriptor chain(211152 group * 512). 합쳐서 1,073,258,496 byte로 1 GiB 예산에 찬다 —
-// 명시된 execution tile이 target 물리 눈금으로 padding된 결과다.
-// CHECK:   aimx.alloc %{{.*}} bytes 196608 align 262144 kind pmm
-// CHECK:   aimx.alloc %{{.*}} bytes 6815744 align 512 kind data
-// CHECK:   aimx.alloc %{{.*}} bytes 106430464 align 512 kind data
-// CHECK:   aimx.alloc %{{.*}} bytes 851443712 align 512 kind data
-// CHECK:   aimx.alloc %{{.*}} bytes 262144 align 512 kind data
-// CHECK:   aimx.alloc %{{.*}} bytes 108109824 align 512 kind descriptor
-
-// chain은 tile loop 밖에서 한 번만 만든다. 재배치가 먼저, 계산이 다음이다.
-// CHECK:   aimx.build_descriptors @matmul_relayout(
-// CHECK:   aimx.build_descriptors @matmul_compute(
-// CHECK-NOT: aimx.build_descriptors
-
-// loop 순서는 n → k → m 이다. 가장 큰 buffer인 B가 (k, n)에만 의존하므로 그 둘이
-// 바깥이고, 훨씬 작은 A는 안쪽에서 m마다 올라간다. k가 상한(k_max) 안이면 k loop은 한
-// 번만 돈다 — K가 런타임 값이라 tile 수도 런타임에 정해지고, 그래서 loop 자체는 언제나
-// 나온다.
-// padding이 없으므로 stage/unstage에 block group attr(group_rows/group_cols)가 없어야
-// 한다 — pitch 값 바로 다음이 into/타입이다.
-// CHECK:   scf.for
-// CHECK:     scf.for
-// CHECK:       aimx.stage {{.*}} pad_to[{{.*}}] pitch %{{.*}} into
-// CHECK:       scf.for
-// CHECK:         aimx.stage {{.*}} pad_to[{{.*}}] pitch %{{.*}} into
-// CHECK:         aimx.invoke
-// k tile은 전부 **같은 C 영역**에 쓴다 — n이나 m을 나눌 때와 다른 점이다. 그래서 두 번째
-// tile부터는 덮는 것이 아니라 이전 부분합에 더한다.
-// CHECK:         aimx.unstage {{.*}} accumulate %{{.*}} :
-
-// 계산은 descriptor chain이 한다. PIM 쪽도 profile도 남지 않는다.
-// CHECK-NOT: linalg.matmul
-// CHECK-NOT: pim.device
-// CHECK-NOT: pim.place
-// CHECK-NOT: pim.access
-// CHECK-NOT: pim.target_profile
-// CHECK-NOT: pim.block_group
-
-// ── descriptor program ──────────────────────────────────────────────────────
-// 재배치: A를 256개씩 읽어(행 간격 padded_k) BC|TP로 다시 쓴다. 두 descriptor가 한 쌍이다.
-// PROGRAM-LABEL: aimx.descriptor_program @matmul_relayout batch 8
-// PROGRAM:         aimx.desc src(%{{.*}}, %{{.*}}) pitch %{{.*}} len 512 opcode pim_mode|stride
-// PROGRAM:         aimx.desc dst(%{{.*}}, %{{.*}}) len 65536 opcode bc|tp
-
-// 계산: reduction step 하나가 A operand와 B operand 한 쌍이고, output block이 끝나면
-// vACC를 C로 흘려보낸다. C만 src와 dst 양쪽에 pitch가 붙는다.
-// A operand는 vecA 한 칸(8192 = 512*16)으로 batch와 무관하고, B operand와 C drain은
-// 출력 block 하나분이라 8192/batch = 1024다.
-// PROGRAM-LABEL: aimx.descriptor_program @matmul_compute batch 8
-// PROGRAM:         aimx.desc src(%{{.*}}, %{{.*}}) len 8192 opcode a_mask|matmul|pim_mode
-// PROGRAM:         aimx.desc src(%{{.*}}, %{{.*}}) pitch %{{.*}} len 1024 opcode b_mask|matmul|pim_mode|stride
-// PROGRAM:         aimx.desc src(%{{.*}}, %{{.*}}) pitch %{{.*}} dst(%{{.*}}, %{{.*}}) pitch %{{.*}} len 1024 opcode c_mask|matmul|stride
+// Common Block=[8,16,32], Group=[1,2,3], Execution Tile=[1,2,1].
+// Two M devices, two K scheduling rounds, and two local N groups.
+// RUN: triton-shared-opt --pim-verify --pim-form-host-plan --convert-pim-to-aimx %s | FileCheck %s --check-prefix=IR --implicit-check-not=aimx.compute_template --implicit-check-not=linalg. --implicit-check-not="pim.device "
+// RUN: triton-shared-opt --cse --pim-form-host-plan --convert-pim-to-aimx %s | FileCheck %s --check-prefix=IR
+// RUN: triton-shared-opt --mlir-print-op-generic --pim-form-host-plan --convert-pim-to-aimx --cse --canonicalize %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=STUB
+// RUN: triton-shared-opt --mlir-print-op-generic --pim-form-host-plan --convert-pim-to-aimx %s | triton-shared-translate --aimx-to-descriptors | FileCheck %s --check-prefix=DESC
+// A는 pim.scatter, B는 pim.broadcast(shared_over = ["m"])다. B만 공유 slot에서 한 번 변환한다.
+// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx %s | FileCheck %s --check-prefix=SHARED
+// RUN: triton-shared-opt --mlir-print-op-generic --pim-form-host-plan --convert-pim-to-aimx=persistent=false %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=BCAST
+// SHARED: aimx.stage {{.*}}group_layout = array<i64: 8, 96, 8, 4096, 1, 1>{{.*}} : memref<*xbf16>
+// SHARED: aimx.stage {{.*}}shared_over = ["m"]{{.*}} : memref<*xbf16>
+// BCAST: char *[[POOL:_pool[0-9]+]] = (char*)aimx_host_buffer((size_t)1 * {{[0-9]+}}ull);
+// BCAST-NEXT: std::once_flag [[ONCE:_once[0-9]+]][1];
+// BCAST-NEXT: #pragma omp parallel for
+// BCAST: std::call_once([[ONCE]][{{_key[0-9]+}}], [&] {
+// BCAST: });
+// BCAST-NEXT: aimx_require(datacopy_cpu2pim({{.*}}, _slot{{[0-9]+}},
+// BCAST: aimx_host_free([[POOL]], (size_t)1 * {{[0-9]+}}ull);
+// IR-DAG: aimx.descriptor_program @matmul_device0_matmul_drain_{{[0-9]+}} batch 8
+// IR-DAG: aimx.descriptor_program @matmul_device0_matmul_accumulate_{{[0-9]+}} batch 8
+// IR-DAG: aimx.descriptor_program @matmul_device0_matmul_relayout_{{[0-9]+}} batch 8
+// IR-DAG: len 512 opcode pim_mode|stride
+// IR-DAG: len 65536 opcode bc|tp
+// IR-DAG: len 8192 opcode a_mask|matmul|pim_mode
+// IR-DAG: len 1024 opcode b_mask|matmul|pim_mode|stride
+// IR-DAG: len 1024 opcode c_mask|matmul|stride
+// IR-LABEL: func.func @matmul
+// IR: aimx.acquire 2
+// IR: scf.for
+// IR: scf.for
+// IR: scf.for %[[ROUND:.*]] =
+// IR: aimx.foreach_device {{.*}} counts [2, 1, 1]
+// IR: aimx.alloc {{.*}} bytes 196608
+// IR: scf.execute_region no_inline
+// M/N traversal encloses preparation and one drain per output microtile.
+// IR: scf.for
+// IR: scf.for
+// IR: aimx.build_descriptors @matmul_device0_copy_
+// IR: scf.for
+// IR: aimx.build_descriptors @matmul_device0_matmul_relayout_
+// IR: aimx.build_descriptors @matmul_device0_matmul_accumulate_
+// IR: aimx.build_descriptors @matmul_device0_matmul_drain_
+// A unique contribution to this C group needs only a copy, not ADD(0, C).
+// IR: aimx.build_descriptors @matmul_device0_copy_
+// IR: aimx.stage {{.*}}group_layout = array<i64: 8, 96, 8, 4096, 1, 1>
+// IR: aimx.stage {{.*}}group_layout = array<i64: 96, 32, 256, 512, 1, 2>
+// IR: aimx.invoke
+// IR: arith.cmpi ne, %[[ROUND]]
+// IR: aimx.unstage {{.*}}group_layout = array<i64: 8, 32, 8, 512, 1, 2>
+// STUB: extern "C" void matmul
+// STUB: #pragma omp parallel for collapse(3) num_threads(2)
+// STUB: int _fpga = AIMX_BASE_FPGA
+// STUB: if (!_resident->ready) {
+// STUB: aimx_prog_matmul_device0_matmul_relayout_
+// STUB: aimx_prog_matmul_device0_matmul_accumulate_
+// STUB: aimx_prog_matmul_device0_matmul_drain_
+// STUB: descriptor upload failed
+// STUB: _resident->ready = true
+// STUB: pim_exec
+// DESC: 0x0u, fpga_id, code);  // copy
+// DESC: 0x19012u, fpga_id, code);
 
 module attributes {pim.target_profile = #pim.target_profile<
-    target = "aimx", num_units = 1,
-    banks_per_unit = 256,
-    cores_per_bank = 1,
-    lanes_per_core = 16,
+    target = "aimx", num_units = 2, banks_per_unit = 256,
+    cores_per_bank = 1, lanes_per_core = 16,
     bank_capacity_limit_bytes = 268435456, local_capacity_limit_bytes = 0>} {
-
-// pim.block_group은 --pim-form-block-groups가 만든 target-neutral block 묶음이다.
-// AiMX lowering이 useful 크기를 실행 단위 [8, 512, 32]에 맞춰 padding한다.
-func.func @matmul(%A: memref<*xf32>, %B: memref<*xf32>, %C: memref<*xf32>,
-                  %K: i32, %N: i32, %ex: index, %ey: index)
+func.func @matmul(%A: memref<*xbf16>, %B: memref<*xbf16>, %C: memref<*xf32>)
     attributes {
-        pim.block = #pim.block<shape = [32, 32, 32]>,
-        pim.block_group = #pim.block_group<blocks = [1, 1, 1]>} {
+      pim.block = #pim.block<shape = [8, 16, 32]>,
+      pim.block_group = #pim.block_group<blocks = [1, 2, 3]>} {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
+  %c2 = arith.constant 2 : index
+  %c8 = arith.constant 8 : index
   %c32 = arith.constant 32 : index
-  %f0 = arith.constant 0.000000e+00 : f32
-  %lda = arith.index_cast %K : i32 to index
-  %ldb = arith.index_cast %N : i32 to index
-  %kk = arith.index_cast %K : i32 to index
-
-  pim.device #pim.device_mapping<partitions = [1, 1, 1]>
-      attributes {
-        pim.execution_tile = #pim.execution_tile<groups = [1, 8, 3248]>} {
-  ^bb0(%px: index, %py: index, %device_k_unused: index):
-    // PIM Device 가 하나라 device 몫이 곧 전체다. 실제 pass 가 내는 모양 그대로 손으로 썼다.
-    %capx = arith.ceildivsi %ex, %c1 : index
-    %startx = arith.muli %px, %capx : index
-    %tripsx = arith.minsi %capx, %capx : index
-    %capy = arith.ceildivsi %ey, %c1 : index
-    %starty = arith.muli %py, %capy : index
-    %tripsy = arith.minsi %capy, %capy : index
-    %tripsk = arith.ceildivsi %kk, %c32 : index
-
-    %ar = arith.muli %startx, %c32 : index
-    %arn = arith.muli %tripsx, %c32 : index
-    %arc = arith.muli %capx, %c32 : index
-    %akn = arith.muli %tripsk, %c32 : index
-    pim.place %A start[%ar, %c0] size[%arn, %akn] allocation_shape[%arc, %akn]
-        strides[%lda, %c1]
-        {direction = "in", access = 0 : i64,
-         shared_over = ["n"]} : memref<*xf32>
-
-    %bc = arith.muli %starty, %c32 : index
-    %bcn = arith.muli %tripsy, %c32 : index
-    %bcc = arith.muli %capy, %c32 : index
-    pim.place %B start[%c0, %bc] size[%akn, %bcn] allocation_shape[%akn, %bcc]
-        strides[%ldb, %c1]
-        {direction = "in", access = 1 : i64,
-         shared_over = ["m"]} : memref<*xf32>
-
-    pim.place %C start[%ar, %bc] size[%arn, %bcn] allocation_shape[%arc, %bcc]
-        strides[%ldb, %c1]
-        {direction = "out", access = 2 : i64} : memref<*xf32>
-
-    scf.for %tx = %c0 to %tripsx step %c1 {
-      %gx = arith.addi %startx, %tx {pim.device_origin} : index
-      %m = arith.muli %gx, %c32 : index
-      scf.for %ty = %c0 to %tripsy step %c1 {
-        %gy = arith.addi %starty, %ty {pim.device_origin} : index
-        %n = arith.muli %gy, %c32 : index
-        %e = tensor.empty() : tensor<32x32xf32>
-        %init = linalg.fill ins(%f0 : f32) outs(%e : tensor<32x32xf32>) -> tensor<32x32xf32>
-        %r = scf.for %tk = %c0 to %tripsk step %c1
-             iter_args(%acc = %init) -> (tensor<32x32xf32>) {
-          %k = arith.muli %tk, %c32 : index
-          %da = pim.access %A offset %m sizes [32, 32] strides[%lda, %c1] origin[%m, %k]
-                {id = 0 : i64} : memref<*xf32> -> !pim.access
-          %ta = pim.load %da : !pim.access -> tensor<32x32xf32>
-          %db = pim.access %B offset %k sizes [32, 32] strides[%ldb, %c1] origin[%k, %n]
-                {id = 1 : i64} : memref<*xf32> -> !pim.access
-          %tb = pim.load %db : !pim.access -> tensor<32x32xf32>
-          %mm = linalg.matmul ins(%ta, %tb : tensor<32x32xf32>, tensor<32x32xf32>)
-                outs(%acc : tensor<32x32xf32>) -> tensor<32x32xf32>
-          scf.yield %mm : tensor<32x32xf32>
-        }
-        %dc = pim.access %C offset %n sizes [32, 32] strides[%ldb, %c1] origin[%m, %n]
-              {id = 2 : i64} : memref<*xf32> -> !pim.access
-        pim.store %r, %dc : tensor<32x32xf32>, !pim.access
-      } {pim.axis = #pim.axis<"n">}
-    } {pim.axis = #pim.axis<"m">}
-  }
+  %c64 = arith.constant 64 : index
+  %c96 = arith.constant 96 : index
+  %c192 = arith.constant 192 : index
+  %zero = arith.constant 0.0 : f32
+  scf.for %roundN = %c0 to %c1 step %c1 {
+  scf.for %roundM = %c0 to %c1 step %c1 {
+  scf.for %roundK = %c0 to %c2 step %c1 {
+    pim.device #pim.device_mapping<partitions = [2, 1, 1]> attributes {
+        pim.execution_tile = #pim.execution_tile<groups = [1, 2, 1]>} {
+    ^bb0(%dm: index, %dn: index, %dk: index):
+      %mStart = arith.muli %dm, %c8 : index
+      %kStart = arith.muli %roundK, %c96 : index
+      pim.place %A start[%mStart, %kStart] size[%c8, %c96]
+          allocation_shape[%c8, %c96] strides[%c192, %c1]
+          {direction = "in", access = 0 : i64} : memref<*xbf16>
+      pim.place %B start[%kStart, %c0] size[%c96, %c64]
+          allocation_shape[%c96, %c64] strides[%c64, %c1]
+          {direction = "in", access = 1 : i64, shared_over = ["m"]}
+          : memref<*xbf16>
+      pim.place %C start[%mStart, %c0] size[%c8, %c64]
+          allocation_shape[%c8, %c64] strides[%c64, %c1]
+          {direction = "out", access = 2 : i64} : memref<*xf32>
+      scf.for %gm = %c0 to %c1 step %c1 {
+        %mOffset = arith.muli %gm, %c8 : index
+        %m = arith.addi %mStart, %mOffset : index
+        scf.for %gn = %c0 to %c2 step %c1 {
+          %n = arith.muli %gn, %c32 : index
+          %empty = tensor.empty() : tensor<8x32xf32>
+          %init = linalg.fill ins(%zero : f32) outs(%empty : tensor<8x32xf32>)
+              -> tensor<8x32xf32>
+          %partial = scf.for %gk = %c0 to %c1 step %c1
+              iter_args(%acc = %init) -> tensor<8x32xf32> {
+            %kOffset = arith.muli %gk, %c96 : index
+            %k = arith.addi %kStart, %kOffset : index
+            %aRow = arith.muli %m, %c192 : index
+            %aOffset = arith.addi %aRow, %k : index
+            %aAccess = pim.access %A offset %aOffset sizes [8, 96]
+                strides[%c192, %c1] origin[%m, %k] {id = 0 : i64}
+                : memref<*xbf16> -> !pim.access
+            %a = pim.load %aAccess : !pim.access -> tensor<8x96xbf16>
+            %bRow = arith.muli %k, %c64 : index
+            %bOffset = arith.addi %bRow, %n : index
+            %bAccess = pim.access %B offset %bOffset sizes [96, 32]
+                strides[%c64, %c1] origin[%k, %n] {id = 1 : i64}
+                : memref<*xbf16> -> !pim.access
+            %b = pim.load %bAccess : !pim.access -> tensor<96x32xbf16>
+            %next = linalg.matmul
+                ins(%a, %b : tensor<8x96xbf16>, tensor<96x32xbf16>)
+                outs(%acc : tensor<8x32xf32>) -> tensor<8x32xf32>
+            scf.yield %next : tensor<8x32xf32>
+          } {pim.reduction = "add", pim.temporal_reduction}
+          %cRow = arith.muli %m, %c64 : index
+          %cOffset = arith.addi %cRow, %n : index
+          %cAccess = pim.access %C offset %cOffset sizes [8, 32]
+              strides[%c64, %c1] origin[%m, %n] {id = 2 : i64}
+              : memref<*xf32> -> !pim.access
+          pim.combine %partial into %cAccess kind "add" : tensor<8x32xf32>, !pim.access
+        } {pim.axis = #pim.axis<"n">}
+      } {pim.axis = #pim.axis<"m">}
+    }
+  } {pim.scheduling_axis = "reduction_k"}
+  } {pim.scheduling_axis = "m"}
+  } {pim.scheduling_axis = "n"}
   return
 }
 }

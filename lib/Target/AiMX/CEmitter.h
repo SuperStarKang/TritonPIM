@@ -6,6 +6,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Value.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -75,6 +76,11 @@ public:
     return std::max<int64_t>(1, t.getIntOrFloatBitWidth() / 8);
   }
 
+  static std::string unsignedType(Type type) {
+    unsigned width = isa<IndexType>(type) ? 64 : cast<IntegerType>(type).getWidth();
+    return "uint" + std::to_string(std::max(width, 8u)) + "_t";
+  }
+
   // 정수 스칼라 연산 하나를 대입문 하나로 옮긴다. 다루지 못하면 실패한다 —
   // 모르는 것을 짐작해 채우지 않는다.
   LogicalResult emitArith(Operation *op, unsigned depth) {
@@ -98,6 +104,13 @@ public:
          << ";\n";
       return success();
     }
+    if (isa<arith::IndexCastUIOp, arith::ExtUIOp>(op)) {
+      Value result = op->getResult(0), source = op->getOperand(0);
+      decl(result);
+      os << "(" << scalarType(result.getType()) << ")(" << unsignedType(source.getType())
+         << ")" << name(source) << ";\n";
+      return success();
+    }
     // 비교와 선택. min/max 를 정규화하면 이 둘로 갈라져 나온다.
     if (auto cmp = dyn_cast<arith::CmpIOp>(op)) {
       const char *sym = nullptr;
@@ -114,7 +127,12 @@ public:
       case arith::CmpIPredicate::uge: sym = ">="; break;
       }
       decl(cmp.getResult());
-      os << name(cmp.getLhs()) << " " << sym << " " << name(cmp.getRhs())
+      bool unsignedComparison = cmp.getPredicate() == arith::CmpIPredicate::ult ||
+                                cmp.getPredicate() == arith::CmpIPredicate::ule ||
+                                cmp.getPredicate() == arith::CmpIPredicate::ugt ||
+                                cmp.getPredicate() == arith::CmpIPredicate::uge;
+      std::string cast = unsignedComparison ? "(" + unsignedType(cmp.getLhs().getType()) + ")" : "";
+      os << cast << name(cmp.getLhs()) << " " << sym << " " << cast << name(cmp.getRhs())
          << ";\n";
       return success();
     }
@@ -140,11 +158,9 @@ public:
     else if (isa<arith::MaxSIOp>(op))
       fmt = "(A) > (B) ? (A) : (B)";
     else if (isa<arith::FloorDivSIOp>(op))
-      // 음이 아닌 값만 나오므로 C 의 절단 나눗셈과 같다.
-      fmt = "A / B";
+      fmt = "A / B - ((A % B != 0) && ((A < 0) != (B < 0)))";
     else if (isa<arith::CeilDivSIOp>(op))
-      // 여기 나오는 값은 tile 개수와 크기라 전부 음이 아니다.
-      fmt = "((A) + (B) - 1) / (B)";
+      fmt = "A / B + ((A % B != 0) && ((A < 0) == (B < 0)))";
     if (!fmt)
       return op->emitError("aimx codegen: unsupported scalar operation");
     decl(op->getResult(0));
@@ -161,20 +177,59 @@ public:
     return success();
   }
 
-  // scf.for 하나를 C for 하나로. 값을 나르는 loop 은 다루지 않는다 — AiMX 쪽 IR 에는
-  // 나오지 않고, 나온다면 그것은 여기 없는 결정이다.
+  // Keep integer/index loop state as descriptor-address/control arithmetic.
+  // Tensor data is already lowered to PIM buffers; no floating-point source
+  // computation is executed here. Results retain their init value on zero trips.
   LogicalResult emitFor(scf::ForOp loop, unsigned depth,
                         function_ref<LogicalResult(Block &, unsigned)> body) {
-    if (loop.getNumResults() != 0)
-      return loop->emitError("aimx codegen: a loop carrying values is not "
-                             "expressible as a descriptor loop");
+    if (scalarType(loop.getInductionVar().getType()).empty())
+      return loop.emitError("aimx codegen: unsupported induction variable type");
+    for (auto [argument, init, result] :
+         llvm::zip(loop.getRegionIterArgs(), loop.getInitArgs(), loop.getResults())) {
+      if (!argument.getType().isIntOrIndex() || scalarType(argument.getType()).empty())
+        return loop.emitError("aimx codegen: loop-carried control values require supported integer/index types");
+      indent(depth);
+      os << scalarType(argument.getType()) << " " << name(argument) << " = "
+         << name(init) << ";\n";
+      bind(result, name(argument));
+    }
     std::string iv = name(loop.getInductionVar());
+    std::string comparisonCast = loop.getUnsignedCmp()
+                                     ? "(" + unsignedType(loop.getInductionVar().getType()) + ")"
+                                     : "";
     indent(depth);
-    os << "for (int64_t " << iv << " = " << name(loop.getLowerBound()) << "; "
-       << iv << " < " << name(loop.getUpperBound()) << "; " << iv
-       << " += " << name(loop.getStep()) << ") {\n";
+    os << "for (" << scalarType(loop.getInductionVar().getType()) << " " << iv
+       << " = " << name(loop.getLowerBound()) << "; "
+       << comparisonCast << iv << " < " << comparisonCast << name(loop.getUpperBound()) << "; " << iv;
+    if (loop.getUnsignedCmp()) {
+      // An unsigned traversal may cross the signed representation's sign bit.
+      // Perform the increment in the unsigned domain, too.
+      os << " = (" << scalarType(loop.getInductionVar().getType()) << ")(" << comparisonCast
+         << iv << " + " << comparisonCast << name(loop.getStep()) << ")";
+    } else {
+      os << " += " << name(loop.getStep());
+    }
+    os << ") {\n";
     if (failed(body(*loop.getBody(), depth + 1)))
       return failure();
+    auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+    SmallVector<std::string> yielded;
+    for (Value value : yield.getOperands()) {
+      if (yield.getNumOperands() == 1) {
+        yielded.push_back(name(value));
+      } else {
+        // Read all incoming values before assigning any carried variable.
+        // Sequential assignments alone would corrupt a swap such as x,y=y,x.
+        std::string snapshot = temp("_yield");
+        indent(depth + 1);
+        os << scalarType(value.getType()) << " " << snapshot << " = " << name(value) << ";\n";
+        yielded.push_back(snapshot);
+      }
+    }
+    for (auto [argument, value] : llvm::zip(loop.getRegionIterArgs(), yielded)) {
+      indent(depth + 1);
+      os << name(argument) << " = " << value << ";\n";
+    }
     indent(depth);
     os << "}\n";
     return success();

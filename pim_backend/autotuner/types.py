@@ -282,9 +282,13 @@ class PIMBenchmarkResult:
     """Measured end-to-end result for one Common IR configuration."""
 
     total_ms: float
-    correctness: bool = True
+    correctness: bool | None = True
     timings: tuple = ()
+    physical_allocations: tuple = ()
 
     @property
     def ok(self):
+        # 검증을 생략한 결과도 성능 탐색 후보로 사용한다.
+        if self.correctness is None:
+            return True
         return self.correctness

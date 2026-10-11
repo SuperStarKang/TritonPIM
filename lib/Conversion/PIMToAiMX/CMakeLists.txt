@@ -1,6 +1,6 @@
 add_triton_library(PIMToAiMX
   PIMToAiMXPass.cpp
-  AiMXLowerMatmulPass.cpp
+  DescriptorBuilder.cpp
 
   DEPENDS
   PIMTableGen

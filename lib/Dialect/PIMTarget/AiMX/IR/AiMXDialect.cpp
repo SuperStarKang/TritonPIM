@@ -1,4 +1,5 @@
 #include "triton-shared/Dialect/PIMTarget/AiMX/IR/AiMXDialect.h"
+#include "triton-shared/Dialect/PIMTarget/AiMX/IR/AiMXFootprint.h"
 
 // 생성된 op builder / type-attr printer-parser가 사용하는 헤더들.
 #include "mlir/IR/Builders.h"
@@ -6,6 +7,7 @@
 // bit enum 의 stringify 는 llvm::join 으로 flag 이름을 잇는다.
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include <limits>
 
 using namespace mlir;
 using namespace mlir::aimx;
@@ -64,9 +66,21 @@ uint32_t flags(Opcode op) { return static_cast<uint32_t>(op); }
 //===----------------------------------------------------------------------===//
 
 LogicalResult ForeachDeviceOp::verify() {
+  if (Attribute persistent = (*this)->getAttr("aimx.persistent"))
+    if (!isa<UnitAttr>(persistent))
+      return emitOpError("aimx.persistent must be a unit attribute");
   ArrayRef<int64_t> counts = getCounts();
   if (counts.size() != getAxes().size())
     return emitOpError("counts must have one entry per axis");
+  int64_t devices = 1;
+  for (int64_t count : counts) {
+    if (count <= 0 || devices > std::numeric_limits<int64_t>::max() / count)
+      return emitOpError("counts must be positive and their product must fit i64");
+    devices *= count;
+  }
+  auto acquire = getSet().getDefiningOp<AcquireOp>();
+  if (!acquire || acquire.getNumDevices() != devices)
+    return emitOpError("counts product must equal the acquired device count");
   Block &block = getBody().front();
   // FPGA 핸들 하나 다음에 축별 좌표.
   if (block.getNumArguments() != 1 + getAxes().size())
@@ -81,7 +95,7 @@ LogicalResult ForeachDeviceOp::verify() {
 }
 
 LogicalResult AllocOp::verify() {
-  if (getBytes() == 0)
+  if (getBytes() <= 0)
     return emitOpError("bytes must be positive");
   int64_t align = getAlignment();
   if (align <= 0 || (align & (align - 1)) != 0)
@@ -117,17 +131,33 @@ static LogicalResult verifyPitched(Operation *op, size_t origin, size_t sizes,
   return success();
 }
 
-// block group 주기 배치. 없는 축은 항등이므로 useful == phys 를 적는 것은 잉여다 —
-// 한 가지 철자만 허용해야 stub 이 attr 유무로 특수화할 수 있다.
+// Optional periodic physical padding; an identity mapping is also valid.
 static LogicalResult verifyGroup(Operation *op, DenseI64ArrayAttr g,
                                  StringRef name) {
   if (!g)
     return success();
   ArrayRef<int64_t> v = g.asArrayRef();
-  if (v.size() != 2 || v[0] <= 0 || v[0] >= v[1])
+  if (v.size() != 2 || v[0] <= 0 || v[0] > v[1])
     return op->emitOpError(name)
-           << " must be [useful, phys] with 0 < useful < phys — a padding-free "
-              "axis carries no group attribute";
+           << " must be [useful, phys] with 0 < useful <= phys";
+  return success();
+}
+
+static LogicalResult verifyGroupLayout(Operation *op, DenseI64ArrayAttr layout,
+                                       DenseI64ArrayAttr rows, DenseI64ArrayAttr cols) {
+  if (!layout) return success();
+  auto shape = layout.asArrayRef();
+  int64_t elements;
+  if (rows || cols)
+    return op->emitOpError("group_layout cannot be combined with periodic group padding");
+  if (shape.size() != 6 || shape[0] <= 0 || shape[1] <= 0 ||
+      shape[2] < shape[0] || shape[3] < shape[1] ||
+      !checkedProduct({shape[2], shape[3], shape[4], shape[5]}, elements) ||
+      elements > kMaxRuntimeAllocationBytes / kTypeSize)
+    return op->emitOpError("group_layout needs representable [useful_rows, useful_cols, "
+                          "physical_rows, physical_cols, row_groups, col_groups]");
+  if ((shape[2] * shape[3]) % kLanes != 0)
+    return op->emitOpError("each contiguous group must contain a multiple of 4096 elements");
   return success();
 }
 
@@ -139,8 +169,17 @@ LogicalResult StageOp::verify() {
     return emitOpError("pad_to describes the 2-D PIM layout and must have rank ")
            << kPitchedRank;
   if (failed(verifyGroup(*this, getGroupRowsAttr(), "group_rows")) ||
-      failed(verifyGroup(*this, getGroupColsAttr(), "group_cols")))
+      failed(verifyGroup(*this, getGroupColsAttr(), "group_cols")) ||
+      failed(verifyGroupLayout(*this, getGroupLayoutAttr(), getGroupRowsAttr(), getGroupColsAttr())))
     return failure();
+  if (auto shared = getSharedOverAttr()) {
+    auto foreach = dyn_cast<ForeachDeviceOp>((*this)->getParentOp());
+    if (!foreach)
+      return emitOpError("shared_over needs a directly enclosing aimx.foreach_device");
+    for (Attribute axis : shared)
+      if (!llvm::is_contained(foreach.getAxes(), axis))
+        return emitOpError("shared_over names an axis outside aimx.foreach_device");
+  }
   return success();
 }
 
@@ -148,7 +187,8 @@ LogicalResult UnstageOp::verify() {
   if (failed(verifyPitched(*this, getOrigin().size(), getSizes().size(),
                            getStrides().size(), getElementType())))
     return failure();
-  if (failed(verifyGroup(*this, getGroupRowsAttr(), "group_rows")))
+  if (failed(verifyGroup(*this, getGroupRowsAttr(), "group_rows")) ||
+      failed(verifyGroupLayout(*this, getGroupLayoutAttr(), getGroupRowsAttr(), getGroupColsAttr())))
     return failure();
   return verifyGroup(*this, getGroupColsAttr(), "group_cols");
 }
@@ -180,10 +220,9 @@ LogicalResult DescOp::verify() {
   if (!program)
     return emitOpError("must be inside an aimx.descriptor_program — batch and "
                        "the length rules come from there");
-  int64_t batch = program.getBatch();
 
   int64_t len = getLen();
-  if (len % kBurstSize != 0)
+  if (len <= 0 || len % kBurstSize != 0)
     return emitOpError("len ")
            << len << " must be a multiple of the " << kBurstSize
            << " byte DRAM burst";
@@ -195,44 +234,9 @@ LogicalResult DescOp::verify() {
                            ? "the stride flag is set but no pitch is given"
                            : "a pitch is given but the stride flag is not set");
 
-  // 확인된 descriptor 형태만 허용한다. 여기서 벗어나면 하드웨어에서 조용히 틀린다.
-  // 각 행은 (status word, len, src pitch 필요, dst pitch 필요) 다.
-  struct Form {
-    uint32_t status;
-    int64_t len;
-    bool srcPitch;
-    bool dstPitch;
-    const char *role;
-  };
-  const uint32_t A = flags(Opcode::a_mask), B = flags(Opcode::b_mask),
-                 C = flags(Opcode::c_mask), MM = flags(Opcode::matmul),
-                 BC = flags(Opcode::bc), TP = flags(Opcode::tp),
-                 PM = flags(Opcode::pim_mode), ST = flags(Opcode::stride);
-  const Form forms[] = {
-      {PM | ST, kPIMWidth, true, false, "A gather"},
-      {BC | TP, kDeviceWidth * batch, false, false, "Arel write"},
-      {A | MM | PM, kDeviceWidth, false, false, "A operand"},
-      {B | MM | PM | ST, kDeviceWidth / batch, true, false, "B operand"},
-      {C | MM | ST, kDeviceWidth / batch, true, true, "C drain"},
-      {BC | TP | ST, kDeviceWidth * batch, true, true, "merged relayout"},
-  };
-  for (const Form &f : forms) {
-    if (f.status != flags(getOpcode()))
-      continue;
-    if (f.len != len)
-      return emitOpError("a ")
-             << f.role << " descriptor must have len " << f.len << ", not "
-             << len;
-    if (f.srcPitch != static_cast<bool>(getSrcPitch()))
-      return emitOpError("a ") << f.role << " descriptor "
-                               << (f.srcPitch ? "needs" : "must not have")
-                               << " a src pitch";
-    if (f.dstPitch != static_cast<bool>(getDstPitch()))
-      return emitOpError("a ") << f.role << " descriptor "
-                               << (f.dstPitch ? "needs" : "must not have")
-                               << " a dst pitch";
-    return success();
-  }
-  return emitOpError("this flag combination is not one of the descriptor forms "
-                     "confirmed on hardware");
+  // Operand/length encoding is checked here, not a whitelist of entire
+  // algorithms. Opcode selection belongs to the target lowering rule.
+  if (getOpcode() == Opcode::copy && (!getSrc() || !getDst()))
+    return emitOpError("copy requires source and destination addresses");
+  return success();
 }
