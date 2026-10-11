@@ -6,6 +6,7 @@ build/*
 /python/examples/test_core.py
 /python/examples/test_annotations.py
 
-/pim_backend/examples
-
-examples/
+*.dt
+*.csv
+*.xlsx
+*.dot

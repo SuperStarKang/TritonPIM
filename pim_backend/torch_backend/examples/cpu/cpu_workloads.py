@@ -1,7 +1,6 @@
-"""Run the INT8 attention/transformer/Llama-2-7b prefill examples on the triton_shared CPU backend.
+"""CPU-only runs of the INT8 attention/transformer/Llama-2-7b prefill examples.
 
-Every Inductor kernel, including each torch._int_mm, is generated as a Triton kernel and
-compiled by triton_shared (TTIR -> linalg -> LLVM). No PIM driver or DPU is used.
+The entry scripts in this directory choose the Inductor CPU backend and call main().
 attention-kernel/attention-layer/transformer use the same synthetic inputs as the PIM
 benchmarks and print the difference from eager ATen. llama runs the 32 checkpoint
 layers of e2e/torch_llama_ttft.py up to the first greedy token.
@@ -15,24 +14,10 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
-import triton
 from torch._inductor import config as inductor_config
-from triton.backends.triton_shared.driver import CPUDriver
 
 from attention.int8_workloads import HEAD_DIM, HIDDEN, SEQUENCE, AttentionKernel, AttentionLayer
 from transformer.int8_workloads import TransformerBlock
-
-
-INDUCTOR_OVERRIDES = {
-    # pointwise/reduction 커널을 C++ 대신 Triton으로 생성한다
-    "cpu_backend": "triton",
-    # _int_mm 후보에서 aten을 빼고 Triton mm template만 남긴다
-    "max_autotune_gemm": True,
-    "max_autotune_gemm_backends": "TRITON",
-    # compile worker subprocess에는 CPUDriver가 active로 설정되지 않는다
-    "compile_threads": 1,
-    "cpp_wrapper": False,
-}
 
 
 def compile_cpu(module):
@@ -91,8 +76,8 @@ def run_llama(checkpoint, prompt_file):
           f"text={tokenizer.decode([token_id])!r}", flush=True)
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+def main(description, inductor_overrides):
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument("workload", choices=("attention-kernel", "attention-layer", "transformer", "llama"))
     parser.add_argument("--heads", type=int, choices=(1, 32), default=1)
     parser.add_argument("--repeat", type=int, default=1)
@@ -104,9 +89,8 @@ def main():
         parser.error("llama requires --checkpoint")
 
     torch.manual_seed(0)
-    triton.runtime.driver.set_active(CPUDriver())
     # 재컴파일 한도를 넘으면 eager로 넘어가지 않고 오류를 낸다
-    with torch.no_grad(), inductor_config.patch(INDUCTOR_OVERRIDES), \
+    with torch.no_grad(), inductor_config.patch(inductor_overrides), \
             torch._dynamo.config.patch(fail_on_recompile_limit_hit=True):
         if args.workload == "attention-kernel":
             inputs = tuple(torch.randint(-8, 8, (args.heads, SEQUENCE, HEAD_DIM), dtype=torch.int8)
@@ -118,7 +102,3 @@ def main():
             run_block(TransformerBlock().eval(), (torch.randn(1, SEQUENCE, HIDDEN),), args.repeat)
         else:
             run_llama(args.checkpoint, args.prompt_file)
-
-
-if __name__ == "__main__":
-    main()
