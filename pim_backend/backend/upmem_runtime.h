@@ -29,6 +29,8 @@ int upmem_runtime_load(const char *binary_path);
 // Explicit request ownership; closing frees the set immediately.
 void upmem_session_open(uint32_t num_units);
 void upmem_session_close(void);
+uint32_t upmem_session_num_units(void);
+struct dpu_set_t upmem_session_devices(void);
 
 #include "upmem_resident.h"
 
@@ -38,6 +40,10 @@ void upmem_bind_devices(struct dpu_set_t set, uint32_t num_axes,
                         const uint32_t *partitions,
                         const uint32_t *device_mapping,
                         uint32_t *logical_for_dpu);
+void upmem_bind_instances(struct dpu_set_t set, uint32_t num_axes,
+                          const uint32_t *partitions,
+                          const uint32_t *device_mapping, uint32_t instances,
+                          uint32_t *logical_for_dpu);
 
 #ifdef __cplusplus
 }

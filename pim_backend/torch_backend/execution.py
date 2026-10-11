@@ -107,3 +107,43 @@ def resolve_execution(torch_config, problem):
     return PIMExecution(
         problem=problem, target=target, config=config,
         torch_config=torch_config)
+
+
+def select_layer_config(problem, target, torch_config, instance_count, *, has_weights):
+    """Choose an existing configuration after the session has acquired its units."""
+    if torch_config.config is not None:
+        candidates = ((torch_config.config, 0.0),)
+    elif torch_config.autotune_cache_path is not None:
+        cache = PIMConfigCache(torch_config.autotune_cache_path,
+                               template_version=TORCH_GEMM_TEMPLATE_VERSION)
+        candidates = tuple((PIMConfig(*key), record["total_ms"])
+                           for key, record in cache.measured_results(problem, target).items()
+                           if record["correctness"])
+    else:
+        raise ValueError("model layers require an explicit config or measured autotune records")
+    engine = ConstraintEngine(problem, target)
+    choices = []
+    lanes = target.runtime_config.nr_tasklets
+    if lanes == 0:
+        lanes = target.common_profile.lanes_per_core
+    for config, cost in candidates:
+        if config.p_k != 1 or not engine.valid(config):
+            continue
+        if not 1 <= lanes <= target.common_profile.lanes_per_core:
+            continue
+        if config.block_m * config.group_m % lanes:
+            continue
+        hierarchy = pim_hierarchy(problem, config)
+        if has_weights and (instance_count != 1 or hierarchy.scheduling_rounds != 1):
+            continue
+        units = config.p_m * config.p_n * config.p_k
+        p_b = min(instance_count, target.common_profile.num_units // units)
+        rounds = (instance_count + p_b - 1) // p_b
+        choices.append((rounds * cost, config, p_b, rounds, hierarchy.rounds))
+    if not choices:
+        raise ValueError(
+            "no model config fits the actual resources; resident weights require "
+            "one instance and one M/N/K round"
+        )
+    _, config, p_b, rounds, mnk_rounds = min(choices, key=lambda choice: choice[0])
+    return config, p_b, rounds, mnk_rounds

@@ -18,14 +18,29 @@ void upmem_bind_devices(struct dpu_set_t set, uint32_t num_axes,
                         const uint32_t *partitions,
                         const uint32_t *device_mapping,
                         uint32_t *logical_for_dpu) {
+    uint32_t units = 1, allocated;
+    for (uint32_t d = 0; d < num_axes; ++d)
+        units *= partitions[d];
+    DPU_ASSERT(dpu_get_nr_dpus(set, &allocated));
+    if (allocated != units) {
+        fprintf(stderr, "UPMEM assignment: expected %u DPUs, got %u\n", units, allocated);
+        abort();
+    }
+    upmem_bind_instances(set, num_axes, partitions, device_mapping, 1, logical_for_dpu);
+}
+
+void upmem_bind_instances(struct dpu_set_t set, uint32_t num_axes,
+                          const uint32_t *partitions,
+                          const uint32_t *device_mapping, uint32_t instances,
+                          uint32_t *logical_for_dpu) {
     uint32_t units = 1, group_size = 1, allocated;
     for (uint32_t d = 0; d < num_axes; ++d) {
         units *= partitions[d];
         group_size *= device_mapping[d];
     }
     DPU_ASSERT(dpu_get_nr_dpus(set, &allocated));
-    if (allocated != units) {
-        fprintf(stderr, "UPMEM assignment: expected %u DPUs, got %u\n", units, allocated);
+    if ((uint64_t)instances * units > allocated) {
+        fprintf(stderr, "UPMEM assignment exceeds the allocated DPU set\n");
         abort();
     }
 
@@ -58,8 +73,13 @@ void upmem_bind_devices(struct dpu_set_t set, uint32_t num_axes,
                 for (uint32_t ci = 0; ci < 8; ++ci) {
                     if (physical[member * 8 + ci] == UINT32_MAX)
                         continue;
-                    uint32_t outer = ordinal / group_size;
-                    uint32_t inner = ordinal % group_size;
+                    if (ordinal >= instances * units) {
+                        logical_for_dpu[physical[member * 8 + ci]] = UINT32_MAX;
+                        ++ordinal;
+                        continue;
+                    }
+                    uint32_t outer = (ordinal % units) / group_size;
+                    uint32_t inner = (ordinal % units) % group_size;
                     uint32_t logical = 0, stride = 1;
                     for (uint32_t d = num_axes; d-- > 0;) {
                         uint32_t blocks = partitions[d] / device_mapping[d];
@@ -70,14 +90,15 @@ void upmem_bind_devices(struct dpu_set_t set, uint32_t num_axes,
                         outer /= blocks;
                         inner /= device_mapping[d];
                     }
-                    logical_for_dpu[physical[member * 8 + ci]] = logical;
+                    logical_for_dpu[physical[member * 8 + ci]] =
+                        (ordinal / units) * units + logical;
                     ++ordinal;
                 }
             }
             rank_base += active;
         }
     }
-    if (ordinal != units) {
+    if (ordinal != allocated) {
         fprintf(stderr, "UPMEM assignment: physical enumeration size mismatch\n");
         abort();
     }
@@ -109,7 +130,7 @@ struct dpu_set_t upmem_runtime_reserve(uint32_t num_units) {
     // 처음이거나 num_units이 다르면 기존 set을 비우고 새로 예약+적재.
     upmem_free_set();
     DPU_ASSERT(dpu_alloc(num_units, NULL, &g_set));
-    g_num_units = num_units;
+    DPU_ASSERT(dpu_get_nr_dpus(g_set, &g_num_units));
     g_loaded[0] = '\0';
     g_have = 1;
     return g_set;
@@ -131,6 +152,14 @@ void upmem_session_close(void) {
     }
     upmem_free_set();
     g_session_open = 0;
+}
+
+uint32_t upmem_session_num_units(void) {
+    return g_num_units;
+}
+
+struct dpu_set_t upmem_session_devices(void) {
+    return g_set;
 }
 
 int upmem_runtime_load(const char *binary_path) {

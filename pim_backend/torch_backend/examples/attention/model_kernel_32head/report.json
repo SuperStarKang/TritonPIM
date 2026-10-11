@@ -1,0 +1,3135 @@
+{
+  "scope": "attention_kernel",
+  "runtime": "model",
+  "gemm_config": "batched",
+  "batch": 1,
+  "sequence": 1024,
+  "heads": 32,
+  "head_dim": 128,
+  "hidden_dim": null,
+  "ffn_dim": null,
+  "inputs": [
+    {
+      "shape": [
+        32,
+        1024,
+        128
+      ],
+      "dtype": "torch.int8"
+    },
+    {
+      "shape": [
+        32,
+        1024,
+        128
+      ],
+      "dtype": "torch.int8"
+    },
+    {
+      "shape": [
+        32,
+        1024,
+        128
+      ],
+      "dtype": "torch.int8"
+    }
+  ],
+  "output": {
+    "shape": [
+      32,
+      1024,
+      128
+    ],
+    "dtype": "torch.float32"
+  },
+  "gemm_dtype": "int8 x int8 -> int32",
+  "cpu_dtype": "float32",
+  "causal": true,
+  "seed": 0,
+  "orientation": "normal",
+  "accuracy_checked": false,
+  "activation_transfer_policy": "always",
+  "resident_weights": 0,
+  "quantization": {
+    "weights": "synthetic int8 [-8, 7], scale=1/(8*sqrt(K))",
+    "activation_scale": 0.03125,
+    "probability": "per-row max/127"
+  },
+  "measurement_scope": "CPU/PIM layer execution with weights already loaded; excludes prepare/upload",
+  "versions": {
+    "torch": "2.12.0+cu130",
+    "triton": "3.4.0"
+  },
+  "target": {
+    "common_profile": {
+      "target": "upmem",
+      "num_units": 2048,
+      "banks_per_unit": 1,
+      "cores_per_bank": 1,
+      "lanes_per_core": 16,
+      "bank_capacity_limit_bytes": 62914560,
+      "local_capacity_limit_bytes": 49152
+    },
+    "runtime_config": {
+      "nr_tasklets": 16,
+      "host_threads": 8
+    }
+  },
+  "cpu_threads": 48,
+  "upmem_backend": "hw",
+  "upmem_profile": null,
+  "gemms": {
+    "_int_mm": {
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 8,
+        "tile_k": 4,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_1": {
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_2": {
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 8,
+        "tile_k": 4,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_3": {
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_4": {
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 8,
+        "tile_k": 4,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_5": {
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_6": {
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 8,
+        "tile_k": 4,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_7": {
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_8": {
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 8,
+        "tile_k": 4,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_9": {
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_10": {
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 8,
+        "tile_k": 4,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_11": {
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_12": {
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 8,
+        "tile_k": 4,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_13": {
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_14": {
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 8,
+        "tile_k": 4,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_15": {
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_16": {
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 8,
+        "tile_k": 4,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_17": {
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_18": {
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 8,
+        "tile_k": 4,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_19": {
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_20": {
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 8,
+        "tile_k": 4,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_21": {
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_22": {
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 8,
+        "tile_k": 4,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_23": {
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_24": {
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 8,
+        "tile_k": 4,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_25": {
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_26": {
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 8,
+        "tile_k": 4,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_27": {
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_28": {
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 8,
+        "tile_k": 4,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_29": {
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_30": {
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 8,
+        "tile_k": 4,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_31": {
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_32": {
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 8,
+        "tile_k": 4,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_33": {
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_34": {
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 8,
+        "tile_k": 4,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_35": {
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_36": {
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 8,
+        "tile_k": 4,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_37": {
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_38": {
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 8,
+        "tile_k": 4,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_39": {
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_40": {
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 8,
+        "tile_k": 4,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_41": {
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_42": {
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 8,
+        "tile_k": 4,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_43": {
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_44": {
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 8,
+        "tile_k": 4,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_45": {
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_46": {
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 8,
+        "tile_k": 4,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_47": {
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_48": {
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 8,
+        "tile_k": 4,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_49": {
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_50": {
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 8,
+        "tile_k": 4,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_51": {
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_52": {
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 8,
+        "tile_k": 4,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_53": {
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_54": {
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 8,
+        "tile_k": 4,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_55": {
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_56": {
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 8,
+        "tile_k": 4,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_57": {
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_58": {
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 8,
+        "tile_k": 4,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_59": {
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_60": {
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 8,
+        "tile_k": 4,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_61": {
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_62": {
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 8,
+        "tile_k": 4,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    },
+    "_int_mm_63": {
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      }
+    }
+  },
+  "stages": [
+    {
+      "name": "_int_mm",
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 8,
+        "tile_k": 4,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      },
+      "instances": 32,
+      "p_b": 32,
+      "batch_rounds": 1,
+      "mnk_rounds": [
+        1,
+        1,
+        1
+      ],
+      "execution_extent": [
+        128,
+        128,
+        128
+      ],
+      "participating_units": 2048,
+      "expected_launches": 1,
+      "program": "/home/dlrkdals/TritonPIM/.triton_cache/AEMNMVLATERROA6B6H57ECBGSSLEM3TZ6TUBY3B4RRPBYZF3ADDA/resident.elf"
+    },
+    {
+      "name": "_int_mm_1",
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 8,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 8,
+        "p_n": 8,
+        "p_k": 1
+      },
+      "instances": 32,
+      "p_b": 32,
+      "batch_rounds": 1,
+      "mnk_rounds": [
+        1,
+        1,
+        1
+      ],
+      "execution_extent": [
+        128,
+        16,
+        1024
+      ],
+      "participating_units": 2048,
+      "expected_launches": 1,
+      "program": "/home/dlrkdals/TritonPIM/.triton_cache/KZWG56AR2JRH2JW5BW4CXDW4BNU4IPKFPING7PBGWAUQ3LUONUZA/resident.elf"
+    }
+  ],
+  "expected_launches": 2,
+  "unique_device_artifacts": 2,
+  "memory": {
+    "weight_bytes": 0,
+    "input_offset": 0,
+    "output_offset": 147456,
+    "bytes_per_unit": 212992
+  },
+  "preparation": {
+    "session_open_ms": 334.198407,
+    "prepare_ms": 20021.071872,
+    "prepare_scope": "FX export/analysis, config selection, CPU/PIM compilation and placement",
+    "weight_load": {
+      "weight_load_ms": 8.176377,
+      "load_transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 0,
+        "output_bytes": 0,
+        "metadata_bytes": 0,
+        "launches": 0,
+        "program_loads": 1,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    }
+  },
+  "warmups": [
+    {
+      "wall_ms": 384.154948,
+      "run_ms": 384.154948,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 369098752,
+        "output_bytes": 150994944,
+        "metadata_bytes": 114688,
+        "launches": 2,
+        "program_loads": 1,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    },
+    {
+      "wall_ms": 391.169049,
+      "run_ms": 391.169049,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 369098752,
+        "output_bytes": 150994944,
+        "metadata_bytes": 114688,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    },
+    {
+      "wall_ms": 389.80138,
+      "run_ms": 389.80138,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 369098752,
+        "output_bytes": 150994944,
+        "metadata_bytes": 114688,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    }
+  ],
+  "samples": [
+    {
+      "wall_ms": 419.753748,
+      "run_ms": 419.753748,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 369098752,
+        "output_bytes": 150994944,
+        "metadata_bytes": 114688,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    },
+    {
+      "wall_ms": 399.732053,
+      "run_ms": 399.732053,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 369098752,
+        "output_bytes": 150994944,
+        "metadata_bytes": 114688,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    },
+    {
+      "wall_ms": 417.009104,
+      "run_ms": 417.009104,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 369098752,
+        "output_bytes": 150994944,
+        "metadata_bytes": 114688,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    },
+    {
+      "wall_ms": 400.923491,
+      "run_ms": 400.923491,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 369098752,
+        "output_bytes": 150994944,
+        "metadata_bytes": 114688,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    },
+    {
+      "wall_ms": 419.489526,
+      "run_ms": 419.489526,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 369098752,
+        "output_bytes": 150994944,
+        "metadata_bytes": 114688,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    },
+    {
+      "wall_ms": 386.667961,
+      "run_ms": 386.667961,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 369098752,
+        "output_bytes": 150994944,
+        "metadata_bytes": 114688,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    },
+    {
+      "wall_ms": 397.157278,
+      "run_ms": 397.157278,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 369098752,
+        "output_bytes": 150994944,
+        "metadata_bytes": 114688,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    },
+    {
+      "wall_ms": 396.593915,
+      "run_ms": 396.593915,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 369098752,
+        "output_bytes": 150994944,
+        "metadata_bytes": 114688,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    },
+    {
+      "wall_ms": 414.494945,
+      "run_ms": 414.494945,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 369098752,
+        "output_bytes": 150994944,
+        "metadata_bytes": 114688,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    },
+    {
+      "wall_ms": 405.341685,
+      "run_ms": 405.341685,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 369098752,
+        "output_bytes": 150994944,
+        "metadata_bytes": 114688,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    }
+  ],
+  "median_wall_ms": 403.132588,
+  "logical_gemm_operations": 17179869184,
+  "logical_gemm_gops_per_s": 42.61592760146694,
+  "profile": {
+    "wall_ms": 418.258227,
+    "transfers": {
+      "weight_bytes": 0,
+      "activation_bytes": 369098752,
+      "output_bytes": 150994944,
+      "metadata_bytes": 114688,
+      "launches": 2,
+      "program_loads": 2,
+      "activation_hits": 0,
+      "resource_opens": 0,
+      "resource_closes": 0,
+      "device_compiles": 0
+    },
+    "partitions": [
+      {
+        "partition": "submod_0",
+        "where": "CPU",
+        "wall_ms": 4.033955,
+        "operators": [
+          "aten.select.int",
+          "aten.select.int",
+          "aten.t.default",
+          "aten.clone.default",
+          "aten.select.int",
+          "aten.select.int",
+          "aten.t.default",
+          "aten.clone.default",
+          "aten.select.int",
+          "aten.select.int",
+          "aten.t.default",
+          "aten.clone.default",
+          "aten.select.int",
+          "aten.select.int",
+          "aten.t.default",
+          "aten.clone.default",
+          "aten.select.int",
+          "aten.select.int",
+          "aten.t.default",
+          "aten.clone.default",
+          "aten.select.int",
+          "aten.select.int",
+          "aten.t.default",
+          "aten.clone.default",
+          "aten.select.int",
+          "aten.select.int",
+          "aten.t.default",
+          "aten.clone.default",
+          "aten.select.int",
+          "aten.select.int",
+          "aten.t.default",
+          "aten.clone.default",
+          "aten.select.int",
+          "aten.select.int",
+          "aten.t.default",
+          "aten.clone.default",
+          "aten.select.int",
+          "aten.select.int",
+          "aten.t.default",
+          "aten.clone.default",
+          "aten.select.int",
+          "aten.select.int",
+          "aten.t.default",
+          "aten.clone.default",
+          "aten.select.int",
+          "aten.select.int",
+          "aten.t.default",
+          "aten.clone.default",
+          "aten.select.int",
+          "aten.select.int",
+          "aten.t.default",
+          "aten.clone.default",
+          "aten.select.int",
+          "aten.select.int",
+          "aten.t.default",
+          "aten.clone.default",
+          "aten.select.int",
+          "aten.select.int",
+          "aten.t.default",
+          "aten.clone.default",
+          "aten.select.int",
+          "aten.select.int",
+          "aten.t.default",
+          "aten.clone.default",
+          "aten.select.int",
+          "aten.select.int",
+          "aten.t.default",
+          "aten.clone.default",
+          "aten.select.int",
+          "aten.select.int",
+          "aten.t.default",
+          "aten.clone.default",
+          "aten.select.int",
+          "aten.select.int",
+          "aten.t.default",
+          "aten.clone.default",
+          "aten.select.int",
+          "aten.select.int",
+          "aten.t.default",
+          "aten.clone.default",
+          "aten.select.int",
+          "aten.select.int",
+          "aten.t.default",
+          "aten.clone.default",
+          "aten.select.int",
+          "aten.select.int",
+          "aten.t.default",
+          "aten.clone.default",
+          "aten.select.int",
+          "aten.select.int",
+          "aten.t.default",
+          "aten.clone.default",
+          "aten.select.int",
+          "aten.select.int",
+          "aten.t.default",
+          "aten.clone.default",
+          "aten.select.int",
+          "aten.select.int",
+          "aten.t.default",
+          "aten.clone.default",
+          "aten.select.int",
+          "aten.select.int",
+          "aten.t.default",
+          "aten.clone.default",
+          "aten.select.int",
+          "aten.select.int",
+          "aten.t.default",
+          "aten.clone.default",
+          "aten.select.int",
+          "aten.select.int",
+          "aten.t.default",
+          "aten.clone.default",
+          "aten.select.int",
+          "aten.select.int",
+          "aten.t.default",
+          "aten.clone.default",
+          "aten.select.int",
+          "aten.select.int",
+          "aten.t.default",
+          "aten.clone.default",
+          "aten.select.int",
+          "aten.select.int",
+          "aten.t.default",
+          "aten.clone.default",
+          "aten.select.int",
+          "aten.select.int",
+          "aten.t.default",
+          "aten.clone.default"
+        ]
+      },
+      {
+        "partition": "submod_1",
+        "where": "CPU+PIM",
+        "wall_ms": 176.296409,
+        "operation": "QK^T",
+        "mnk": [
+          1024,
+          1024,
+          128
+        ],
+        "padded_mnk": [
+          1024,
+          1024,
+          128
+        ],
+        "weight": null,
+        "config": {
+          "block_m": 16,
+          "block_n": 16,
+          "block_k": 32,
+          "group_m": 1,
+          "group_n": 1,
+          "group_k": 1,
+          "tile_m": 8,
+          "tile_n": 8,
+          "tile_k": 4,
+          "p_m": 8,
+          "p_n": 8,
+          "p_k": 1
+        },
+        "stage": "_int_mm",
+        "instances": 32,
+        "native_ms": {
+          "prepare": 0.18173299999999132,
+          "h2d": 12.711162,
+          "kernel": 25.348938,
+          "d2h": 34.150619,
+          "reduction": 0.0,
+          "buffer_alloc": 0.0,
+          "buffer_free": 0.0,
+          "acquire": 0.0,
+          "buffer_init": 1.1458969999999997,
+          "layout_a": 3.8305869999999986,
+          "layout_b": 3.779246000000001,
+          "layout_other": 0.0,
+          "layout_c": 86.77184999999989
+        },
+        "outside_native_stages_ms": 8.376377000000133,
+        "transfers": {
+          "weight_bytes": 0,
+          "activation_bytes": 67108864,
+          "output_bytes": 134217728,
+          "metadata_bytes": 57344,
+          "launches": 1,
+          "program_loads": 1,
+          "activation_hits": 0,
+          "resource_opens": 0,
+          "resource_closes": 0,
+          "device_compiles": 0
+        }
+      },
+      {
+        "partition": "submod_2",
+        "where": "CPU",
+        "wall_ms": 42.831717,
+        "operators": [
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.masked_fill.Scalar",
+          "aten.softmax.int",
+          "aten.amax.default",
+          "aten.div.Tensor",
+          "aten.div.Tensor",
+          "aten.round.default",
+          "aten.clamp.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.select.int",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.masked_fill.Scalar",
+          "aten.softmax.int",
+          "aten.amax.default",
+          "aten.div.Tensor",
+          "aten.div.Tensor",
+          "aten.round.default",
+          "aten.clamp.default",
+          "aten._to_copy.default",
+          "aten.select.int",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.masked_fill.Scalar",
+          "aten.softmax.int",
+          "aten.amax.default",
+          "aten.div.Tensor",
+          "aten.div.Tensor",
+          "aten.round.default",
+          "aten.clamp.default",
+          "aten._to_copy.default",
+          "aten.select.int",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.masked_fill.Scalar",
+          "aten.softmax.int",
+          "aten.amax.default",
+          "aten.div.Tensor",
+          "aten.div.Tensor",
+          "aten.round.default",
+          "aten.clamp.default",
+          "aten._to_copy.default",
+          "aten.select.int",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.masked_fill.Scalar",
+          "aten.softmax.int",
+          "aten.amax.default",
+          "aten.div.Tensor",
+          "aten.div.Tensor",
+          "aten.round.default",
+          "aten.clamp.default",
+          "aten._to_copy.default",
+          "aten.select.int",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.masked_fill.Scalar",
+          "aten.softmax.int",
+          "aten.amax.default",
+          "aten.div.Tensor",
+          "aten.div.Tensor",
+          "aten.round.default",
+          "aten.clamp.default",
+          "aten._to_copy.default",
+          "aten.select.int",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.masked_fill.Scalar",
+          "aten.softmax.int",
+          "aten.amax.default",
+          "aten.div.Tensor",
+          "aten.div.Tensor",
+          "aten.round.default",
+          "aten.clamp.default",
+          "aten._to_copy.default",
+          "aten.select.int",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.masked_fill.Scalar",
+          "aten.softmax.int",
+          "aten.amax.default",
+          "aten.div.Tensor",
+          "aten.div.Tensor",
+          "aten.round.default",
+          "aten.clamp.default",
+          "aten._to_copy.default",
+          "aten.select.int",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.masked_fill.Scalar",
+          "aten.softmax.int",
+          "aten.amax.default",
+          "aten.div.Tensor",
+          "aten.div.Tensor",
+          "aten.round.default",
+          "aten.clamp.default",
+          "aten._to_copy.default",
+          "aten.select.int",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.masked_fill.Scalar",
+          "aten.softmax.int",
+          "aten.amax.default",
+          "aten.div.Tensor",
+          "aten.div.Tensor",
+          "aten.round.default",
+          "aten.clamp.default",
+          "aten._to_copy.default",
+          "aten.select.int",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.masked_fill.Scalar",
+          "aten.softmax.int",
+          "aten.amax.default",
+          "aten.div.Tensor",
+          "aten.div.Tensor",
+          "aten.round.default",
+          "aten.clamp.default",
+          "aten._to_copy.default",
+          "aten.select.int",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.masked_fill.Scalar",
+          "aten.softmax.int",
+          "aten.amax.default",
+          "aten.div.Tensor",
+          "aten.div.Tensor",
+          "aten.round.default",
+          "aten.clamp.default",
+          "aten._to_copy.default",
+          "aten.select.int",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.masked_fill.Scalar",
+          "aten.softmax.int",
+          "aten.amax.default",
+          "aten.div.Tensor",
+          "aten.div.Tensor",
+          "aten.round.default",
+          "aten.clamp.default",
+          "aten._to_copy.default",
+          "aten.select.int",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.masked_fill.Scalar",
+          "aten.softmax.int",
+          "aten.amax.default",
+          "aten.div.Tensor",
+          "aten.div.Tensor",
+          "aten.round.default",
+          "aten.clamp.default",
+          "aten._to_copy.default",
+          "aten.select.int",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.masked_fill.Scalar",
+          "aten.softmax.int",
+          "aten.amax.default",
+          "aten.div.Tensor",
+          "aten.div.Tensor",
+          "aten.round.default",
+          "aten.clamp.default",
+          "aten._to_copy.default",
+          "aten.select.int",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.masked_fill.Scalar",
+          "aten.softmax.int",
+          "aten.amax.default",
+          "aten.div.Tensor",
+          "aten.div.Tensor",
+          "aten.round.default",
+          "aten.clamp.default",
+          "aten._to_copy.default",
+          "aten.select.int",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.masked_fill.Scalar",
+          "aten.softmax.int",
+          "aten.amax.default",
+          "aten.div.Tensor",
+          "aten.div.Tensor",
+          "aten.round.default",
+          "aten.clamp.default",
+          "aten._to_copy.default",
+          "aten.select.int",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.masked_fill.Scalar",
+          "aten.softmax.int",
+          "aten.amax.default",
+          "aten.div.Tensor",
+          "aten.div.Tensor",
+          "aten.round.default",
+          "aten.clamp.default",
+          "aten._to_copy.default",
+          "aten.select.int",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.masked_fill.Scalar",
+          "aten.softmax.int",
+          "aten.amax.default",
+          "aten.div.Tensor",
+          "aten.div.Tensor",
+          "aten.round.default",
+          "aten.clamp.default",
+          "aten._to_copy.default",
+          "aten.select.int",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.masked_fill.Scalar",
+          "aten.softmax.int",
+          "aten.amax.default",
+          "aten.div.Tensor",
+          "aten.div.Tensor",
+          "aten.round.default",
+          "aten.clamp.default",
+          "aten._to_copy.default",
+          "aten.select.int",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.masked_fill.Scalar",
+          "aten.softmax.int",
+          "aten.amax.default",
+          "aten.div.Tensor",
+          "aten.div.Tensor",
+          "aten.round.default",
+          "aten.clamp.default",
+          "aten._to_copy.default",
+          "aten.select.int",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.masked_fill.Scalar",
+          "aten.softmax.int",
+          "aten.amax.default",
+          "aten.div.Tensor",
+          "aten.div.Tensor",
+          "aten.round.default",
+          "aten.clamp.default",
+          "aten._to_copy.default",
+          "aten.select.int",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.masked_fill.Scalar",
+          "aten.softmax.int",
+          "aten.amax.default",
+          "aten.div.Tensor",
+          "aten.div.Tensor",
+          "aten.round.default",
+          "aten.clamp.default",
+          "aten._to_copy.default",
+          "aten.select.int",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.masked_fill.Scalar",
+          "aten.softmax.int",
+          "aten.amax.default",
+          "aten.div.Tensor",
+          "aten.div.Tensor",
+          "aten.round.default",
+          "aten.clamp.default",
+          "aten._to_copy.default",
+          "aten.select.int",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.masked_fill.Scalar",
+          "aten.softmax.int",
+          "aten.amax.default",
+          "aten.div.Tensor",
+          "aten.div.Tensor",
+          "aten.round.default",
+          "aten.clamp.default",
+          "aten._to_copy.default",
+          "aten.select.int",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.masked_fill.Scalar",
+          "aten.softmax.int",
+          "aten.amax.default",
+          "aten.div.Tensor",
+          "aten.div.Tensor",
+          "aten.round.default",
+          "aten.clamp.default",
+          "aten._to_copy.default",
+          "aten.select.int",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.masked_fill.Scalar",
+          "aten.softmax.int",
+          "aten.amax.default",
+          "aten.div.Tensor",
+          "aten.div.Tensor",
+          "aten.round.default",
+          "aten.clamp.default",
+          "aten._to_copy.default",
+          "aten.select.int",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.masked_fill.Scalar",
+          "aten.softmax.int",
+          "aten.amax.default",
+          "aten.div.Tensor",
+          "aten.div.Tensor",
+          "aten.round.default",
+          "aten.clamp.default",
+          "aten._to_copy.default",
+          "aten.select.int",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.masked_fill.Scalar",
+          "aten.softmax.int",
+          "aten.amax.default",
+          "aten.div.Tensor",
+          "aten.div.Tensor",
+          "aten.round.default",
+          "aten.clamp.default",
+          "aten._to_copy.default",
+          "aten.select.int",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.masked_fill.Scalar",
+          "aten.softmax.int",
+          "aten.amax.default",
+          "aten.div.Tensor",
+          "aten.div.Tensor",
+          "aten.round.default",
+          "aten.clamp.default",
+          "aten._to_copy.default",
+          "aten.select.int",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.masked_fill.Scalar",
+          "aten.softmax.int",
+          "aten.amax.default",
+          "aten.div.Tensor",
+          "aten.div.Tensor",
+          "aten.round.default",
+          "aten.clamp.default",
+          "aten._to_copy.default",
+          "aten.select.int",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.masked_fill.Scalar",
+          "aten.softmax.int",
+          "aten.amax.default",
+          "aten.div.Tensor",
+          "aten.div.Tensor",
+          "aten.round.default",
+          "aten.clamp.default",
+          "aten._to_copy.default",
+          "aten.select.int"
+        ]
+      },
+      {
+        "partition": "submod_3",
+        "where": "CPU+PIM",
+        "wall_ms": 156.336318,
+        "operation": "PV",
+        "mnk": [
+          1024,
+          128,
+          1024
+        ],
+        "padded_mnk": [
+          1024,
+          128,
+          1024
+        ],
+        "weight": null,
+        "config": {
+          "block_m": 16,
+          "block_n": 16,
+          "block_k": 32,
+          "group_m": 1,
+          "group_n": 1,
+          "group_k": 1,
+          "tile_m": 8,
+          "tile_n": 1,
+          "tile_k": 32,
+          "p_m": 8,
+          "p_n": 8,
+          "p_k": 1
+        },
+        "stage": "_int_mm_1",
+        "instances": 32,
+        "native_ms": {
+          "prepare": 0.18561399999999093,
+          "h2d": 37.06031,
+          "kernel": 24.528578,
+          "d2h": 4.882232,
+          "reduction": 0.0,
+          "buffer_alloc": 0.0,
+          "buffer_free": 0.0,
+          "acquire": 0.0,
+          "buffer_init": 5.2645029999999995,
+          "layout_a": 17.877693999999998,
+          "layout_b": 3.1917280000000026,
+          "layout_other": 0.0,
+          "layout_c": 56.022752999999945
+        },
+        "outside_native_stages_ms": 7.322906000000074,
+        "transfers": {
+          "weight_bytes": 0,
+          "activation_bytes": 301989888,
+          "output_bytes": 16777216,
+          "metadata_bytes": 57344,
+          "launches": 1,
+          "program_loads": 1,
+          "activation_hits": 0,
+          "resource_opens": 0,
+          "resource_closes": 0,
+          "device_compiles": 0
+        }
+      },
+      {
+        "partition": "submod_4",
+        "where": "CPU",
+        "wall_ms": 15.058478,
+        "operators": [
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "<built-in function getitem>",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.mul.Tensor",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.mul.Tensor",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.mul.Tensor",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.mul.Tensor",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.mul.Tensor",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.mul.Tensor",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.mul.Tensor",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.mul.Tensor",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.mul.Tensor",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.mul.Tensor",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.mul.Tensor",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.mul.Tensor",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.mul.Tensor",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.mul.Tensor",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.mul.Tensor",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.mul.Tensor",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.mul.Tensor",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.mul.Tensor",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.mul.Tensor",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.mul.Tensor",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.mul.Tensor",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.mul.Tensor",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.mul.Tensor",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.mul.Tensor",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.mul.Tensor",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.mul.Tensor",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.mul.Tensor",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.mul.Tensor",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.mul.Tensor",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.mul.Tensor",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.mul.Tensor",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.mul.Tensor",
+          "aten.stack.default"
+        ]
+      }
+    ],
+    "gemm_totals": {
+      "QK^T": {
+        "calls": 1,
+        "instances": 32,
+        "wall_ms": 176.296409
+      },
+      "PV": {
+        "calls": 1,
+        "instances": 32,
+        "wall_ms": 156.336318
+      }
+    },
+    "native_timing_scope": "generated model host v3; kernel includes active metadata transfer; program load is outside native stages",
+    "cpu_partitions_ms": 61.92415,
+    "outside_partitions_ms": 23.70134999999999
+  },
+  "session_close_ms": 18.422462,
+  "session_totals": {
+    "weight_bytes": 0,
+    "activation_bytes": 5167382528,
+    "output_bytes": 2113929216,
+    "metadata_bytes": 1605632,
+    "launches": 28,
+    "program_loads": 28,
+    "activation_hits": 0,
+    "resource_opens": 1,
+    "resource_closes": 1,
+    "device_compiles": 0
+  }
+}

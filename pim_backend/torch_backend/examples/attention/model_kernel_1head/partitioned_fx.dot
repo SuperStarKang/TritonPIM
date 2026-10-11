@@ -1,0 +1,36 @@
+digraph FX {
+rankdir=LR;
+node [shape=box];
+"query" [label="query\nplaceholder: query"];
+"key" [label="key\nplaceholder: key"];
+"value" [label="value\nplaceholder: value"];
+"submod_0" [label="submod_0\ncall_module: submod_0"];
+"query" -> "submod_0";
+"key" -> "submod_0";
+"getitem" [label="getitem\ncall_function: <built-in function getitem>"];
+"submod_0" -> "getitem";
+"getitem_1" [label="getitem_1\ncall_function: <built-in function getitem>"];
+"submod_0" -> "getitem_1";
+"submod_1" [label="submod_1\ncall_module: submod_1"];
+"getitem" -> "submod_1";
+"getitem_1" -> "submod_1";
+"resident_b_mask" [label="resident_b_mask\nget_attr: resident_b_mask"];
+"submod_2" [label="submod_2\ncall_module: submod_2"];
+"submod_1" -> "submod_2";
+"resident_b_mask" -> "submod_2";
+"value" -> "submod_2";
+"getitem_2" [label="getitem_2\ncall_function: <built-in function getitem>"];
+"submod_2" -> "getitem_2";
+"getitem_3" [label="getitem_3\ncall_function: <built-in function getitem>"];
+"submod_2" -> "getitem_3";
+"getitem_4" [label="getitem_4\ncall_function: <built-in function getitem>"];
+"submod_2" -> "getitem_4";
+"submod_3" [label="submod_3\ncall_module: submod_3"];
+"getitem_2" -> "submod_3";
+"getitem_3" -> "submod_3";
+"submod_4" [label="submod_4\ncall_module: submod_4"];
+"submod_3" -> "submod_4";
+"getitem_4" -> "submod_4";
+"output" [label="output\noutput: output"];
+"submod_4" -> "output";
+}

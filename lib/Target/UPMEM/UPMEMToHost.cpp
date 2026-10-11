@@ -29,7 +29,11 @@ namespace {
 struct HostEmitter {
   CEmitter e;
   MetadataLayout metadata;
-  HostEmitter(raw_ostream &os) : e(os) {}
+  bool model;
+  llvm::DenseMap<Value, unsigned> argumentIndices;
+  llvm::DenseMap<Value, unsigned> poolIndices;
+  llvm::DenseMap<StringRef, unsigned> bindingIndices;
+  HostEmitter(raw_ostream &os, bool model = false) : e(os), model(model) {}
   raw_ostream &os() { return e.os; }
 
   // 전송 배열 이름. round loop 안에 foreach 가 또 나오므로 함수 전체에서 유일해야 한다.
@@ -107,6 +111,7 @@ struct HostEmitter {
     if (auto n = host->getAttrOfType<IntegerAttr>("upmem.host_threads"))
       threads = n.getInt();
     for (auto mram : module.getOps<upmem::MRAMOp>()) {
+      bindingIndices[mram.getSymName()] = bindingIndices.size();
       auto t = cast<MemRefType>(mram.getType());
       mramBytes[mram.getSymName()] =
           elementCount(t) * elementBytes(t.getElementType());
@@ -118,16 +123,41 @@ struct HostEmitter {
     // upmem_runtime.h가 dpu.h를 C 링키지로 감싸 준다. 이 헤더가 확보한 집합을 쥐고 있어
     // 같은 유닛 수·같은 프로그램이면 다시 확보하지 않는다.
     os() << "#include \"upmem_runtime.h\"\n\n";
+    if (model)
+      os() << "#include \"upmem_model.h\"\n\n";
     os() << "#ifndef DPU_BINARY\n#define DPU_BINARY \"kernel.dpu\"\n#endif\n\n";
     metadata.emit(os());
     emitTimingPreamble();
 
+    if (model) {
+      SmallVector<int64_t> poolBytes;
+      host.walk([&](memref::AllocOp alloc) {
+        poolIndices[alloc.getResult()] = poolBytes.size();
+        poolBytes.push_back(elementCount(alloc.getType()) *
+                            elementBytes(alloc.getType().getElementType()));
+      });
+      os() << "extern \"C\" {\nuint32_t pim_model_pool_count = "
+           << poolBytes.size() << ";\nuint64_t pim_model_pool_bytes[] = {";
+      llvm::interleaveComma(poolBytes, os());
+      os() << "};\nuint32_t pim_model_metadata_bytes = " << metadata.bytes << ";\n";
+      auto bindings = host.getBody().front().getOps<upmem::BindDevicesOp>();
+      if (bindings.empty())
+        return host.emitError("model host requires an explicit device binding");
+      auto binding = *bindings.begin();
+      os() << "uint32_t pim_model_device_mapping[] = {";
+      llvm::interleaveComma(binding.getDeviceMapping(), os());
+      os() << "};\n}\n";
+    }
+
     os() << "extern \"C\" void " << host.getName() << "(";
+    if (model)
+      os() << "struct upmem_model_kernel *_model, ";
     for (auto [i, arg] : llvm::enumerate(host.getArguments())) {
       if (i)
         os() << ", ";
       std::string n = "a" + std::to_string(i);
       e.bind(arg, n);
+      argumentIndices[arg] = i;
       if (auto mr = dyn_cast<BaseMemRefType>(arg.getType())) {
         std::string ct = CEmitter::scalarType(mr.getElementType(), true);
         if (ct.empty())
@@ -143,8 +173,13 @@ struct HostEmitter {
     os() << ") {\n";
     os() << "  struct dpu_set_t _set, _dpu;\n  uint32_t _idx;\n";
     os() << "  memset(pim_timing_ms, 0, sizeof pim_timing_ms);  // PIM_TIMING\n";
-    if (failed(emitBlock(host.getBody().front(), 1)))
+    if (model)
+      os() << "  for (_model->batch_base = 0; _model->batch_base < _model->instances; "
+              "_model->batch_base += _model->batch_size) {\n";
+    if (failed(emitBlock(host.getBody().front(), model ? 2 : 1)))
       return failure();
+    if (model)
+      os() << "  }\n";
     os() << "}\n";
     return success();
   }
@@ -169,6 +204,12 @@ struct HostEmitter {
       if (ct.empty() || elementCount(type) <= 0)
         return alloc.emitError("host pool needs positive extents and scalar elements");
       std::string pool = e.name(alloc.getResult());
+      if (model) {
+        e.indent(depth);
+        os() << ct << "* " << pool << " = (" << ct << "*)_model->pools["
+             << poolIndices.lookup(alloc.getResult()) << "];\n";
+        return success();
+      }
       startTimer(BufferAlloc, depth);
       e.indent(depth);
       os() << ct << "* " << pool << " = (" << ct << "*)malloc("
@@ -180,6 +221,8 @@ struct HostEmitter {
       return success();
     }
     if (auto dealloc = dyn_cast<memref::DeallocOp>(op)) {
+      if (model)
+        return success();
       startTimer(BufferFree, depth);
       e.indent(depth);
       os() << "free(" << e.name(dealloc.getMemref()) << ");\n";
@@ -189,6 +232,11 @@ struct HostEmitter {
 
     if (auto acq = dyn_cast<upmem::AcquireOp>(op)) {
       e.bind(acq.getResult(), "_set");
+      if (model) {
+        e.indent(depth);
+        os() << "_set = _model->set;\n";
+        return success();
+      }
       startTimer(Acquire, depth);
       e.indent(depth);
       os() << "_set = upmem_acquire(" << acq.getNumUnits() << ", DPU_BINARY);\n";
@@ -196,6 +244,10 @@ struct HostEmitter {
       return success();
     }
     if (auto binding = dyn_cast<upmem::BindDevicesOp>(op)) {
+      if (model) {
+        e.bind(binding.getAssignment(), "_model->mapping");
+        return success();
+      }
       std::string assignment = e.name(binding.getAssignment());
       int64_t units = 1;
       for (int64_t count : binding.getPartitions())
@@ -221,7 +273,10 @@ struct HostEmitter {
     if (isa<upmem::LaunchOp>(op)) {
       startTimer(Kernel, depth);  // PIM_TIMING: PGEMM timer[2]와 같은 동기식 launch 구간
       e.indent(depth);
-      os() << "DPU_ASSERT(dpu_launch(_set, DPU_SYNCHRONOUS));\n";
+      if (model)
+        os() << "upmem_model_launch(_model);\n";
+      else
+        os() << "DPU_ASSERT(dpu_launch(_set, DPU_SYNCHRONOUS));\n";
       stopTimer(Kernel, depth);
       return success();
     }
@@ -271,6 +326,8 @@ struct HostEmitter {
   }
 
   LogicalResult emitForeachUnit(upmem::ForeachUnitOp fe, unsigned depth) {
+    if (model)
+      return emitModelForeachUnit(fe, depth);
     ArrayRef<int64_t> counts = fe.getCounts();
     int64_t units = 1;
     for (int64_t c : counts)
@@ -388,6 +445,72 @@ struct HostEmitter {
     return success();
   }
 
+  std::string modelPointer(Value value) {
+    auto type = cast<BaseMemRefType>(value.getType());
+    return "((" + CEmitter::scalarType(type.getElementType(), true) +
+           "*)_model->arguments[_instance * _model->argument_count + " +
+           std::to_string(argumentIndices.find(value)->second) + "])";
+  }
+
+  LogicalResult emitModelForeachUnit(upmem::ForeachUnitOp fe, unsigned depth) {
+    ArrayRef<int64_t> counts = fe.getCounts();
+    int64_t units = 1;
+    for (int64_t count : counts)
+      units *= count;
+    Block &body = fe.getBody().front();
+    startTimer(Prepare, depth);
+    e.indent(depth);
+    os() << "auto *_args = (struct _pim_metadata_t*)_model->metadata;\n";
+    e.indent(depth);
+    os() << "for (uint32_t _batch_slot = 0; _batch_slot < _model->batch_size; ++_batch_slot) {\n";
+    e.indent(depth + 1);
+    os() << "uint32_t _instance = _model->batch_base + _batch_slot;\n";
+    e.indent(depth + 1);
+    os() << "if (_instance >= _model->instances) break;\n";
+    e.indent(depth + 1);
+    os() << "for (int64_t _u = 0; _u < " << units << "; ++_u) {\n";
+    emitCoords(counts, body, 1, depth + 2, "_u");
+    e.indent(depth + 2);
+    os() << "uint32_t _job = _batch_slot * " << units << " + _u;\n";
+    for (Operation &op : body) {
+      if (auto stage = dyn_cast<upmem::StageOp>(&op)) {
+        if (!argumentIndices.count(stage.getSrc()))
+          return stage.emitError("model GEMM staging requires a host argument source");
+        if (failed(emitStage(stage, depth + 2, counts, body)))
+          return failure();
+      } else if (auto to = dyn_cast<upmem::ToMRAMOp>(&op)) {
+        e.indent(depth + 2);
+        os() << "_model->pointers[" << bindingIndices.find(to.getDst())->second
+             << "][_job] = " << e.name(to.getBuffer()) << ";\n";
+      } else if (auto tv = dyn_cast<upmem::ToHostVarOp>(&op)) {
+        const auto *field = metadata.find(tv.getDst());
+        if (!field || field->type != tv.getValue().getType())
+          return tv.emitError("unknown model metadata field");
+        e.indent(depth + 2);
+        os() << "_args[_job]." << field->name << " = " << e.name(tv.getValue()) << ";\n";
+      } else if (isa<arith::ArithDialect>(op.getDialect())) {
+        if (failed(e.emitArith(&op, depth + 2, true)))
+          return failure();
+      } else {
+        return op.emitError("unsupported model GEMM staging operation");
+      }
+    }
+    e.indent(depth + 1);
+    os() << "}\n";
+    e.indent(depth);
+    os() << "}\n";
+    stopTimer(Prepare, depth);
+    startTimer(H2D, depth);
+    for (auto to : body.getOps<upmem::ToMRAMOp>()) {
+      e.indent(depth);
+      os() << "upmem_model_transfer(_model, " << bindingIndices.find(to.getDst())->second << ", 0);\n";
+    }
+    e.indent(depth);
+    os() << "upmem_model_metadata(_model, \"" << metadata.symbol << "\");\n";
+    stopTimer(H2D, depth);
+    return success();
+  }
+
   // 타일 단위 레이아웃의 자리. 축마다 타일 loop(_t)와 타일 안 loop(_e)가 하나씩 있다.
   //   (타일 번호를 축별 타일 수로 편 값) * 타일 원소 수 + (타일 안의 자리)
   // blocks(d) = 그 축의 타일 수를 내는 C 식.
@@ -485,8 +608,19 @@ struct HostEmitter {
            << e.name(body.getArgument(1 + d)) << ";\n";
     }
     e.indent(depth);
-    os() << ct << "* " << buf << " = " << e.name(st.getDst()) << " + "
-         << buf << "_key * " << elementCount(rt) << ";\n";
+    os() << ct << "* " << buf << " = " << e.name(st.getDst()) << " + ";
+    if (model)
+      os() << "_batch_slot * " << elementCount(cast<MemRefType>(st.getDst().getType())) << " + ";
+    os() << buf << "_key * " << elementCount(rt) << ";\n";
+    if (model) {
+      auto transfer = *st.getResult().getUsers().begin();
+      auto to = dyn_cast<upmem::ToMRAMOp>(transfer);
+      if (!to)
+        return st.emitError("model stage must feed an MRAM transfer");
+      e.indent(depth);
+      os() << "if (upmem_model_wants(_model, " << bindingIndices.find(to.getDst())->second << ")) {\n";
+      ++depth;
+    }
     // 같은 slot은 공유 축 좌표가 모두 0인 대표 device에서 한 번만 채운다.
     if (!representative.empty()) {
       e.indent(depth);
@@ -512,11 +646,15 @@ struct HostEmitter {
                         return "(" + e.name(st.getPadTo()[d]) + " / " +
                                std::to_string(tile[d]) + ")";
                       })
-         << "] = " << e.name(st.getSrc()) << "["
+         << "] = " << (model ? modelPointer(st.getSrc()) : e.name(st.getSrc())) << "["
          << strideIndex(rank, tile, st.getOrigin(), st.getStrides()) << "];\n";
     stopTimer(layoutSlot, depth);
     startTimer(Prepare, depth);
     if (!representative.empty()) {
+      e.indent(--depth);
+      os() << "}\n";
+    }
+    if (model) {
       e.indent(--depth);
       os() << "}\n";
     }
@@ -531,6 +669,18 @@ struct HostEmitter {
     if (mram == mramBytes.end() || bytes > mram->second)
       return g.emitError("gather fixed slot exceeds the source MRAM buffer");
     startTimer(D2H, depth);
+    if (model) {
+      unsigned binding = bindingIndices.find(g.getSrc())->second;
+      e.indent(depth);
+      os() << "for (uint32_t _job = 0; _job < _model->batch_size * _model->logical_units; ++_job)\n";
+      e.indent(depth + 1);
+      os() << "_model->pointers[" << binding << "][_job] = " << e.name(g.getDst())
+           << " + (uint64_t)_job * " << elements << ";\n";
+      e.indent(depth);
+      os() << "upmem_model_transfer(_model, " << binding << ", 1);\n";
+      stopTimer(D2H, depth);
+      return success();
+    }
     e.indent(depth);
     os() << "_idx = 0;\n";
     e.indent(depth);
@@ -557,14 +707,28 @@ struct HostEmitter {
     std::string part = e.name(body.getArgument(0));
 
     startTimer(Prepare, depth);
+    if (model) {
+      e.indent(depth);
+      os() << "if (!_model->upload_weights) {\n";
+      e.indent(++depth);
+      os() << "for (uint32_t _batch_slot = 0; _batch_slot < _model->batch_size; ++_batch_slot) {\n";
+      e.indent(++depth);
+      os() << "uint32_t _instance = _model->batch_base + _batch_slot;\n";
+      e.indent(depth);
+      os() << "if (_instance >= _model->instances) break;\n";
+    }
     e.indent(depth);
     os() << "for (int64_t _g = 0; _g < " << groups << "; ++_g) {\n";
     emitCoords(counts, body, 1, depth + 1, "_g");
     e.indent(depth + 1);
-    os() << ct << "* " << part << " = " << parts << " + _g * "
-         << elementCount(rt) / rt.getShape()[0] << ";\n";
+    os() << ct << "* " << part << " = " << parts << " + ";
+    if (model)
+      os() << "_batch_slot * " << elementCount(rt) << " + ";
+    os() << "_g * " << elementCount(rt) / rt.getShape()[0] << ";\n";
     for (Operation &op : body) {
       if (auto un = dyn_cast<upmem::UnstageOp>(&op)) {
+        if (model && !argumentIndices.count(un.getDst()))
+          return un.emitError("model GEMM output requires a host argument destination");
         if (failed(emitUnstage(un, depth + 1)))
           return failure();
       } else if (isa<arith::ArithDialect>(op.getDialect())) {
@@ -576,6 +740,12 @@ struct HostEmitter {
     }
     e.indent(depth);
     os() << "}\n";
+    if (model) {
+      e.indent(--depth);
+      os() << "}\n";
+      e.indent(--depth);
+      os() << "}\n";
+    }
     stopTimer(Prepare, depth);
     return success();
   }
@@ -594,7 +764,7 @@ struct HostEmitter {
       startTimer(slot, d);
       emitTileLoops(rank, tile, un.getSizes(), d);
       e.indent(d + 1 + 2 * rank);
-      os() << e.name(un.getDst()) << "["
+      os() << (model ? modelPointer(un.getDst()) : e.name(un.getDst())) << "["
            << strideIndex(rank, tile, un.getOrigin(), un.getStrides())
            << "] " << assignOp << " " << e.name(un.getBuffer()) << "["
            << tileIndex(rank, tile,
@@ -626,6 +796,10 @@ static LogicalResult translateUPMEMToHost(ModuleOp module, raw_ostream &os) {
   return HostEmitter(os).run(module);
 }
 
+static LogicalResult translateUPMEMToModelHost(ModuleOp module, raw_ostream &os) {
+  return HostEmitter(os, true).run(module);
+}
+
 } // namespace
 
 void mlir::triton::registerUPMEMToHostTranslation() {
@@ -634,6 +808,14 @@ void mlir::triton::registerUPMEMToHostTranslation() {
       translateUPMEMToHost, [](DialectRegistry &registry) {
         // 모듈 전체를 파싱하므로 device 쪽 몸체에 나오는 것까지 등록해야 한다.
         // 다루지 못하는 op은 파싱 실패가 아니라 emitter의 에러로 드러나야 원인이 보인다.
+        registry.insert<arith::ArithDialect, func::FuncDialect,
+                        linalg::LinalgDialect, memref::MemRefDialect,
+                        scf::SCFDialect, tensor::TensorDialect,
+                        upmem::UPMEMDialect>();
+      });
+  TranslateFromMLIRRegistration modelReg(
+      "upmem-to-model-host", "emit a session-owned batched GEMM host entry",
+      translateUPMEMToModelHost, [](DialectRegistry &registry) {
         registry.insert<arith::ArithDialect, func::FuncDialect,
                         linalg::LinalgDialect, memref::MemRefDialect,
                         scf::SCFDialect, tensor::TensorDialect,
