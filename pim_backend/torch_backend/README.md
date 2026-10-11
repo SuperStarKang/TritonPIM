@@ -37,6 +37,42 @@ CPU float32 또는 int32 C[M,N]
 Tensor device는 계속 CPU다. PIM은 tensor device가 아니라 이 template의 compile 및
 execution backend다.
 
+## 모델 단위 Session 실행
+
+`PIMSession`에 진입하면서 DPU를 먼저 확보하고 실제 자원 수를 조회한다.
+`prepare(layers, example_inputs, configure=...)`는 Torch block들을 FX로 분석하고
+LayerPlan을 생성한 뒤 config, batch 배정, 공통 주소와 컴파일을 확정한다.
+`run_model()`은 Layer 진입 시 weight를 올리고 준비한 CPU/PIM 구간을 순서대로 실행한다.
+동일 형태의 독립 activation GEMM과 FP32 `aten.bmm`은 하나의 native batch 실행으로 묶는다.
+
+```python
+def configure(gemms, spec):
+    return {
+        gemm.node: PIMTorchConfig(spec=spec, config=gemm_configs[gemm.mnk])
+        for gemm in gemms
+    }
+
+
+with PIMSession(target_spec("upmem", num_units=512, nr_tasklets=16)) as session:
+    plans = session.prepare(blocks, example_inputs, configure=configure)
+    output = session.run_model(*inputs)
+```
+
+`blocks`는 실행 순서대로 나열한 Torch module이며 `example_inputs`는 첫 block의 positional 입력 tuple이다.
+`configure(gemms, spec)`에는 각 block의 GEMM 분석 결과와 실제 확보한 자원 spec이 전달된다.
+이 함수는 원본 FX GEMM 이름을 `PIMTorchConfig`에 연결한다. 위 예제의 `gemm_configs`는
+`(M, N, K)`별 명시적 config 사전이며, 대신 `autotune_cache_path`로 기존 측정 후보를 제공할 수 있다.
+LayerPlan이 해당 후보에서 Execution Tile, partition, `p_b`, round를 결정한다.
+CPU 컴파일 준비에서 계산한 실제 출력으로 다음 block을 분석하며, tuple 출력은 positional 입력으로 전달한다.
+모든 block의 메모리 요구량을 모은 뒤 adapter가 공통 주소와 native artifact를 확정한다.
+`build_layer_plan()`은 이 과정에서 쓰는 기존 FX 분석 함수로 유지한다.
+Activation/ready table은 만들지 않는다. Weight는 현재 Layer만 device에 상주하며,
+KV API는 우선 CPU 저장소를 제공한다. 정적 shape, UPMEM, `p_k=1`, 동기 실행을 지원한다.
+Resident weight GEMM은 단일 instance·단일 M/N/K round로 제한한다.
+
+설계·상세 범위·검증 명령은 [모델 runtime 설계](../../design/ModelRuntime_Design.md),
+실행 예제는 [torch_model_session.py](examples/torch_model_session.py)를 참고한다.
+
 FX graph 전체의 weight를 UPMEM에 유지하는 별도 실행 경로는
 [ResidentBlock 사용법](RESIDENT.md)을 참고한다. 기존 lowering을 유지하며,
 모든 weight가 같은 전체 DPU 집합과 공용 입력·출력 scratch를 사용한다.
@@ -58,7 +94,8 @@ Attention kernel, projection을 포함한 Attention layer, FFN을 포함한 Tran
 
 ## Common IR configuration
 
-Torch integration은 별도 실행 plan을 만들지 않는다.
+일반 GEMM lowering의 3계층 정보는 기존 Common IR config를 사용한다.
+모델 경로의 `LayerPlan`은 이 정보에 CPU/PIM 순서와 instance 배정을 연결한다.
 
 | 값 | 소유자 |
 |---|---|

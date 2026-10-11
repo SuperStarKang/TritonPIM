@@ -5,3 +5,8 @@ build/*
 .vscode/*
 /python/examples/test_core.py
 /python/examples/test_annotations.py
+
+*.dt
+*.csv
+*.xlsx
+*.dot

@@ -412,8 +412,8 @@ class PIMBackend(BaseBackend):
 
     @functools.lru_cache()
     def hash(self):
-        # Regenerate artifacts when a target's execution or allocation plan changes.
-        return f"{self.target}-pim-common-ir-v9-device-mapping-host-pools-host-plan-shared-over-input-reuse-upmem-metadata-v2-rhs-row-major-v1-timing-v3-aimx-contiguous-groups-v2-vacc-reduction-v2"
+        # Regenerate artifacts when the Common/UPMEM execution plan changes.
+        return f"{self.target}-pim-common-ir-v10-model-batching-device-active-host-pools-upmem-metadata-v2-rhs-row-major-v1-timing-v3"
 
     def get_module_map(self) -> Dict[str, ModuleType]:
         return {}

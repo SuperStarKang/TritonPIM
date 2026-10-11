@@ -1,4 +1,4 @@
-"""Compile reusable FX layer plans independently of request resources."""
+"""FX block plans for model preparation and the legacy compiled-layer API."""
 
 from dataclasses import dataclass
 import time
@@ -51,6 +51,28 @@ class LayerPlan:
     tensor_inputs: tuple
     backend_plan: object = None
     compile_ms: float = 0.0
+    stages: tuple = ()
+    example_inputs: tuple = ()
+    weight_bytes_per_unit: int = 0
+    exported_graph: fx.GraphModule | None = None
+
+    def plan_model(self, spec, runtime):
+        self.spec = spec
+        for stage in self.stages:
+            stage.prepare(spec, runtime)
+
+    def compile_cpu(self):
+        from .model import CompileModelCPU
+
+        leaves, _ = _pytree.tree_flatten((self.example_inputs, {}))
+        outputs = CompileModelCPU(self.graph).run(*leaves)
+        return _pytree.tree_unflatten(list(outputs), self.output_spec)
+
+    def run_model(self, *inputs):
+        leaves, _ = _pytree.tree_flatten((inputs, {}))
+        with torch.no_grad():
+            outputs = self.graph(*leaves)
+        return _pytree.tree_unflatten(list(outputs), self.output_spec)
 
     def check_state(self):
         if not self.runtime.compiled:

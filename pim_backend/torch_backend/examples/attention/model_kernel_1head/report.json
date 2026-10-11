@@ -1,0 +1,685 @@
+{
+  "scope": "attention_kernel",
+  "runtime": "model",
+  "gemm_config": "baseline",
+  "batch": 1,
+  "sequence": 1024,
+  "heads": 1,
+  "head_dim": 128,
+  "hidden_dim": null,
+  "ffn_dim": null,
+  "inputs": [
+    {
+      "shape": [
+        1,
+        1024,
+        128
+      ],
+      "dtype": "torch.int8"
+    },
+    {
+      "shape": [
+        1,
+        1024,
+        128
+      ],
+      "dtype": "torch.int8"
+    },
+    {
+      "shape": [
+        1,
+        1024,
+        128
+      ],
+      "dtype": "torch.int8"
+    }
+  ],
+  "output": {
+    "shape": [
+      1,
+      1024,
+      128
+    ],
+    "dtype": "torch.float32"
+  },
+  "gemm_dtype": "int8 x int8 -> int32",
+  "cpu_dtype": "float32",
+  "causal": true,
+  "seed": 0,
+  "orientation": "normal",
+  "accuracy_checked": false,
+  "activation_transfer_policy": "always",
+  "resident_weights": 0,
+  "quantization": {
+    "weights": "synthetic int8 [-8, 7], scale=1/(8*sqrt(K))",
+    "activation_scale": 0.03125,
+    "probability": "per-row max/127"
+  },
+  "measurement_scope": "CPU/PIM layer execution with weights already loaded; excludes prepare/upload",
+  "versions": {
+    "torch": "2.12.0+cu130",
+    "triton": "3.4.0"
+  },
+  "target": {
+    "common_profile": {
+      "target": "upmem",
+      "num_units": 2048,
+      "banks_per_unit": 1,
+      "cores_per_bank": 1,
+      "lanes_per_core": 16,
+      "bank_capacity_limit_bytes": 62914560,
+      "local_capacity_limit_bytes": 49152
+    },
+    "runtime_config": {
+      "nr_tasklets": 16,
+      "host_threads": 8
+    }
+  },
+  "cpu_threads": 48,
+  "upmem_backend": "hw",
+  "upmem_profile": null,
+  "gemms": {
+    "_int_mm": {
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 2,
+        "tile_n": 1,
+        "tile_k": 4,
+        "p_m": 32,
+        "p_n": 64,
+        "p_k": 1
+      }
+    },
+    "_int_mm_1": {
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 4,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 1,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 64,
+        "p_n": 32,
+        "p_k": 1
+      }
+    }
+  },
+  "stages": [
+    {
+      "name": "_int_mm",
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 2,
+        "tile_n": 1,
+        "tile_k": 4,
+        "p_m": 32,
+        "p_n": 64,
+        "p_k": 1
+      },
+      "instances": 1,
+      "p_b": 1,
+      "batch_rounds": 1,
+      "mnk_rounds": [
+        1,
+        1,
+        1
+      ],
+      "execution_extent": [
+        32,
+        16,
+        128
+      ],
+      "participating_units": 2048,
+      "expected_launches": 1,
+      "program": "/home/dlrkdals/TritonPIM/.triton_cache/7P3BMYXKZW7EHG2WHAPPWRFFWIGMQWAOXDIWADQM3HBE2WUKPECQ/resident.elf"
+    },
+    {
+      "name": "_int_mm_1",
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "config": {
+        "block_m": 16,
+        "block_n": 4,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 1,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 64,
+        "p_n": 32,
+        "p_k": 1
+      },
+      "instances": 1,
+      "p_b": 1,
+      "batch_rounds": 1,
+      "mnk_rounds": [
+        1,
+        1,
+        1
+      ],
+      "execution_extent": [
+        16,
+        4,
+        1024
+      ],
+      "participating_units": 2048,
+      "expected_launches": 1,
+      "program": "/home/dlrkdals/TritonPIM/.triton_cache/HTTFBS4HZ4NGVVM4JNJJA4NVAPJBRM5KTCLNXVVSZPALORQXLCKQ/resident.elf"
+    }
+  ],
+  "expected_launches": 2,
+  "unique_device_artifacts": 2,
+  "memory": {
+    "weight_bytes": 0,
+    "input_offset": 0,
+    "output_offset": 20480,
+    "bytes_per_unit": 22528
+  },
+  "preparation": {
+    "export_ms": 79.350971,
+    "plan_ms": 383.984816,
+    "session_open_ms": 337.899364,
+    "prepare_ms": 16406.802779,
+    "weight_load": {
+      "weight_load_ms": 7.774633,
+      "load_transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 0,
+        "output_bytes": 0,
+        "metadata_bytes": 0,
+        "launches": 0,
+        "program_loads": 1,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    }
+  },
+  "warmups": [
+    {
+      "wall_ms": 63.527669,
+      "run_ms": 63.527669,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 54525952,
+        "output_bytes": 4718592,
+        "metadata_bytes": 114688,
+        "launches": 2,
+        "program_loads": 1,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    },
+    {
+      "wall_ms": 69.635473,
+      "run_ms": 69.635473,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 54525952,
+        "output_bytes": 4718592,
+        "metadata_bytes": 114688,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    },
+    {
+      "wall_ms": 54.094159,
+      "run_ms": 54.094159,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 54525952,
+        "output_bytes": 4718592,
+        "metadata_bytes": 114688,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    }
+  ],
+  "samples": [
+    {
+      "wall_ms": 55.937898,
+      "run_ms": 55.937898,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 54525952,
+        "output_bytes": 4718592,
+        "metadata_bytes": 114688,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    },
+    {
+      "wall_ms": 51.989566,
+      "run_ms": 51.989566,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 54525952,
+        "output_bytes": 4718592,
+        "metadata_bytes": 114688,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    },
+    {
+      "wall_ms": 63.8896,
+      "run_ms": 63.8896,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 54525952,
+        "output_bytes": 4718592,
+        "metadata_bytes": 114688,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    },
+    {
+      "wall_ms": 55.942791,
+      "run_ms": 55.942791,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 54525952,
+        "output_bytes": 4718592,
+        "metadata_bytes": 114688,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    },
+    {
+      "wall_ms": 56.923345,
+      "run_ms": 56.923345,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 54525952,
+        "output_bytes": 4718592,
+        "metadata_bytes": 114688,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    },
+    {
+      "wall_ms": 62.726097,
+      "run_ms": 62.726097,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 54525952,
+        "output_bytes": 4718592,
+        "metadata_bytes": 114688,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    },
+    {
+      "wall_ms": 52.083248,
+      "run_ms": 52.083248,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 54525952,
+        "output_bytes": 4718592,
+        "metadata_bytes": 114688,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    },
+    {
+      "wall_ms": 59.931905,
+      "run_ms": 59.931905,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 54525952,
+        "output_bytes": 4718592,
+        "metadata_bytes": 114688,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    },
+    {
+      "wall_ms": 59.94666,
+      "run_ms": 59.94666,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 54525952,
+        "output_bytes": 4718592,
+        "metadata_bytes": 114688,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    },
+    {
+      "wall_ms": 60.334539,
+      "run_ms": 60.334539,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 54525952,
+        "output_bytes": 4718592,
+        "metadata_bytes": 114688,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    }
+  ],
+  "median_wall_ms": 58.427625,
+  "logical_gemm_operations": 536870912,
+  "logical_gemm_gops_per_s": 9.188648554515094,
+  "profile": {
+    "wall_ms": 67.005004,
+    "transfers": {
+      "weight_bytes": 0,
+      "activation_bytes": 54525952,
+      "output_bytes": 4718592,
+      "metadata_bytes": 114688,
+      "launches": 2,
+      "program_loads": 2,
+      "activation_hits": 0,
+      "resource_opens": 0,
+      "resource_closes": 0,
+      "device_compiles": 0
+    },
+    "partitions": [
+      {
+        "partition": "submod_0",
+        "where": "CPU",
+        "wall_ms": 0.324937,
+        "operators": [
+          "aten.select.int",
+          "aten.select.int",
+          "aten.t.default",
+          "aten.clone.default"
+        ]
+      },
+      {
+        "partition": "submod_1",
+        "where": "CPU+PIM",
+        "wall_ms": 36.540478,
+        "operation": "QK^T",
+        "mnk": [
+          1024,
+          1024,
+          128
+        ],
+        "padded_mnk": [
+          1024,
+          1024,
+          128
+        ],
+        "weight": null,
+        "config": {
+          "block_m": 16,
+          "block_n": 16,
+          "block_k": 32,
+          "group_m": 1,
+          "group_n": 1,
+          "group_k": 1,
+          "tile_m": 2,
+          "tile_n": 1,
+          "tile_k": 4,
+          "p_m": 32,
+          "p_n": 64,
+          "p_k": 1
+        },
+        "stage": "_int_mm",
+        "instances": 1,
+        "native_ms": {
+          "prepare": 0.2356929999999893,
+          "h2d": 3.936538,
+          "kernel": 1.713954,
+          "d2h": 1.722539,
+          "reduction": 0.0,
+          "buffer_alloc": 0.0,
+          "buffer_free": 0.0,
+          "acquire": 0.0,
+          "buffer_init": 0.039541999999999994,
+          "layout_a": 0.44132099999999996,
+          "layout_b": 0.7648580000000003,
+          "layout_other": 0.0,
+          "layout_c": 12.722468999999972
+        },
+        "outside_native_stages_ms": 14.963564000000037,
+        "transfers": {
+          "weight_bytes": 0,
+          "activation_bytes": 12582912,
+          "output_bytes": 4194304,
+          "metadata_bytes": 57344,
+          "launches": 1,
+          "program_loads": 1,
+          "activation_hits": 0,
+          "resource_opens": 0,
+          "resource_closes": 0,
+          "device_compiles": 0
+        }
+      },
+      {
+        "partition": "submod_2",
+        "where": "CPU",
+        "wall_ms": 0.933951,
+        "operators": [
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.masked_fill.Scalar",
+          "aten.softmax.int",
+          "aten.amax.default",
+          "aten.div.Tensor",
+          "aten.div.Tensor",
+          "aten.round.default",
+          "aten.clamp.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.select.int"
+        ]
+      },
+      {
+        "partition": "submod_3",
+        "where": "CPU+PIM",
+        "wall_ms": 26.187918,
+        "operation": "PV",
+        "mnk": [
+          1024,
+          128,
+          1024
+        ],
+        "padded_mnk": [
+          1024,
+          128,
+          1024
+        ],
+        "weight": null,
+        "config": {
+          "block_m": 16,
+          "block_n": 4,
+          "block_k": 32,
+          "group_m": 1,
+          "group_n": 1,
+          "group_k": 1,
+          "tile_m": 1,
+          "tile_n": 1,
+          "tile_k": 32,
+          "p_m": 64,
+          "p_n": 32,
+          "p_k": 1
+        },
+        "stage": "_int_mm_1",
+        "instances": 1,
+        "native_ms": {
+          "prepare": 0.1669380000000072,
+          "h2d": 8.531087,
+          "kernel": 2.025778,
+          "d2h": 1.07096,
+          "reduction": 0.0,
+          "buffer_alloc": 0.0,
+          "buffer_free": 0.0,
+          "acquire": 0.0,
+          "buffer_init": 0.2174450000000001,
+          "layout_a": 1.0779489999999998,
+          "layout_b": 0.35182699999999995,
+          "layout_other": 0.0,
+          "layout_c": 2.6814139999999944
+        },
+        "outside_native_stages_ms": 10.064519999999998,
+        "transfers": {
+          "weight_bytes": 0,
+          "activation_bytes": 41943040,
+          "output_bytes": 524288,
+          "metadata_bytes": 57344,
+          "launches": 1,
+          "program_loads": 1,
+          "activation_hits": 0,
+          "resource_opens": 0,
+          "resource_closes": 0,
+          "device_compiles": 0
+        }
+      },
+      {
+        "partition": "submod_4",
+        "where": "CPU",
+        "wall_ms": 1.718739,
+        "operators": [
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.mul.Tensor",
+          "aten.stack.default"
+        ]
+      }
+    ],
+    "gemm_totals": {
+      "QK^T": {
+        "calls": 1,
+        "instances": 1,
+        "wall_ms": 36.540478
+      },
+      "PV": {
+        "calls": 1,
+        "instances": 1,
+        "wall_ms": 26.187918
+      }
+    },
+    "native_timing_scope": "generated model host v3; kernel includes active metadata transfer; program load is outside native stages",
+    "cpu_partitions_ms": 2.977627,
+    "outside_partitions_ms": 1.2989809999999977
+  },
+  "session_close_ms": 12.879284,
+  "session_totals": {
+    "weight_bytes": 0,
+    "activation_bytes": 763363328,
+    "output_bytes": 66060288,
+    "metadata_bytes": 1605632,
+    "launches": 28,
+    "program_loads": 28,
+    "activation_hits": 0,
+    "resource_opens": 1,
+    "resource_closes": 1,
+    "device_compiles": 0
+  }
+}
