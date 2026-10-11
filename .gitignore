@@ -7,3 +7,5 @@ build/*
 /python/examples/test_annotations.py
 
 /pim_backend/examples
+
+examples/
