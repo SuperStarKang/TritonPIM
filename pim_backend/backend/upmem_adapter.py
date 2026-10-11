@@ -1,8 +1,7 @@
-"""UPMEM implementation of the request runtime contract.
+"""UPMEM resources shared by model execution and the legacy layer API.
 
-Compilation records immutable host/device artifacts without acquiring hardware.
-Loading a layer captures its packed weights, uploads them, and releases their
-host staging buffers. Only the current layer owns MRAM addresses.
+Model plans select configurations after open and share a model-wide MRAM layout.
+The legacy path compiles before open and captures weights on each layer load.
 """
 
 from contextlib import ExitStack
@@ -110,10 +109,14 @@ class UPMEMAdapter:
         self.library.upmem_session_open.restype = None
         self.library.upmem_session_close.argtypes = []
         self.library.upmem_session_close.restype = None
+        self.library.upmem_session_num_units.argtypes = []
+        self.library.upmem_session_num_units.restype = ctypes.c_uint32
         self.runtime = None
+        self.model = None
         self.bindings = {}
         self.totals = {name: 0 for name, _ in TransferStats._fields_}
         self.totals.update(resource_opens=0, resource_closes=0)
+        self.totals["device_compiles"] = 0
         self.cleanup = None
 
     def validate_config(self, config):
@@ -168,6 +171,7 @@ class UPMEMAdapter:
         with ExitStack() as cleanup:
             cleanup.enter_context(resident_lock)
             self.library.upmem_session_open(self.spec.common_profile.num_units)
+            self.num_units = self.library.upmem_session_num_units()
             self.totals["resource_opens"] += 1
             cleanup.callback(self._release_resources)
             cleanup.callback(self._close_layer)
@@ -178,6 +182,11 @@ class UPMEMAdapter:
         self.totals["resource_closes"] += 1
 
     def _close_layer(self):
+        if self.model is not None:
+            for name, value in self.model.stats().items():
+                self.totals[name] += value
+            self.model.close()
+            self.model = None
         if self.runtime is not None:
             for name, value in self.runtime.stats().items():
                 self.totals[name] += value
@@ -222,10 +231,24 @@ class UPMEMAdapter:
 
     def stats(self):
         totals = dict(self.totals)
+        if self.model is not None:
+            for name, value in self.model.stats().items():
+                totals[name] += value
         if self.runtime is not None:
             for name, value in self.runtime.stats().items():
                 totals[name] += value
         return totals
+
+    def begin_model(self):
+        from .upmem_model import UPMEMModelRuntime
+
+        if self.runtime is not None or self.model is not None:
+            raise RuntimeError("prepare one model per session; legacy resident layers cannot share it")
+        self.model = UPMEMModelRuntime(self)
+
+    def prepare_model(self, plans):
+        self.model.place(plans, self.spec.common_profile.bank_capacity_limit_bytes,
+                         self.num_units)
 
     def close(self):
         if self.cleanup is not None:

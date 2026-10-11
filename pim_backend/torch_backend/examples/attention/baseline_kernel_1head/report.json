@@ -1,0 +1,646 @@
+{
+  "scope": "attention_kernel",
+  "batch": 1,
+  "sequence": 1024,
+  "heads": 1,
+  "head_dim": 128,
+  "hidden_dim": null,
+  "ffn_dim": null,
+  "inputs": [
+    {
+      "shape": [
+        1,
+        1024,
+        128
+      ],
+      "dtype": "torch.int8"
+    },
+    {
+      "shape": [
+        1,
+        1024,
+        128
+      ],
+      "dtype": "torch.int8"
+    },
+    {
+      "shape": [
+        1,
+        1024,
+        128
+      ],
+      "dtype": "torch.int8"
+    }
+  ],
+  "output": {
+    "shape": [
+      1,
+      1024,
+      128
+    ],
+    "dtype": "torch.float32"
+  },
+  "gemm_dtype": "int8 x int8 -> int32",
+  "cpu_dtype": "float32",
+  "activation_transfer_policy": "always",
+  "quantization": {
+    "weights": "synthetic int8 [-8, 7], scale=1/(8*sqrt(K))",
+    "activation_scale": 0.03125,
+    "probability": "per-row max/127"
+  },
+  "causal": true,
+  "seed": 0,
+  "orientation": "normal",
+  "accuracy_checked": false,
+  "versions": {
+    "torch": "2.12.0+cu130",
+    "triton": "3.4.0"
+  },
+  "target": {
+    "common_profile": {
+      "target": "upmem",
+      "num_units": 2048,
+      "banks_per_unit": 1,
+      "cores_per_bank": 1,
+      "lanes_per_core": 16,
+      "bank_capacity_limit_bytes": 62914560,
+      "local_capacity_limit_bytes": 49152
+    },
+    "runtime_config": {
+      "nr_tasklets": 16,
+      "host_threads": 8
+    }
+  },
+  "cpu_threads": 48,
+  "upmem_backend": "hw",
+  "upmem_profile": null,
+  "gemms": {
+    "_int_mm": {
+      "operation": "QK^T",
+      "mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "weight": null,
+      "padded_mnk": [
+        1024,
+        1024,
+        128
+      ],
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 2,
+        "tile_n": 1,
+        "tile_k": 4,
+        "p_m": 32,
+        "p_n": 64,
+        "p_k": 1
+      }
+    },
+    "_int_mm_1": {
+      "operation": "PV",
+      "mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "weight": null,
+      "padded_mnk": [
+        1024,
+        128,
+        1024
+      ],
+      "config": {
+        "block_m": 16,
+        "block_n": 4,
+        "block_k": 32,
+        "group_m": 1,
+        "group_n": 1,
+        "group_k": 1,
+        "tile_m": 1,
+        "tile_n": 1,
+        "tile_k": 32,
+        "p_m": 64,
+        "p_n": 32,
+        "p_k": 1
+      }
+    }
+  },
+  "resident_weights": 0,
+  "preparation": {
+    "export_ms": 75.95186,
+    "compile_ms": 16839.708287,
+    "session_open_ms": 350.988745,
+    "weight_load": {
+      "layer": 0,
+      "weight_load_ms": 21.722432,
+      "capture_ms": 10.686651999999999,
+      "upload_ms": 7.383219,
+      "upload_breakdown_ms": {
+        "h2d": 0.0,
+        "program_load": 7.380514,
+        "resident_host": 0.0027050000000006236
+      },
+      "load_transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 0,
+        "output_bytes": 0,
+        "metadata_bytes": 0,
+        "launches": 0,
+        "program_loads": 1,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    }
+  },
+  "warmups": [
+    {
+      "run_ms": 42.277202,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 54525952,
+        "output_bytes": 4718592,
+        "metadata_bytes": 98304,
+        "launches": 2,
+        "program_loads": 1,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    },
+    {
+      "run_ms": 42.920504,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 54525952,
+        "output_bytes": 4718592,
+        "metadata_bytes": 98304,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    },
+    {
+      "run_ms": 47.978897,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 54525952,
+        "output_bytes": 4718592,
+        "metadata_bytes": 98304,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    }
+  ],
+  "samples": [
+    {
+      "wall_ms": 59.80888,
+      "run_ms": 59.760379,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 54525952,
+        "output_bytes": 4718592,
+        "metadata_bytes": 98304,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    },
+    {
+      "wall_ms": 51.963578,
+      "run_ms": 51.919783,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 54525952,
+        "output_bytes": 4718592,
+        "metadata_bytes": 98304,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    },
+    {
+      "wall_ms": 50.196717,
+      "run_ms": 50.14306,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 54525952,
+        "output_bytes": 4718592,
+        "metadata_bytes": 98304,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    },
+    {
+      "wall_ms": 49.319801,
+      "run_ms": 49.26402,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 54525952,
+        "output_bytes": 4718592,
+        "metadata_bytes": 98304,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    },
+    {
+      "wall_ms": 61.312244,
+      "run_ms": 61.23683,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 54525952,
+        "output_bytes": 4718592,
+        "metadata_bytes": 98304,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    },
+    {
+      "wall_ms": 63.006678,
+      "run_ms": 62.950688,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 54525952,
+        "output_bytes": 4718592,
+        "metadata_bytes": 98304,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    },
+    {
+      "wall_ms": 61.348745,
+      "run_ms": 61.253475,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 54525952,
+        "output_bytes": 4718592,
+        "metadata_bytes": 98304,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    },
+    {
+      "wall_ms": 60.130331,
+      "run_ms": 60.048728,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 54525952,
+        "output_bytes": 4718592,
+        "metadata_bytes": 98304,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    },
+    {
+      "wall_ms": 58.328512,
+      "run_ms": 58.267734,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 54525952,
+        "output_bytes": 4718592,
+        "metadata_bytes": 98304,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    },
+    {
+      "wall_ms": 59.650195,
+      "run_ms": 59.567153,
+      "transfers": {
+        "weight_bytes": 0,
+        "activation_bytes": 54525952,
+        "output_bytes": 4718592,
+        "metadata_bytes": 98304,
+        "launches": 2,
+        "program_loads": 2,
+        "activation_hits": 0,
+        "resource_opens": 0,
+        "resource_closes": 0,
+        "device_compiles": 0
+      }
+    }
+  ],
+  "median_wall_ms": 59.7295375,
+  "logical_gemm_operations": 536870912,
+  "logical_gemm_gops_per_s": 8.988365463235004,
+  "profile": {
+    "wall_ms": 59.757459,
+    "transfers": {
+      "weight_bytes": 0,
+      "activation_bytes": 54525952,
+      "output_bytes": 4718592,
+      "metadata_bytes": 98304,
+      "launches": 2,
+      "program_loads": 2,
+      "activation_hits": 0,
+      "resource_opens": 0,
+      "resource_closes": 0,
+      "device_compiles": 0
+    },
+    "timing_version": 4,
+    "partitions": [
+      {
+        "partition": "submod_0",
+        "where": "CPU",
+        "operators": [
+          "aten.select.int",
+          "aten.select.int",
+          "aten.t.default",
+          "aten.clone.default"
+        ],
+        "wall_ms": 0.426415
+      },
+      {
+        "partition": "submod_1",
+        "where": "CPU+PIM",
+        "operators": [
+          "QK^T"
+        ],
+        "wall_ms": 32.602211,
+        "gemm": "_int_mm",
+        "operation": "QK^T",
+        "mnk": [
+          1024,
+          1024,
+          128
+        ],
+        "weight": null,
+        "padded_mnk": [
+          1024,
+          1024,
+          128
+        ],
+        "config": {
+          "block_m": 16,
+          "block_n": 16,
+          "block_k": 32,
+          "group_m": 1,
+          "group_n": 1,
+          "group_k": 1,
+          "tile_m": 2,
+          "tile_n": 1,
+          "tile_k": 4,
+          "p_m": 32,
+          "p_n": 64,
+          "p_k": 1
+        },
+        "native_ms": {
+          "prepare": 0.8212210000000033,
+          "h2d": 3.2520320000000003,
+          "kernel": 1.318543,
+          "d2h": 1.700821,
+          "reduction": 0.0,
+          "buffer_alloc": 0.001939,
+          "buffer_free": 0.001324,
+          "acquire": 0.000531,
+          "buffer_init": 0.103919,
+          "layout_a": 0.4463599999999999,
+          "layout_b": 0.7399850000000003,
+          "layout_other": 0.0,
+          "layout_c": 8.464895999999989,
+          "program_load": 14.155212,
+          "resident_host": 0.3778559999999995
+        },
+        "h2d_ms": {
+          "weight": 0.0,
+          "activation": 2.550987,
+          "metadata": 0.701045
+        },
+        "transfers": {
+          "weight_bytes": 0,
+          "activation_bytes": 12582912,
+          "output_bytes": 4194304,
+          "metadata_bytes": 49152,
+          "launches": 1,
+          "program_loads": 1,
+          "activation_hits": 0,
+          "resource_opens": 0,
+          "resource_closes": 0,
+          "device_compiles": 0
+        },
+        "outside_native_stages_ms": 1.217572000000004
+      },
+      {
+        "partition": "submod_2",
+        "where": "CPU",
+        "operators": [
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.masked_fill.Scalar",
+          "aten.softmax.int",
+          "aten.amax.default",
+          "aten.div.Tensor",
+          "aten.div.Tensor",
+          "aten.round.default",
+          "aten.clamp.default",
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.select.int"
+        ],
+        "wall_ms": 0.982071
+      },
+      {
+        "partition": "submod_3",
+        "where": "CPU+PIM",
+        "operators": [
+          "PV"
+        ],
+        "wall_ms": 20.233485,
+        "gemm": "_int_mm_1",
+        "operation": "PV",
+        "mnk": [
+          1024,
+          128,
+          1024
+        ],
+        "weight": null,
+        "padded_mnk": [
+          1024,
+          128,
+          1024
+        ],
+        "config": {
+          "block_m": 16,
+          "block_n": 4,
+          "block_k": 32,
+          "group_m": 1,
+          "group_n": 1,
+          "group_k": 1,
+          "tile_m": 1,
+          "tile_n": 1,
+          "tile_k": 32,
+          "p_m": 64,
+          "p_n": 32,
+          "p_k": 1
+        },
+        "native_ms": {
+          "prepare": 0.5445939999999768,
+          "h2d": 7.581029,
+          "kernel": 1.691564,
+          "d2h": 1.110299,
+          "reduction": 0.0,
+          "buffer_alloc": 0.0013880000000000001,
+          "buffer_free": 0.0010119999999999999,
+          "acquire": 0.000322,
+          "buffer_init": 0.277167,
+          "layout_a": 1.142688,
+          "layout_b": 0.3357099999999999,
+          "layout_other": 0.0,
+          "layout_c": 2.431247000000004,
+          "program_load": 3.896433,
+          "resident_host": 0.2952830000000004
+        },
+        "h2d_ms": {
+          "weight": 0.0,
+          "activation": 6.888757,
+          "metadata": 0.692272
+        },
+        "transfers": {
+          "weight_bytes": 0,
+          "activation_bytes": 41943040,
+          "output_bytes": 524288,
+          "metadata_bytes": 49152,
+          "launches": 1,
+          "program_loads": 1,
+          "activation_hits": 0,
+          "resource_opens": 0,
+          "resource_closes": 0,
+          "device_compiles": 0
+        },
+        "outside_native_stages_ms": 0.9247490000000198
+      },
+      {
+        "partition": "submod_4",
+        "where": "CPU",
+        "operators": [
+          "aten._assert_tensor_metadata.default",
+          "aten._to_copy.default",
+          "aten.mul.Tensor",
+          "aten.mul.Tensor",
+          "aten.stack.default"
+        ],
+        "wall_ms": 3.507825
+      }
+    ],
+    "gemm_totals": {
+      "QK^T": {
+        "calls": 1,
+        "wall_ms": 32.602211,
+        "native_ms": {
+          "prepare": 0.8212210000000033,
+          "h2d": 3.2520320000000003,
+          "kernel": 1.318543,
+          "d2h": 1.700821,
+          "reduction": 0.0,
+          "buffer_alloc": 0.001939,
+          "buffer_free": 0.001324,
+          "acquire": 0.000531,
+          "buffer_init": 0.103919,
+          "layout_a": 0.4463599999999999,
+          "layout_b": 0.7399850000000003,
+          "layout_other": 0.0,
+          "layout_c": 8.464895999999989,
+          "program_load": 14.155212,
+          "resident_host": 0.3778559999999995
+        },
+        "h2d_ms": {
+          "weight": 0.0,
+          "activation": 2.550987,
+          "metadata": 0.701045
+        }
+      },
+      "PV": {
+        "calls": 1,
+        "wall_ms": 20.233485,
+        "native_ms": {
+          "prepare": 0.5445939999999768,
+          "h2d": 7.581029,
+          "kernel": 1.691564,
+          "d2h": 1.110299,
+          "reduction": 0.0,
+          "buffer_alloc": 0.0013880000000000001,
+          "buffer_free": 0.0010119999999999999,
+          "acquire": 0.000322,
+          "buffer_init": 0.277167,
+          "layout_a": 1.142688,
+          "layout_b": 0.3357099999999999,
+          "layout_other": 0.0,
+          "layout_c": 2.431247000000004,
+          "program_load": 3.896433,
+          "resident_host": 0.2952830000000004
+        },
+        "h2d_ms": {
+          "weight": 0.0,
+          "activation": 6.888757,
+          "metadata": 0.692272
+        }
+      }
+    },
+    "cpu_partitions_ms": 4.916311,
+    "outside_partitions_ms": 2.0054519999999982
+  },
+  "session_close_ms": 17.856951,
+  "session_totals": {
+    "weight_bytes": 0,
+    "activation_bytes": 763363328,
+    "output_bytes": 66060288,
+    "metadata_bytes": 1376256,
+    "launches": 28,
+    "program_loads": 28,
+    "activation_hits": 0,
+    "resource_opens": 1,
+    "resource_closes": 1,
+    "device_compiles": 0
+  }
+}

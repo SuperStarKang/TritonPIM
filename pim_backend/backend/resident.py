@@ -27,6 +27,7 @@ class Binding:
     symbol: str
     size: int
     role: int
+    operand: int | None = None
 
 
 class TransferStats(ctypes.Structure):
@@ -73,17 +74,20 @@ def _artifact_bindings(target_ir, arguments, physical_inputs, weight_mask, units
     for symbol, count, dtype in declarations:
         if symbol in outputs:
             role = OUTPUT
+            operand = None
         else:
             argument = arguments[host_args.index(sources[symbol])]
-            roles = {weight_mask[index] for index, tensor in enumerate(physical_inputs)
-                     if tensor.data_ptr() == argument.data_ptr()}
+            operands = [index for index, tensor in enumerate(physical_inputs)
+                        if tensor.data_ptr() == argument.data_ptr()]
+            roles = {weight_mask[index] for index in operands}
             if len(roles) != 1:
                 raise ValueError(f"cannot associate {symbol} with the FX operand provenance")
             role = WEIGHT if roles.pop() else INPUT
+            operand = operands[0]
         size = int(count) * {"i8": 1, "i32": 4, "f32": 4}[dtype]
         if size % 8:
             raise ValueError(f"{symbol}: MRAM transfer size {size} is not aligned to 8 bytes")
-        bindings.append(Binding(symbol, size, role))
+        bindings.append(Binding(symbol, size, role, operand))
     return tuple(bindings)
 
 
@@ -146,7 +150,7 @@ def _check_device_elf(data, addresses):
             raise ValueError(f"linker did not place {symbol} at {address:#x}")
 
 
-def _build_program(bundle, addresses):
+def _build_program(bundle, addresses, *, stats=None):
     key = hashlib.sha256((bundle["device"] + "|resident-device-v1|"
                           + str(bundle["nr_tasklets"])
                           + json.dumps(addresses, sort_keys=True)).encode()).hexdigest()
@@ -166,7 +170,10 @@ def _build_program(bundle, addresses):
         ])
         data = binary.read_bytes()
         _check_device_elf(data, addresses)
-        return cache.put(data, "resident.elf", binary=True)
+        path = cache.put(data, "resident.elf", binary=True)
+        if stats is not None:
+            stats["device_compiles"] += 1
+        return path
 
 
 class ResidentRuntime:

@@ -79,7 +79,8 @@ def _build_upmem_runtime() -> str:
     backend_dir = os.path.dirname(os.path.abspath(__file__))
     rt_c = os.path.join(backend_dir, "upmem_runtime.c")
     runtime_sources = ("upmem_runtime.c", "upmem_runtime.h",
-                       "upmem_resident.c", "upmem_resident.h")
+                       "upmem_resident.c", "upmem_resident.h",
+                       "upmem_model.c", "upmem_model.h")
     key = hashlib.sha256(("upmem_runtime|" + "".join(
         Path(backend_dir, name).read_text() for name in runtime_sources
     )).encode("utf-8")).hexdigest()
@@ -92,6 +93,7 @@ def _build_upmem_runtime() -> str:
             subprocess.check_call(
                 ["gcc", "-O2", "-fPIC", "-shared", f"-Wl,-soname,{so_name}",
                  rt_c, os.path.join(backend_dir, "upmem_resident.c"),
+                 os.path.join(backend_dir, "upmem_model.c"),
                  *_upmem_host_flags(), "-o", so_tmp])
             so_path = cache.put(Path(so_tmp).read_bytes(), so_name, binary=True)
     return so_path

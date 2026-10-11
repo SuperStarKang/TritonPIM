@@ -101,7 +101,9 @@ func.func @kernel(%A: memref<*xi8>, %C: memref<*xi32>, %lda: index, %ldc: index)
 // WRAM 버퍼는 전역이다.
 // DEVICE: __dma_aligned int8_t w0[128];
 // DEVICE: __dma_aligned int32_t w1[256];
+// DEVICE: __host uint32_t _pim_model_active = 1;
 // DEVICE: int main()
+// DEVICE-NEXT: if (!_pim_model_active) return 0;
 // DEVICE: int32_t {{.*}} = _pim_metadata.f0;
 // 행마다 DMA 하나. 크기는 버퍼 타입에서 나온다(8x16 i8 의 한 행 = 16 바이트).
 // DEVICE: mram_read((__mram_ptr void*)(A_mram + {{.*}}), (void*){{.*}}, 16);
