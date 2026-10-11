@@ -169,7 +169,11 @@ def _ttsharedir_to_pim_common(ttshared: str, options) -> str:
     # AiMX consumes the annotated loop/combine structure. General SCF
     # canonicalization can erase single-trip loops and their axis metadata.
     # Its target entry folds scalar arithmetic without changing those loops.
-    if options.pim_target != "aimx":
+    if options.pim_target == "aimx":
+        # AiMX의 pim.load는 resident panel의 view라 hoist 이득이 없고, vACC는 K Group 안의 A/B load를 요구한다.
+        # TODO: reuse는 MRAM→WRAM 재읽기를 줄이는 UPMEM 최적화다. Common에서 UPMEM lowering으로 옮긴다.
+        passes.remove("--pim-reuse-execution-tile-inputs")
+    else:
         passes.append("-canonicalize")
     return _run_opt(ttshared, passes)
 
