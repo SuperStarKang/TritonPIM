@@ -148,8 +148,8 @@ def test():
     M, N, K = 1024, 4096, 4096
     # M, N, K = 1024, 28672, 8192
 
-    a = torch.randn((M, K)).to(torch.float16)
-    b = torch.randn((K, N)).to(torch.float16)
+    a = torch.randn((M, K)).to(torch.bfloat16)
+    b = torch.randn((K, N)).to(torch.bfloat16)
 
     ref = torch.matmul(a.to(torch.float32), b.to(torch.float32))
     print(f"M={M}, N={N}, K={K}", flush=True)
@@ -197,7 +197,7 @@ def run_layout_worker(case, input_file, output_file):
     inputs = torch.load(input_file, weights_only=True)
     a, b = inputs["a"], inputs["b"]
     assert a.shape == (128, 256) and b.shape == (256, 512)
-    assert a.dtype == b.dtype == torch.float16
+    assert a.dtype == b.dtype == torch.bfloat16
     assert a.is_contiguous() and b.is_contiguous()
     out = torch.full((128, 512), float("nan"), dtype=torch.float32)
     print(f"[case] {input_file.stem} {case} fpga=0 "
@@ -256,26 +256,26 @@ def run_layout_worker(case, input_file, output_file):
 def run_layout_experiment():
     results_dir = Path(__file__).resolve().parent / "gemm_pitch_results"
     results_dir.mkdir(exist_ok=True)
-    probes = [("zero", torch.zeros((128, 256), dtype=torch.float16),
-               torch.ones((256, 512), dtype=torch.float16))]
+    probes = [("zero", torch.zeros((128, 256), dtype=torch.bfloat16),
+               torch.ones((256, 512), dtype=torch.bfloat16))]
     for scale in (1.0, 0.5):
         for k_start in range(0, 256, 32):
-            b = torch.zeros((256, 512), dtype=torch.float16)
+            b = torch.zeros((256, 512), dtype=torch.bfloat16)
             b[k_start:k_start + 32] = scale
             probes.append((f"k{k_start}_{k_start + 32}_scale{scale:g}",
-                           torch.ones((128, 256), dtype=torch.float16), b))
+                           torch.ones((128, 256), dtype=torch.bfloat16), b))
         probes.append((f"all_ones_scale{scale:g}",
-                       torch.ones((128, 256), dtype=torch.float16),
-                       torch.full((256, 512), scale, dtype=torch.float16)))
-    a = torch.zeros((128, 256), dtype=torch.float16)
-    a[:, 128] = torch.arange(1, 129, dtype=torch.float16)
-    probes.append(("row_tags_k128", a, torch.ones((256, 512), dtype=torch.float16)))
-    b = torch.zeros((256, 512), dtype=torch.float16)
-    b[128] = (torch.arange(512) % 256 + 1).half()
-    probes.append(("column_tags_k128", torch.ones((128, 256), dtype=torch.float16), b))
+                       torch.ones((128, 256), dtype=torch.bfloat16),
+                       torch.full((256, 512), scale, dtype=torch.bfloat16)))
+    a = torch.zeros((128, 256), dtype=torch.bfloat16)
+    a[:, 128] = torch.arange(1, 129, dtype=torch.bfloat16)
+    probes.append(("row_tags_k128", a, torch.ones((256, 512), dtype=torch.bfloat16)))
+    b = torch.zeros((256, 512), dtype=torch.bfloat16)
+    b[128] = (torch.arange(512) % 256 + 1).bfloat16()
+    probes.append(("column_tags_k128", torch.ones((128, 256), dtype=torch.bfloat16), b))
     torch.manual_seed(0)
-    probes.append(("random_seed0", torch.randn((128, 256)).bfloat16().half(),
-                   torch.randn((256, 512)).bfloat16().half()))
+    probes.append(("random_seed0", torch.randn((128, 256)).bfloat16(),
+                   torch.randn((256, 512)).bfloat16()))
     print("[experiment] M=128 N=512 K=256 BLOCK=(32,512,64) "
           "G=(1,1,1) tile=(1,1,4) batch=8 fpga=0 "
           f"probes={len(probes)} sequential_workers={len(probes) * len(LAYOUT_CASES)}",

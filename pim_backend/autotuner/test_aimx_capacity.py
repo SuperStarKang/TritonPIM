@@ -1,6 +1,7 @@
 import unittest
 
-from .constraints import ConstraintEngine, aimx_runtime_allocations
+from .constraints import ConstraintEngine
+from .model import aimx_runtime_allocations
 from .features import extract_features
 from .targets import target_spec
 from .types import PIMConfig, PIMProblem

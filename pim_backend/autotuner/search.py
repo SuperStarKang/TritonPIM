@@ -14,9 +14,11 @@ from .features import (
     feature_names,
 )
 from .forest import RandomForestClassifier
+from .model import target_model
 from .space import axis_values, build_config_space, heuristic_seeds, make_config
+from .space import ladder_neighbors, legal_partitions, regroup
 from .space import structured_valid_configs
-from .types import PIMBenchmarkResult, ceil_div, pim_hierarchy
+from .types import PIMBenchmarkResult, pim_hierarchy
 
 
 @dataclass
@@ -24,7 +26,8 @@ class SearchBudget:
     max_generations: int = 10
     max_benchmarks: int = 100
     max_autotune_seconds: float = None
-    improvement_epsilon: float = 0.01
+    # 측정 noise 수준. 이보다 크게 좋아진 generation은 stale을 0으로 되돌린다.
+    improvement_epsilon: float = 0.002
     patience: int = 3
 
 
@@ -125,7 +128,14 @@ def _step_values(values, current):
     return neighbors
 
 
-def semantic_mutate(problem, config, fragment_kinds, spec):
+def semantic_mutate(problem, target, config, fragment_kinds, spec, legal):
+    """Neighbors of ``config`` for the fragments a decision path used.
+
+    A Block or Group change moves to the new Block Group's ladder point with
+    the closest Execution Tile count, so the frontier position is kept.
+    A Tile or partition change also adds the adjacent frontier points.
+    ``legal`` is ``legal_partitions(...)``.
+    """
     blocks = (config.block_m, config.block_n, config.block_k)
     groups = (config.group_m, config.group_n, config.group_k)
     tiles = (config.tile_m, config.tile_n, config.tile_k)
@@ -136,6 +146,12 @@ def semantic_mutate(problem, config, fragment_kinds, spec):
         return make_config(
             new_blocks, new_groups, new_tiles, new_partitions)
 
+    def regrouped(new_blocks, new_groups):
+        moved = regroup(
+            problem, target, config, new_blocks, new_groups, spec, legal)
+        if moved is not None:
+            neighbors.append(moved)
+
     neighbors = []
     for kind in fragment_kinds:
         axis = _AXIS_INDEX[kind[-1]]
@@ -144,13 +160,13 @@ def semantic_mutate(problem, config, fragment_kinds, spec):
                     axis_values(problem, spec, "block", axis), blocks[axis]):
                 new = list(blocks)
                 new[axis] = value
-                neighbors.append(rebuild(new_blocks=tuple(new)))
+                regrouped(tuple(new), groups)
         elif kind.startswith("group_"):
             for value in _step_values(
                     axis_values(problem, spec, "group", axis), groups[axis]):
                 new = list(groups)
                 new[axis] = value
-                neighbors.append(rebuild(new_groups=tuple(new)))
+                regrouped(blocks, tuple(new))
         elif kind.startswith("tile_"):
             for value in _step_values(
                     axis_values(problem, spec, "tile", axis), tiles[axis]):
@@ -166,6 +182,9 @@ def semantic_mutate(problem, config, fragment_kinds, spec):
                 neighbors.append(rebuild(new_partitions=tuple(new)))
         else:
             raise ValueError(f"알 수 없는 fragment 종류: {kind}")
+    if any(kind.startswith(("tile_", "p_")) for kind in fragment_kinds):
+        neighbors.extend(
+            ladder_neighbors(problem, target, config, spec, legal))
     return neighbors
 
 
@@ -214,6 +233,8 @@ def tune(problem, target, benchmark_fn, *, space=None, cache=None,
     spec = space if space is not None else build_config_space(problem, target)
     budget = budget if budget is not None else SearchBudget()
     engine = ConstraintEngine(problem, target)
+    model = target_model(target)
+    partitions = legal_partitions(problem, target, spec)
     rng = random.Random(seed)
     names = feature_names()
     start_time = time.monotonic()
@@ -224,10 +245,9 @@ def tune(problem, target, benchmark_fn, *, space=None, cache=None,
             config, result = hit
             features = extract_features(problem, target, config)
             if result.physical_allocations:
-                features = replace(features, unit_memory_pressure=max(
-                    sum(ceil_div(size, 8192) * 32 for size in plan)
-                    for plan in result.physical_allocations
-                ) / target.common_profile.bank_capacity_limit_bytes)
+                features = replace(
+                    features, unit_memory_pressure=model.physical_pressure(
+                        result.physical_allocations))
             record = TuningRecord(config, features, result)
             if verbose:
                 print(
@@ -288,10 +308,9 @@ def tune(problem, target, benchmark_fn, *, space=None, cache=None,
             result = PIMBenchmarkResult(**stored)
             source = " (cache)"
         if result.physical_allocations:
-            features = replace(features, unit_memory_pressure=max(
-                sum(ceil_div(size, 8192) * 32 for size in plan)
-                for plan in result.physical_allocations
-            ) / target.common_profile.bank_capacity_limit_bytes)
+            features = replace(
+                features, unit_memory_pressure=model.physical_pressure(
+                    result.physical_allocations))
         record = TuningRecord(config, features, result)
         records.append(record)
         if verbose:
@@ -353,7 +372,7 @@ def tune(problem, target, benchmark_fn, *, space=None, cache=None,
                     if fragment not in fragments:
                         fragments.append(fragment)
             candidates.extend(semantic_mutate(
-                problem, record.config, fragments, spec))
+                problem, target, record.config, fragments, spec, partitions))
 
         scored = []
         scored_keys = set()

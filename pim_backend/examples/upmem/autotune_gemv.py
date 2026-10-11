@@ -18,7 +18,7 @@ from pathlib import Path
 import torch
 import triton
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # autotuner
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # autotuner
 
 import triton.backends.pim.driver as pim_driver  # noqa: E402
 from triton.backends.pim.driver import PIMDriver  # noqa: E402

@@ -1,106 +1,26 @@
 """Static constraints for values represented by PIM Common IR."""
 
-from .targets import AiMXRuntimeConfig
+from .model import access_footprint_bytes, group_extent, target_model
 from .types import AXES, ceil_div
-
-
-AIMX_PMM_BYTES = 0x30000
-AIMX_RUNTIME_POOL_BYTES = 2 * 1024 * 1024
-AIMX_MAX_SINGLE_ALLOCATION_BYTES = 1023 * AIMX_RUNTIME_POOL_BYTES
-
-
-def _round_up(value, unit):
-    return ceil_div(value, unit) * unit
-
-
-def access_footprint_bytes(problem, extents):
-    """Allocation footprint of all unique ``pim.place`` buffers."""
-    return sum(
-        access.elements(extents) * access.element_bytes
-        for access in problem.accesses
-    )
-
-
-def gemm_footprint_bytes(problem, size_m, size_n, size_k):
-    """Compatibility name for callers that still construct a GEMM problem."""
-    return access_footprint_bytes(problem, (size_m, size_n, size_k))
-
-
-def group_extent(config):
-    return (
-        config.block_m * config.group_m,
-        config.block_n * config.group_n,
-        config.block_k * config.group_k,
-    )
-
-
-def local_memory_footprint(problem, config):
-    return access_footprint_bytes(problem, group_extent(config))
-
-
-def unit_memory_footprint(problem, config):
-    return access_footprint_bytes(problem, config.execution_extent)
-
-
-def aimx_runtime_allocations(problem, target, config):
-    """Precompile lower bound for GEMM residency and its MAC chain.
-
-    Scratch, constants, copies and fused operations come from the compiled
-    Common IR. The target's allocation report and capacity check are final.
-    """
-    runtime = target.runtime_config
-    assert isinstance(runtime, AiMXRuntimeConfig)
-    batch = runtime.batch
-    useful_m, useful_n, useful_k = group_extent(config)
-    physical_m = _round_up(useful_m, batch)
-    # B/C Group panel rows are stored 4096 elements wide (aimx_matmul_row_alignment),
-    # while MAC/drain covers only useful N in 4096/batch microtiles.
-    physical_n = _round_up(useful_n, 4096)
-    computed_n = _round_up(useful_n, 4096 // batch)
-    physical_k = _round_up(useful_k, 256)
-    padded_k = _round_up(useful_k, 4096)
-
-    rows = physical_m // batch
-    cols = computed_n * batch // 4096
-    steps = ceil_div(useful_k, 256 // batch)
-    tile_steps = _round_up(config.tile_k * steps, batch)
-    descriptor_groups = config.tile_m * config.tile_n * (
-        config.tile_k * 2 * (physical_k // 256) * rows
-        + rows * cols * (2 * tile_steps + 1)
-    )
-    # AiMX staging converts host values to BF16; host dtype is not DRAM dtype.
-    input_bytes = output_bytes = 2
-    return {
-        "PMM": AIMX_PMM_BYTES,
-        "A": config.tile_m * config.tile_k * physical_m * padded_k * input_bytes,
-        "Arel": config.tile_k * physical_m * physical_k * input_bytes * 16,
-        "B": config.tile_k * config.tile_n * physical_k * physical_n * input_bytes,
-        "C": config.tile_m * config.tile_n * physical_m * physical_n * output_bytes,
-        "descriptor chain": descriptor_groups * 512,
-    }
 
 
 class ConstraintEngine:
     def __init__(self, problem, target):
         self.problem = problem
         self.target = target
+        self.model = target_model(target)
 
     def check(self, config):
         problem = self.problem
-        profile = self.target.common_profile
+        model = self.model
         values = config.key()
         if min(values) < 1:
             return "Block, Group, Tile, partition 값은 모두 1 이상이어야 한다"
         if min(problem.axis_extents) < 1:
             return "m/n/k axis extent는 모두 1 이상이어야 한다"
-        if profile.target == "aimx":
-            if problem.compute_kind != "matmul":
-                return "현재 AiMX lowering은 matmul만 지원한다"
-            if config.p_k != 1:
-                return "AiMX cross-device combine은 미구현이므로 p_k=1이어야 한다"
-            if any(access.dtype not in ("bfloat16", "float16", "float32")
-                   for access in problem.accesses):
-                return "AiMX host buffer는 bfloat16/float16/float32여야 한다"
+        reason = model.problem_reason(problem)
+        if reason is not None:
+            return reason
         if not problem.output_accesses:
             return "PIM problem에는 output access가 하나 이상 필요하다"
         for access in problem.accesses:
@@ -125,8 +45,15 @@ class ConstraintEngine:
                     f"extent가 1인 {AXES[axis]} axis의 "
                     "Block/Group/Tile/partition은 모두 1이어야 한다")
 
-        block_group_extent = tuple(
-            blocks[axis] * groups[axis] for axis in range(3))
+        # 각 계층은 아래 계층 단위 수를 넘지 않는다: 완전히 빈 Block을 Group에 두지 않는다
+        for axis in range(3):
+            blocks_in_axis = ceil_div(problem.axis_extents[axis], blocks[axis])
+            if groups[axis] > blocks_in_axis:
+                return (
+                    f"{AXES[axis]} group({groups[axis]})이 Block 수"
+                    f"({blocks_in_axis})보다 크다")
+
+        block_group_extent = group_extent(config)
         total_groups = tuple(
             ceil_div(problem.axis_extents[axis], block_group_extent[axis])
             for axis in range(3))
@@ -145,45 +72,35 @@ class ConstraintEngine:
                     f"{AXES[axis]} partition({partitions[axis]})이 "
                     f"execution tiles({execution_tiles[axis]})보다 크다")
 
-        local_bytes = local_memory_footprint(problem, config)
-        if (profile.local_capacity_limit_bytes > 0
-                and local_bytes > profile.local_capacity_limit_bytes):
+        # Block Group: device 하나의 연산 단위
+        reason = model.group_reason(problem, block_group_extent)
+        if reason is not None:
+            return reason
+        local_bytes = access_footprint_bytes(problem, block_group_extent)
+        if model.local_capacity > 0 and local_bytes > model.local_capacity:
             return (
                 f"Block Group local memory overflow: {local_bytes} > "
-                f"{profile.local_capacity_limit_bytes}")
+                f"{model.local_capacity}")
 
-        unit_limit = (
-            profile.banks_per_unit * profile.bank_capacity_limit_bytes)
-        if (profile.target == "aimx"
-                and problem.uses_aimx_matmul_primitive):
-            allocations = aimx_runtime_allocations(problem, self.target, config)
-            for name, size in allocations.items():
-                if size > AIMX_MAX_SINGLE_ALLOCATION_BYTES:
-                    return (
-                        f"AiMX {name} allocation overflow: {size} > "
-                        f"{AIMX_MAX_SINGLE_ALLOCATION_BYTES}")
-            unit_bytes = sum(allocations.values())
-            per_bank = sum(
-                ceil_div(size, 8192) * 32
-                for size in allocations.values()
-            )
-            if per_bank > profile.bank_capacity_limit_bytes:
-                return (
-                    f"AiMX bank footprint overflow: {per_bank} > "
-                    f"{profile.bank_capacity_limit_bytes}")
-        else:
-            unit_bytes = unit_memory_footprint(problem, config)
-        if unit_bytes > unit_limit:
-            return f"PIM unit memory overflow: {unit_bytes} > {unit_limit}"
+        # Execution Tile: device 하나의 bank 용량
+        reason = model.allocation_reason(problem, config)
+        if reason is not None:
+            return reason
+        unit_bytes = (
+            sum(model.access_allocations(problem, config))
+            + sum(model.overhead_allocations(problem, config).values()))
+        if unit_bytes > model.unit_capacity:
+            return (
+                f"PIM unit memory overflow: {unit_bytes} > "
+                f"{model.unit_capacity}")
 
-        p_m, p_n, p_k = config.p_m, config.p_n, config.p_k
-        active_units = p_m * p_n * p_k
-        if active_units > profile.num_units:
+        # Device Partition: 여러 device
+        active_units = config.p_m * config.p_n * config.p_k
+        if active_units > model.num_units:
             return (
                 f"p_m*p_n*p_k({active_units})가 num_units"
-                f"({profile.num_units})를 넘는다")
-
-        return None
+                f"({model.num_units})를 넘는다")
+        return model.mapping_reason(problem, partitions)
 
     def valid(self, config):
         return self.check(config) is None

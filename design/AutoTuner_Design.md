@@ -12,165 +12,288 @@ PIMProblem(access dependency) + PIMTargetSpec
   [Block, Group, Execution Tile, p_m/p_n/p_k]
              │
              ▼
-       PIM Common IR lowering
-             │
-             ▼
-       target IR lowering
-             │
-             ▼
-          real execution
+  PIM Common IR lowering → target IR lowering → real execution
 ```
 
-## 2. 유일한 공통 configuration
+설계 원칙은 두 가지다.
+
+- **seed 알고리즘은 하나다.** target 이름으로 분기하지 않는다.
+- **target 차이는 숫자로만 들어온다.** target은 `TargetModel`을 통해 용량, padding,
+  허용 mapping만 알려 준다. UPMEM의 작은 Block Group과 AiMX의 큰 Block Group은
+  이 숫자에서 자동으로 갈린다.
+
+## 2. Configuration
 
 ```text
 PIMConfig
-  block_m, block_n, block_k
-  group_m, group_n, group_k
-  tile_m, tile_n, tile_k
-  p_m, p_n, p_k
+  block_m, block_n, block_k      Triton Block        → #pim.block
+  group_m, group_n, group_k      Block Group         → #pim.block_group
+  tile_m,  tile_n,  tile_k       Execution Tile      → #pim.execution_tile
+  p_m,     p_n,     p_k          Device Partition    → #pim.device_mapping
 ```
 
-- `block_*`: Triton block 크기. TTShared→PIM에서 `#pim.block`으로 복원한다.
-- `group_*`: Block Group 하나에 묶는 Block 수.
-- `tile_*`: Execution Tile 하나에 묶는 Block Group 수.
-- `p_*`: `[p_m,p_n,p_k]` PIM Device mapping.
-
-Execution Tile의 논리 원소 크기는 저장하지 않고 다음처럼 파생한다.
+모든 후보는 Common IR과 같은 식으로 해석한다.
 
 ```text
-extent_axis = block_axis * group_axis * tile_axis
+block_group_extent[d] = block[d] * group[d]
+total_groups[d]       = ceildiv(problem[d], block_group_extent[d])
+execution_tiles[d]    = ceildiv(total_groups[d], tile[d])
+rounds[d]             = ceildiv(execution_tiles[d], p[d])
 ```
 
-`distribution_policy`, `reduction_policy`, `capacity_limit_*`, residency,
-streaming, persistence, bank/core partition은 Config가 아니다.
+`PIMProblem`은 Common IR에서 읽은 의미만 정규화한다. 담는 값은 `compute_kind`,
+axis extent `[m,n,k]`, unique `pim.place` buffer(direction, dtype, layout,
+access axes, irregular)다. 입력 access가 쓰지 않는 축이 `shared_over`이고,
+input에는 있고 output에는 없는 `k`가 reduction axis다.
 
-`PIMProblem`은 별도 실행 policy가 아니라 PIM Common IR에서 읽은 다음 의미만
-정규화한다.
+## 3. 계층별 역할
+
+각 계층은 고려하는 자원이 하나씩 정해져 있다. 앞 계층이 정한 단위를 다음 계층이 묶는다.
+
+| 계층 | 고려하는 자원 | 결정 방식 |
+|---|---|---|
+| Triton Block | 프로그램 단위 | 후보 열거 |
+| Block Group | **device 1개의 연산 능력** | 규칙 (target 숫자) |
+| Execution Tile | **device 1개의 bank 용량** | 규칙으로 상한을 구하고 ladder 생성 |
+| Device Partition | **device 여러 개의 병렬성** | **측정으로 선택** (frontier + LFBO) |
+
+마지막 계층에서 "device 하나가 처리하는 양을 크게"와 "여러 device로 나누기" 사이의
+trade-off를 실제 실행 시간으로 결정한다.
+
+## 4. 전체 동작
 
 ```text
-compute_kind
-axis extents [m,n,k]
-unique pim.place buffers
-  direction, dtype, layout, access-dependent axes, irregular 여부
+ Triton kernel + tensors → PIMProblem          PIMTargetSpec → TargetModel
+                    │                                     │
+ ═════════ Stage A: frontier seed (공통 알고리즘) ═════════╪═══════════
+   A1 Triton Block      block ∈ block_values                │
+   A2 Block Group       device 1개 연산 포화 ◄──────────────┤ padding, lanes,
+                    │   → 상위 K개                          │ local capacity
+   A3 Execution Tile    T_max(bank 용량) → … → T_min ◄──────┤ allocations,
+                    │   (device당 처리량 大 → 小)           │ bank capacity
+   A4 Partition         ladder 단계마다 active 최대 p ◄─────┘ num_units, mapping
+                    │   → frontier
+ ═══════════════════╪═══════════════════════════════════════════════
+   B  Constraint        ConstraintEngine (TargetModel 경유)
+   C  초기 측정          frontier → cache warm-start → structured random
+   D  LFBO              Random Forest → 계층 일관 mutation → 측정 반복
+   E  선택 + cache       end-to-end 시간 최소
 ```
 
-입력 access가 사용하지 않는 logical axis가 `shared_over`다. Reduction axis는
-input access에는 있지만 output access에는 없는 `k`로 파생한다. `axis_sources`,
-residency flag, reduction policy는 추가하지 않는다. 연산 종류는 target별 선택 knob가
-아니라 Common IR의 compute op를 식별하기 위해서만 사용한다.
+## 5. TargetModel
 
-## 3. Target 정보
+seed, constraint, feature는 `autotuner/model.py`의 `TargetModel`만 호출한다.
+target별 규칙은 subclass(`UPMEMModel`, `AiMXModel`)에만 존재하고,
+`target_model(spec)`이 `common_profile.target`으로 하나를 고른다.
 
-compiler와 autotuner는 하나의 정의를 공유한다.
+| 질의 | 쓰는 계층 | UPMEM | AiMX |
+|---|---|---|---|
+| `problem_reason` | 전체 | 없음 | matmul만, bf16/fp16/fp32 |
+| `group_reason(extent)` | Block Group | `extent_m % lanes != 0`이면 거부 | 없음 |
+| `local_capacity` | Block Group | 48 KiB | 0 (local 없음) |
+| `scheduled_compute` | Block Group, feature | 논리 compute | m→batch, n→4096/batch, k→256 올림 |
+| `access_allocations` | Block Group, Tile, feature | 논리 footprint | A/B/C (물리 padding 포함) |
+| `overhead_allocations` | Tile | 없음 | PMM, Arel, descriptor chain |
+| `allocation_reason` | Tile | 없음 | 단일 할당 ≤ 1023×2 MiB, bank interleave footprint |
+| `unit_capacity` | Tile | `banks_per_unit × bank_capacity` | 같음 |
+| `num_units`, `mapping_reason(p)` | Partition | profile 값, 없음 | `/dev/pl_dma*` 수, `p_k≠1` 거부 |
+| `physical_pressure(plans)` | 측정 후 feature | 합 / unit capacity | bank interleave / bank capacity |
+
+- UPMEM lane 규칙은 lowering이 Block Group의 출력 m 행을 모든 tasklet에 똑같이
+  나누기 때문에 생긴다(`PIMToUPMEMPass.cpp`). `lanes = nr_tasklets` 또는
+  `lanes_per_core`다.
+- AiMX 할당은 GEMM의 **하한 추정**이다. scratch, 상수, fusion 할당은 lowering이
+  최종 검사한다. 따라서 constraint를 통과해도 lowering이 용량 초과 오류를 낼 수 있고,
+  그 오류를 다른 config로 대체하지 않는다.
+- access 할당과 overhead 할당을 나누는 이유가 있다. access 할당은 buffer별 전송량
+  feature와 Block Group compute/byte에, overhead 할당은 용량 검사에만 쓴다.
+
+## 6. Stage A: frontier seed
+
+구현은 `autotuner/space.py`에 있다.
+
+### 6.1 A1 Triton Block
+
+`block_values`의 모든 값을 후보로 둔다. extent가 1인 축은 1로 고정한다.
+Block을 하나로 고정하지 않는다. `group_values`의 최대값이 32이므로, Block이 작으면
+도달할 수 있는 Block Group extent의 상한도 작아지기 때문이다. 예를 들어 AiMX의
+n=4096은 block 128 × group 32로만 만들 수 있다.
+
+### 6.2 A2 Block Group — `rank_block_groups`
+
+모든 (block, group) 조합을 tile=1, p=1로 만든 뒤 `ConstraintEngine`을 통과한 것만
+남긴다. 통과 조건에는 lane 규칙, local capacity, 단일 Block Group의 bank 용량이
+포함된다. 남은 후보를 다음 키로 정렬한다.
 
 ```text
-PIMTargetSpec
-  common_profile: PIMTargetProfile
-    target
-    num_units
-    banks_per_unit
-    cores_per_bank
-    lanes_per_core
-    bank_capacity_limit_bytes
-    local_capacity_limit_bytes
-
-  runtime_config
-    UPMEM: nr_tasklets, host_threads
-    AiMX:  batch, base_fpga
+key 1  compute efficiency = useful compute / (Π total_groups × scheduled_compute)  ↑
+key 2  reachable units    = Block Group grid가 채울 수 있는 최대 active unit      ↑
+key 3  compute per byte   = Π block_group_extent / Σ access_allocations             ↑
+tie    Π block 큰 쪽
+→ extent마다 하나씩 남기고 상위 block_group_top_k개(기본 3)를 사용
 ```
 
-공통 profile은 그대로 `#pim.target_profile`이 된다. runtime config는 target
-lowering/runtime에만 전달된다.
+- key 1은 device 내부 연산 활용도다. 문제 경계 padding과 target 고유 padding을
+  모두 포함한다.
+- key 2는 뒤 계층의 선택지를 지킨다. Block Group 하나가 문제 전체가 되면 Partition
+  단계에서 비교할 대상이 사라진다. `mapping_reason`을 반영하므로 AiMX에서는 k 방향
+  grid가 병렬성으로 계산되지 않는다.
+- key 3은 할당 bytes 기준이다. 따라서 저장 padding(AiMX의 n 4096 폭)도 여기서
+  반영된다.
 
-## 4. 초기 후보
+### 6.3 A3 Execution Tile — `tile_ladder`
 
-기본 Group은 Block 하나인 `[1,1,1]`에서 시작한다. 이것이 Common IR의 최소
-Block Group이다. 더 큰 Group은 search가 실제 성능을 비교해 선택한다.
+```text
+T_max  tile=(1,1,1)에서 시작해 축마다 다음 tile 값 후보를 만들고,
+       constraint를 통과한 것 중 execution tile compute/resident byte가
+       가장 큰 축 하나를 키운다. 더 키울 수 없으면 멈춘다.
+ladder T_max에서 compute/byte 손실이 가장 작은 축을 한 단계씩 줄인다.
+       Execution Tile grid가 도달 가능한 최대 active unit을 채우면 멈춘다.
+```
 
-Execution Tile seed는 다음 경계를 지킨다.
+- 축별 tile 값은 `tile_values` 중 total groups보다 작은 값에 total groups를 더한 것이다.
+- ladder는 "device 하나가 많이 처리"하는 쪽부터 "여러 device로 나누기 쉬운" 쪽까지의
+  후보 축이다. 길면 양 끝을 포함해 `max_ladder_steps`개(기본 4, 2 이상)를 log 간격으로
+  고른다.
 
-- 작은 문제: 해당 device partition에 필요한 Block Group 수까지만 묶는다.
-- 큰 문제: unit/bank capacity를 넘기 전까지만 묶는다.
-- 전체 문제를 PIM DRAM 크기에 맞춰 padding하지 않는다.
+### 6.4 A4 Partition — `best_partitions`
 
-`p_m/p_n/p_k`는 policy 이름에서 계산하지 않고 후보의 정수 값으로 직접 탐색한다.
-첫 seed는 problem grid가 허용하는 범위에서 `num_units`에 가장 가까운
-active-unit 수를 사용한다. 그러나 이것은 고정 정책이 아니며, 축별
-seed와 random/LFBO 후보도 함께 측정해 한 device의 utilization과 여러 device의
-parallelism을 실제 end-to-end 시간으로 비교한다.
-`(1,1,1)`은 강제 baseline이 아니다. problem grid가 unit 하나만 허용할 때만
-최대 feasible seed 자체가 `(1,1,1)`이 된다.
+ladder 단계마다 Execution Tile grid에 들어가는 legal partition 중 active unit이 최대인
+것을 고른다. 동률이면 rounds, reduction bytes, stage bytes 순으로 작은 것을 고르고
+최대 2개를 남긴다. legal partition은 `partition_values`의 조합 중
+`p_m·p_n·p_k ≤ num_units`이고 `mapping_reason`이 `None`인 것이다.
 
-UPMEM 초기 후보에는 유효한 각 `p_k` 값에 대해 `p_m*p_n*p_k`가 최대인
-partition 조합을 추가한다. 이는 K-only 분할과 spatial 분할을 별도의 낮은
-parallelism으로 비교하지 않고, 가능한 한 같은 전체 active-unit 범위에서
-split-K 비율을 실제 측정하기 위한 seed다. 최종 선택은 여전히 end-to-end
-측정값으로 결정한다.
+`heuristic_seeds`는 Block Group 순위 순서로, 각 ladder를 **최대 병렬 쪽부터** 나열한다.
+따라서 첫 seed는 최상위 Block Group의 최대 병렬 frontier 점이고, search 없이 실행할 때의
+기본 config가 된다.
 
-## 5. Constraint
+### 6.5 Worked example
 
-compile 전에 수학적으로 실행 불가능한 후보만 제거한다.
+**AiMX, M=N=K=4096, fp16, num_units=4, batch=8**
 
-1. Block, Group, Tile, partition은 모두 양수다.
-2. Block Group working set은 `local_capacity_limit_bytes` 이하다.
-3. Execution Tile working set은 unit의 bank capacity 이하다.
-4. `p_m*p_n*p_k <= num_units`다.
-5. 각 partition은 해당 Execution Tile grid보다 크지 않다.
-6. 한 K Execution Tile window는 한 `p_k` plane 안에 들어간다.
-7. AiMX의 물리 padding과 allocation 상한은 AiMX runtime config의 `batch`로
-   계산한다.
+| 단계 | 결과 | 근거 |
+|---|---|---|
+| A2 | extent (1024,4096,4096) = block (128,128,128) × group (8,32,32) | padding이 없고(key 1 = 1), grid (4,1,1)이 4 unit을 채우며, 같은 조건에서 compute/byte가 최대 |
+| A3 | ladder (4,1,1) → (2,1,1) → (1,1,1) | tile_m=4일 때 약 0.75 GiB로 heap 8 GiB 안. Execution Tile 수 1 → 2 → 4 |
+| A4 | p (1,1,1) / (2,1,1) / (4,1,1) | p_k=1만 legal |
 
-Reduction이 있는 현재 Triton kernel legality로
-`K % (p_k * block_k) == 0`도 확인한다. 이것은 Common IR 속성이 아니라 각 spatial
-K plane이 Block K 경계에서 시작해야 하는 현재 kernel template의 지원 조건이다.
-사용하지 않는 축은 Block, Group, Tile, partition을 모두 1로 고정한다.
+```text
+frontier   tile      p        device당 연산   H2D (A + B×복제)
+F1         (1,1,1)   (4,1,1)  25%             32 + 32×4 MiB
+F2         (2,1,1)   (2,1,1)  50%             32 + 32×2 MiB
+F3         (4,1,1)   (1,1,1)  100%            32 + 32 MiB
+```
 
-Target lowering이 이미 검사하는 alignment나 reduction 위치를 공통 Config의
-정책으로 복제하지 않는다.
+B는 m 방향 `shared_over`이므로 p_m만큼 복제된다. F1(device 4개)과 F3(device 1개)
+중 어느 쪽이 빠른지는 측정으로 정한다.
 
-## 6. 내부 feature
+**UPMEM, M=N=K=4096, int8→int32, num_units=2048, lanes=16**
 
-다음 값은 search 모델 입력을 위해 Common IR 값에서 일시적으로 파생한다.
+| extent (m,n,k) | local bytes ≤ 49,152 | compute/byte |
+|---|---|---|
+| (64,64,128) | 32,768 | 16.0 |
+| **(64,64,256)** | 49,152 | **21.3** |
+| (128,128,128) | 98,304 ✗ | — |
+| (8,…) | lane 규칙 ✗ | — |
 
-- active units와 scheduling rounds
-- effective utilization과 load imbalance
-- 모든 input placement의 transfer 및 `shared_over`에 따른 reuse 양
-- p_k partial output과 reduction data 양
-- padding ratio
-- local/unit memory pressure
+A2는 block (64,64,128) × group (1,1,2)를 고른다. ladder는 MRAM 60 MiB 상한에서 시작해
+Execution Tile 수가 2048 이상이 될 때까지 줄어든다.
 
-이 값들은 compiler option, PIM attribute, cache의 Config에 들어가지 않는다.
-최종 objective는 항상 실제 측정한 end-to-end 시간이다.
+같은 알고리즘인데 AiMX는 (1024,4096,4096), UPMEM은 (64,64,256)이 나온다. 결과를 가른
+것은 target 이름이 아니라 padding 단위와 local 48 KiB라는 숫자다.
 
-## 7. LFBO search
+## 7. Stage B: Constraint
 
-최대 active-unit seed와 cache warm start를 먼저 실측한다. 이후 UPMEM의
-`p_k` 단계별 최대 active-unit seed, 축별·균형 seed, random valid candidate를
-측정한 후 상위 quantile을 GOOD으로 표시한다.
-Random Forest의 decision path에서 중요하게 사용된 feature를 Block, Group, Tile,
-`p_m/p_n/p_k`에 다시 연결하고, 해당 값의 이웃 후보만 생성한다. Constraint를
-통과한 후보를 실제 실행하고 다시 학습한다. partition 이웃으로 이동할 때는
-같은 축의 Execution Tile 크기만 새 device plane의 group 수 이하로 줄인다.
-그렇지 않으면 유효한 `p_k` 증가도 이전 `tile_k` 때문에 생성 직후 제거되기
-때문이다.
+`ConstraintEngine.check`는 compile 전에 실행할 수 없는 후보만 제거한다. 검사 순서는
+다음과 같다.
 
-Cache key에는 problem shape, compute kind, access별 dtype/layout/dependency, 일곱
-common profile 값, target runtime config, compiler/template version을 포함한다. 이전
-policy 기반 Config cache는 새
-schema와 key가 달라 재사용하지 않는다. Access 기반 공통 분석을 사용하는
-search-v3도 이전 GEMM 전용 feature 결과를 best로 곧바로 반환하지 않도록 별도
-cache schema를 사용한다.
+1. Block, Group, Tile, partition과 axis extent는 모두 양수
+2. `TargetModel.problem_reason`
+3. access direction/axis, reduction axis는 `k`, reduction이 없으면 K=1
+4. extent가 1인 축은 Block/Group/Tile/partition이 모두 1
+5. 각 계층은 아래 계층 단위 수를 넘지 않는다: group ≤ ceil(extent/block),
+   tile ≤ total groups, partition ≤ execution tiles. 완전히 빈 Block, Block Group,
+   Execution Tile을 만들지 않는다. 문제 경계의 나머지는 lowering이 mask와 padding으로
+   처리하고, 그 비용은 compute efficiency에 반영된다
+6. Block Group: `group_reason`, logical footprint ≤ `local_capacity`(0이면 생략)
+7. Execution Tile: `allocation_reason`, access + overhead 할당 ≤ `unit_capacity`
+8. Partition: `p_m·p_n·p_k ≤ num_units`, `mapping_reason`
 
-## 8. Target lowering과의 경계
+## 8. Stage C~E: 측정과 탐색
 
-- UPMEM은 Common IR의 계층과 mapping을 DPU MRAM/WRAM 실행으로 옮긴다.
+### 8.1 초기 측정
+
+순서는 frontier 첫 seed → cache warm-start(비슷한 shape의 best) → 나머지 frontier →
+structured random이다.
+
+structured random은 block/group을 무작위로 고른다. partition은 Block Group grid의
+최대 active 조합 중에서 고르고, tile은 목표 round 수에서 역산한다. 이 후보는 다음
+초기 안전 경계를 통과해야 측정한다.
+
+| 경계 | 기본값 |
+|---|---|
+| schedule utilization | ≥ 0.5 |
+| padding ratio (`scheduled_compute` 기준) | ≤ 0.5 |
+| scheduling rounds | ≤ 4 |
+| reduction contributions | ≤ 64 |
+
+frontier seed는 용량과 grid에서 구성되므로 이 경계를 적용하지 않는다. 경계 값은
+`PIMConfigSpace` 또는 `space_overrides`로 바꿀 수 있다.
+
+### 8.2 Feature
+
+다음 값을 Common IR 값과 `TargetModel`에서 파생해 Random Forest 입력으로만 쓴다.
+compiler option이나 IR attribute가 되지 않는다.
+
+| feature | 계층 |
+|---|---|
+| block_group_compute_per_byte, local_memory_pressure | Block Group |
+| execution_tile_compute_per_byte, unit_memory_pressure | Execution Tile |
+| stage/h2d/d2h bytes | Execution Tile + Partition |
+| active_units, useful/scheduled tiles, schedule_utilization, rounds, reduction_bytes | Partition |
+| padding_ratio | 전체 (`scheduled_compute` 기준) |
+
+측정 결과에 lowering의 `physical_allocations`가 있으면 `unit_memory_pressure`를
+`physical_pressure`로 교체한다.
+
+### 8.3 LFBO
+
+상위 quantile을 GOOD으로 표시해 Random Forest를 학습한다. 좋은 기록의 decision path에
+쓰인 feature를 Block/Group/Tile/partition fragment로 되돌리고, 그 이웃을 만든다.
+
+| 바뀐 fragment | 이웃 생성 (`semantic_mutate`) |
+|---|---|
+| block, group | 새 Block Group의 ladder에서 **Execution Tile 수가 가장 가까운 점**으로 이동(`regroup`). partition이 들어가면 유지하고, 아니면 최대 active로 교체 |
+| tile, partition | 해당 값 한 단계 이동 + 같은 Block Group ladder의 인접 frontier 점(`ladder_neighbors`) |
+
+이웃은 constraint를 통과한 것만 Random Forest 확률과 다양성 penalty로 고른 뒤 측정한다.
+budget(`max_benchmarks`, `max_autotune_seconds`)이 끝나거나 `patience`(기본 3) generation
+연속으로 개선이 `improvement_epsilon`(기본 0.002) 미만이면 종료한다. 개선이 epsilon 이상인
+generation은 stale count를 0으로 되돌린다. epsilon은 측정 noise 수준이다. 1 device처럼
+config 간 차이가 작은 지형에서 0.5%씩 이어지는 개선 추세를 끊지 않기 위해서다.
+
+### 8.4 Cache
+
+best와 측정 기록을 `TRITON_CACHE_DIR/pim_autotune_cache.json`에 저장한다. Key에는
+problem shape, compute kind, access별 dtype/layout/dependency, common profile 일곱 값,
+target runtime config, template version이 들어간다.
+
+## 9. Target lowering과의 경계
+
+- UPMEM은 Common IR 계층과 mapping을 DPU MRAM/WRAM 실행으로 옮긴다.
 - AiMX는 같은 계층을 physical group과 descriptor chain으로 옮긴다.
-- reduction 위치, descriptor 재사용, physical buffer 재사용은 target lowering의
-  고정 의미이며 autotuner boolean knob가 아니다.
-- autotuner는 `p_k`를 포함한 후보 전체를 실제로 실행한 시간으로 비교한다.
+- reduction 위치, descriptor 재사용, physical buffer 재사용은 target lowering의 고정
+  의미이며 autotuner knob가 아니다.
+- 새 target은 `TargetModel` subclass 하나를 추가하고 `target_model`에 등록한다. seed,
+  constraint, feature 코드는 바꾸지 않는다.
 
-공통 problem/footprint 모델은 GEMV/GEMM, elementwise, reduction, flattened
-convolution, fused placement, irregular access를 같은 access dependency로 표현한다.
-각 연산의 frontend lowering과 target compute lowering은 별도 구현 범위지만 Config
-schema와 LFBO search는 바꾸지 않는다.
+## 10. 검증
+
+```sh
+# triton_shared 에서
+python -m unittest pim_backend.autotuner.test_aimx_capacity \
+  pim_backend.autotuner.test_seed_frontier
+```
+
+`test_seed_frontier`는 6.5절의 결과(Block Group 순위, ladder, frontier seed 순서,
+p_k 제외, UPMEM lane 규칙)를 고정한다.

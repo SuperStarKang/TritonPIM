@@ -25,11 +25,13 @@ TORCH_DTYPE_NAMES = {
     torch.int8: "int8",
     torch.int32: "int32",
     torch.float16: "float16",
+    torch.bfloat16: "bfloat16",
     torch.float32: "float32",
 }
 OUTPUT_DTYPES = {
     "int8": "int32",
     "float16": "float32",
+    "bfloat16": "float32",
     "float32": "float32",
 }
 

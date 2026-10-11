@@ -1,12 +1,10 @@
 """Features derived from the three PIM Common IR hierarchy levels."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 
-from .constraints import (
-    aimx_runtime_allocations, local_memory_footprint, unit_memory_footprint,
-)
-from .types import AXES, ceil_div, pim_hierarchy
+from .model import group_extent, target_model
+from .types import AXES, pim_hierarchy
 
 
 @dataclass(frozen=True)
@@ -27,8 +25,13 @@ class PIMFeatures:
     unit_memory_pressure: float
 
 
+def block_group_config(config):
+    """The same config with one Block Group per Execution Tile."""
+    return replace(config, tile_m=1, tile_n=1, tile_k=1)
+
+
 def extract_features(problem, target, config):
-    profile = target.common_profile
+    model = target_model(target)
     hierarchy = pim_hierarchy(problem, config)
     partitions = (config.p_m, config.p_n, config.p_k)
     active_units = math.prod(partitions)
@@ -36,32 +39,25 @@ def extract_features(problem, target, config):
     useful_tiles = hierarchy.useful_execution_tiles
     scheduled_tiles = scheduling_rounds * active_units
 
-    block_group_bytes = local_memory_footprint(problem, config)
-    execution_tile_bytes = unit_memory_footprint(problem, config)
-    block_group_compute = math.prod(hierarchy.block_group_extent)
+    tile_access_bytes = model.access_allocations(problem, config)
+    block_group_bytes = sum(model.access_allocations(
+        problem, block_group_config(config)))
+    execution_tile_bytes = (
+        sum(tile_access_bytes)
+        + sum(model.overhead_allocations(problem, config).values()))
+    block_group_compute = math.prod(group_extent(config))
     execution_tile_compute = math.prod(config.execution_extent)
-    aimx_allocations = None
-    if profile.target == "aimx" and problem.uses_aimx_matmul_primitive:
-        aimx_allocations = aimx_runtime_allocations(problem, target, config)
-        execution_tile_bytes = sum(aimx_allocations.values())
-        block_group_bytes = (
-            aimx_allocations["A"] // (config.tile_m * config.tile_k)
-            + aimx_allocations["B"] // (config.tile_k * config.tile_n)
-            + aimx_allocations["C"] // (config.tile_m * config.tile_n)
-            + aimx_allocations["Arel"] // config.tile_k
-        )
 
     # Host staging은 pim.place.shared_over 축의 같은 buffer를 공유한다.
     # H2D는 그 buffer를 공유하더라도 모든 active device의 MRAM으로 전송한다.
     stage_bytes = 0
     input_tile_bytes = 0
-    for access in problem.input_accesses:
-        tile_bytes = (
-            access.elements(config.execution_extent) * access.element_bytes)
-        if aimx_allocations is not None:
-            tile_bytes = aimx_allocations[{
-                ("m", "k"): "A", ("k", "n"): "B", ("m", "n"): "C",
-            }[access.axes]]
+    output_tile_bytes = 0
+    for access, tile_bytes in zip(problem.accesses, tile_access_bytes):
+        if access.direction in ("out", "inout"):
+            output_tile_bytes += tile_bytes
+        if access.direction not in ("in", "inout"):
+            continue
         distinct_per_round = math.prod(
             partitions[axis]
             for axis, name in enumerate(AXES)
@@ -69,13 +65,7 @@ def extract_features(problem, target, config):
         stage_bytes += scheduling_rounds * distinct_per_round * tile_bytes
         input_tile_bytes += tile_bytes
     h2d_bytes = scheduling_rounds * active_units * input_tile_bytes
-
-    output_tile_bytes = sum(
-        access.elements(config.execution_extent) * access.element_bytes
-        for access in problem.output_accesses)
     d2h_bytes = scheduling_rounds * active_units * output_tile_bytes
-    if aimx_allocations is not None:
-        d2h_bytes = scheduling_rounds * active_units * aimx_allocations["C"]
 
     final_output_bytes = sum(
         access.elements(problem.axis_extents) * access.element_bytes
@@ -84,21 +74,12 @@ def extract_features(problem, target, config):
         hierarchy.rounds[2] * config.p_k if problem.has_reduction else 1)
     reduction_bytes = final_output_bytes * (k_contributions - 1)
 
-    scheduled_compute = scheduled_tiles * execution_tile_compute
-    if aimx_allocations is not None:
-        batch = target.runtime_config.batch
-        gm, gn, gk = hierarchy.block_group_extent
-        mac_k = ceil_div(gk, 256 // batch) * (256 // batch)
-        scheduled_compute = scheduled_tiles * config.tile_m * config.tile_n * (
-            ceil_div(gm, batch) * batch
-            * ceil_div(gn, 4096 // batch) * (4096 // batch)
-            * ceil_div(config.tile_k * mac_k, 256) * 256
-        )
+    scheduled_compute = (
+        scheduled_tiles * model.scheduled_compute(problem, config))
     useful_compute = math.prod(problem.axis_extents)
     padding_ratio = (scheduled_compute - useful_compute) / scheduled_compute
 
-    local_limit = profile.local_capacity_limit_bytes
-    unit_limit = profile.banks_per_unit * profile.bank_capacity_limit_bytes
+    local_limit = model.local_capacity
     return PIMFeatures(
         block_group_compute_per_byte=(
             block_group_compute / block_group_bytes),
@@ -116,7 +97,7 @@ def extract_features(problem, target, config):
         padding_ratio=padding_ratio,
         local_memory_pressure=(
             block_group_bytes / local_limit if local_limit else 0.0),
-        unit_memory_pressure=execution_tile_bytes / unit_limit,
+        unit_memory_pressure=execution_tile_bytes / model.unit_capacity,
     )
 
 

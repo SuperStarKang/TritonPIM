@@ -20,7 +20,7 @@ import torch
 import triton
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))         # GEMM 커널
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # autotuner
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # autotuner
 
 from triton.backends.pim.driver import PIMDriver  # noqa: E402
 

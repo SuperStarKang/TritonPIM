@@ -113,10 +113,6 @@ class PIMProblem:
     def has_reduction(self):
         return "k" in self.reduction_axes
 
-    @property
-    def uses_aimx_matmul_primitive(self):
-        return self.compute_kind in ("matmul", "matvec")
-
     def shared_over(self, access):
         return tuple(
             axis for axis in AXES

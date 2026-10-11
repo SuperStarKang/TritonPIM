@@ -1382,6 +1382,16 @@ descriptor의 주소는 전부 `base + offset(loop index)` 꼴이고 `offset`은
 `(m_t, k_t, n_t, batch, padded_k)`만의 함수다. tile 모양이 같고 `base`도 같으므로
 **descriptor chain이 모든 tile에서 byte 단위로 동일하다.**
 
+이 성질은 lowering이 `offset`에서 round와 device 좌표를 실제로 지울 때만 IR에 드러난다.
+`accessView`는 `access origin − placement start`를 그대로 빼지 않고, 두 식을
+`constant + Σ coefficient·leaf` 선형식으로 펼친 뒤 뺀다(`localOffset`). Triton은 block
+좌표를 i32로 계산하므로 두 식 모두 `index_cast`와 서로 다른 상수 분해
+(예: `(i32)(t·32)·32`와 `(i32)((t·4 + g)·8)·32`)를 거친다. 그래서 같은 꼴끼리 맞추는
+pattern으로는 공통 항 `1024·t`가 지워지지 않는다. 지워지지 않으면 descriptor 주소가 round
+loop 변수에 의존한다고 분류되어(`DescriptorReuse::Addresses`), 매 호출·매 round마다 모든
+record를 patch하고 chain 전체를 다시 업로드한다. 4096³ GEMM에서 이 비용은 chain 528 MiB
+기준 약 184 ms였다.
+
 | | naive | 이 설계 |
 | --- | --- | --- |
 | chain 생성 | invocation마다 | **launch당 한 번** |

@@ -218,6 +218,56 @@ private:
                          product->getOperand(i));
     return code.create<arith::SubIOp>(loc, a, b);
   }
+  // An index expression as constant + Σ coefficient·leaf. index_cast and
+  // multiplication by a constant stay linear for in-range Common coordinates.
+  struct LinearIndex {
+    int64_t constant = 0;
+    llvm::MapVector<Value, int64_t> terms;
+  };
+  static void addLinear(Value value, int64_t scale, LinearIndex &form) {
+    if (auto constant = getConstantIntValue(value)) {
+      form.constant += scale * *constant;
+      return;
+    }
+    if (auto sum = value.getDefiningOp<arith::AddIOp>()) {
+      addLinear(sum.getLhs(), scale, form);
+      addLinear(sum.getRhs(), scale, form);
+      return;
+    }
+    if (auto difference = value.getDefiningOp<arith::SubIOp>()) {
+      addLinear(difference.getLhs(), scale, form);
+      addLinear(difference.getRhs(), -scale, form);
+      return;
+    }
+    if (auto product = value.getDefiningOp<arith::MulIOp>())
+      for (unsigned i = 0; i != 2; ++i)
+        if (auto factor = getConstantIntValue(product->getOperand(i))) {
+          addLinear(product->getOperand(1 - i), scale * *factor, form);
+          return;
+        }
+    if (auto cast = value.getDefiningOp<arith::IndexCastOp>()) {
+      addLinear(cast.getIn(), scale, form);
+      return;
+    }
+    form.terms[value] += scale;
+  }
+  // Resident-local offset origin - start. The scheduling terms both sides share
+  // (round and device coordinates) cancel, so descriptor addresses stay the same
+  // across rounds and calls and the runtime stub reuses the chain unchanged.
+  Value localOffset(Value origin, Value start) {
+    LinearIndex form;
+    addLinear(origin, 1, form);
+    addLinear(start, -1, form);
+    Value offset = c(code, form.constant);
+    for (auto [leaf, coefficient] : form.terms) {
+      if (coefficient == 0) continue;
+      Value index = leaf.getType().isIndex()
+                        ? leaf
+                        : code.create<arith::IndexCastOp>(loc, code.getIndexType(), leaf);
+      offset = add(offset, mul(index, c(code, coefficient)));
+    }
+    return offset;
+  }
   static bool isIndexOperation(Operation *op) {
     return op->getName().getDialectNamespace() == "arith" && op->getNumRegions() == 0 &&
            op->getNumResults() != 0 && llvm::all_of(op->getResultTypes(), [](Type t) {
@@ -740,10 +790,10 @@ private:
     }
     // Origin/stride is Common's coordinate representation of its linear offset.
     // Translate these coordinates; do not reverse-engineer a kernel loop pattern.
-    Value row = sub(mapped(access.getOrigin()[0]), mapped(placement.source.getStart()[0]));
+    Value row = localOffset(mapped(access.getOrigin()[0]), mapped(placement.source.getStart()[0]));
     Value col = c(code, 0);
     if (access.getOrigin().size() == 2)
-      col = sub(mapped(access.getOrigin()[1]), mapped(placement.source.getStart()[1]));
+      col = localOffset(mapped(access.getOrigin()[1]), mapped(placement.source.getStart()[1]));
     Value rowGroup = code.create<arith::DivSIOp>(loc, row, c(code, view.layout.usefulRows));
     Value colGroup = code.create<arith::DivSIOp>(loc, col, c(code, view.layout.usefulCols));
     Value panel = add(mul(rowGroup, c(code, placement.cols / view.layout.cols)), colGroup);
