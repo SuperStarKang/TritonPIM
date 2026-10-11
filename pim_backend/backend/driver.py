@@ -260,6 +260,49 @@ def _build_aimx_so(stub_src: str, descriptors: str, base_fpga: int) -> str:
     return so_path
 
 
+def _aimx_resident_runtime_path() -> str:
+    # PIMSession loads the same runtime instance the stage stubs link against.
+    includes = _aimx_include_dirs()
+    library = os.path.realpath(os.path.join(includes[1], "..", "lib", "libpim.so"))
+    return _build_aimx_resident_runtime(includes, library)
+
+
+def _build_aimx_model_so(model_src: str, descriptors: str) -> str:
+    # --aimx-to-model-stub 결과를 .so로 빌드한다. FPGA 번호와 context는 session이 인자로
+    # 넘기므로 AIMX_BASE_FPGA, AIMX_KERNEL_KEY를 정의하지 않는다. 나머지 옵션은
+    # _build_aimx_so와 같은 이유로 같다.
+    includes = _aimx_include_dirs()
+    library = os.path.realpath(os.path.join(includes[1], "..", "lib", "libpim.so"))
+    resident_runtime = _build_aimx_resident_runtime(includes, library)
+    backend_dir = os.path.dirname(os.path.abspath(__file__))
+    runtime_h = Path(os.path.join(backend_dir, "aimx_runtime.h")).read_text()
+    key = hashlib.sha256(
+        ("aimx-model|" + model_src + descriptors + "|" + "|".join(includes) + "|"
+         + runtime_h + f"|resident={resident_runtime}").encode("utf-8")).hexdigest()
+    cache = get_cache_manager(key)
+    so_name = "model_host.so"
+    so_path = cache.get_file(so_name)
+    if so_path is not None:
+        return so_path
+    with tempfile.TemporaryDirectory() as tmp:
+        Path(os.path.join(tmp, "aimx_descriptors.h")).write_text(descriptors)
+        model_cpp = os.path.join(tmp, "model.cpp")
+        Path(model_cpp).write_text(model_src)
+        so_tmp = os.path.join(tmp, so_name)
+        subprocess.check_call(
+            ["g++", "-O3", "-std=c++17", "-fPIC", "-shared", "-fopenmp", "-Wl,-z,defs",
+             "-Wno-unused-function", "-Wno-narrowing", "-Wno-write-strings",
+             f"-I{tmp}", f"-I{backend_dir}", *[f"-I{d}" for d in includes],
+             model_cpp, resident_runtime,
+             "-Wl,-rpath," + os.path.dirname(resident_runtime),
+             library, "-Wl,-rpath," + os.path.dirname(library),
+             "-lpthread", "-lm", "-o", so_tmp])
+        so_path = cache.put(Path(so_tmp).read_bytes(), so_name, binary=True)
+        cache.put(model_src, "model.cpp", binary=False)
+        cache.put(descriptors, "aimx_descriptors.h", binary=False)
+    return so_path
+
+
 class PIMLauncher(object):
 
     def __init__(self, src, metadata):

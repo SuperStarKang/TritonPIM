@@ -12,8 +12,12 @@
 #
 # 실행:
 #   conda activate pim_triton
-#   python autotune_torch.py --m 8192 --n 8192 --k 128      # attention QK
+#   python autotune_torch.py --m 8192 --n 8192 --k 128      # attention QK (UPMEM, INT8)
 #   python autotune_torch.py --m 8192 --n 128  --k 8192     # attention P.V
+#   python autotune_torch.py --target aimx --num-units 1 --dtype float32 --m 256 --n 512 --k 512
+#
+# PIMSession 모델 경로는 PIMTorchConfig(autotune_cache_path=...)로 이 측정 기록을 읽는다.
+# target spec(unit 수, 용량)이 측정 때와 같아야 같은 기록을 찾는다.
 #
 # 직접 예제와 cache 파일은 공유할 수 있지만 template version이 context key에
 # 포함되므로 각 경로의 측정과 best는 서로 덮어쓰지 않는다.
@@ -31,7 +35,7 @@ import torch
 import triton.backends.pim.driver as pim_driver
 
 from torch_backend import PIMInductorBackend, PIMTorchConfig
-from torch_backend.template import TORCH_INT_MM_TEMPLATE_VERSION
+from torch_backend.template import TORCH_GEMM_TEMPLATE_VERSION
 from torch_backend._autotuner import (
     DEFAULT_CACHE_PATH,
     PIMConfigCache,
@@ -43,8 +47,12 @@ from torch_backend._autotuner import (
 from autotuner import PIMBenchmarkResult, SearchBudget, tune
 
 
-def pim_mm(a, b):
+def pim_int_mm(a, b):
     return torch._int_mm(a, b)
+
+
+def pim_mm(a, b):
+    return torch.mm(a, b)
 
 
 def sampled_reference(a, b, limit=32):
@@ -77,16 +85,29 @@ def main():
     parser.add_argument("--retune", action="store_true",
                         help="cache에 있어도 다시 탐색한다")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--target", choices=("upmem", "aimx"), default="upmem")
+    parser.add_argument("--num-units", type=int, default=0,
+                        help="0이면 target 기본값 (UPMEM 2048, AiMX는 보이는 FPGA 수)")
+    parser.add_argument("--dtype", choices=("int8", "float32"), default="int8",
+                        help="int8: _int_mm -> int32, float32: mm -> float32")
     args = parser.parse_args()
 
-    target = target_spec("upmem")
-    problem = PIMProblem(M=args.m, N=args.n, K=args.k,
-                         input_dtype="int8", output_dtype="int32")
-
+    target = target_spec(args.target, num_units=args.num_units)
     torch.manual_seed(args.seed)
-    a = torch.randint(-8, 8, (args.m, args.k), dtype=torch.int8)
-    b = torch.randint(-8, 8, (args.k, args.n), dtype=torch.int8)
-    rows, cols, ref_block = sampled_reference(a, b)
+    if args.dtype == "int8":
+        problem = PIMProblem(M=args.m, N=args.n, K=args.k,
+                             input_dtype="int8", output_dtype="int32")
+        operation = pim_int_mm
+        a = torch.randint(-8, 8, (args.m, args.k), dtype=torch.int8)
+        b = torch.randint(-8, 8, (args.k, args.n), dtype=torch.int8)
+        rows, cols, ref_block = sampled_reference(a, b)
+    else:
+        # 실수 경로는 정확도를 검사하지 않는다 (correctness=None). 시간만 비교한다.
+        problem = PIMProblem(M=args.m, N=args.n, K=args.k,
+                             input_dtype="float32", output_dtype="float32")
+        operation = pim_mm
+        a = torch.randn(args.m, args.k)
+        b = torch.randn(args.k, args.n)
 
     base = PIMTorchConfig(spec=target)
 
@@ -95,7 +116,7 @@ def main():
         # 컴파일해 둔 것을 그대로 돌려준다 — 입력 shape가 같기 때문이다.
         torch._dynamo.reset()
         compiled = torch.compile(
-            pim_mm,
+            operation,
             backend=PIMInductorBackend(replace(base, config=config)),
             fullgraph=True,
             dynamic=False,
@@ -110,29 +131,32 @@ def main():
             samples.append((time.perf_counter_ns() - start) / 1e6)
             stage_samples.append(tuple(pim_driver.timing))
 
-        got = out.index_select(0, rows).index_select(1, cols)
         timings = tuple(
             (name, statistics.median(
                 sample[stage] for sample in stage_samples))
             for stage, name in enumerate(pim_driver.TIMING_STAGES)
         )
+        correctness = None
+        if args.dtype == "int8":
+            got = out.index_select(0, rows).index_select(1, cols)
+            correctness = bool(torch.equal(got, ref_block))
         return PIMBenchmarkResult(
             total_ms=statistics.median(samples),
-            correctness=bool(torch.equal(got, ref_block)),
+            correctness=correctness,
             timings=timings,
         )
 
     space = build_config_space(problem, target)
     cache = PIMConfigCache(
         args.cache,
-        template_version=TORCH_INT_MM_TEMPLATE_VERSION,
+        template_version=TORCH_GEMM_TEMPLATE_VERSION,
     )
     budget = SearchBudget(max_generations=args.max_generations,
                           max_benchmarks=args.max_benchmarks,
                           max_autotune_seconds=args.max_seconds)
 
-    print(f"problem (M,N,K)=({args.m},{args.n},{args.k})  "
-          f"target=upmem num_units={target.common_profile.num_units}")
+    print(f"problem (M,N,K)=({args.m},{args.n},{args.k}) dtype={args.dtype} "
+          f"target={args.target} num_units={target.common_profile.num_units}")
     print(f"cache: {args.cache}")
 
     result = tune(problem, target, benchmark_fn, space=space, cache=cache,

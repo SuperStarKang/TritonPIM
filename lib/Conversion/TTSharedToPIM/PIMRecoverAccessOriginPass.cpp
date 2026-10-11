@@ -86,6 +86,26 @@ static SmallVector<Value> flattenTerms(Value offset) {
   return terms;
 }
 
+// valid 는 축마다 min(max(min(start + block, extent), start) - start, block) 꼴이다.
+// 그 안의 subi(x, start)에서 loop 에 의존하는 쪽이 그 축의 시작점이다. 없으면 널.
+static Value validStart(Value valid) {
+  SmallVector<Value> work{valid};
+  llvm::DenseSet<Value> seen;
+  while (!work.empty()) {
+    Value c = work.pop_back_val();
+    if (!seen.insert(c).second)
+      continue;
+    Operation *def = c.getDefiningOp();
+    if (!def)
+      continue;
+    if (auto sub = dyn_cast<arith::SubIOp>(def))
+      if (dependsOnLoop(sub.getRhs()))
+        return sub.getRhs();
+    work.append(def->getOperands().begin(), def->getOperands().end());
+  }
+  return Value();
+}
+
 static Value castToIndex(OpBuilder &b, Location loc, Value v) {
   return isa<IndexType>(v.getType())
              ? v
@@ -120,6 +140,11 @@ struct PIMRecoverAccessOriginPass
     for (unsigned d = 0; d < rank; d++)
       canonicalStride(access.getStrides()[d], strideBase[d], strideCoeff[d]);
 
+    SmallVector<Value> start(rank);
+    if (!access.getValid().empty())
+      for (unsigned d = 0; d < rank; d++)
+        start[d] = validStart(access.getValid()[d]);
+
     SmallVector<Value> origin(rank);
     // tile에는 없고 원본 버퍼에는 있는 축. 크기 1로 앞에 새로 만든다.
     SmallVector<Value> extraStride, extraOrigin;
@@ -143,13 +168,21 @@ struct PIMRecoverAccessOriginPass
         canonicalStride(stride, base, coeff);
 
       unsigned axis = rank;
-      for (unsigned d = 0; d < rank; d++)
-        if (base == strideBase[d] && strideCoeff[d] != 0 &&
-            coeff % strideCoeff[d] == 0) {
+      // valid 가 알려 주는 축 시작점과 같은 항은 그 축이다. stride 배수만 보면 열 시작
+      // (pid_n * BLOCK_N)이 행 stride 의 배수일 때(N <= BLOCK_N) 행 축과 구별되지 않는다.
+      for (unsigned d = 0; d < rank && axis == rank; d++)
+        if (start[d] && base == strideBase[d] && strideCoeff[d] != 0 &&
+            coeff % strideCoeff[d] == 0 &&
+            (peelCast(term) == peelCast(start[d]) ||
+             peelCast(index) == peelCast(start[d])))
           axis = d;
-          coeff /= strideCoeff[d];
-          break;
-        }
+      // 시작점이 없거나 맞는 축이 없으면 stride 배수가 처음 나누어떨어지는 축이다.
+      for (unsigned d = 0; d < rank && axis == rank; d++)
+        if (base == strideBase[d] && strideCoeff[d] != 0 &&
+            coeff % strideCoeff[d] == 0)
+          axis = d;
+      if (axis != rank)
+        coeff /= strideCoeff[axis];
 
       Value contribution = castToIndex(b, loc, index);
       if (coeff != 1)

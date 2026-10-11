@@ -252,9 +252,11 @@ def _aimx_to_artifact(aimx_ir: str, metadata, options) -> bytes:
         raise RuntimeError("AiMX target IR에 물리 allocation 계획이 없습니다")
     metadata["aimx_allocations"] = allocations
     # base_fpga는 컴파일이 아니라 빌드 때 -D로 들어간다. launcher가 읽도록 번들에 싣는다.
+    # target_ir은 PIMSession 모델 경로가 --aimx-to-model-stub으로 다시 번역할 때 쓴다.
     return json.dumps({"stub": stub_src, "descriptors": descriptors,
                        "base_fpga": options.base_fpga,
-                       "allocations": allocations}).encode("utf-8")
+                       "allocations": allocations,
+                       "target_ir": aimx_ir}).encode("utf-8")
 
 
 @dataclass(frozen=True)
@@ -417,7 +419,7 @@ class PIMBackend(BaseBackend):
     @functools.lru_cache()
     def hash(self):
         # Regenerate artifacts when the Common/UPMEM execution plan changes.
-        return f"{self.target}-pim-common-ir-v10-model-batching-device-active-host-pools-upmem-metadata-v2-rhs-row-major-v1-timing-v3"
+        return f"{self.target}-pim-common-ir-v10-model-batching-device-active-host-pools-upmem-metadata-v2-rhs-row-major-v1-timing-v3-aimx-bundle-target-ir-v1"
 
     def get_module_map(self) -> Dict[str, ModuleType]:
         return {}

@@ -8,6 +8,7 @@ from contextlib import ExitStack
 import ctypes
 from dataclasses import dataclass
 
+from .residency import UnitResources
 from .resident import (
     INPUT, MRAM_BASE, OUTPUT, WEIGHT, ResidentInvocation, ResidentRuntime,
     TransferStats, _artifact_bindings, _build_host, _build_program,
@@ -246,9 +247,19 @@ class UPMEMAdapter:
             raise RuntimeError("prepare one model per session; legacy resident layers cannot share it")
         self.model = UPMEMModelRuntime(self)
 
-    def prepare_model(self, plans):
-        self.model.place(plans, self.spec.common_profile.bank_capacity_limit_bytes,
-                         self.num_units)
+    def resources(self):
+        profile = self.spec.common_profile
+        return UnitResources(
+            self.num_units, profile.banks_per_unit * profile.bank_capacity_limit_bytes)
+
+    def requirements(self, plans):
+        return self.model.requirements(plans)
+
+    def prepare_model(self, plans, residency):
+        self.model.place(plans, residency, self.num_units)
+
+    def weight_table(self, plans):
+        return self.model.weight_table(plans)
 
     def close(self):
         if self.cleanup is not None:

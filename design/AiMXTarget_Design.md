@@ -2729,3 +2729,53 @@ N > 512(panel 하나에 microtile 여러 개), K가 256의 배수가 아닌 경�
 M/N tail(mask), `num_units > 1`, `batch ≠ 8`, K > 4096인 GEMV는 FPGA로 확인하지 않았다.
 autotuner의 용량 하한(`autotuner/constraints.py`의 `aimx_runtime_allocations`)은 아직 B/C
 행을 `4096/batch`로 계산한다.
+
+## 19. Model session 실행 — FPGA 단위 batch와 weight 상주
+
+**내용**
+`PIMSession` 모델 경로에서 AiMX는 일반 stub과 별도의 **model stub**(`--aimx-to-model-stub`)을
+사용한다. Model stub은 다음을 바꾼다.
+
+1. Device 상주 상태를 kernel key로 찾지 않고, session이 만든 context를 인자로 받는다.
+   FPGA당 plan 하나라는 암묵적 교체가 없으므로 여러 stage의 weight와 chain이 함께 남는다.
+2. Host 인자에서 오는 `aimx.stage`는 `weights[arg] == upload`일 때만 실행한다.
+   Upload 호출은 weight stage와 descriptor build만 하고 invoke/unstage를 하지 않는다.
+   실행 호출은 activation stage, invoke, unstage를 하고 weight는 다시 보내지 않는다.
+3. Instance(head 등) batch를 **FPGA 단위**로 실행한다. job = `batch_slot × P + u`이고
+   job마다 FPGA 하나와 context 하나를 쓴다. Batch round는 같은 FPGA에서 순차로 돈다.
+
+**근거**
+- Channel·bank에는 독립 명령이 없고(§1.3, §15 E11), output block 안에서 같은 행은 같은 A 행을,
+  같은 열은 같은 B 열을 공유한다(§1.5, §3.3). operand를 공유하지 않는 head를 device 하나에
+  넣으면 교차 항을 계산하게 되고, PV(N=128)와 QKᵀ(K=128)에서는 padding 대비 효율 이득이 없다.
+  그래서 bank 단위 packing은 하지 않는다. UPMEM DPU에 대응하는 독립 실행 단위는 FPGA다.
+- F1(§7) 이후 descriptor 주소는 placement 기준 local offset이므로, batch round가 바뀌어도
+  같은 FPGA의 chain은 `Unchanged`로 재사용된다. activation만 다시 stage하면 된다.
+- Context의 slot 크기와 각 slot을 채우는 host 인자는 stub이 표로 내보낸다
+  (`pim_model_slot_bytes`, `pim_model_slot_input`, `pim_model_slot_output`).
+  Python adapter는 이 표로 weight·state 요구량을 계산해 공통 상주 정책에 보고한다.
+
+**예시**
+
+```text
+extern "C" void gemm_kernel(aimx_model_call *_model, uint16_t* a0, uint16_t* a1, float* a2, ...)
+  for batch_base in 0, batch_size, 2·batch_size, ...          ← batch round
+    round loops (기존 host 구조)
+      #pragma omp parallel for num_threads(batch_size × P)
+      for job in 0 .. batch_size·P-1:
+        slot = job / P, u = job % P, instance = batch_base + slot
+        a0, a1, a2 = _model->pointers[instance]              ← instance별 host tensor
+        _fpga = _model->fpgas[job], _resident = _model->contexts[job]
+        stage(host 인자 i)   if (_model->weights[i] == _model->upload)
+        build chain          if (!_resident->ready)
+        invoke, unstage      if (!_model->upload)
+```
+
+| 호출 | 하는 일 |
+|---|---|
+| upload (`upload = 1`) | weight stage, buffer 할당, chain build |
+| 실행 (`upload = 0`) | activation stage, (state 해제 뒤라면 할당과 build), invoke, unstage |
+| `aimx_model_release(ctx, keep)` | `keep`이 아닌 slot 해제, `ready = false` (P-2는 weight slot 유지, P-3은 전부 해제) |
+
+Resident weight GEMM은 instance 1개, scheduling round 1회로 제한한다(`select_layer_config`).
+여러 round가 같은 buffer에 서로 다른 weight tile을 올리면 상주가 성립하지 않기 때문이다.

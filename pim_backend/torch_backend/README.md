@@ -369,8 +369,12 @@ Activation은 한 호출 안의 Q/K/V와 gate/up을 포함해 모든 GEMM에서 
 공통 코드에는 DPU handle이나 MRAM 주소가 없다. `RuntimeBackend`는
 컴파일 artifact 준비, 자원 open/close, layer 교체, kernel invocation, 누적
 통계를 정의한다. `PIMTargetSpec.common_profile.target`이 adapter를 선택한다.
-UPMEM adapter만 구현되어 있으며, 다른 target의 resident 실행 요청은
-`NotImplementedError`로 종료한다. compiler의 3계층 lowering은 변경하지 않는다.
+UPMEM adapter와 AiMX adapter가 있다. 두 adapter 모두 `PIMSession.prepare/run_model`
+모델 경로에서 공통 상주 정책(P-1/P-2/P-3, `backend/residency.py`)을 사용한다. AiMX
+adapter는 모델 경로만 지원하고 FPGA 단위 instance batch를 사용한다(`examples/aimx_model_session.py`, 설계는
+`design/ModelRuntime_Design.md`의 공통 상주 정책과 `design/AiMXTarget_Design.md` §19).
+그 밖의 target과 AiMX의 legacy layer API는 `NotImplementedError`로 종료한다.
+compiler의 3계층 lowering은 변경하지 않는다.
 
 UPMEM에서는 session open/close가 `upmem_session_open/close`를 거쳐
 `dpu_alloc/free`를 호출한다. layer 교체는 이전 native resident block의

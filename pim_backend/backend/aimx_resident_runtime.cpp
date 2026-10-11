@@ -163,3 +163,68 @@ extern "C" void aimx_resident_reset() {
     clear(*entry.second);
   }
 }
+
+// ── Model-session contexts ───────────────────────────────────────────────────
+// PIMSession owns these. Unlike aimx_resident_acquire there is no per-FPGA plan
+// key, so contexts of different stages coexist on one FPGA until released.
+
+extern "C" int aimx_model_open() {
+  Registry &r = registry();
+  checkProcess(r);
+  std::lock_guard<std::mutex> lock(r.mutex);
+  int available = r.devices.empty() ? init_mpim_drv() : totalDevNum;
+  aimx_require(available > 0, "AiMX initialization failed or no FPGA is visible");
+  for (int fpga = 0; fpga < available; ++fpga) {
+    auto &entry = r.devices[fpga];
+    if (!entry) {
+      entry = std::make_unique<DeviceState>();
+      entry->fpga = fpga;
+    }
+  }
+  return available;
+}
+
+extern "C" aimx_resident_context *aimx_model_create(int fpga, size_t slots) {
+  Registry &r = registry();
+  checkProcess(r);
+  {
+    std::lock_guard<std::mutex> lock(r.mutex);
+    aimx_require(r.devices.count(fpga) == 1, "model context on an unopened FPGA");
+  }
+  aimx_require(slots > 0, "a model context needs at least one slot");
+  auto *state = new DeviceState;
+  state->fpga = fpga;
+  state->plan = "model";
+  state->buffers.resize(slots);
+  state->context = {state->buffers.data(), slots, false, state};
+  return &state->context;
+}
+
+extern "C" void aimx_model_release(aimx_resident_context *context, const int *keep) {
+  auto &state = *static_cast<DeviceState *>(context->owner);
+  for (size_t slot = context->count; slot-- > 0;) {
+    auto &buffer = context->buffers[slot];
+    if (keep[slot] || !buffer.va)
+      continue;
+    pim_free((void *)buffer.va, state.fpga);
+    if (buffer.host)
+      munmap(buffer.host, (size_t)buffer.bytes);
+    buffer = {};
+  }
+  // Freed buffers come back at new physical addresses, so the chain is rebuilt.
+  context->ready = false;
+}
+
+extern "C" void aimx_model_destroy(aimx_resident_context *context) {
+  auto *state = static_cast<DeviceState *>(context->owner);
+  clear(*state);
+  delete state;
+}
+
+extern "C" int64_t aimx_model_live_bytes(aimx_resident_context *context) {
+  int64_t bytes = 0;
+  for (size_t slot = 0; slot < context->count; ++slot)
+    if (context->buffers[slot].va)
+      bytes += context->buffers[slot].bytes;
+  return bytes;
+}

@@ -168,6 +168,53 @@ Weight/KV의 저장 위치는 준비 단계에 정하며 실행 중 자동 migra
 KV는 준비 시 정한 CPU 또는 PIM 위치를 사용한다. 첫 구현에서 지원하는 저장 위치를 API와 예제에 명시한다.
 한 Layer weight 상주 정책에서는 다음 모델 순회 때 weight를 다시 전송한다.
 
+## 공통 상주 정책 (P-1 / P-2 / P-3)
+
+**내용**
+무엇을 device에 남길지는 target과 무관한 `ResidencyPlanner`(`backend/residency.py`)가 결정한다.
+Adapter는 실제 자원(unit 수, unit당 용량)과 stage별 요구량(weight, state, 공용 scratch의
+unit당 byte)만 보고한다. Planner는 아래 순서로 처음 만족하는 정책을 고르고, `PIMSession.run_model`은
+그 정책에 따라 layer 진입과 종료 때 adapter의 `enter_layer`/`exit_layer`를 호출한다.
+
+**근거**
+- Weight는 요청 사이에 바뀌지 않는다. 용량이 허락하면 다시 보낼 이유가 없다.
+- State는 weight가 아니면서 device에 상주하는 것이다. AiMX에서는 descriptor chain, PMM,
+  Arel, activation buffer이고, UPMEM에서는 MRAM을 쓰지 않으므로 0이다.
+  prefill에서는 state가 weight보다 커질 수 있어서(AiMX chain), weight와 분리해서 판단한다.
+- 공용 scratch는 모든 stage가 같은 영역을 쓰므로 최댓값만 더한다. stage마다 자기 activation
+  buffer를 갖는 target은 그 크기를 state로 보고하고 scratch는 0으로 보고한다.
+- Stage가 일부 unit만 쓰더라도 첫 unit은 모든 stage가 쓴다. 그래서 stage 요구량을 모두 더한
+  값을 unit 하나의 상한으로 사용한다(보수적 판단).
+
+**예시**
+
+```text
+W_l = layer l의 weight 합, S_l = layer l의 state 합, X = 공용 input + output scratch 최댓값
+cap = unit당 용량 (adapter 보고)
+
+P-1 model    Σ_l W_l + Σ_l S_l + X ≤ cap   모든 layer의 weight와 state를 상주
+P-2 weights  Σ_l W_l + max_l S_l + X ≤ cap 모든 weight 상주, state는 layer마다 만들고 해제
+P-3 layer    max_l W_l + max_l S_l + X ≤ cap layer마다 weight와 state를 교체
+그 외        준비 단계에서 오류 (필요량과 용량을 보고)
+```
+
+| 정책 | `enter_layer` | `exit_layer` | 요청당 weight 전송 |
+|---|---|---|---|
+| P-1 model | 첫 진입에서만 weight upload + state 생성 | 없음 | session 동안 1회 |
+| P-2 weights | 첫 진입에서만 weight upload. state는 첫 실행에서 생성 | state 해제 | session 동안 1회 |
+| P-3 layer | weight upload | weight와 state 해제 | layer마다 |
+
+모든 adapter가 이 정책을 따른다. Target별 차이는 보고하는 숫자와 배치 방법뿐이다.
+
+| target | state | 공용 scratch | 정책별 배치 |
+|---|---|---|---|
+| UPMEM | 0 (프로그램은 IRAM) | 입력·출력 MRAM scratch 1벌 | P-1/P-2: layer마다 다른 weight 주소(누적), P-3: 모든 layer가 같은 weight 영역을 재사용. stage 프로그램은 배치된 주소로 link |
+| AiMX | descriptor chain, PMM, Arel, activation buffer | 0 (stage마다 자기 buffer) | (stage, FPGA)별 context. P-2는 weight slot만 남기고 해제, P-3은 모두 해제 |
+
+UPMEM은 state가 0이라 P-2의 필요량이 P-1과 같으므로 P-2가 선택되는 일은 없다.
+작은 모델은 P-1이 되어 두 번째 요청부터 weight를 보내지 않고, Llama-2-7B INT8처럼
+전체 weight가 MRAM을 넘으면 P-3이 되어 기존과 같이 layer마다 weight를 보낸다.
+
 ## Config와 cache
 
 **내용**

@@ -9,6 +9,7 @@ import tempfile
 from triton.runtime.cache import get_cache_manager
 
 from .compiler import _run_translate
+from .residency import LAYER, StageRequirement
 from .resident import INPUT, MRAM_BASE, OUTPUT, WEIGHT, TransferStats, _artifact_bindings, _build_program
 from .runtime import current_invocation
 
@@ -85,6 +86,8 @@ class UPMEMModelRuntime:
         self.library = adapter.library
         self.stages = []
         self.loaded_program = None
+        self.policy = None
+        self.loaded = set()
         self.totals = {"program_loads": 0, "device_compiles": 0}
         pointer = ctypes.c_void_p
         uint = ctypes.c_uint32
@@ -107,42 +110,68 @@ class UPMEMModelRuntime:
     def compile_invocation(self, stage, physical_inputs):
         return ModelCompileInvocation(self, stage, physical_inputs)
 
-    def place(self, plans, capacity, units):
-        weight_bytes = 0
+    @staticmethod
+    def _role_bytes(stage, role):
+        return sum(binding.size for binding in stage.bindings if binding.role == role)
+
+    def requirements(self, plans):
+        # 프로그램은 IRAM에 적재되므로 MRAM state는 없다. 입력·출력 scratch는 모든
+        # stage가 같은 영역을 쓰고, 출력은 stage마다 slot 하나다.
+        return [
+            StageRequirement(plan.index, stage.name, self._role_bytes(stage, WEIGHT), 0,
+                             self._role_bytes(stage, INPUT),
+                             max(binding.size for binding in stage.bindings
+                                 if binding.role == OUTPUT))
+            for plan in plans for stage in plan.stages
+        ]
+
+    def place(self, plans, residency, units):
+        """Lay out MRAM for the chosen policy and link every stage program.
+
+        P-3 (layer) reuses one weight region for every layer; P-1/P-2 give each
+        layer its own weight addresses so nothing is uploaded twice.
+        """
+        self.policy = residency.policy
+        weight_region = 0
         input_bytes = 0
         output_bytes = 0
+        offset = 0
         for plan in plans:
-            offset = 0
+            if self.policy == LAYER:
+                offset = 0
+            start = offset
             for stage in plan.stages:
                 stage.addresses = {}
                 for binding in stage.bindings:
                     if binding.role == WEIGHT:
                         stage.addresses[binding.symbol] = MRAM_BASE + offset
                         offset += binding.size
-                input_bytes = max(input_bytes, sum(binding.size for binding in stage.bindings
-                                                   if binding.role == INPUT))
+                input_bytes = max(input_bytes, self._role_bytes(stage, INPUT))
                 output_bytes = max(output_bytes, *(binding.size for binding in stage.bindings
                                                    if binding.role == OUTPUT))
-            plan.weight_bytes_per_unit = offset
-            weight_bytes = max(weight_bytes, offset)
-        footprint = weight_bytes + input_bytes + output_bytes
-        if footprint > capacity:
-            raise ValueError(f"model needs {footprint} MRAM bytes per unit; capacity is {capacity}")
+            plan.weight_bytes_per_unit = offset - start
+            weight_region = max(weight_region, offset)
+        footprint = weight_region + input_bytes + output_bytes
+        if footprint != residency.bytes_per_unit:
+            raise RuntimeError(
+                f"MRAM layout needs {footprint} bytes per unit; the residency plan "
+                f"computed {residency.bytes_per_unit}")
         for plan in plans:
             for stage in plan.stages:
-                offset = weight_bytes
+                offset = weight_region
                 for binding in stage.bindings:
                     if binding.role == INPUT:
                         stage.addresses[binding.symbol] = MRAM_BASE + offset
                         offset += binding.size
                     elif binding.role == OUTPUT:
-                        stage.addresses[binding.symbol] = MRAM_BASE + weight_bytes + input_bytes
+                        stage.addresses[binding.symbol] = MRAM_BASE + weight_region + input_bytes
                 stage.program = _build_program(stage.bundle, stage.addresses, stats=self.totals)
                 self._create_stage(stage, units)
             plan.backend_plan = {
+                "policy": self.policy,
                 "weight_bytes": plan.weight_bytes_per_unit,
-                "input_offset": weight_bytes,
-                "output_offset": weight_bytes + input_bytes,
+                "input_offset": weight_region,
+                "output_offset": weight_region + input_bytes,
                 "bytes_per_unit": footprint,
             }
 
@@ -186,6 +215,31 @@ class UPMEMModelRuntime:
             if any(stage.weight_mask):
                 self.invoke(stage, stage.preparation_matrices, stage.preparation_output,
                             upload_weights=True)
+
+    def enter_layer(self, plan):
+        if plan.index in self.loaded:
+            return
+        self.load_weights(plan)
+        self.loaded.add(plan.index)
+
+    def exit_layer(self, plan):
+        # P-3에서는 다음 layer가 같은 weight 영역을 덮어쓴다. 해제할 device 상태는 없다.
+        if self.policy == LAYER:
+            self.loaded.discard(plan.index)
+
+    def weight_table(self, plans):
+        table = {}
+        for plan in plans:
+            for stage in plan.stages:
+                for binding in stage.bindings:
+                    if binding.role == WEIGHT:
+                        table[(plan.index, stage.name, binding.operand)] = {
+                            "tensor": stage.weights[binding.operand],
+                            "address": stage.addresses[binding.symbol],
+                            "bytes_per_unit": binding.size,
+                            "mapping": stage.physical_mapping,
+                        }
+        return table
 
     def run(self, stage, matrices, output):
         self.load_program(stage)

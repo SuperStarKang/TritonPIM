@@ -11,6 +11,8 @@ namespace triton {
 // stub 이 launch 당 한 번만 부른다.
 void registerAiMXToDescriptorsTranslation();
 void registerAiMXToRuntimeStubTranslation();
+// PIMSession 모델 경로의 stage stub. session context, weight 상주, FPGA 단위 batch.
+void registerAiMXToModelStubTranslation();
 
 } // namespace triton
 } // namespace mlir

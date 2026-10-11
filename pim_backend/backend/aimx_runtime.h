@@ -103,6 +103,29 @@ void aimx_resident_release(aimx_resident_context *context);
 void aimx_resident_reset();
 }
 
+// Model-session stage call (--aimx-to-model-stub). One entry call runs one stage
+// for every instance; job = batch slot * devices + device, one FPGA per job.
+struct aimx_model_call {
+  aimx_resident_context **contexts; // [batch_size * devices]
+  const int *fpgas;                 // [batch_size * devices]
+  void *const *pointers;            // [instances * arguments], host tensors per instance
+  const int *weights;               // [arguments], 1 when the argument is a resident weight
+  uint32_t instances, batch_size, arguments;
+  int upload;                       // 1: stage weights and build chains, no invoke/unstage
+  uint32_t batch_base;
+};
+extern "C" {
+// Opens every physical FPGA once and returns how many exist.
+int aimx_model_open();
+// Session-owned contexts. Never replaced implicitly; slots are allocated by the
+// stage stub on first use and stay until release or destroy.
+aimx_resident_context *aimx_model_create(int fpga, size_t slots);
+// Frees every slot whose keep[slot] is 0 and invalidates the descriptor chain.
+void aimx_model_release(aimx_resident_context *context, const int *keep);
+void aimx_model_destroy(aimx_resident_context *context);
+int64_t aimx_model_live_bytes(aimx_resident_context *context);
+}
+
 // Address relocation for an already-built descriptor group. The compiler emits
 // this only when record count/order are unchanged. Match mPIM_RD_INSTR_MC's
 // channel replication and high/low packing, leaving next/len/status untouched.

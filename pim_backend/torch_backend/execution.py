@@ -116,25 +116,30 @@ def select_layer_config(problem, target, torch_config, instance_count, *, has_we
     elif torch_config.autotune_cache_path is not None:
         cache = PIMConfigCache(torch_config.autotune_cache_path,
                                template_version=TORCH_GEMM_TEMPLATE_VERSION)
+        # correctness None은 검사를 생략한 측정이다 (PIMBenchmarkResult.ok와 같은 의미).
         candidates = tuple((PIMConfig(*key), record["total_ms"])
                            for key, record in cache.measured_results(problem, target).items()
-                           if record["correctness"])
+                           if record["correctness"] is not False)
     else:
         raise ValueError("model layers require an explicit config or measured autotune records")
+    # Target 고유 조건(UPMEM tasklet 분할, AiMX 할당 등)은 ConstraintEngine이 검사한다.
     engine = ConstraintEngine(problem, target)
     choices = []
-    lanes = target.runtime_config.nr_tasklets
-    if lanes == 0:
-        lanes = target.common_profile.lanes_per_core
+    # 거부한 후보마다 이유를 남긴다. 모두 거부되면 그대로 보고한다.
+    rejected = []
     for config, cost in candidates:
-        if config.p_k != 1 or not engine.valid(config):
+        if config.p_k != 1:
+            rejected.append((config.key(), "model layers require p_k=1"))
             continue
-        if not 1 <= lanes <= target.common_profile.lanes_per_core:
-            continue
-        if config.block_m * config.group_m % lanes:
+        reason = engine.check(config)
+        if reason is not None:
+            rejected.append((config.key(), reason))
             continue
         hierarchy = pim_hierarchy(problem, config)
         if has_weights and (instance_count != 1 or hierarchy.scheduling_rounds != 1):
+            rejected.append((config.key(), (
+                f"resident weights require one instance and one M/N/K round; got "
+                f"{instance_count} instances and rounds {hierarchy.rounds}")))
             continue
         units = config.p_m * config.p_n * config.p_k
         p_b = min(instance_count, target.common_profile.num_units // units)
@@ -142,8 +147,8 @@ def select_layer_config(problem, target, torch_config, instance_count, *, has_we
         choices.append((rounds * cost, config, p_b, rounds, hierarchy.rounds))
     if not choices:
         raise ValueError(
-            "no model config fits the actual resources; resident weights require "
-            "one instance and one M/N/K round"
-        )
+            f"no model config fits the actual resources for (M,N,K)=({problem.M},"
+            f"{problem.N},{problem.K}) on {target.common_profile.num_units} units: "
+            + "; ".join(f"{key}: {reason}" for key, reason in rejected))
     _, config, p_b, rounds, mnk_rounds = min(choices, key=lambda choice: choice[0])
     return config, p_b, rounds, mnk_rounds

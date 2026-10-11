@@ -12,6 +12,21 @@
 // STUB: _resident->ready =
 // STUB: pim_exec
 // DESC: static uint32_t aimx_prog_cast_add_device0_elementwise_
+// The model-session stub takes session contexts and per-instance tensors instead of a kernel key.
+// RUN: triton-shared-opt --mlir-print-op-generic --pim-map-devices='p-m=2 p-n=1 p-k=1' --pim-place-data --cse --canonicalize --pim-form-host-plan --convert-pim-to-aimx --cse --canonicalize %s | triton-shared-translate --aimx-to-model-stub | FileCheck %s --check-prefix=MODEL --implicit-check-not=aimx_resident_acquire
+// MODEL: extern "C" void cast_add(aimx_model_call *_model,
+// MODEL: for (_model->batch_base = 0; _model->batch_base < _model->instances;
+// MODEL: num_threads(_model->batch_size * 2)
+// MODEL: if (_instance >= _model->instances) continue;
+// MODEL: *a0 = (float*)_model->pointers[(size_t)_instance * _model->arguments + 0];
+// MODEL: int _fpga = _model->fpgas[_job];
+// MODEL: aimx_resident_context *_resident = _model->contexts[_job];
+// MODEL: if (_model->weights[0] == _model->upload) {
+// MODEL: if (!_resident->ready) {
+// MODEL: if (!_model->upload) {
+// MODEL: pim_exec
+// MODEL: pim_model_slot_count =
+// MODEL: pim_model_device_count = 2;
 
 #identity = affine_map<(m,n) -> (m,n)>
 module attributes {pim.target_profile = #pim.target_profile<target = "aimx",

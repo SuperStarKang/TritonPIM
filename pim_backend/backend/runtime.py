@@ -7,6 +7,8 @@ from threading import RLock, get_ident
 import time
 from typing import Protocol
 
+from .residency import plan_residency
+
 
 current_invocation = ContextVar("pim_invocation", default=None)
 current_layer = ContextVar("pim_layer", default=None)
@@ -28,6 +30,11 @@ class RuntimeBackend(Protocol):
     across layer replacements. begin_run validates the loaded plan before each
     execution. Activations are sent for every GEMM; weights remain resident.
     close releases resources.
+
+    The model path is driven by the common residency policy: the adapter reports
+    resources() and requirements(plans), takes the chosen plan in
+    prepare_model(plans, residency), returns weight_table(plans), and its model
+    runtime implements enter_layer/exit_layer.
     """
 
     def validate_config(self, config): ...
@@ -36,7 +43,10 @@ class RuntimeBackend(Protocol):
     def open(self): ...
     num_units: int
     def begin_model(self): ...
-    def prepare_model(self, plans): ...
+    def resources(self): ...
+    def requirements(self, plans): ...
+    def prepare_model(self, plans, residency): ...
+    def weight_table(self, plans): ...
     def load_layer(self, plan): ...
     def begin_run(self, plan): ...
     def invocation(self, kernel, physical_inputs): ...
@@ -49,6 +59,10 @@ def create_runtime(spec) -> RuntimeBackend:
         from .upmem_adapter import UPMEMAdapter
 
         return UPMEMAdapter(spec)
+    if spec.common_profile.target == "aimx":
+        from .aimx_adapter import AiMXAdapter
+
+        return AiMXAdapter(spec)
     raise NotImplementedError(
         f"{spec.common_profile.target}: request-scoped weight residency has no adapter"
     )
@@ -83,6 +97,7 @@ class PIMSession:
         self.weight_table = {}
         self.kv_table = {}
         self.loaded_layer = None
+        self.residency = None
 
     def __enter__(self):
         if self.phase != "new" or current_session.get() is not None:
@@ -115,8 +130,6 @@ class PIMSession:
         from torch_backend.fx_analysis import analyze_fx_gemms
         from torch_backend.model import build_layer_plan
 
-        from .resident import WEIGHT
-
         self._check_owner()
         layers = tuple(layers)
         if not layers:
@@ -137,17 +150,10 @@ class PIMSession:
                 example_inputs = outputs if isinstance(outputs, tuple) else (outputs,)
 
         self.layers = tuple(plans)
-        self.backend.prepare_model(self.layers)
-        for plan in self.layers:
-            for stage in plan.stages:
-                for binding in stage.bindings:
-                    if binding.role == WEIGHT:
-                        self.weight_table[(plan.index, stage.name, binding.operand)] = {
-                            "tensor": stage.weights[binding.operand],
-                            "address": stage.addresses[binding.symbol],
-                            "bytes_per_unit": binding.size,
-                            "mapping": stage.physical_mapping,
-                        }
+        self.residency = plan_residency(
+            self.backend.resources(), self.backend.requirements(self.layers))
+        self.backend.prepare_model(self.layers, self.residency)
+        self.weight_table = self.backend.weight_table(self.layers)
         return self.layers
 
     @property
@@ -160,9 +166,10 @@ class PIMSession:
         if not self.layers:
             raise RuntimeError("prepare the model before running it")
         for plan in self.layers:
-            self.backend.model.load_weights(plan)
+            self.backend.model.enter_layer(plan)
             self.loaded_layer = plan.index
             outputs = plan.run_model(*inputs)
+            self.backend.model.exit_layer(plan)
             inputs = outputs if isinstance(outputs, tuple) else (outputs,)
         return outputs
 
