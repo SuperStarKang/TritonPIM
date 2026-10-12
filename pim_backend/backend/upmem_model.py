@@ -10,7 +10,7 @@ from triton.runtime.cache import get_cache_manager
 
 from .compiler import _run_translate
 from .residency import LAYER, StageRequirement
-from .resident import INPUT, MRAM_BASE, OUTPUT, WEIGHT, TransferStats, _artifact_bindings, _build_program
+from .upmem_artifact import INPUT, MRAM_BASE, OUTPUT, WEIGHT, TransferStats, _artifact_bindings, _build_program
 from .runtime import current_invocation
 
 
@@ -125,7 +125,7 @@ class UPMEMModelRuntime:
             for plan in plans for stage in plan.stages
         ]
 
-    def place(self, plans, residency, units):
+    def place(self, plans, residency):
         """Lay out MRAM for the chosen policy and link every stage program.
 
         P-3 (layer) reuses one weight region for every layer; P-1/P-2 give each
@@ -166,7 +166,6 @@ class UPMEMModelRuntime:
                     elif binding.role == OUTPUT:
                         stage.addresses[binding.symbol] = MRAM_BASE + weight_region + input_bytes
                 stage.program = _build_program(stage.bundle, stage.addresses, stats=self.totals)
-                self._create_stage(stage, units)
             plan.backend_plan = {
                 "policy": self.policy,
                 "weight_bytes": plan.weight_bytes_per_unit,
@@ -174,6 +173,12 @@ class UPMEMModelRuntime:
                 "output_offset": weight_region + input_bytes,
                 "bytes_per_unit": footprint,
             }
+
+    def bind(self, plans, units):
+        """Runtime: create the native handle of every placed stage on the open DPU set."""
+        for plan in plans:
+            for stage in plan.stages:
+                self._create_stage(stage, units)
 
     def _create_stage(self, stage, units):
         uint = ctypes.c_uint32

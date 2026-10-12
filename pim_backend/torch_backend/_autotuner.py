@@ -17,25 +17,31 @@ if _PIM_BACKEND_DIR not in sys.path:
 
 from autotuner import (
     ConstraintEngine,
+    PIMBenchmarkResult,
     PIMConfig,
     PIMConfigCache,
     PIMAccess,
     PIMProblem,
     PIMTargetSpec,
+    SearchBudget,
     build_config_space,
     heuristic_seeds,
     pim_hierarchy,
     target_spec,
+    tune,
 )
 from autotuner.decorator import (
     DEFAULT_CACHE_PATH,
     pim_launch_options,
 )
+from autotuner.model import target_model
+from autotuner.space import axis_values, legal_partitions
 
 __all__ = [
-    "ConstraintEngine", "PIMAccess", "PIMConfig", "PIMConfigCache",
-    "PIMProblem",
-    "PIMTargetSpec", "build_config_space",
-    "heuristic_seeds", "pim_hierarchy", "target_spec",
+    "ConstraintEngine", "PIMAccess", "PIMBenchmarkResult", "PIMConfig",
+    "PIMConfigCache", "PIMProblem",
+    "PIMTargetSpec", "SearchBudget", "build_config_space",
+    "heuristic_seeds", "pim_hierarchy", "target_spec", "tune",
     "DEFAULT_CACHE_PATH", "pim_launch_options",
+    "target_model", "axis_values", "legal_partitions",
 ]

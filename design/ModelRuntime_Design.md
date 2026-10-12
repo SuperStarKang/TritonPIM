@@ -338,7 +338,7 @@ LayerPlan은 Session 객체 내부를 조회하지 않고 전달받은 spec과 r
 | 마지막 batch | 비활성 DPU는 device 진입 시 반환, 전송·출력 복원 제외 |
 | KV | `reserve_kv`, `append_kv`, `kv_view`; CPU 저장소, sequence 축은 끝에서 두 번째 |
 | 준비된 plan | Session에 연결됨; 다른 Session에는 새 plan을 만들어 준비 |
-| 기존 API | `compile_layer/start/load_weights/run_layer` 경로 유지 |
+| 기존 API | `compile_layer/start/load_weights/run_layer` 경로는 제거됨 (model 경로만 유지) |
 | 남은 구현 | Attention 그래프의 KV 연결, PIM KV 저장, MoE expert placement/routing |
 
 KV API는 exported graph에 append/read 연산을 자동 삽입하지 않는다.
@@ -369,7 +369,7 @@ python -m pytest triton_shared/pim_backend/torch_backend/tests/test_layer_bmm.py
 
 python -m pytest triton_shared/pim_backend/torch_backend/tests/test_model_session.py -q
 
-python triton_shared/pim_backend/torch_backend/examples/torch_model_session.py
+python triton_shared/pim_backend/torch_backend/examples/upmem/torch_model_session.py
 ```
 
 | 검증 | 기대 결과 |

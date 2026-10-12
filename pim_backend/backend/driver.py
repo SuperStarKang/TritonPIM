@@ -39,8 +39,7 @@ from .runtime import current_invocation, resident_lock
 
 # ── PIM_TIMING (임시): 마지막 launch의 단계별 시간(ms)과 그 단계 이름.
 # 지울 때 이 표시를 찾으면 된다. 두 target의 단계 이름이 다르므로 launch마다 다시 놓는다.
-UPMEM_TIMING_VERSION = 3  # Generated host ABI; resident reports are adjusted by the runtime.
-UPMEM_RESIDENT_TIMING_VERSION = 4
+UPMEM_TIMING_VERSION = 3  # Generated host ABI.
 _STAGE_NAMES = {
     # H2D/D2H: prepare+push. kernel: synchronous dpu_launch only.
     # Exclusive action timings; summing them never counts layout twice.
@@ -49,12 +48,9 @@ _STAGE_NAMES = {
               "layout_a", "layout_b", "layout_other", "layout_c"),
     "aimx": ("alloc", "build", "stage", "invoke", "unstage"),
 }
-UPMEM_RESIDENT_TIMING_STAGES = _STAGE_NAMES["upmem"] + ("program_load", "resident_host")
 TIMING_STAGES = _STAGE_NAMES["upmem"]
 TIMING_VERSION = UPMEM_TIMING_VERSION
 timing = [0.0] * len(TIMING_STAGES)
-# H2D role subtotals, already included in the resident h2d stage.
-resident_h2d_timing = None
 # 마지막 launch의 pim_exec 호출 수. aimx만 낸다(upmem은 0으로 둔다). execution tile 하나의
 # throughput은 invoke 시간을 이 값으로 나눠야 나오는데, host에서 tile 산술을 다시 하면
 # device 분할 규칙이 바뀔 때마다 어긋난다.
@@ -382,10 +378,9 @@ class PIMLauncher(object):
         # ── PIM_TIMING (임시): 생성된 host 코드가 단계별 시간을 전역 배열에 남긴다.
         # 성능 판단이 끝나면 이 블록과 위의 PIM_TIMING 정의, UPMEMToHost.cpp / AiMXToRuntimeStub.cpp의
         # 같은 표시를 지운다. 단계 이름은 target마다 다르므로 같이 놓는다.
-        global TIMING_STAGES, TIMING_VERSION, resident_h2d_timing, invokes
+        global TIMING_STAGES, TIMING_VERSION, invokes
         TIMING_STAGES = _STAGE_NAMES[self.pim_target]
         TIMING_VERSION = UPMEM_TIMING_VERSION if self.pim_target == "upmem" else None
-        resident_h2d_timing = None
         timing[:] = list((ctypes.c_double * len(TIMING_STAGES)).in_dll(lib, "pim_timing_ms"))
         # 이 전역은 AiMXToRuntimeStub.cpp만 낸다. upmem .so에서 in_dll을 부르면
         # ValueError로 launch 자체가 실패하므로 target을 보고 부른다.

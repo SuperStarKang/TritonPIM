@@ -71,26 +71,30 @@ KV API는 우선 CPU 저장소를 제공한다. 정적 shape, UPMEM, `p_k=1`, �
 Resident weight GEMM은 단일 instance·단일 M/N/K round로 제한한다.
 
 설계·상세 범위·검증 명령은 [모델 runtime 설계](../../design/ModelRuntime_Design.md),
-실행 예제는 [torch_model_session.py](examples/torch_model_session.py)를 참고한다.
+실행 예제는 [torch_model_session.py](examples/upmem/torch_model_session.py)를 참고한다.
 
-FX graph 전체의 weight를 UPMEM에 유지하는 별도 실행 경로는
-[ResidentBlock 사용법](RESIDENT.md)을 참고한다. 기존 lowering을 유지하며,
-모든 weight가 같은 전체 DPU 집합과 공용 입력·출력 scratch를 사용한다.
-`prepare_block()`은 `linear`/`addmm`를 먼저 정규화하고 각 `mm`을 PIM 구간으로 분리한다.
-Bias, scaling, reshape 등은 CPU 구간에서 처리한다.
-`examples/attention/torch_resident_attention.py`는 1024/4096 single-head FP32 attention의
-weight residency, 정확도와 준비/반복 실행 시간을 측정한다. 설정과 JSON 항목은
-[ResidentBlock 사용법](RESIDENT.md)의 attention 실험 항목에 설명되어 있다.
-`examples/transformer/torch_resident_transformer.py --layers 1`은 여기에 causal mask, RoPE,
-output projection, RMSNorm, residual, SwiGLU FFN을 포함한다. `--layers 2` 또는
-`--layers 4`로 서로 다른 weight를 가진 여러 block을 하나의 resident graph에서 실행한다.
-Normal orientation, FP32, 2048 DPU·16 tasklet을 사용하며, 준비 전 MRAM과 host weight
-capture 크기를 출력한다. 자세한 설정은 같은 문서의 Transformer stack 실험 항목에 있다.
+## Policy 우선 model compile
 
-INT8 성능 측정은 [examples/README.md](examples/README.md)의 세 benchmark를 사용한다.
-Attention kernel, projection을 포함한 Attention layer, FFN을 포함한 Transformer block을
-각각 실행하며, session alloc/free와 weight 준비, 반복 실행, partition profile을 분리한다.
-모델 정확도 비교나 checkpoint 로딩은 하지 않는다.
+`compile_model()`은 residency policy를 먼저 정하고, 그 policy의 제약 안에서만 stage
+config를 autotuning한 뒤, 장치 할당 없이 모든 stage를 컴파일한다. 반환된 session은
+open할 때 장치를 할당하고 컴파일된 stage를 결합한다. 같은 프로세스에서 실행한다.
+
+```python
+compiled = compile_model(layers, example_inputs, target="aimx", units=1,
+                         runtime_options={"base_fpga": 0})
+with compiled.session as session:
+    output = session.run_model(*inputs)
+```
+
+```text
+compile time  stage 분석 → 최소 footprint → policy (P-1/P-2/P-3)
+              → stage class별 제약 tune() (weight 상주 후 E 측정)
+              → 최속 조합 또는 DP → PIMSession.compile (할당 없음)
+runtime       open (할당, unit 수 확인, stage 결합) → run_model → close
+```
+
+설계와 식은 [Torch integration 설계](../../design/TorchIntegration.md), 실행 예제는
+[benchmark_aimx_model_compile.py](examples/aimx/benchmark_aimx_model_compile.py)를 참고한다.
 
 ## Common IR configuration
 
@@ -212,100 +216,9 @@ cmake --build /home/dlrkdals/TritonPIM/triton/build/cmake.linux-x86_64-cpython-3
 Python backend compile cache version도 변경했다. 재빌드 후 새 Python 프로세스에서 실행한다.
 driver는 네이티브 host의 timing version을 실행 전에 확인하고 버전이 다르면 중단한다.
 일반 UPMEM 실행은 `TIMING_STAGES` 순서의 13개 항목이며 AiMX의 5개 항목은 유지한다.
-Resident 실행은 runtime이 SDK H2D를 직접 측정하고 `program_load`, `resident_host`를
-분리한 15개 항목을 보고한다. `TIMING_VERSION`은 일반 UPMEM 실행에서 3,
-resident 실행에서 4이며 JSON에는 이 실행별 버전을 기록한다.
 생성 host의 ABI 검사에 쓰는 `UPMEM_TIMING_VERSION`은 3으로 유지한다.
 기존 `combine` 시간은 v3의 `layout_c + reduction`과 출력 쪽 `prepare`로 나뉜다.
 이전 JSON의 `stage/combine/host_alloc/host_free`는 당시 범위로 해석해야 한다.
-Attention profiler는 JSON에 `pim_timing_version`도 기록한다.
-
-`pim_backend/examples/pim_transpose_gemm.py`는 같은 `C=AB`를 계산하면서 Host B의
-저장 배치만 비교한다. `row_major`는 원래 B(stride `(N,1)`), `k_contiguous`는
-`B.T.contiguous().T`(같은 `[K,N]` 값, stride `(1,K)`)를 전달한다. A와 출력,
-GEMM 설정과 backend의 row-major `[Ktile,Ntile]` 타일 패킹은 두 경우에 동일하다.
-직접 Triton을 호출해 실제 stride를 전달하므로 Torch lowering의 contiguous 복사가 없다.
-
-각 layout에서 warm-up 3회 이후 10회 측정한 중앙값을 나란히 출력하고,
-모든 실행 결과를 동일한 CPU int32 reference와 정확히 비교한다.
-`input_transform`은 매 호출의 B 준비 시간(전치 버퍼 할당 포함), `layout_b`는
-native B 패킹 시간이다. `input_transform+layout_b`도 매 호출에서 합산한 뒤
-중앙값을 낸다. `launch_wall`은 입력 준비를 제외하고, `e2e`는 입력 준비와 launch를
-포함한다. native stage는 `launch_wall` 안에 포함되므로 이 값들을 다시 합산하지 않는다.
-출력 할당, 입력 생성, reference 계산과 정확도 검사는 측정에서 제외한다.
-
-block `(32,32,64)`, group `(1,1,1)`, partition `(4,16,1)`의 64 DPU를 사용한다.
-Host threads는 8, tasklet은 16, staging reuse는 켠다.
-
-| `(M,N,K)` | `(tile_m,tile_n,tile_k)` |
-|---|---|
-| `(512,512,512)` | `(4,1,8)` |
-| `(1024,4096,1024)` | `(8,8,16)` |
-| `(1024,8192,2048)` | `(8,16,32)` |
-
-각 shape는 padding 없이 한 round에 맞으며 split-K는 사용하지 않는다.
-backend가 준비된 환경에서 사용자가 실행한다:
-
-```bash
-python /home/dlrkdals/TritonPIM/triton_shared/pim_backend/examples/pim_transpose_gemm.py
-```
-
-## Attention 한 번의 실행을 표로 보기
-
-`examples/attention/profile_attention.py`는 Attention 전체를 `torch.compile(fullgraph=True)`로
-컴파일하고, 준비 호출 뒤 **한 번의 compiled 호출**에서 실행된 커널들을 표로 낸다.
-기본 범위는 head 하나이며 `--group G`로 KV head 하나를 공유하는 query head G개를
-함께 측정한다. 입력 Q/K/V는 int8, 최종 출력은 복원된 float32다. 출력 복원도 측정에
-포함된다. QKV/output projection, 입력 양자화, 전체 layer의 KV group loop는 포함하지 않는다.
-
-환경과 backend 빌드가 준비된 뒤 사용자가 직접 실행하는 명령:
-
-```bash
-conda activate pim_triton
-cd /home/dlrkdals/TritonPIM
-source set_env.sh
-UPMEM_PROFILE=backend=hw TRITON_ALWAYS_COMPILE=0 \
-  python triton_shared/pim_backend/torch_backend/examples/attention/profile_attention.py \
-  --seq 256 --head-dim 128 --causal --num-units 2048
-```
-
-`--num-units`는 장비의 사용 가능한 DPU 수에 맞춘다. 실제 활성 DPU 수는 QK/PV별로
-표에 나온다. 기본 `--warmup 1`은 컴파일과 초기 실행을 포함한 준비 호출이며 본 측정에서
-제외된다. 따라서 명령 한 번에 기본 준비 1회 + 측정 1회가 실행된다. 정확도 확인이나
-별도의 참조 실행은 자동 수행하지 않는다.
-
-출력 열은 `operator | shape | where | time (ms) | % total | dtype`이다.
-
-- 실제 생성된 `cpp_*` 함수와 PIM `.run` 호출을 감싼다. CPU 연산이 fusion되어 있으면
-  `fused` 한 행으로 표시한다. softmax 등의 개별 ATen 시간을 임의로 분배하지 않는다.
-- PIM shape는 `A @ B -> C`, CPU shape는 출력과 임시 버퍼를 포함한 tensor 인자들의
-  서로 다른 shape 목록이다. 정확한 인자 순서, dtype, stride는 JSON에 남는다.
-- QK/PV의 `CPU+UPMEM` 시간은 host launcher와 전송을 포함한다. 아래 별도 표의
-  `TIMING_STAGES`의 13개 항목은 각 PIM 행에 이미 포함된 세부 시간이다.
-  각 launch 직후 driver timing을 복사하므로 두 GEMM 모두 기록된다.
-- `kernel`에는 DPU 내부 DMA가 포함되고, `stage`에는 runtime의 DPU 확보/바이너리
-  재적재 비용도 들어갈 수 있다. QK/PV 교대 호출의 실제 비용을 그대로 측정한다.
-- `wrapper/alloc/tracing/other`는 총시간에서 계측한 커널 호출 시간을 뺀 값이다.
-  Python wrapper, 할당, 계측 기록 비용과 계측되지 않은 호출이 여기에 포함된다.
-  총시간은 계측이 추가된 실행의 wall time이며, 입력 생성과 출력/파일 저장은 제외한다.
-
-`--cache PATH`로 두 GEMM의 Torch autotune 결과를 사용한다. 없으면 heuristic seed이고,
-캐시를 지정했는데 해당 shape/target 항목이 없으면 오류다. `--cpu-threads`와
-`--host-threads`로 CPU 및 UPMEM host 작업의 스레드 수를 정할 수 있다.
-`--json attention.json`은 개별 커널, 선택 설정, 환경, 준비/전체 시간을 저장하고,
-`-v`는 원래 생성된 커널 이름과 PIM 설정도 출력한다.
-
-`--save-inputs /tmp/attention_s1024.npz`는 입력 생성 뒤, 준비/측정 전에 2-D
-`q/k/v/mask`를 저장한다. PIMLLM artifact의 `scripts/profile_attention_tvm.py`에
-`--inputs /tmp/attention_s1024.npz`와 동일한 seq/head-dim/group을 전달하면 같은
-데이터로 TVM Attention을 측정할 수 있다. TVM profiler는 내부 워밍업이 3회이므로
-비교할 때 Torch도 `--warmup 3`으로 맞춘다. TVM의 TOTAL은 내부 그래프 계측 구간이며,
-Torch의 TOTAL에는 Python 호출 경계 비용도 포함된다는 차이를 함께 기록한다.
-
-계측기는 로컬 Torch의 `PyCodeCache.modules`와 생성된 Python wrapper를 사용한다.
-warm-up 뒤 해당 모듈의 커널 참조만 임시 교체하고 호출 후 복원한다. Torch 내부 API가
-바뀌거나 측정 중 재컴파일되면 계측을 다시 맞춰야 한다. 기대한 PIM 2회가 기록되지
-않으면 결과를 정상 표로 출력하지 않고 진단한다.
 
 ## 역할별 파일
 
@@ -321,122 +234,17 @@ warm-up 뒤 해당 모듈의 커널 참조만 임시 교체하고 호출 후 복
 | `backend.py` | `torch.compile` backend entry |
 | `fx_analysis.py` | GEMM shape/dtype, weight 출처 분석 |
 | `fx_normalization.py` | `linear`/`addmm` 정규화와 원본 GEMM 대응 |
-| `resident.py` | 정규화된 FX graph 분할, 고정 weight 준비와 반복 실행 |
-| `layer.py` | 하드웨어 할당 없는 `compile_layer`, `LayerPlan`, runtime FX load/run 노드 |
+| `model.py` | weight freeze, `LayerPlan`, `build_layer_plan`: FX graph를 CPU/PIM stage partition으로 분할 |
+| `model_policy.py` | stage class 분석, footprint 추정, residency policy 판정과 제약 |
+| `model_compile.py` | 제약 autotuning, stage 측정, config 조합 선택, `compile_model` |
 | `../backend/runtime.py` | 공통 `RuntimeBackend` 계약과 요청 단위 `PIMSession` |
-| `../backend/upmem_adapter.py` | UPMEM artifact 준비, layer MRAM 교체, 명시적 자원 할당/해제 |
+| `../backend/upmem_adapter.py` | UPMEM 모델 경로: stage 배치·program 링크, DPU 할당/해제와 stage 결합 |
+| `../backend/upmem_artifact.py` | UPMEM stage의 MRAM binding 해석과 주소 고정 DPU program 링크 |
+| `../backend/aimx_adapter.py` | AiMX 모델 경로: FPGA 자원, stage 배치와 context 결합 |
 
-## 요청 단위 session과 Llama TTFT
+예제는 target별로 나뉜다: [examples/upmem](examples/upmem), [examples/aimx](examples/aimx).
+목록은 [examples/README.md](examples/README.md)에 있다.
 
-`examples/e2e/torch_llama_ttft.py`는 로컬 Llama-2-7b-hf를 FP32로 불러온 뒤
-각 layer의 7개 projection weight를 tensor별 absmax/128 scale로 INT8화한다.
-Batch 1, sequence 1024, 32개 layer의 prefill과 첫 greedy token ID 생성을 수행하며
-2048개 unit과 16개 UPMEM tasklet을 사용한다. Layer의 7개 projection과 head별
-QK/PV 64개는 PIM에서 INT8×INT8→INT32로 실행한다. Activation scale은 1/32,
-probability scale은 행별 max/127이다. 비선형 연산, embedding, 최종 RMSNorm,
-마지막 token의 lm_head와 KV cache는 CPU FP32다. QKV/epilogue fusion과
-후속 decode, calibration, HF CPU reference 정확도 검증은 포함하지 않는다.
-
-```text
-요청 전: weight INT8 양자화 + export + FX 분석/정규화 + PIM/CPU 컴파일 + ELF 링크
-         compile_layer(...) -> LayerPlan × 32 (DPU 할당/H2D 없음)
-
-요청:    tokenize -> PIMSession.__enter__ -> embedding
-                       │ alloc 1회
-                       v
-         LoadLayerWeights(0) -> ready_0 -> RunLayer(0) -> hidden_0, KV_0, done_0
-              ^                                                       │
-              │            LoadLayerWeights(1) <──────────────────────┘
-              │                    -> ready_1 -> RunLayer(1) -> ...
-              │                         ...
-         같은 전체 unit 집합     LoadLayerWeights(31) -> RunLayer(31)
-                                                      │
-                                    CPU norm -> lm_head -> argmax
-                                                      │ 첫 token ID: TTFT 종료
-                                           PIMSession.close -> free 1회
-```
-
-`LoadLayerWeights`와 `RunLayer`는 실제 실행되는 바깥 FX GraphModule의
-`call_module` 노드다. 바깥 그래프는 Python으로 실행하고, 안쪽 layer의 GEMM과
-CPU partition만 컴파일한다. load/run 모듈에는 `_is_impure=True`를 표시하고,
-이전 layer의 completion token을 다음 weight 교체의 입력으로 연결한다.
-session은 오래된 token, 다른 plan, 다른 thread의 실행을 거부한다.
-같은 plan의 완료 token은 다음 `run_layer`에도 사용할 수 있다. 이 경우 weight를
-다시 보내지 않는다. adapter의 `begin_run`은 실행 가능한 layer 상태를 확인한다.
-Activation은 한 호출 안의 Q/K/V와 gate/up을 포함해 모든 GEMM에서 전송한다.
-내용 비교와 검사용 host 복사본은 제거했으며 `activation_hits`는 항상 0이다.
-
-공통 코드에는 DPU handle이나 MRAM 주소가 없다. `RuntimeBackend`는
-컴파일 artifact 준비, 자원 open/close, layer 교체, kernel invocation, 누적
-통계를 정의한다. `PIMTargetSpec.common_profile.target`이 adapter를 선택한다.
-UPMEM adapter와 AiMX adapter가 있다. 두 adapter 모두 `PIMSession.prepare/run_model`
-모델 경로에서 공통 상주 정책(P-1/P-2/P-3, `backend/residency.py`)을 사용한다. AiMX
-adapter는 모델 경로만 지원하고 FPGA 단위 instance batch를 사용한다(`examples/aimx_model_session.py`, 설계는
-`design/ModelRuntime_Design.md`의 공통 상주 정책과 `design/AiMXTarget_Design.md` §19).
-그 밖의 target과 AiMX의 legacy layer API는 `NotImplementedError`로 종료한다.
-compiler의 3계층 lowering은 변경하지 않는다.
-
-UPMEM에서는 session open/close가 `upmem_session_open/close`를 거쳐
-`dpu_alloc/free`를 호출한다. layer 교체는 이전 native resident block의
-host 상태를 해제한 뒤 같은 DPU 집합에 새 block을 연결한다. layer의 모든
-weight와 공용 input/output scratch를 배치하고, 컴파일 때 링크한 MRAM 주소와
-capture 결과를 대조한 뒤 weight를 전송한다. 현재는 `p_k=1`, 한 scheduling
-round와 weight당 한 window를 요구한다. 실행 도중의 GEMM은 weight H2D를
-생략하지만, 기존 generated host 코드의 weight packing까지 생략하지는 않는다.
-
-모든 layer의 packed weight를 host에 보관하지 않는다. 각 load 노드에서 현재
-layer만 capture하고, upload 직후 native staging buffer를 해제한다. 원본 모델과
-각 plan의 contiguous/padded weight는 host에 계속 존재한다. 현재 배치의
-INT8 weight 복제량은 layer당 6.09375 GiB, 전체 요청 weight H2D는 195 GiB다.
-MRAM weight는 DPU당 layer 하나의 3.046875 MiB만 상주하며 scratch가 추가된다. 이는 최초 기준
-구현의 비용이며, layer 교체가 weight 전송 자체를 없애는 것은 아니다.
-
-기존 `prepare_block` 예제는 기존 lifecycle을 유지한다. 새 session 실험은
-독립 프로세스에서 실행한다. 이전 API가 남긴 implicit DPU 할당이 있는
-프로세스에서는 새 session이 소유권 충돌을 진단한다.
-
-backend 환경과 하드웨어 설정을 준비한 뒤 사용자가 직접 실행한다:
-
-```bash
-cd /home/dlrkdals/TritonPIM/triton_shared/pim_backend/torch_backend/examples
-python e2e/torch_llama_ttft.py \
-  --checkpoint /path/to/models--meta-llama--Llama-2-7b-hf/snapshots/SNAPSHOT \
-  --prompt-file e2e/prompt.txt
-```
-
-`prompt.txt`는 tokenizer의 특수 token을 포함해 1024 token 이상인 일반 텍스트다.
-처음 1024 token을 사용한다. 실행 결과는 `examples/e2e/llama_int8_ttft_report/`에 저장된다.
-
-| 결과 | 의미 |
-|---|---|
-| `request_fx.txt`, `.dot` | 실제 load/run 노드와 layer 사이 token/activation 의존성 |
-| `layer_N_export.txt`, `.dot` | GEMM shape와 weight 출처를 표시한 원본 FX |
-| `layer_N_partitions.txt`, `.dot` | PIM GEMM/CPU partition 실행 그래프 |
-| `report.json` | 준비 시간, TTFT, layer별 load/run 시간, 전송량, dtype과 양자화 설정 |
-
-`ttft_ms`는 tokenization 시작부터 첫 token ID의 `.item()`까지다. 자원 할당,
-layer별 capture/packing/upload, activation 전송, 계산, CPU 후처리를 포함한다.
-파일 읽기, 모델 로딩, weight 양자화, export/컴파일, 첫 token 이후 free는
-제외한다. `request_ms_including_close`에는 free까지 포함된다.
-`weight_load_ms` 안에 `capture_ms`와 `upload_ms`가 포함되므로 중복 합산하지 않는다.
-capture에는 native packing 등이, upload에는 최초 program load와 weight H2D가
-포함된다. `upload_breakdown_ms`는 upload 시간을 실제 SDK `h2d`, `program_load`,
-나머지 `resident_host`로 나눈다. run 시간은 layer의 CPU 연산과 host 처리, 전송,
-PIM 연산 전체다. TTFT 보고서의 `activation_transfer_policy`는 `always`이며
-각 layer의 `run_transfers.activation_hits`는 0이다. 보고서는
-`gemm_dtype="int8 x int8 -> int32"`, `cpu_dtype="float32"`,
-`lm_head_scope="last_token_only"`, `accuracy_checked=false`를 기록한다.
-Resident H2D v4의 상세 정의는 [실험 안내](examples/README.md)에 있다.
-
-측정 중 Dynamo 재컴파일은 오류로 처리한다. 측정 후 allocation/free 1회씩,
-2272번의 실제 PIM launch, 모든 layer의 run 구간 weight H2D=0을 검사한다.
-CPU KV cache는 layer당 `[1,32,1024,128]` K/V이며 총 1 GiB다. 실행 통계를
-저장하고 자원 수명과 전송 카운터를 확인한 뒤
-`TTFT execution complete: resources=1/1 launches=2272 run_weight_h2d=0 activation_hits=0 gemm_dtype=int8->int32`을 출력한다.
-
-PIMLLM 원본은 KL calibration과 warm-up 후 `gm.run()` 시간을 사용하며 전체
-sequence의 lm_head를 계산한다. 현재 경로는 같은 GEMM dtype의 성능 실험이며,
-PIMLLM과 전체 시간을 비교하려면 모델·lm_head 범위와 측정 경계도 맞춰야 한다.
 
 ## 현재 지원 범위
 

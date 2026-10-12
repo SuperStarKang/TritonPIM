@@ -25,9 +25,8 @@ from .execution import PIMExecution, resolve_execution
 from .runtime_compat import set_driver_to_backend
 from .scheduling import PIMCombinedScheduling
 from .template import pim_gemm_template
-from .resident import ResidentBlock, ResidentGemmConfig, benchmark_resident_plans, prepare_block
-from .layer import LayerPlan, LoadLayerWeights, RunLayer, compile_layer
-from .model import build_layer_plan
+from .model import LayerPlan, build_layer_plan
+from .model_compile import CompiledModel, compile_model
 from triton.backends.pim.runtime import PIMSession
 
 __all__ = [
@@ -43,14 +42,9 @@ __all__ = [
     "set_driver_to_backend",
     "target_spec",
     "validate_pim_options",
-    "ResidentBlock",
-    "ResidentGemmConfig",
-    "benchmark_resident_plans",
-    "prepare_block",
     "PIMSession",
     "LayerPlan",
-    "LoadLayerWeights",
-    "RunLayer",
-    "compile_layer",
     "build_layer_plan",
+    "CompiledModel",
+    "compile_model",
 ]

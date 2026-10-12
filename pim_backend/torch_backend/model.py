@@ -1,10 +1,12 @@
 """FX layer planning and synchronous multi-instance GEMM execution."""
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import operator
 
 import torch
 from torch import fx
+from torch.export.graph_signature import InputKind, OutputKind
+from torch.fx.operator_schemas import normalize_function
 from torch.fx.passes.split_module import split_module
 from torch.utils import _pytree
 
@@ -12,8 +14,113 @@ from ._autotuner import PIMProblem
 from .backend import PIMInductorBackend
 from .execution import select_layer_config
 from .fx_normalization import normalize_fx_gemms
-from .layer import LayerPlan
-from .resident import _freeze_graph, _gemm_operands, _tensor_signature
+
+
+# weight에서 출발해 weight만 읽는 view/copy는 freeze 시 미리 계산해 상수로 둔다.
+_WEIGHT_VIEWS = frozenset((
+    torch.ops.aten.t.default,
+    torch.ops.aten.transpose.int,
+    torch.ops.aten.permute.default,
+    torch.ops.aten.view.default,
+    torch.ops.aten.reshape.default,
+    torch.ops.aten.contiguous.default,
+    torch.ops.aten.clone.default,
+    torch.ops.aten.detach.default,
+    torch.ops.aten._to_copy.default,
+))
+
+
+def _freeze_graph(exported_program):
+    """Replace parameters, buffers and their weight-only views with graph constants.
+
+    Returns the frozen GraphModule and, per constant node, the frozen tensor.
+    """
+    if any(spec.kind != OutputKind.USER_OUTPUT
+           for spec in exported_program.graph_signature.output_specs):
+        raise ValueError("model layers require an inference graph without input or buffer mutation")
+    graph = fx.Graph()
+    root = torch.nn.Module()
+    copied = {}
+    values = {}
+    frozen = {}
+    inputs = {spec.arg.name: spec for spec in exported_program.graph_signature.input_specs}
+    for node in exported_program.graph_module.graph.nodes:
+        value = None
+        if node.op == "placeholder":
+            spec = inputs[node.name]
+            if spec.kind in (InputKind.PARAMETER, InputKind.BUFFER):
+                table = (exported_program.constants
+                         if spec.kind == InputKind.BUFFER and spec.persistent is False
+                         else exported_program.state_dict)
+                value = table[spec.target]
+            elif spec.kind == InputKind.CONSTANT_TENSOR:
+                value = exported_program.constants[spec.target]
+            elif spec.kind != InputKind.USER_INPUT:
+                raise ValueError(f"unsupported exported input kind: {spec.kind}")
+            if value is not None:
+                if not isinstance(value, torch.Tensor) or value.device.type != "cpu":
+                    raise ValueError(f"frozen input {spec.target!r} must be a CPU tensor")
+                value = value.detach()
+        elif node.op == "call_function" and node.target in _WEIGHT_VIEWS:
+            dependencies = list(node.all_input_nodes)
+            if dependencies and all(dependency in values for dependency in dependencies):
+                value = node.target(*fx.map_arg(node.args, values.__getitem__),
+                                    **fx.map_arg(node.kwargs, values.__getitem__))
+        elif node.op == "get_attr":
+            raise ValueError("model layers expect the lifted graph of a torch.export.ExportedProgram")
+
+        if value is not None:
+            root.register_buffer("resident_" + node.name, value)
+            replacement = graph.get_attr("resident_" + node.name)
+            replacement.name = node.name
+            replacement.meta = node.meta.copy()
+            copied[node] = replacement
+            values[node] = value
+            frozen[replacement] = value
+        else:
+            copied[node] = graph.node_copy(node, copied.__getitem__)
+    return fx.GraphModule(root, graph), frozen
+
+
+def _gemm_operands(node):
+    arguments = normalize_function(
+        node.target, node.args, dict(node.kwargs),
+        normalize_to_only_use_kwargs=True,
+    )
+    if arguments is None:
+        raise ValueError(f"{node.name}: cannot resolve GEMM arguments")
+    return arguments.kwargs["input"], arguments.kwargs["mat2"]
+
+
+@dataclass
+class LayerPlan:
+    """One Torch block split into CPU partitions and PIM stages."""
+
+    index: int
+    graph: fx.GraphModule
+    output_spec: object
+    stages: tuple
+    example_inputs: tuple
+    exported_graph: fx.GraphModule
+    spec: object = None
+    backend_plan: object = None
+    weight_bytes_per_unit: int = 0
+
+    def plan_model(self, spec, runtime):
+        self.spec = spec
+        for stage in self.stages:
+            stage.prepare(spec, runtime)
+
+    def compile_cpu(self):
+        leaves, _ = _pytree.tree_flatten((self.example_inputs, {}))
+        outputs = CompileModelCPU(self.graph).run(*leaves)
+        return _pytree.tree_unflatten(list(outputs), self.output_spec)
+
+    def run_model(self, *inputs):
+        leaves, _ = _pytree.tree_flatten((inputs, {}))
+        with torch.no_grad():
+            outputs = self.graph(*leaves)
+        return _pytree.tree_unflatten(list(outputs), self.output_spec)
 
 
 class _LayerGemm(torch.nn.Module):
@@ -115,13 +222,13 @@ def build_layer_plan(exported_program, example_inputs, *, configs, index):
     GEMMs of the same shape/config are grouped; weight GEMMs remain stationary
     single-instance stages. aten.bmm uses its explicit operand batch dimension.
     """
-    leaves, specification = _pytree.tree_flatten((example_inputs, {}))
+    _, specification = _pytree.tree_flatten((example_inputs, {}))
     if specification != exported_program.call_spec.in_spec:
         raise ValueError("example_inputs must match the exported positional inputs")
     normalized, mappings = normalize_fx_gemms(exported_program, allow_bmm=True)
     if set(configs) != {mapping.original.node for mapping in mappings}:
         raise ValueError("configs must contain every original GEMM exactly once")
-    frozen_graph, frozen, states = _freeze_graph(normalized)
+    frozen_graph, frozen = _freeze_graph(normalized)
     mappings_by_name = {mapping.normalized.node: mapping for mapping in mappings}
     depths = {}
     groups = {}
@@ -195,9 +302,6 @@ def build_layer_plan(exported_program, example_inputs, *, configs, index):
     split = split_module(grouped, grouped, partitions.__getitem__,
                          keep_original_order=True, keep_original_node_name=True)
     return LayerPlan(
-        index, None, split, None, states, specification, exported_program.call_spec.out_spec,
-        tuple(_tensor_signature(value) if isinstance(value, torch.Tensor) else value for value in leaves),
-        tuple(isinstance(value, torch.Tensor) for value in leaves),
-        stages=tuple(stages), example_inputs=tuple(example_inputs),
-        exported_graph=exported_program.graph_module,
+        index, split, exported_program.call_spec.out_spec, tuple(stages),
+        tuple(example_inputs), exported_program.graph_module,
     )

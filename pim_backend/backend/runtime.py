@@ -1,8 +1,8 @@
-"""Vendor-neutral lifecycle for compiled layers and request-scoped resources."""
+"""Vendor-neutral lifecycle of compiled model layers and their device resources."""
 
 from contextlib import ExitStack
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from threading import RLock, get_ident
 import time
 from typing import Protocol
@@ -11,45 +11,34 @@ from .residency import plan_residency
 
 
 current_invocation = ContextVar("pim_invocation", default=None)
-current_layer = ContextVar("pim_layer", default=None)
 current_session = ContextVar("pim_session", default=None)
+# UPMEM DPU 집합은 프로세스 전역이다. session과 직접 launch가 동시에 쓰지 않게 한다.
 resident_lock = RLock()
 
 
 class RuntimeBackend(Protocol):
-    """Synchronous adapter contract for model and legacy layer execution.
+    """Synchronous adapter contract of the model path.
 
-    open exposes the actual num_units. begin_model creates the target execution
-    runtime. prepare_model places the planned layers on those resources and
-    finalizes their shared weight/scratch layout and native artifacts.
+    begin_model creates the target model runtime. resources() reports the spec's
+    unit count and capacity; requirements(plans) reports per-stage bytes for the
+    common residency policy; prepare_model(plans, residency) places the layers
+    and links native artifacts. None of these touch the device, so a model can
+    be compiled before open().
 
-    Legacy compile_invocation/finalize_plan must not allocate device resources or
-    perform transfers. load_layer replaces the previous placement on the same
-    resources and returns timing fields in milliseconds. invocation returns a
-    context manager; stats contains cumulative transfer bytes and launch counts
-    across layer replacements. begin_run validates the loaded plan before each
-    execution. Activations are sent for every GEMM; weights remain resident.
-    close releases resources.
-
-    The model path is driven by the common residency policy: the adapter reports
-    resources() and requirements(plans), takes the chosen plan in
-    prepare_model(plans, residency), returns weight_table(plans), and its model
-    runtime implements enter_layer/exit_layer.
+    open() allocates the units and exposes num_units. bind_model(plans) creates
+    the per-stage device handles, weight_table(plans) reports weight placement,
+    and the model runtime implements enter_layer/run/exit_layer. stats contains
+    cumulative transfer bytes and launch counts. close releases resources.
     """
 
-    def validate_config(self, config): ...
-    def compile_invocation(self, kernel, physical_inputs): ...
-    def finalize_plan(self, plan): ...
     def open(self): ...
     num_units: int
     def begin_model(self): ...
     def resources(self): ...
     def requirements(self, plans): ...
     def prepare_model(self, plans, residency): ...
+    def bind_model(self, plans): ...
     def weight_table(self, plans): ...
-    def load_layer(self, plan): ...
-    def begin_run(self, plan): ...
-    def invocation(self, kernel, physical_inputs): ...
     def stats(self) -> dict: ...
     def close(self): ...
 
@@ -68,29 +57,18 @@ def create_runtime(spec) -> RuntimeBackend:
     )
 
 
-@dataclass(frozen=True, eq=False)
-class ExecutionToken:
-    session: object
-    generation: int
-    completed: bool
-
-
 class PIMSession:
     """Own model resources, layer weights and KV storage until close.
 
-    prepare creates LayerPlans from Torch blocks after acquiring resources.
-    run_model executes those plans without completion tokens.
-    start/load_weights/run_layer retain the legacy compiled-layer API.
+    compile() prepares Torch blocks before open; entering the session then
+    allocates and binds them. prepare() does both inside an open session.
+    run_model executes the prepared layers in order.
     """
 
     def __init__(self, spec):
         self.spec = spec
         self.backend = None
         self.phase = "new"
-        self.plan = None
-        self.token = None
-        self.generation = 0
-        self.records = []
         self.open_ms = 0.0
         self.close_ms = 0.0
         self.layers = ()
@@ -100,13 +78,23 @@ class PIMSession:
         self.residency = None
 
     def __enter__(self):
-        if self.phase != "new" or current_session.get() is not None:
+        if self.phase not in ("new", "compiled") or current_session.get() is not None:
             raise RuntimeError("a PIMSession must be opened once and cannot be nested")
         start = time.perf_counter_ns()
-        self.backend = create_runtime(self.spec)
+        if self.backend is None:
+            self.backend = create_runtime(self.spec)
         with ExitStack() as cleanup:
             self.backend.open()
             cleanup.callback(self.backend.close)
+            if self.phase == "compiled":
+                # compile time의 artifact와 배치는 그 unit 수를 전제로 만들었다.
+                compiled_units = self.spec.common_profile.num_units
+                if self.backend.num_units != compiled_units:
+                    raise ValueError(
+                        f"the model was compiled for {compiled_units} units; "
+                        f"{self.backend.num_units} were allocated")
+                self.backend.bind_model(self.layers)
+                self.weight_table = self.backend.weight_table(self.layers)
             token = current_session.set(self)
             cleanup.callback(current_session.reset, token)
             self.cleanup = cleanup.pop_all()
@@ -119,18 +107,38 @@ class PIMSession:
         self.open_ms = (time.perf_counter_ns() - start) / 1e6
         return self
 
+    def compile(self, layers, example_inputs, *, configure):
+        """Compile time: prepare Torch blocks without allocating device resources.
+
+        The session keeps the compiled layers; entering it allocates the units,
+        checks their count against the spec and binds the compiled stages.
+        """
+        if self.phase != "new" or self.backend is not None:
+            raise RuntimeError("compile a PIMSession once, before opening it")
+        self.backend = create_runtime(self.spec)
+        self._build(layers, example_inputs, configure)
+        self.phase = "compiled"
+        return self.layers
+
     def prepare(self, layers, example_inputs, *, configure):
         """Export and prepare Torch blocks on the session's allocated resources.
 
         configure(gemms, spec) maps original FX GEMM names to PIMTorchConfig.
         CPU preparation outputs supply the next block's positional inputs.
         """
+        self._check_owner()
+        self._build(layers, example_inputs, configure)
+        self.backend.bind_model(self.layers)
+        self.weight_table = self.backend.weight_table(self.layers)
+        return self.layers
+
+    def _build(self, layers, example_inputs, configure):
+        """Export, configure, compile and place the layers; no device access."""
         import torch
 
         from torch_backend.fx_analysis import analyze_fx_gemms
         from torch_backend.model import build_layer_plan
 
-        self._check_owner()
         layers = tuple(layers)
         if not layers:
             raise ValueError("a model requires at least one layer")
@@ -153,12 +161,6 @@ class PIMSession:
         self.residency = plan_residency(
             self.backend.resources(), self.backend.requirements(self.layers))
         self.backend.prepare_model(self.layers, self.residency)
-        self.weight_table = self.backend.weight_table(self.layers)
-        return self.layers
-
-    @property
-    def loaded_program(self):
-        return self.backend.model.loaded_program
 
     def run_model(self, *inputs):
         """Chain prepared blocks; tuple outputs become the next block's inputs."""
@@ -207,70 +209,6 @@ class PIMSession:
         if current_session.get() is not self or get_ident() != self.thread:
             raise RuntimeError("PIMSession must be used by its owning thread and context")
 
-    def start(self):
-        self._check_owner()
-        if self.phase != "idle" or self.token is not None:
-            raise RuntimeError("the request has already started")
-        self.token = ExecutionToken(self, 0, True)
-        return self.token
-
-    def load_weights(self, plan, previous):
-        self._check_owner()
-        if (self.phase != "idle" or self.token is None
-                or previous is not self.token or not previous.completed):
-            raise RuntimeError("weight replacement requires the previous completion token")
-        if plan.spec != self.spec:
-            raise ValueError("layer and session target specifications differ")
-        plan.check_state()
-        self.phase = "loading"
-        before = self.backend.stats()
-        start = time.perf_counter_ns()
-        timings = self.backend.load_layer(plan)
-        elapsed = (time.perf_counter_ns() - start) / 1e6
-        after = self.backend.stats()
-        self.records.append({
-            "layer": plan.index,
-            "weight_load_ms": elapsed,
-            **timings,
-            "load_transfers": {name: after[name] - before[name] for name in before},
-        })
-        self.plan = plan
-        self.generation += 1
-        self.token = ExecutionToken(self, self.generation, False)
-        self.phase = "ready"
-        return self.token
-
-    def run_layer(self, plan, inputs, ready):
-        self._check_owner()
-        if (self.phase not in ("ready", "idle") or self.plan is None
-                or ready is not self.token or plan is not self.plan):
-            raise RuntimeError("layer execution requires its latest token and resident plan")
-        if current_layer.get() is not None:
-            raise RuntimeError("nested layer execution is unsupported")
-        self.phase = "running"
-        before = self.backend.stats()
-        start = time.perf_counter_ns()
-        self.backend.begin_run(plan)
-        with ExitStack() as scope:
-            scope.callback(current_layer.reset, current_layer.set((self, plan, ready)))
-            outputs = plan.run(*inputs)
-        elapsed = (time.perf_counter_ns() - start) / 1e6
-        after = self.backend.stats()
-        transfers = {name: after[name] - before[name] for name in before}
-        if transfers["weight_bytes"] != 0:
-            raise RuntimeError("a layer execution transferred weights after its load node")
-        self.records[-1].update(run_ms=elapsed, run_transfers=transfers)
-        self.token = ExecutionToken(self, self.generation, True)
-        self.phase = "idle"
-        return outputs, self.token
-
-    def invocation(self, kernel, physical_inputs, ready):
-        self._check_owner()
-        if (self.phase != "running" or ready is not self.token
-                or kernel.runtime is not self.plan.runtime):
-            raise RuntimeError("kernel does not belong to the executing layer")
-        return self.backend.invocation(kernel, physical_inputs)
-
     def stats(self):
         if self.backend is None:
             raise RuntimeError("PIMSession has not been opened")
@@ -286,7 +224,6 @@ class PIMSession:
         self.cleanup.close()
         self.close_ms = (time.perf_counter_ns() - start) / 1e6
         self.phase = "closed"
-        self.plan = None
         self.layers = ()
         self.weight_table.clear()
         self.kv_table.clear()

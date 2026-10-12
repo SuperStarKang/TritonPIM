@@ -79,6 +79,10 @@ def aimx_runtime_allocations(problem, target, config):
 class TargetModel:
     """Target-neutral defaults: logical footprint, no padding, any mapping."""
 
+    # True면 activation input/output buffer를 모든 stage가 같은 영역으로 공유한다.
+    # False면 stage마다 자기 buffer를 가져 state로 상주한다.
+    shared_activation_scratch = False
+
     def __init__(self, target):
         self.target = target
         self.profile = target.common_profile
@@ -135,6 +139,9 @@ class TargetModel:
 
 
 class UPMEMModel(TargetModel):
+    # 모든 stage가 MRAM의 같은 input/output 영역을 쓴다 (upmem_model.place).
+    shared_activation_scratch = True
+
     def group_reason(self, problem, extent):
         runtime = self.target.runtime_config
         assert isinstance(runtime, UPMEMRuntimeConfig)

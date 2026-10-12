@@ -5,10 +5,13 @@ from .types import AXES, ceil_div
 
 
 class ConstraintEngine:
-    def __init__(self, problem, target):
+    def __init__(self, problem, target, constraint=None):
         self.problem = problem
         self.target = target
         self.model = target_model(target)
+        # constraint(problem, config) -> 거부 사유 문자열 또는 None. 정적 검사를 모두
+        # 통과한 config에만 부른다 (예: residency policy가 정한 weight stage 조건).
+        self.constraint = constraint
 
     def check(self, config):
         problem = self.problem
@@ -100,7 +103,10 @@ class ConstraintEngine:
             return (
                 f"p_m*p_n*p_k({active_units})가 num_units"
                 f"({model.num_units})를 넘는다")
-        return model.mapping_reason(problem, partitions)
+        reason = model.mapping_reason(problem, partitions)
+        if reason is not None or self.constraint is None:
+            return reason
+        return self.constraint(problem, config)
 
     def valid(self, config):
         return self.check(config) is None

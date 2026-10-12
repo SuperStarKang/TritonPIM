@@ -229,10 +229,12 @@ def rank_with_diversity_penalty(scored, count, diversity_weight):
 def tune(problem, target, benchmark_fn, *, space=None, cache=None,
          budget=None, seed=0, initial_random=6, search_copies=5,
          select_per_generation=8, good_quantile=0.1,
-         diversity_weight=0.2, retune=False, verbose=False):
+         diversity_weight=0.2, retune=False, verbose=False,
+         constraint=None, initial=()):
+    """constraint는 ConstraintEngine에 더하는 검사, initial은 가장 먼저 측정할 config들이다."""
     spec = space if space is not None else build_config_space(problem, target)
     budget = budget if budget is not None else SearchBudget()
-    engine = ConstraintEngine(problem, target)
+    engine = ConstraintEngine(problem, target, constraint=constraint)
     model = target_model(target)
     partitions = legal_partitions(problem, target, spec)
     rng = random.Random(seed)
@@ -332,7 +334,7 @@ def tune(problem, target, benchmark_fn, *, space=None, cache=None,
     structured_configs = structured_valid_configs(
         problem, target, spec, initial_random, rng, engine)
     warm = cache.lookup_similar(problem, target) if cache is not None else []
-    population = seeds[:1] + warm + seeds[1:] + structured_configs
+    population = list(initial) + seeds[:1] + warm + seeds[1:] + structured_configs
 
     for config in population:
         if config.key() in seen or not engine.valid(config):

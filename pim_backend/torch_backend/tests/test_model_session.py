@@ -6,7 +6,7 @@ from triton.backends.pim.residency import LAYER
 
 from torch_backend import PIMSession, PIMTorchConfig, target_spec
 from torch_backend._autotuner import PIMConfig
-from torch_backend.examples.torch_model_session import HeadBlock
+from torch_backend.examples.upmem.torch_model_session import HeadBlock
 
 
 def test_model_owns_resources_and_kv_across_layer_replacements():

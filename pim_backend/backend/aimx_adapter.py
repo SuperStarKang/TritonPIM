@@ -9,9 +9,6 @@ import ctypes
 from .residency import UnitResources
 
 
-_LEGACY = "AiMX supports only the PIMSession model path (prepare/run_model)"
-
-
 class AiMXAdapter:
     def __init__(self, spec):
         from .driver import _aimx_resident_runtime_path
@@ -34,24 +31,6 @@ class AiMXAdapter:
         self.visible_fpgas = 0
         self.num_units = 0
 
-    def validate_config(self, config):
-        raise NotImplementedError(_LEGACY)
-
-    def compile_invocation(self, kernel, physical_inputs):
-        raise NotImplementedError(_LEGACY)
-
-    def finalize_plan(self, plan):
-        raise NotImplementedError(_LEGACY)
-
-    def load_layer(self, plan):
-        raise NotImplementedError(_LEGACY)
-
-    def begin_run(self, plan):
-        raise NotImplementedError(_LEGACY)
-
-    def invocation(self, kernel, physical_inputs):
-        raise NotImplementedError(_LEGACY)
-
     def open(self):
         if self.visible_fpgas:
             raise RuntimeError("AiMX adapter cannot be opened twice")
@@ -65,9 +44,10 @@ class AiMXAdapter:
         self.num_units = requested
 
     def resources(self):
+        # compile time에도 부른다. unit 수는 spec이 정하고 open()이 같은 수를 확보한다.
         profile = self.spec.common_profile
         return UnitResources(
-            self.num_units, profile.banks_per_unit * profile.bank_capacity_limit_bytes)
+            profile.num_units, profile.banks_per_unit * profile.bank_capacity_limit_bytes)
 
     def begin_model(self):
         from .aimx_model import AiMXModelRuntime
@@ -81,6 +61,9 @@ class AiMXAdapter:
 
     def prepare_model(self, plans, residency):
         self.model.place(plans, residency)
+
+    def bind_model(self, plans):
+        self.model.bind(plans)
 
     def weight_table(self, plans):
         return self.model.weight_table(plans)

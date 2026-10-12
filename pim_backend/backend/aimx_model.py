@@ -43,7 +43,7 @@ class ModelCompileInvocation:
         return False
 
     def launch(self, launcher, bundle, entry, grid, arguments):
-        from .driver import _build_aimx_model_so
+        from .driver import _STAGE_NAMES, _build_aimx_model_so
 
         if launcher.pim_target != "aimx":
             raise ValueError("AiMX model compilation received a different target")
@@ -58,6 +58,9 @@ class ModelCompileInvocation:
             for pointer in launcher.arg_is_pointer
         ] + [ctypes.c_int32] * 3
         stage.function.restype = None
+        stage.timing_names = _STAGE_NAMES["aimx"]
+        stage.last_native_ms = dict.fromkeys(stage.timing_names, 0.0)
+        stage.last_pim_exec = 0
 
         library = stage.library
         slots = ctypes.c_uint32.in_dll(library, "pim_model_slot_count").value
@@ -101,7 +104,7 @@ class AiMXModelRuntime:
     def __init__(self, adapter):
         self.library = adapter.library
         self.base_fpga = adapter.spec.runtime_config.base_fpga
-        self.units = adapter.num_units
+        self.units = adapter.spec.common_profile.num_units
         self.stages = []
         self.policy = None
         self.loaded = set()
@@ -128,8 +131,6 @@ class AiMXModelRuntime:
     def place(self, plans, residency):
         self.policy = residency.policy
         for plan in plans:
-            for stage in plan.stages:
-                self._create_stage(stage)
             plan.weight_bytes_per_unit = sum(self._bytes(stage, True) for stage in plan.stages)
             plan.backend_plan = {
                 "policy": residency.policy,
@@ -137,6 +138,12 @@ class AiMXModelRuntime:
                 "state_bytes": sum(self._bytes(stage, False) for stage in plan.stages),
                 "bytes_per_unit": residency.bytes_per_unit,
             }
+
+    def bind(self, plans):
+        """Runtime: create the FPGA contexts of every placed stage."""
+        for plan in plans:
+            for stage in plan.stages:
+                self._create_stage(stage)
 
     def _create_stage(self, stage):
         jobs = stage.p_b * stage.devices
@@ -173,6 +180,11 @@ class AiMXModelRuntime:
         ]
         stage.call.upload = int(upload)
         stage.function(ctypes.byref(stage.call), *call_arguments)
+        # stub이 호출마다 0으로 두고 누적한 native 시간. FPGA thread마다 따로 재서 더하므로
+        # 여러 FPGA가 동시에 일하면 합이 wall time보다 클 수 있다(device 시간의 합).
+        timing = (ctypes.c_double * len(stage.timing_names)).in_dll(stage.library, "pim_timing_ms")
+        stage.last_native_ms = dict(zip(stage.timing_names, timing))
+        stage.last_pim_exec = ctypes.c_uint64.in_dll(stage.library, "pim_invoke_count").value
 
     def enter_layer(self, plan):
         if plan.index in self.loaded:
