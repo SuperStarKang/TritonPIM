@@ -54,7 +54,8 @@ def aimx_runtime_allocations(problem, target, config):
     physical_n = _round_up(useful_n, 4096)
     computed_n = _round_up(useful_n, 4096 // batch)
     physical_k = _round_up(useful_k, 256)
-    padded_k = _round_up(useful_k, 4096)
+    # A의 K 저장 pitch (lowering의 matmul-k-alignment, 0이면 4096/batch).
+    padded_k = _round_up(useful_k, runtime.matmul_k_alignment or 4096 // batch)
 
     rows = physical_m // batch
     cols = computed_n * batch // 4096

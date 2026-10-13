@@ -88,6 +88,7 @@ def pim_launch_options(config, target):
         options.update(
             batch=runtime.batch,
             base_fpga=runtime.base_fpga,
+            aimx_matmul_k_alignment=runtime.matmul_k_alignment,
         )
     return options
 

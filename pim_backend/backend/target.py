@@ -53,6 +53,8 @@ class UPMEMRuntimeConfig(PIMTargetRuntimeConfig):
 class AiMXRuntimeConfig(PIMTargetRuntimeConfig):
     batch: int
     base_fpga: int
+    # GEMM A의 K 저장 pitch (BF16 원소). lowering의 matmul-k-alignment와 같고 0은 4096/batch.
+    matmul_k_alignment: int
 
 
 @dataclass(frozen=True)
@@ -99,7 +101,7 @@ def aimx_target_spec(*, num_units=0, banks_per_unit=0,
                      cores_per_bank=0, lanes_per_core=16,
                      bank_capacity_limit_bytes=0,
                      local_capacity_limit_bytes=0,
-                     batch=8, base_fpga=0):
+                     batch=8, base_fpga=0, matmul_k_alignment=0):
     return PIMTargetSpec(
         common_profile=PIMTargetProfile(
             target="aimx",
@@ -114,6 +116,7 @@ def aimx_target_spec(*, num_units=0, banks_per_unit=0,
         runtime_config=AiMXRuntimeConfig(
             batch=batch,
             base_fpga=base_fpga,
+            matmul_k_alignment=matmul_k_alignment,
         ),
     )
 

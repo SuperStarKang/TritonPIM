@@ -52,12 +52,13 @@ public:
                  pim::TargetProfileAttr profile, int64_t batch,
                  int64_t matvecRowAlignment, bool matvecFirstNOnly,
                  int64_t matmulRowAlignment, bool matmulUsefulNOnly,
-                 bool persistent, unsigned site)
+                 int64_t matmulKAlignment, bool persistent, unsigned site)
       : module(module), device(device), profile(profile), batch(batch),
         matvecRowAlignment(matvecRowAlignment),
         matvecFirstNOnly(matvecFirstNOnly),
         matmulRowAlignment(matmulRowAlignment),
-        matmulUsefulNOnly(matmulUsefulNOnly), persistent(persistent),
+        matmulUsefulNOnly(matmulUsefulNOnly),
+        matmulKAlignment(matmulKAlignment), persistent(persistent),
         prefix((device->getParentOfType<func::FuncOp>().getName() +
                 "_device" + Twine(site)).str()),
         setup(module.getContext()), code(module.getContext()), loc(device.getLoc()) {}
@@ -161,6 +162,7 @@ private:
   bool matvecFirstNOnly;
   int64_t matmulRowAlignment;
   bool matmulUsefulNOnly;
+  int64_t matmulKAlignment;
   bool persistent;
   std::string prefix;
   unsigned symbol = 0;
@@ -411,8 +413,10 @@ private:
         columnAlignment = matvecRowAlignment;
       if (isa<linalg::MatmulOp>(op) && matmulRowAlignment != 0)
         columnAlignment = matmulRowAlignment;
+      // A의 K 저장 pitch. MAC은 K를 256 단위로만 채운 Arel을 읽으므로 계산 순서와 무관하다.
+      int64_t kAlignment = isa<linalg::MatmulOp>(op) ? matmulKAlignment : aimx::kLanes;
       if (!aimx::checkedRoundUp(a.rows, batch, a.rows) ||
-          !aimx::checkedRoundUp(a.cols, aimx::kLanes, a.cols) ||
+          !aimx::checkedRoundUp(a.cols, kAlignment, a.cols) ||
           !aimx::checkedRoundUp(b.rows, aimx::kRegSize, b.rows) ||
           !aimx::checkedRoundUp(b.cols, columnAlignment, b.cols) ||
           !aimx::checkedRoundUp(out.rows, batch, out.rows) ||
@@ -1476,6 +1480,15 @@ struct ConvertPIMToAiMXPass
       module.emitError("AiMX matmul row alignment must be zero or a positive multiple of 4096/batch");
       return signalPassFailure();
     }
+    // A gather는 256 원소씩 읽고, batch행 묶음은 4096 원소(8 KiB) 단위로 연속이어야 한다.
+    // 0은 이 조건을 만족하는 가장 작은 값 4096/batch이다.
+    int64_t kAlignment = matmulKAlignment == 0 ? aimx::kLanes / batch : int64_t(matmulKAlignment);
+    if (kAlignment <= 0 || kAlignment % aimx::kRegSize != 0 ||
+        (kAlignment * batch) % aimx::kLanes != 0) {
+      module.emitError("AiMX matmul K alignment must be 0 or a positive multiple of 256 whose "
+                       "product with batch is a multiple of 4096");
+      return signalPassFailure();
+    }
     WalkResult unplanned = module.walk([&](pim::DeviceOp device) {
       device.emitOpError("requires pim-form-host-plan before AiMX lowering");
       return WalkResult::interrupt();
@@ -1488,7 +1501,8 @@ struct ConvertPIMToAiMXPass
     for (pim::PartitionOp device : devices)
       if (failed(DeviceLowering(module, device, profile, batch, matvecRowAlignment,
                                 matvecFirstNOnly, matmulRowAlignment,
-                                matmulUsefulNOnly, persistent, site++).run()))
+                                matmulUsefulNOnly, kAlignment, persistent,
+                                site++).run()))
         return signalPassFailure();
     module->removeAttr("pim.target_profile");
     module.walk([](func::FuncOp function) {

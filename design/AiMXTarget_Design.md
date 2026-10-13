@@ -156,7 +156,7 @@ Compiler option과 target IR의 단위는 다음과 같이 구분한다.
 | **logical output tile** | Triton program instance 하나가 덮는 **출력** 직사각형 | `BLOCK_M × BLOCK_N` |
 | **internal reduction step** | 그 program instance 안의 `k` loop 한 걸음 | `BLOCK_K` |
 | **batch** | output block의 행 수. `{1, 2, 4, 8}` | `N_BATCH_SIZE_TYPES = 4`가 정한 상한 |
-| **padded_k** | A의 행 pitch. `ceil(k/CHUNK) * CHUNK` | element |
+| **padded_k** | A의 행 pitch. `ceil(k / (4096/batch)) * (4096/batch)` (§18.8; 참조 구현은 `CHUNK`=4096) | element |
 | **padded_n** | B와 C의 행 pitch. `r_size`에 들어가는 값 | element |
 | **Arel** | 재배치된 A. §1.6의 순열을 적용한 8192 byte 블록의 나열 | `m * k * 16` element |
 
@@ -627,7 +627,7 @@ execution tile (m_t × k_t × n_t)
 | --- | --- | --- | --- |
 | `m_t` | `batch` | output block 행이 안 맞아 batch class가 섞인다 (§2.5) | ④ |
 | `k_t` | **256** | vecA 적재가 꼬리를 못 덮는다 → **조용한 오답** | ⑤ `REG_SIZE` |
-| A의 행 pitch | **4096 element** (`padded_k`) | A 행 간격이 하드웨어 기대와 다름 | `CHUNK` |
+| A의 행 pitch | **`4096/batch` element** (`padded_k`, §18.8) | batch행 묶음이 8 KiB 단위로 떨어지지 않음 → 컴파일 오류 | 8 KiB interleave |
 | `n_t` | **`4096/batch`의 배수** | 배수가 아니면 `r_loop_var`가 내림되어 **n 꼬리가 조용히 빠진다** | ④ + §15 E9 |
 | B와 C의 행 pitch | **서로 같아야 한다** | 같은 `r_size` 필드가 둘 다에 실린다 | §1.8 (f) |
 | `batch` | **`{1, 2, 4, 8}`** | 그 밖의 값은 encoding이 없다 | `N_BATCH_SIZE_TYPES = 4` |
@@ -2752,6 +2752,34 @@ N > 512(panel 하나에 microtile 여러 개), K가 256의 배수가 아닌 경�
 M/N tail(mask), `num_units > 1`, `batch ≠ 8`, K > 4096인 GEMV는 FPGA로 확인하지 않았다.
 autotuner의 용량 하한(`autotuner/constraints.py`의 `aimx_runtime_allocations`)은 아직 B/C
 행을 `4096/batch`로 계산한다.
+
+### 18.8 GEMM A 행(K) pitch — 기본값 `4096/batch` (2026-10-13 FPGA 실측)
+
+A는 Group panel의 K를 `matmul-k-alignment` 단위로 올려 저장한다. MAC은 K를 256 단위로만 채운
+Arel을 읽으므로, 이 pitch는 A의 저장 위치와 gather descriptor의 stride만 바꾸고 곱과 누산 순서는
+바꾸지 않는다. 그래서 pitch를 줄여도 결과는 4096과 bit 단위로 같아야 하고, 실측도 그랬다.
+
+pitch의 하한은 두 규칙에서 나온다. (1) gather가 256 원소씩 읽으므로 256의 배수, (2) A의 행은
+batch의 배수이고 batch행 묶음이 8 KiB(4096 원소, 256 bank 한 바퀴)의 배수여야 하므로
+`batch × pitch`가 4096의 배수. batch ≤ 8에서 (2)의 최솟값 `4096/batch`가 (1)도 만족한다.
+**기본값 0은 `4096/batch`**이다 (batch 8: 512, 4: 1024, 2: 2048, 1: 4096).
+
+| 항목 | 값 |
+| --- | --- |
+| 옵션 | pass `matmul-k-alignment`, compiler `aimx_matmul_k_alignment`, target spec `matmul_k_alignment` (모두 기본 0) |
+| 실험 | `examples/aimx/verify_k_alignment.py`: case 4개 (K 128 · 256 · 384 · 1024, M=32, N=512, batch 8, FPGA 1개), 정렬마다 worker 1개, case마다 2회 |
+| 판정 | 정렬별 결과 == 4096 결과 (bit), 같은 정렬 1회차 == 2회차 (bit) |
+| 이득 | A 저장·zero fill·업로드 bytes가 pitch에 비례해 감소 (`datacopy_cpu2pim(…, padRows × pitch × 2)`). Arel과 MAC은 그대로 |
+
+| 정렬 | k128 | k256_t4 | k384 | k1024_t4 | 판정 |
+| --- | --- | --- | --- | --- | --- |
+| 512 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 통과 |
+| 1024 | 결과 파일 저장 후 worker 종료 시 segfault (-11) | | | | 미판정 |
+| 2048 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 통과 |
+
+(`a / b` = 4096 대비 다른 원소 수 / 같은 정렬 2회 사이 다른 원소 수. relative_l2는 정렬과 무관하게
+0.8951 %, 0.7876 %, 0.7672 %, 0.7661 %로 같았다.) M=32라 A 감소분(256 KiB → 32 KiB)이 stage 시간에
+드러나지 않았다. `invoke`는 정렬과 무관했다. 확인하지 않은 범위: batch 1·2·4, model stub 경로, FPGA 2개.
 
 ## 19. Model session 실행 — FPGA 단위 batch와 weight 상주
 

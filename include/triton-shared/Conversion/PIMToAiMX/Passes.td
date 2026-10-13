@@ -48,6 +48,8 @@ def ConvertPIMToAiMX : Pass<"convert-pim-to-aimx", "mlir::ModuleOp"> {
            "GEMM B/C row alignment in BF16 elements; 0 preserves 4096/batch alignment. Used for layout comparisons.">,
     Option<"matmulUsefulNOnly", "matmul-useful-n-only", "bool", "false",
            "GEMM computes useful N rounded to 4096/batch independently of storage pitch; false traverses the padded N extent.">,
+    Option<"matmulKAlignment", "matmul-k-alignment", "int64_t", "0",
+           "GEMM A row (K) alignment in BF16 elements; 0 uses 4096/batch, the smallest legal value. Otherwise a multiple of 256 whose product with batch is a multiple of 4096.">,
     Option<"persistent", "persistent", "bool", "true",
            "Retain fixed per-FPGA buffers and descriptor chains across rounds and calls.">,
   ];

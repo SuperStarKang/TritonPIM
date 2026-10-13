@@ -99,6 +99,7 @@ def _aimx_spec(o) -> PIMTargetSpec:
         local_capacity_limit_bytes=o.local_capacity_limit_bytes,
         batch=o.batch,
         base_fpga=o.base_fpga,
+        matmul_k_alignment=o.aimx_matmul_k_alignment,
     )
 
 
@@ -223,7 +224,8 @@ def _aimx_passes(options):
             f"matvec-row-alignment={options.aimx_matvec_row_alignment} "
             f"matvec-first-n-only={str(options.aimx_matvec_first_n_only).lower()} "
             f"matmul-row-alignment={options.aimx_matmul_row_alignment} "
-            f"matmul-useful-n-only={str(options.aimx_matmul_useful_n_only).lower()}")
+            f"matmul-useful-n-only={str(options.aimx_matmul_useful_n_only).lower()} "
+            f"matmul-k-alignment={options.aimx_matmul_k_alignment}")
     return [tile, "-cse", "-canonicalize"]
 
 
@@ -338,6 +340,10 @@ class PIMOptions:
     aimx_matmul_row_alignment: int = 4096
     # Compute only useful N microtiles of the 4096-element storage rows.
     aimx_matmul_useful_n_only: bool = True
+    # GEMM A row (K) pitch. MAC reads the 256-aligned relayout, so the pitch changes
+    # only the A storage and its gather stride. 0 uses 4096/batch, the smallest pitch
+    # whose batch rows fill whole 8 KiB interleave units (FPGA-checked, design §18.8).
+    aimx_matmul_k_alignment: int = 0
     def __post_init__(self):
         # target 없이 PIM을 쓰는 것은 의도된 사용이 아니므로 기본값으로 때우지 않고 바로 터뜨린다.
         if self.pim_target is None:

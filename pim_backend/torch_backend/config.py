@@ -35,7 +35,7 @@ PIM_OPTION_KEYS = (
     "host_threads",
     "group_m", "group_n", "group_k",
     "tile_m", "tile_n", "tile_k",
-    "batch", "base_fpga",
+    "batch", "base_fpga", "aimx_matmul_k_alignment",
 )
 
 
