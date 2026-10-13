@@ -8,7 +8,7 @@ one FPGA. Weights are staged only by upload calls; run calls stage activations.
 import ctypes
 
 from .compiler import _run_translate
-from .residency import LAYER, MODEL, WEIGHTS, StageRequirement
+from .residency import MODEL, StageRequirement
 from .runtime import current_invocation
 
 
@@ -156,7 +156,6 @@ class AiMXModelRuntime:
             self.library.aimx_model_create(fpga, slots) for fpga in stage.fpgas))
         stage.pointers = (ctypes.c_void_p * (stage.instance_count * arguments))()
         stage.weight_flags = (ctypes.c_int * arguments)(*stage.argument_weights)
-        stage.keep_weights = (ctypes.c_int * slots)(*(int(weight) for weight in stage.slot_weights))
         stage.keep_none = (ctypes.c_int * slots)()
         stage.call = AiMXModelCall(
             ctypes.cast(stage.contexts, ctypes.POINTER(ctypes.c_void_p)),
@@ -200,13 +199,12 @@ class AiMXModelRuntime:
     def exit_layer(self, plan):
         if self.policy == MODEL:
             return
+        # P-2: 다음 layer를 위해 weight와 state를 모두 해제하고, 다시 진입하면 weight부터 올린다.
         for stage in plan.stages:
-            keep = stage.keep_weights if self.policy == WEIGHTS else stage.keep_none
             for context in stage.contexts:
-                self.library.aimx_model_release(context, keep)
+                self.library.aimx_model_release(context, stage.keep_none)
             self.totals["state_releases"] += 1
-        if self.policy == LAYER:
-            self.loaded.discard(plan.index)
+        self.loaded.discard(plan.index)
 
     def run(self, stage, matrices, output):
         self.invoke(stage, matrices, output, upload=False)

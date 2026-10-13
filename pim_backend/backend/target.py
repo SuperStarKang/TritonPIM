@@ -8,7 +8,20 @@ from dataclasses import dataclass
 import glob
 
 
-AIMX_BANKS_PER_UNIT = 256
+# Silent-PIM (AiMX) 한 unit = GDDR6 칩 8개 (칩당 4 GB, 2 channel).
+#   channel 16 (칩당 2) × bank 16 = bank 256, bank당 ALU 16 → lane 4096
+#   channel 2 GB, bank 128 MB, 전체 32 GB, column 접근 256 bit (= bf16 16개)
+AIMX_CHIPS_PER_UNIT = 8
+AIMX_CHANNELS_PER_UNIT = 16
+AIMX_BANKS_PER_CHANNEL = 16
+AIMX_BANKS_PER_UNIT = AIMX_CHANNELS_PER_UNIT * AIMX_BANKS_PER_CHANNEL
+AIMX_ALUS_PER_BANK = 16
+AIMX_PHYSICAL_BANK_BYTES = 128 * 1024 * 1024
+AIMX_PHYSICAL_UNIT_BYTES = AIMX_BANKS_PER_UNIT * AIMX_PHYSICAL_BANK_BYTES  # 32 GB
+
+# 할당 가능한 용량은 물리 용량이 아니라 pim_sw runtime heap이다
+# (mem_src/mdrv_interface.c: heap_size = 0x1FEE00000, 8 GB - 18 MB). 이를 넘으면
+# runtime이 "PIM] OOM"으로 종료하므로 planner의 bank 용량은 heap을 bank 수로 나눈 값이다.
 AIMX_DEVICE_HEAP_BYTES = 0x1FEE00000
 AIMX_BANK_CAPACITY_BYTES = (
     AIMX_DEVICE_HEAP_BYTES // AIMX_BANKS_PER_UNIT)

@@ -68,7 +68,7 @@ def main():
             torch.testing.assert_close(output, reference, rtol=0, atol=0)
             after = session.stats()
             assert after["launches"] - before["launches"] == 8
-            # P-1/P-2는 첫 요청에서만 weight를 올리고, P-3은 매 요청 올린다.
+            # P-1은 첫 요청에서만 weight를 올리고, P-2는 매 요청 올린다.
             uploads = invocation == 0 or session.residency.policy == LAYER
             assert after["weight_bytes"] - before["weight_bytes"] == (4096 if uploads else 0)
             assert after["device_compiles"] == prepared["device_compiles"]

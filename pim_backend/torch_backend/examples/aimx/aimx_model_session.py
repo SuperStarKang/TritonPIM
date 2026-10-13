@@ -3,7 +3,7 @@
 Two blocks, each with a stationary FP32 projection and two batched head stages
 (QK^T and scores @ heads, four instances each). Runs on one or more AiMX FPGAs;
 with one FPGA the four instances run as four batch rounds.
---capacity-mib lowers the per-FPGA capacity the planner sees, to exercise P-2/P-3.
+--capacity-mib lowers the per-FPGA capacity the planner sees, to exercise P-2 (one layer resident).
 --autotune-cache selects each stage's config from measured records
 (examples/autotune_torch.py --target aimx --dtype float32) instead of the fixed configs.
 """

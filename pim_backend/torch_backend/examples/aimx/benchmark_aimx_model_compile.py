@@ -1,8 +1,11 @@
-"""Policy-first model compile and runtime of one FP32 layer on AiMX.
+"""Model compile and runtime of FP32 layers on AiMX, with a selectable policy strategy.
 
-Compile time: stage analysis -> residency policy -> policy-constrained autotuning
--> config selection -> PIM/CPU compilation, without allocating the FPGAs.
-Runtime: open (allocate, bind stages) -> run the partitioned FX graph -> close.
+Compile time: stage analysis -> feasible residency policies -> autotuning with
+weights resident -> config and policy selection -> PIM/CPU compilation, without
+allocating the FPGAs. Runtime: open (allocate, bind stages) -> run -> close.
+
+--strategy joint        compare the best configs of every feasible policy
+--strategy layer_first  fastest configs for one layer; P-1 if all layers fit, else P-2
 """
 
 import argparse
@@ -17,12 +20,15 @@ from aimx_benchmark_common import StageProfile
 from fp32_workloads import HIDDEN, SEQUENCE, AttentionLayer, TransformerBlock
 from torch_backend import compile_model
 from torch_backend._autotuner import DEFAULT_CACHE_PATH
+from torch_backend.model_compile import STRATEGIES
 
 
 def main():
     torch.set_num_threads(8)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scope", choices=("attention", "transformer"), required=True)
+    parser.add_argument("--layers", type=int, default=1, help="blocks with independent weights")
+    parser.add_argument("--strategy", choices=STRATEGIES, default="joint")
     parser.add_argument("--units", type=int, default=1, help="AiMX FPGAs")
     parser.add_argument("--base-fpga", type=int, default=0)
     parser.add_argument("--cache", default=DEFAULT_CACHE_PATH)
@@ -34,26 +40,35 @@ def main():
     parser.add_argument("--repeat", type=int, default=3)
     parser.add_argument("--report-dir", type=Path, default=None)
     args = parser.parse_args()
-    if args.warmup < 1 or args.repeat < 1:
-        raise ValueError("--warmup and --repeat must be at least 1")
-    report_dir = args.report_dir or Path(__file__).with_name(f"aimx_{args.scope}_model_compile_report")
+    if args.warmup < 1 or args.repeat < 1 or args.layers < 1:
+        raise ValueError("--warmup, --repeat and --layers must be at least 1")
+    report_dir = args.report_dir or Path(__file__).with_name(
+        f"aimx_{args.scope}_l{args.layers}_{args.strategy}_report")
     report_dir.mkdir(parents=True, exist_ok=True)
+    # P-1은 session의 첫 호출에서만 weight를 올린다. 이 실험의 요청 수는 first + warmup + sample이다.
+    requests = 1 + args.warmup + args.repeat
 
     torch.manual_seed(0)
-    model = (AttentionLayer() if args.scope == "attention" else TransformerBlock()).eval()
+    block = AttentionLayer if args.scope == "attention" else TransformerBlock
+    layers = [block().eval() for _ in range(args.layers)]
     inputs = (torch.randn(1, SEQUENCE, HIDDEN),)
 
     compiled = compile_model(
-        [model], inputs, target="aimx", units=args.units,
-        runtime_options={"base_fpga": args.base_fpga}, cache_path=args.cache,
-        max_benchmarks=args.max_benchmarks, max_generations=args.max_generations,
-        warmup=args.tune_warmup, repeat=args.tune_repeat,
+        layers, inputs, target="aimx", units=args.units, requests=requests,
+        strategy=args.strategy, runtime_options={"base_fpga": args.base_fpga},
+        cache_path=args.cache, max_benchmarks=args.max_benchmarks,
+        max_generations=args.max_generations, warmup=args.tune_warmup, repeat=args.tune_repeat,
     )
     report = compiled.report
-    print(f"compile: policy={report['policy']} selection={report['selection']} "
+    print(f"compile: strategy={args.strategy} layers={args.layers} requests={requests} "
+          f"policy={report['policy']} selection={report['selection']} "
           f"needed_bytes={report['needed_bytes']} compiled_bytes={report['compiled_bytes_per_unit']} "
           f"capacity={report['capacity_bytes']} analysis_ms={report['analysis_ms']:.1f} "
           f"tuning_ms={report['tuning_ms']:.1f} compile_ms={report['compile_ms']:.1f}", flush=True)
+    for name, evaluation in report["policy_evaluations"].items():
+        print(f"  policy {name}: request_ms={evaluation['request_ms']:.3f} "
+              f"needed_bytes={evaluation['needed_bytes']} selection={evaluation['selection']}",
+              flush=True)
     for stage_class in report["stage_classes"]:
         selected = stage_class["selected"]
         print(f"  {stage_class['label']}: stages/layer={stage_class['stages_per_layer']} "
@@ -62,17 +77,10 @@ def main():
               flush=True)
 
     with torch.no_grad():
-        reference = model(*inputs)
+        reference = inputs[0]
+        for layer in layers:
+            reference = layer(reference)
         with compiled.session as session:
-            plan, = session.layers
-            labels = {}
-            for stage in plan.stages:
-                gemm = stage.gemms[0]
-                weight = gemm.right.weight_target or gemm.left.weight_target
-                labels[stage.name] = {
-                    "operation": weight.removesuffix(".weight") if weight else f"{gemm.op} {stage.shape}",
-                    "mnk": list(stage.shape), "config": list(stage.config.key()),
-                }
             # 첫 호출은 layer 진입 시 weight upload를 포함한다.
             calls = []
             for phase, count in (("first", 1), ("warmup", args.warmup), ("sample", args.repeat)):
@@ -92,10 +100,26 @@ def main():
 
             # session.run_model과 같은 layer 진입/퇴장 사이에서 partition별 시간을 잰다.
             runtime = session.backend.model
-            profiler = StageProfile(plan, labels)
-            runtime.enter_layer(plan)
-            profiler.run(*inputs)
-            runtime.exit_layer(plan)
+            records = []
+            activation = inputs
+            for plan in session.layers:
+                labels = {}
+                for stage in plan.stages:
+                    gemm = stage.gemms[0]
+                    weight = gemm.right.weight_target or gemm.left.weight_target
+                    labels[stage.name] = {
+                        "layer": plan.index,
+                        "operation": weight.removesuffix(".weight") if weight else f"{gemm.op} {stage.shape}",
+                        "mnk": list(stage.shape), "config": list(stage.config.key()),
+                    }
+                profiler = StageProfile(plan, labels)
+                start = time.perf_counter_ns()
+                runtime.enter_layer(plan)
+                enter_ms = (time.perf_counter_ns() - start) / 1e6
+                activation = tuple(profiler.run(*activation))
+                runtime.exit_layer(plan)
+                records.append({"layer": plan.index, "enter_layer_ms": enter_ms,
+                                "partitions": profiler.records})
             session_totals = session.stats()
 
     median_ms = statistics.median(call["wall_ms"] for call in calls if call["phase"] == "sample")
@@ -103,11 +127,12 @@ def main():
         "scope": args.scope, "open_ms": compiled.session.open_ms,
         "close_ms": compiled.session.close_ms, "calls": calls, "median_wall_ms": median_ms,
         "estimate_error_ms": median_ms - report["estimated_request_ms"],
-        "profile": profiler.records, "session_totals": session_totals,
+        "profile": records, "session_totals": session_totals,
     })
     (report_dir / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    print(f"{args.scope}: median_wall_ms={median_ms:.3f} "
-          f"estimated_request_ms={report['estimated_request_ms']:.3f}", flush=True)
+    print(f"{args.scope}: layers={args.layers} strategy={args.strategy} policy={report['policy']} "
+          f"median_wall_ms={median_ms:.3f} estimated_request_ms={report['estimated_request_ms']:.3f}",
+          flush=True)
     print(f"report={report_dir.resolve() / 'report.json'}", flush=True)
 
 

@@ -315,6 +315,9 @@ def tune(problem, target, benchmark_fn, *, space=None, cache=None,
                     result.physical_allocations))
         record = TuningRecord(config, features, result)
         records.append(record)
+        if cache is not None and stored is None:
+            # 탐색이 중간에 끊겨도 잰 후보는 남는다. 다음 탐색은 이 기록을 다시 재지 않는다.
+            cache.store_partial(problem, target, records)
         if verbose:
             stages = "".join(
                 f" {name}={milliseconds:.2f}"

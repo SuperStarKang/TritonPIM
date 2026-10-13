@@ -57,14 +57,21 @@ class PIMConfigCache:
             f"{problem.M}x{problem.N}x{problem.K}|"
             + self._context_key(problem, target))
 
-    def lookup(self, problem, target):
+    def _complete_entry(self, problem, target):
+        # store_partial만 거친 entry는 탐색이 끝나지 않았으므로 best가 없다.
         entry = self.entries.get(self._key(problem, target))
+        if entry is None or not entry.get("complete", True):
+            return None
+        return entry
+
+    def lookup(self, problem, target):
+        entry = self._complete_entry(problem, target)
         if entry is None:
             return None
         return _decode_config(entry["config"])
 
     def lookup_result(self, problem, target):
-        entry = self.entries.get(self._key(problem, target))
+        entry = self._complete_entry(problem, target)
         if entry is None:
             return None
         config = _decode_config(entry["config"])
@@ -91,7 +98,7 @@ class PIMConfigCache:
         context = self._context_key(problem, target)
         matches = []
         for entry in self.entries.values():
-            if entry.get("context") != context:
+            if entry.get("context") != context or not entry.get("complete", True):
                 continue
             stored = entry["problem"]
             distance = (
@@ -106,8 +113,7 @@ class PIMConfigCache:
             for _, entry in matches[:limit]
         ]
 
-    def store(self, problem, target, record, records=(), replace=False):
-        key = self._key(problem, target)
+    def _merged_records(self, key, records, replace):
         merged = {}
         previous = None if replace else self.entries.get(key)
         if previous is not None:
@@ -121,14 +127,43 @@ class PIMConfigCache:
                     for field in RESULT_FIELDS
                 },
             }
+        return list(merged.values())
+
+    def store(self, problem, target, record, records=(), replace=False):
+        """Finish a search: keep its best and every measured record."""
+        key = self._key(problem, target)
         self.entries[key] = {
             "problem": {
                 "M": problem.M, "N": problem.N, "K": problem.K},
             "context": self._context_key(problem, target),
+            "complete": True,
             "config": asdict(record.config),
             "total_ms": record.result.total_ms,
-            "records": list(merged.values()),
+            "records": self._merged_records(key, records, replace),
         }
+        self._write()
+
+    def store_partial(self, problem, target, records):
+        """Keep the records of a search that has not finished.
+
+        The entry has no best, so lookup treats it as a miss and the next
+        search resumes with these records instead of measuring them again.
+        """
+        key = self._key(problem, target)
+        previous = self.entries.get(key)
+        if previous is not None and previous.get("complete", True):
+            # 끝난 탐색을 retune하는 중이면 끝난 entry를 그대로 두고 마지막 store가 덮는다.
+            return
+        self.entries[key] = {
+            "problem": {
+                "M": problem.M, "N": problem.N, "K": problem.K},
+            "context": self._context_key(problem, target),
+            "complete": False,
+            "records": self._merged_records(key, records, False),
+        }
+        self._write()
+
+    def _write(self):
         directory = os.path.dirname(os.path.abspath(self.path))
         os.makedirs(directory, exist_ok=True)
         with tempfile.NamedTemporaryFile(

@@ -7,9 +7,8 @@ the per-unit bytes each stage needs. The planner never sees vendor handles.
 from dataclasses import dataclass
 
 
-MODEL = "model"      # P-1: every layer's weights and state stay resident
-WEIGHTS = "weights"  # P-2: every weight stays; state is built and freed per layer
-LAYER = "layer"      # P-3: weights and state are replaced per layer
+MODEL = "model"  # P-1: every layer's weights and state stay resident
+LAYER = "layer"  # P-2: one layer's weights and state; replaced at every layer
 
 
 @dataclass(frozen=True)
@@ -44,7 +43,7 @@ class ResidencyPlan:
 
 
 def plan_residency(resources, requirements):
-    """Pick P-1, P-2 or P-3, whichever fits one unit first.
+    """Pick P-1 (all layers) or P-2 (one layer), whichever fits one unit first.
 
     Every stage is assumed to occupy the first unit, so stage sums bound the
     most loaded unit.
@@ -59,8 +58,7 @@ def plan_residency(resources, requirements):
                + max(requirement.output_bytes for requirement in requirements))
     candidates = (
         (MODEL, sum(weights.values()) + sum(states.values()) + scratch),
-        (WEIGHTS, sum(weights.values()) + max(states.values()) + scratch),
-        (LAYER, max(weights.values()) + max(states.values()) + scratch),
+        (LAYER, max(weights[layer] + states[layer] for layer in layers) + scratch),
     )
     for policy, needed in candidates:
         if needed <= resources.capacity_bytes:

@@ -87,7 +87,7 @@ with compiled.session as session:
 ```
 
 ```text
-compile time  stage 분석 → 최소 footprint → policy (P-1/P-2/P-3)
+compile time  stage 분석 → 최소 footprint → policy (P-1 모든 layer / P-2 layer 하나)
               → stage class별 제약 tune() (weight 상주 후 E 측정)
               → 최속 조합 또는 DP → PIMSession.compile (할당 없음)
 runtime       open (할당, unit 수 확인, stage 결합) → run_model → close

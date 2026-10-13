@@ -128,7 +128,7 @@ class UPMEMModelRuntime:
     def place(self, plans, residency):
         """Lay out MRAM for the chosen policy and link every stage program.
 
-        P-3 (layer) reuses one weight region for every layer; P-1/P-2 give each
+        P-2 (layer) reuses one weight region for every layer; P-1 (model) gives each
         layer its own weight addresses so nothing is uploaded twice.
         """
         self.policy = residency.policy
@@ -228,7 +228,7 @@ class UPMEMModelRuntime:
         self.loaded.add(plan.index)
 
     def exit_layer(self, plan):
-        # P-3에서는 다음 layer가 같은 weight 영역을 덮어쓴다. 해제할 device 상태는 없다.
+        # P-2에서는 다음 layer가 같은 weight 영역을 덮어쓴다. 해제할 device 상태는 없다.
         if self.policy == LAYER:
             self.loaded.discard(plan.index)
 

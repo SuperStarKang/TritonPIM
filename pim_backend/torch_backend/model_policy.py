@@ -10,9 +10,7 @@ import math
 
 import torch
 
-from triton.backends.pim.residency import (
-    LAYER, MODEL, WEIGHTS, StageRequirement, UnitResources, plan_residency,
-)
+from triton.backends.pim.residency import LAYER, MODEL
 
 from ._autotuner import (
     ConstraintEngine, PIMConfig, PIMProblem, axis_values, build_config_space,
@@ -211,28 +209,17 @@ def minimum_footprint(stage_class, spec):
     return best[1]
 
 
-def decide_policy(classes, minimum, spec):
-    """P-1 -> P-2 -> P-3 with every stage at its minimum footprint."""
-    profile = spec.common_profile
-    resources = UnitResources(
-        profile.num_units, profile.banks_per_unit * profile.bank_capacity_limit_bytes)
-    requirements = []
-    for stage_class in classes:
-        size = minimum[stage_class.key].footprint
-        for layer, count in enumerate(stage_class.counts):
-            requirements.extend(
-                StageRequirement(layer, f"{stage_class.key.label()}#{index}",
-                                 size.weight, size.state, size.input, size.output)
-                for index in range(count))
-    return plan_residency(resources, requirements)
+def policy_lower_bound(policy, classes, minimum):
+    """Bytes per unit the policy needs with every stage at its minimum footprint."""
+    sizes = [minimum[stage_class.key].footprint for stage_class in classes]
+    return (sum(policy_bytes(policy, stage_class, size) for stage_class, size in zip(classes, sizes))
+            + max(size.input for size in sizes) + max(size.output for size in sizes))
 
 
 def coefficients(policy, stage_class):
     """How many times a class's weight and state bytes count in the policy formula."""
     if policy == MODEL:
         return stage_class.total, stage_class.total
-    if policy == WEIGHTS:
-        return stage_class.total, stage_class.per_layer
     if policy == LAYER:
         return stage_class.per_layer, stage_class.per_layer
     raise ValueError(f"unknown residency policy {policy}")

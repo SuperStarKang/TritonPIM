@@ -175,6 +175,30 @@ Compiler option과 target IR의 단위는 다음과 같이 구분한다.
 
 ## 1. 하드웨어 구조
 
+### 1.0 모듈 구성 (8 × GDDR6)
+
+Silent-PIM (AiMX) 한 unit은 GDDR6 칩 8개로 이루어진 단일 device다. 칩마다 메모리 셀과 PIM
+연산 유닛이 함께 있다.
+
+| 항목 | 값 |
+| --- | --- |
+| 총 메모리 용량 | 32 GB (4 GB × 8 GDDR6) |
+| channel 수 (전체) | 16 (칩당 2 channel × 8 칩) |
+| channel 용량 | 2 GB |
+| bank 수 (전체) | 256 (16 channel × 16 bank) |
+| bank 용량 | 128 MB |
+| ALU 수 (전체) | 4096 (16 channel × 16 bank × 16 ALU) |
+| column 접근 단위 | 256 bit (= bf16 16개) |
+
+ALU 4096개가 r 축(n 축) 병렬도 `PIM_WIDTH × NUM_CHANNELS / TYPE_SIZE = 4096`(코드의 `RCHUNK`)를
+정한다. 한 cycle에 bf16 MAC 4096개를 동시에 수행한다. 참조 구현에서 q 축(k 축) padding 명령의
+발사 단위는 `CHUNK = 512` element(vecA의 1/8, 2 channel 몫)이다.
+
+**할당 가능한 용량은 물리 용량과 다르다.** pim_sw runtime은 unit마다 heap을
+`0x1FEE00000`(8 GB − 18 MB)로 잡고 넘으면 `PIM] OOM`으로 종료한다
+(`mem_src/mdrv_interface.c`). 그래서 target profile의 `bank_capacity_limit_bytes`는
+`heap / 256`이고, 물리 bank 용량 128 MB는 `backend/target.py`에 상수로만 기록한다.
+
 ### 1.1 기계 상수
 
 `pim_math.h`에서 그대로 온다.
@@ -216,9 +240,8 @@ Compiler option과 target IR의 단위는 다음과 같이 구분한다.
 `TYPE_SIZE = 2`가 bfloat16을 뜻하지만 **누산기는 fp32가 아니다.** 실제 형식과 그 결과인
 동적 범위 제약은 §11.1에 있다.
 
-물리 channel은 8개다. `NUM_CHANNELS = 16`과 맞추면 "channel 8개 × pseudo-channel 2개
-= descriptor queue 16개"가 가장 일관된 해석이고 lane 수는 `8 × 2 × 16 × 16 = 4096`으로
-같다 (§15 E1). 이 문서의 어떤 식도 8이냐 16이냐가 아니라 `NUM_CHANNELS`라는 기호에만
+channel은 16개다: GDDR6 칩 8개 × 칩당 2 channel (§1.0). `NUM_CHANNELS = 16`과 같고 lane 수는
+`16 × 16 × 16 = 4096`이다 (§15 E1, 닫힘). 이 문서의 어떤 식도 8이냐 16이냐가 아니라 `NUM_CHANNELS`라는 기호에만
 의존한다.
 
 ### 1.2 계층과 크기 — 상수들이 서로 맞물린다
@@ -2140,7 +2163,7 @@ compiler의 문제가 아니라 §12가 존재하는 이유 자체다.
 > hardware가 막히는 정확한 지점(`dma_fops_pl.c`의 timeout 경로가 정리 코드를 건너뛴다),
 > reboot 없이 회복하는 사다리, 실행 직전 guard 코드, 위험도 오름차순 실험 순서가 거기 있습니다.
 
-### E1. channel 8개 vs `NUM_CHANNELS = 16`
+### ~~E1. channel 8개 vs `NUM_CHANNELS = 16`~~ — **닫힘. 칩 8개 × 2 channel = 16 channel (§1.0)**
 
 물리 channel은 8개인데 `pim_math.h`는 16입니다. "channel 8 × pseudo-channel 2"로
 읽으면 lane 4096개가 맞아떨어집니다.
@@ -2775,7 +2798,7 @@ extern "C" void gemm_kernel(aimx_model_call *_model, uint16_t* a0, uint16_t* a1,
 |---|---|
 | upload (`upload = 1`) | weight stage, buffer 할당, chain build |
 | 실행 (`upload = 0`) | activation stage, (state 해제 뒤라면 할당과 build), invoke, unstage |
-| `aimx_model_release(ctx, keep)` | `keep`이 아닌 slot 해제, `ready = false` (P-2는 weight slot 유지, P-3은 전부 해제) |
+| `aimx_model_release(ctx, keep)` | `keep`이 아닌 slot 해제, `ready = false` (P-2 layer 정책에서 전부 해제) |
 
 Resident weight GEMM은 instance 1개, scheduling round 1회로 제한한다(`select_layer_config`).
 여러 round가 같은 buffer에 서로 다른 weight tile을 올리면 상주가 성립하지 않기 때문이다.

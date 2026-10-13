@@ -12,10 +12,11 @@ compile time은 residency policy 결정, policy 제약 안의 autotuning, kernel
 ════════════════════ COMPILE TIME (장치 할당 없음) ═════════════════════════════
  1. Target spec      등록된 target profile + 입력 unit 수 → PIMTargetSpec
  2. Stage 분석       torch.export → FX GEMM 분석 → layer별 stage와 stage class
- 3. Policy 결정      stage class별 최소 footprint → P-1 / P-2 / P-3, 용량
- 4. 제약 autotuning  stage class별 tune(): policy 제약 안의 후보만 측정
+ 3. 가능한 정책     stage class별 최소 footprint → F ⊆ {P-1(모든 layer), P-2(layer 하나)}
+ 4. 제약 autotuning  stage class별 tune() 1회: P-2 예산 안의 후보만 측정 (정책 무관 cache)
                      측정 = weight 1회 upload 후 반복 실행 시간 E (+ U, footprint)
- 5. 조합 선택        stage class별 config: 최속 조합이 용량에 맞으면 그대로, 아니면 DP
+ 5. 정책·조합 선택   joint: F의 정책마다 최속 조합 또는 DP → 요청당 시간 최소 정책
+                     layer_first: layer 하나 기준 최속 조합 → P-1에 맞으면 P-1, 아니면 P-2
  6. 컴파일·배치      PIM stage: Triton → TTIR → TTShared → PIM Common IR → Target IR
                      CPU partition: Inductor, residency plan, target 주소 배치
 ════════════════════ RUNTIME (요청마다) ═══════════════════════════════════════
@@ -39,7 +40,7 @@ compile time은 residency policy 결정, policy 제약 안의 autotuning, kernel
 | activation stage | 두 operand가 모두 activation인 stage (QKᵀ, PV). `p_k=1`, M/N/K round ≤ 4 |
 | stage class | `(M,N,K)`, dtype, op, weight mask, instance 수가 같은 stage의 모음. autotuning과 config 선택의 단위 |
 | footprint | stage 하나가 unit 하나에 상주시키는 bytes: weight / state / input scratch / output scratch |
-| residency policy | P-1 `model`: 모든 layer의 weight와 state 상주. P-2 `weights`: 모든 weight 상주, state는 layer마다. P-3 `layer`: layer마다 weight와 state 교체 |
+| residency policy | P-1 `model`: 모든 layer의 weight와 state 상주. P-2 `layer`: layer 하나의 weight와 state만 상주, layer마다 교체 |
 | E | weight가 이미 상주한 상태에서 stage 한 번의 실행 시간 |
 | U | stage weight의 upload 시간 |
 | Cap | unit 하나의 용량 = `banks_per_unit × bank_capacity_limit_bytes` |
@@ -126,30 +127,33 @@ footprint가 "가장 작은 Block Group 하나씩, round 수천 번"인 config�
 m_min(class) = min_{c ∈ C_ws(class)} footprint(c)
 ```
 
-layer마다 stage별 `m_min`을 `StageRequirement`로 만들어 `plan_residency`에 넣는다.
-P-1 → P-2 → P-3 순서로 처음 용량에 맞는 policy를 고른다.
+정책마다 아래 식에 `m_min`을 넣어 **가능한 정책 집합 F**를 구한다. 정책을 여기서 하나로
+정하지 않는다. 최종 정책은 측정 뒤 §6의 전략이 정한다.
 
 ```text
 P-1: Σ_layer Σ_stage (weight + state) + max input + max output ≤ Cap
-P-2: Σ_layer Σ_stage weight + max_layer Σ_stage state + max input + max output ≤ Cap
-P-3: max_layer Σ_stage (weight + state) + max input + max output ≤ Cap
+P-2: max_layer Σ_stage (weight + state) + max input + max output ≤ Cap
 ```
 
-최소 footprint config가 실제로 존재하므로 판정된 policy는 실현 가능하다. 다만 target model은
-추정치이다. 실측 footprint가 추정보다 커서 policy를 지킬 수 없으면 5단계에서 예외가 난다.
+최소 footprint config가 실제로 존재하므로 F에 든 정책은 실현 가능하다. 다만 target model은
+추정치이다. 실측 footprint로 고른 조합이 어느 정책에도 맞지 않으면 §6에서 예외가 난다.
+F가 비면 tuning 전에 예외가 난다.
 
 ### 4.3 Policy가 정하는 것
 
 | policy | weight stage 제약 | 목적함수 (요청 하나) |
 |---|---|---|
-| P-1 `model` | round 1, `p_k=1`, footprint ≤ 예산 | Σ count·E |
-| P-2 `weights` | 같음 | Σ count·E (layer 진입 시 state 재구성은 측정하지 않는다) |
-| P-3 `layer` | 같음 | Σ count·(E + U) |
+| P-1 `model` | round 1, `p_k=1`, footprint ≤ 예산 | Σ count·(E + U/R) |
+| P-2 `layer` | 같음 | Σ count·(E + U) |
+
+R은 session 하나가 처리하는 요청 수다. P-1은 weight를 session에 한 번 올리므로 요청 하나는
+U의 1/R만 낸다.
 
 activation stage는 `p_k=1`, M/N/K round ≤ 4, footprint ≤ 예산을 지킨다. weight가 없으므로 U=0이다.
 
-stage class j의 예산은 다른 class가 모두 최소 footprint일 때 남는 용량이다. 아래의
-`bytes_policy`는 §6의 식이다.
+tuning 예산은 **P-2 기준**이다. P-1의 계수는 P-2 이상이므로 P-1에서 가능한 config는 P-2에서도
+가능하다. 그래서 P-2 예산으로 한 번 측정한 후보 집합이 두 정책 모두의 후보를 포함한다. stage
+class j의 예산은 다른 class가 모두 최소 footprint일 때 남는 용량이다.
 
 ```text
 budget_j = Cap − Σ_{i≠j} bytes_policy(i, m_min(i)) − scratch_min
@@ -170,7 +174,7 @@ autotuner 엔진(`autotuner/`: space, `ConstraintEngine`, search, cache)은 하�
 | 초기 round 패턴 | (1,1,1), (2,1,1), … | weight stage는 (1,1,1)만 |
 | 초기 후보 | heuristic seed, cache 유사 기록 | + 최소 footprint config (`tune(initial=...)`) |
 | `benchmark_fn` | `torch.compile(mm)` 한 번 호출 시간 | `PIMSession` stage, weight 1회 upload 후 E |
-| cache context | `torch-gemm-semantic-k-v2` | `torch-gemm-semantic-k-v2\|model-<policy>\|<op>\|w<weight mask>\|x<instances>` |
+| cache context | `torch-gemm-semantic-k-v2` | `torch-gemm-semantic-k-v2\|model\|<op>\|w<weight mask>\|x<instances>` (정책 무관, 측정 공유) |
 
 `ConstraintEngine.check`는 기존 검사를 모두 통과한 config에 대해 마지막으로
 `constraint(problem, config)`를 부른다. 문자열을 돌려주면 거부 사유이다. `tune()`은
@@ -196,6 +200,16 @@ with PIMSession(spec) as session:
 `physical_allocations`는 search feature의 memory pressure와 조합 선택에 함께 쓰인다.
 같은 config가 이미 cache에 있으면 측정하지 않는다.
 
+**후보마다 새 프로세스.** 위 측정은 `multiprocessing` spawn으로 만든 새 프로세스에서 한다
+(`measure_isolated`). weight는 shape만 넘기고 자식이 같은 shape의 난수로 만든다(E, U,
+footprint는 값과 무관하다). device context, stub 라이브러리, host DMA buffer가 자식과 함께
+사라지므로 후보가 늘어도 누적되지 않는다. runtime이 `exit`나 segfault로 끝나면 그 후보만
+`correctness=False`(timings에 exit code)로 기록하고 탐색을 계속한다. 이 후보는 선택에서 제외된다.
+
+**후보마다 cache 저장.** `tune()`은 새로 잰 후보마다 `PIMConfigCache.store_partial`로 기록을
+남긴다. 이 entry는 `complete: false`라 lookup에서는 miss이고, 다음 탐색은 남은 기록을 다시 재지
+않고 이어서 진행한다. 탐색이 끝나면 `store`가 best와 함께 `complete: true`로 덮는다.
+
 ---
 
 ## 6. 조합 선택
@@ -206,16 +220,15 @@ stage class j가 config c를 고르면 policy 식에 들어가는 bytes와 시�
 ```text
                  weight 계수   state 계수
 P-1 model           n_j          n_j
-P-2 weights         n_j          l_j
-P-3 layer           l_j          l_j
+P-2 layer           l_j          l_j
 
 bytes_policy(j, c) = a_j·weight(c) + b_j·state(c)
 scratch(c_*)       = max_j input(c_j) + max_j output(c_j)
-time(j, c)         = n_j·E(c)  (+ n_j·U(c), P-3)
+time(j, c)         = n_j·(E(c) + share·U(c)),  share = 1/R (P-1), 1 (P-2)
 ```
 
 layer 구성이 같으면 이 식은 `plan_residency`와 정확히 같다. layer마다 구성이 다르면
-P-2/P-3의 `l_j`가 layer별 최대치라서 실제보다 크게(안전하게) 잡힌다.
+P-2의 `l_j`가 layer별 최대치라서 실제보다 크게(안전하게) 잡힌다.
 
 ```text
 1. stage class마다 측정 기록 중 time 최소 config → 합이 Cap 이하이면 그대로 사용
@@ -224,11 +237,31 @@ P-2/P-3의 `l_j`가 layer별 최대치라서 실제보다 크게(안전하게) �
      input ≤ I, output ≤ O인 후보만으로
      Σ_j bytes_policy(j, c_j) ≤ Cap − I − O 에서 Σ_j time(j, c_j) 최소를 DP로 구한다
      (bytes는 MiB 단위로 올림)
-3. 가능한 조합이 없으면 예외
+3. 가능한 조합이 없으면 그 정책은 제외
 ```
 
 용량이 남으면 1단계에서 끝나므로 DP를 쓰지 않는다. DP는 빠른 config가 더 큰 footprint를
 쓰고, 그 합이 용량에 닿을 때만 결과를 바꾼다.
+
+### 6.1 정책 선택 전략
+
+| 전략 | 동작 | 최적성 |
+|---|---|---|
+| `joint` | F의 정책마다 위 1–3을 풀고 요청당 시간이 작은 정책을 고른다. 같으면 P-1 | 측정된 후보 안에서 (정책, config) 전체 최적 |
+| `layer_first` | P-2 예산으로 share=0(실행 시간만) 최속 조합을 고른 뒤, 그 조합이 P-1 식에 맞으면 P-1, 아니면 P-2 | P-1에 맞추려고 config를 줄이는 선택은 하지 않는다 |
+
+```text
+joint가 layer_first보다 나아지는 경우 (같은 측정 후보 기준)
+  layer_first의 조합이 P-1 용량을 넘지만, 조금 느린 조합은 P-1에 들어가고
+  Σ_j n_j·[E_j(느린) − E_j(빠른)]  <  Σ_j n_j·U_j·(1 − 1/R)
+  → layer_first는 P-2(매 요청 upload), joint는 P-1
+
+두 전략이 같은 결과를 내는 경우
+  · layer_first 조합이 P-1에 들어감 (용량 여유)
+  · 최소 footprint로도 P-1이 안 됨 (P-2만 가능)
+  즉 차이는  Cap / M_fast < L ≤ Cap / M_min  인 layer 수 L에서만 생긴다
+  (M_fast: layer_first 조합의 layer당 bytes, M_min: 최소 footprint의 layer당 bytes)
+```
 
 ---
 
@@ -275,8 +308,8 @@ from torch_backend import compile_model
 
 compiled = compile_model(
     layers, example_inputs,
-    target="aimx", units=1, runtime_options={"base_fpga": 0},
-    cache_path=..., max_benchmarks=20, warmup=1, repeat=3,
+    target="aimx", units=1, requests=R, strategy="joint",   # 또는 "layer_first"
+    runtime_options={"base_fpga": 0}, cache_path=..., max_benchmarks=20, warmup=1, repeat=3,
 )
 compiled.report          # policy, stage class별 측정 기록과 선택, 예산
 with compiled.session as session:
@@ -328,7 +361,6 @@ template 조건:
 ## 10. 제한
 
 - stage class 단위로 config를 고른다. 같은 class의 stage들은 같은 config를 쓴다.
-- P-2의 layer 진입 state 재구성 시간은 목적함수에 없다.
 - policy 판정은 target model 추정 footprint를 쓴다. 선택은 실측 footprint를 쓴다.
 - 측정은 stage를 하나씩 실행한다. stage 사이의 host/CPU 겹침은 반영하지 않는다.
 - compile time artifact는 프로세스 메모리에 있다. 프로세스 사이의 저장은 지원하지 않는다.
