@@ -96,7 +96,6 @@ def main():
             error = (output - reference).abs().max().item()
             print(f"invocation={invocation} max_abs={error:.4g} latency_ms={elapsed:.3f} "
                   f"weight_uploads={after['weight_uploads'] - before['weight_uploads']} "
-                  f"state_releases={after['state_releases'] - before['state_releases']} "
                   f"invocations={after['invocations'] - before['invocations']} "
                   f"live_bytes={after['live_bytes']}")
     print("aimx model session: executed (accuracy not checked)")

@@ -9,7 +9,7 @@ import tempfile
 from triton.runtime.cache import get_cache_manager
 
 from .compiler import _run_translate
-from .residency import LAYER, StageRequirement
+from .residency import LAYER, LayerSlots, StageRequirement
 from .upmem_artifact import INPUT, MRAM_BASE, OUTPUT, WEIGHT, TransferStats, _artifact_bindings, _build_program
 from .runtime import current_invocation
 
@@ -87,7 +87,7 @@ class UPMEMModelRuntime:
         self.stages = []
         self.loaded_program = None
         self.policy = None
-        self.loaded = set()
+        self.slots = None
         self.totals = {"program_loads": 0, "device_compiles": 0}
         pointer = ctypes.c_void_p
         uint = ctypes.c_uint32
@@ -132,6 +132,7 @@ class UPMEMModelRuntime:
         layer its own weight addresses so nothing is uploaded twice.
         """
         self.policy = residency.policy
+        self.slots = LayerSlots(residency.policy, [plan.index for plan in plans])
         weight_region = 0
         input_bytes = 0
         output_bytes = 0
@@ -222,15 +223,13 @@ class UPMEMModelRuntime:
                             upload_weights=True)
 
     def enter_layer(self, plan):
-        if plan.index in self.loaded:
+        # slot이 이미 이 layer의 weight를 담고 있으면 올리지 않는다.
+        if not self.slots.enter(plan.index):
             return
         self.load_weights(plan)
-        self.loaded.add(plan.index)
 
     def exit_layer(self, plan):
-        # P-2에서는 다음 layer가 같은 weight 영역을 덮어쓴다. 해제할 device 상태는 없다.
-        if self.policy == LAYER:
-            self.loaded.discard(plan.index)
+        """P-2에서는 다음 layer가 같은 weight 영역을 덮어쓴다. 해제할 device 상태는 없다."""
 
     def weight_table(self, plans):
         table = {}

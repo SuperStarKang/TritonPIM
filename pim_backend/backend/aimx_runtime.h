@@ -75,6 +75,33 @@ static inline void aimx_require(int ok, const char *what) {
   }
 }
 
+// host <-> PIM DRAM 전송을 AIMX_DMA_CHUNK_BYTES 단위로 나눠 datacopy_* 를 부른다.
+// libpim 은 256 MiB(QDMA_MAX_COPY)보다 작은 요청을 pwrite/pread 한 번으로 보내고, qdma_pf 는
+// 그때마다 page 주소 목록(sgl)을 물리 연속 메모리로 kmalloc 한다(page 당 약 62 B). 66 MiB 전송이면
+// 1 MiB(order 8)가 필요해 host RAM 이 조각나면 ENOMEM 이 난다(Llama-2-7b BF16 13.5 GB 적재 중 실측).
+// 2 MiB 면 목록이 32 KiB(order 3) 이하라 커널이 항상 할당한다. 크기 인자 int 의 2 GiB 한계도 피한다.
+// TODO: host RAM 이 늘어 조각화 여유가 생기면(또는 모델 weight 를 host 에 두지 않게 되면)
+//       이 분할을 되돌려 datacopy_* 를 한 번에 부른다. pwrite 호출 수가 줄어 전송 고정 비용이 준다.
+#define AIMX_DMA_CHUNK_BYTES ((size_t)2 << 20)
+
+static inline int aimx_copy_to_pim(void *pim_dst, const void *host_src, size_t bytes, int fpga) {
+  for (size_t done = 0; done < bytes; done += AIMX_DMA_CHUNK_BYTES) {
+    size_t size = bytes - done < AIMX_DMA_CHUNK_BYTES ? bytes - done : AIMX_DMA_CHUNK_BYTES;
+    if (datacopy_cpu2pim((char *)pim_dst + done, (const char *)host_src + done, (int)size, fpga) < 0)
+      return -1;
+  }
+  return 0;
+}
+
+static inline int aimx_copy_from_pim(void *host_dst, const void *pim_src, size_t bytes, int fpga) {
+  for (size_t done = 0; done < bytes; done += AIMX_DMA_CHUNK_BYTES) {
+    size_t size = bytes - done < AIMX_DMA_CHUNK_BYTES ? bytes - done : AIMX_DMA_CHUNK_BYTES;
+    if (datacopy_pim2cpu((char *)host_dst + done, (const char *)pim_src + done, (int)size, fpga) < 0)
+      return -1;
+  }
+  return 0;
+}
+
 // Shared across generated kernel DSOs by libaimx_resident. A lease owns one
 // physical FPGA through staging, synchronous invocation and result collection.
 // Addresses and chain records stay live until plan replacement or explicit reset.
@@ -118,10 +145,9 @@ extern "C" {
 // Opens every physical FPGA once and returns how many exist.
 int aimx_model_open();
 // Session-owned contexts. Never replaced implicitly; slots are allocated by the
-// stage stub on first use and stay until release or destroy.
+// stage stub on first use and stay until destroy. Layers that share a residency
+// slot share the context, so its buffers and descriptor chain are built once.
 aimx_resident_context *aimx_model_create(int fpga, size_t slots);
-// Frees every slot whose keep[slot] is 0 and invalidates the descriptor chain.
-void aimx_model_release(aimx_resident_context *context, const int *keep);
 void aimx_model_destroy(aimx_resident_context *context);
 int64_t aimx_model_live_bytes(aimx_resident_context *context);
 }

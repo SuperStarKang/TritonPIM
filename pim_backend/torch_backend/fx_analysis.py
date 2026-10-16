@@ -16,6 +16,13 @@ _SUPPORTED_GEMMS = frozenset((
     aten._int_mm.default,
 ))
 
+# 실수 GEMM의 입력 dtype -> (출력, accumulator). BF16은 Triton이 BF16 누산을 받지 않으므로
+# FP32로 누산하고 출력에서 BF16으로 바꾼다. _int_mm은 언제나 int8 -> int32다.
+FLOAT_GEMM_DTYPES = {
+    torch.float32: (torch.float32, torch.float32),
+    torch.bfloat16: (torch.bfloat16, torch.float32),
+}
+
 _GEMM_SCHEMAS = frozenset((
     "aten::linear",
     "aten::mm",
@@ -151,8 +158,16 @@ def _analyze_gemm(node, weights):
     if type(alpha) not in (int, float) or type(beta) not in (int, float):
         raise ValueError(f"{node.name}: alpha and beta must be static real scalars")
 
-    input_dtype = torch.int8 if is_integer else torch.float32
-    output_dtype = torch.int32 if is_integer else torch.float32
+    if is_integer:
+        input_dtype = torch.int8
+        output_dtype = accumulator_dtype = torch.int32
+    else:
+        input_dtype = left.dtype
+        if input_dtype not in FLOAT_GEMM_DTYPES:
+            raise ValueError(
+                f"{node.name}: inputs must be one of {tuple(FLOAT_GEMM_DTYPES)}, got {left.dtype}"
+            )
+        output_dtype, accumulator_dtype = FLOAT_GEMM_DTYPES[input_dtype]
 
     if left.dtype != input_dtype or right.dtype != input_dtype:
         raise ValueError(
@@ -214,7 +229,7 @@ def _analyze_gemm(node, weights):
         mnk=(m, n, k),
         output_shape=output_shape,
         output_dtype=output_dtype,
-        accumulator_dtype=output_dtype,
+        accumulator_dtype=accumulator_dtype,
         reshape_left=is_linear and len(left.shape) != 2,
         transpose_right=is_linear,
         alpha=alpha,

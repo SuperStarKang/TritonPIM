@@ -173,6 +173,7 @@ def PIM_LoadOp : PIM_Op<"load", [MemoryEffects<[MemRead]>]> {
 
 // local→host 직접 전송. 서로 독립적인 K contribution을 최종 output에 합치는 write는
 // 아래 pim.combine으로 표현한다. 따라서 이 op 자체에는 partial/final 의미가 없다.
+// store와 combine은 값을 목적지 buffer의 원소 타입으로 쓴다 (예: FP32 누산 → BF16 출력).
 def PIM_StoreOp : PIM_Op<"store", [MemoryEffects<[MemWrite]>]> {
   let summary = "Store a tile through a PIM access";
   let arguments = (ins AnyRankedTensor:$value, PIM_AccessType:$access);

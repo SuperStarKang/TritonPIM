@@ -70,17 +70,26 @@ struct StubEmitter {
   // ── PIM_TIMING (임시) ──────────────────────────────────────────────────────
   // 어느 단계가 오래 걸리는지 보려고 넣은 계측이다. 성능 판단이 끝나면 지운다.
   // 지우려면 PIM_TIMING 표시가 붙은 곳(이 블록, run 의 memset 한 줄, emitOp 의 mark
-  // 호출, emitForeachDevice 의 시계 시작과 mark 호출)과 driver.py 의 같은 표시를 지운다.
+  // 호출, emitForeachDevice 의 시계 시작과 mark 호출, emitConstruction / emitStage /
+  // emitUnstage 안의 mark 호출)과 driver.py 의 같은 표시를 지운다.
   //
   // UPMEM 과 달리 여기서는 **누적**한다. stage / invoke / unstage 가 tile loop 안에서
   // 여러 번 돌기 때문에 덮어쓰면 마지막 tile 한 번만 남는다.
+  //
+  // 칸 순서는 driver.py 의 _STAGE_NAMES["aimx"] 와 같아야 한다. layout 변환(host 조립)과
+  // DMA 를 다른 칸에 둔다: stage = layout_in + h2d, unstage = d2h + layout_out,
+  // descriptor 는 build(생성) + desc_h2d(업로드).
+  enum TimingSlot {
+    kAlloc, kBuild, kDescH2D, kLayoutIn, kH2D, kInvoke, kD2H, kLayoutOut, kTimingSlots
+  };
+
   void emitTimingPreamble() {
     os() << "// PIM_TIMING: 단계별 누적 시간(ms). launcher 가 이름으로 읽어 간다.\n"
          << "// PIM Device 를 여럿 쓰면 스레드마다 자기 시계를 들고 한 배열에 더하므로\n"
          << "// 합계가 wall-clock 을 넘을 수 있다 — device 시간의 총합이라는 뜻이다.\n"
          << "#include <time.h>\n"
-         << "extern \"C\" double pim_timing_ms[5];\n"
-         << "double pim_timing_ms[5];\n"
+         << "extern \"C\" double pim_timing_ms[" << kTimingSlots << "];\n"
+         << "double pim_timing_ms[" << kTimingSlots << "];\n"
          << "static double _pim_now() {\n"
          << "  struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);\n"
          << "  return ts.tv_sec * 1e3 + ts.tv_nsec * 1e-6;\n"
@@ -275,20 +284,20 @@ struct StubEmitter {
     if (auto alloc = dyn_cast<aimx::AllocOp>(op)) {
       if (failed(emitAlloc(alloc, depth)))
         return failure();
-      mark(0, depth);
+      mark(kAlloc, depth);
       return success();
     }
     if (auto build = dyn_cast<aimx::BuildDescriptorsOp>(op)) {
       if (failed(emitBuild(build, depth, patchAddresses)))
         return failure();
-      mark(1, depth);
+      mark(kBuild, depth);
       return success();
     }
     if (auto st = dyn_cast<aimx::StageOp>(op)) {
       if (!model) {
         if (failed(emitStage(st, depth)))
           return failure();
-        mark(2, depth);
+        mark(kH2D, depth);
         return success();
       }
       // weight 는 upload 호출에서만, activation 과 상수는 실행 호출에서만 올린다.
@@ -304,7 +313,7 @@ struct StubEmitter {
         os() << "if (!_model->upload) {\n";
       if (failed(emitStage(st, depth + 1)))
         return failure();
-      mark(2, depth + 1);
+      mark(kH2D, depth + 1);
       e.indent(depth);
       os() << "}\n";
       return success();
@@ -317,7 +326,7 @@ struct StubEmitter {
       }
       if (failed(emitInvoke(inv, guarded)))
         return failure();
-      mark(3, guarded);
+      mark(kInvoke, guarded);
       if (model) {
         e.indent(depth);
         os() << "}\n";
@@ -336,7 +345,7 @@ struct StubEmitter {
       }
       if (failed(emitUnstage(un, guarded)))
         return failure();
-      mark(4, guarded);
+      mark(kLayoutOut, guarded);
       if (model) {
         e.indent(depth);
         os() << "}\n";
@@ -501,7 +510,7 @@ struct StubEmitter {
         emitFree(buffers[v], inner);
     }
     // PIM_TIMING: 놓는 것도 메모리 관리이므로 잡는 것과 같은 칸에 넣는다.
-    mark(0, inner);
+    mark(kAlloc, inner);
     buffers.clear();
     allocated.clear();
     havePMM = false;
@@ -727,6 +736,8 @@ struct StubEmitter {
       e.indent(depth);
       os() << "}\n";
     }
+    // 여기까지가 descriptor 생성(patch 포함), 아래가 그 업로드다.
+    mark(kBuild, depth);
     // Address patches update the retained host records. The current transfer
     // API uploads one contiguous chain; this is not sparse device-side DMA.
     for (Value value : chains) {
@@ -734,9 +745,9 @@ struct StubEmitter {
       e.indent(depth);
       os() << "if (" << chain.idx << " != 0)\n";
       e.indent(depth + 1);
-      os() << "aimx_require(datacopy_cpu2pim((void*)" << chain.va << ", " << chain.host
-           << ", (int)(sizeof(pim_isa_32_t) * " << chain.idx
-           << "), _fpga) >= 0, \"descriptor upload failed\");\n";
+      os() << "aimx_require(aimx_copy_to_pim((void*)" << chain.va << ", " << chain.host
+           << ", sizeof(pim_isa_32_t) * (size_t)" << chain.idx
+           << ", _fpga) >= 0, \"descriptor upload failed\");\n";
     }
     if (persistentBody) {
       e.indent(depth);
@@ -744,7 +755,7 @@ struct StubEmitter {
     }
     e.indent(depth - 1);
     os() << "}\n";
-    mark(1, depth - 1);
+    mark(kDescH2D, depth - 1);
     return success();
   }
 
@@ -1121,10 +1132,12 @@ struct StubEmitter {
       e.indent(depth + 1);
       os() << "});\n";
     }
+    // 공유 slot 이면 먼저 온 thread 가 조립하는 동안 기다린 시간도 여기 들어간다.
+    mark(kLayoutIn, depth + 1);
     e.indent(depth + 1);
-    os() << "aimx_require(datacopy_cpu2pim((void*)" << b.va << ", " << host
-         << ", (int)((size_t)" << padRows << " * (size_t)" << pitch << " * "
-         << bytes << "), _fpga) >= 0, \"input upload failed\");\n";
+    os() << "aimx_require(aimx_copy_to_pim((void*)" << b.va << ", " << host
+         << ", (size_t)" << padRows << " * (size_t)" << pitch << " * "
+         << bytes << ", _fpga) >= 0, \"input upload failed\");\n";
     e.indent(depth);
     os() << "}\n";
     return success();
@@ -1169,9 +1182,10 @@ struct StubEmitter {
            << "ll && " << panelElements * rowGroups * colGroups * bytes << "ull <= "
            << b.bytes << "ull, \"unstage does not match the contiguous group layout\");\n";
       e.indent(depth + 1);
-      os() << "aimx_require(datacopy_pim2cpu(" << b.host << ", (void*)" << b.va
+      os() << "aimx_require(aimx_copy_from_pim(" << b.host << ", (void*)" << b.va
            << ", " << panelElements * rowGroups * colGroups * bytes
-           << ", _fpga) >= 0, \"output download failed\");\n";
+           << "ull, _fpga) >= 0, \"output download failed\");\n";
+      mark(kD2H, depth + 1);
       auto scatter = [&](unsigned d, bool accumulate) {
         e.indent(d);
         os() << "for (int64_t " << i << " = 0; " << i << " < " << rows << "; ++" << i << ") {\n";
@@ -1251,9 +1265,10 @@ struct StubEmitter {
          << "ull, \"unstage reads past the PIM DRAM buffer\");\n";
     // 실제로 쓴 행까지만 되읽는다. 행 group 밖의 padding 자리는 읽지 않는다.
     e.indent(depth + 1);
-    os() << "aimx_require(datacopy_pim2cpu(" << b.host << ", (void*)" << b.va
-         << ", (int)((size_t)" << physRows << " * (size_t)" << pitch << " * "
-         << bytes << "), _fpga) >= 0, \"output download failed\");\n";
+    os() << "aimx_require(aimx_copy_from_pim(" << b.host << ", (void*)" << b.va
+         << ", (size_t)" << physRows << " * (size_t)" << pitch << " * "
+         << bytes << ", _fpga) >= 0, \"output download failed\");\n";
+    mark(kD2H, depth + 1);
     // stage 와 같은 이유로 행 주소를 밖으로 뺀다. group_cols 가 있으면 block group
     // 단위로 잘라 읽는다 — 유효 열 j 가 물리 칸 (j/useful)*phys + j%useful 에 있고,
     // pad 열은 계산 결과 자체가 0 이라 건너뛴다.

@@ -33,8 +33,20 @@ CONFIGS = {
     # QK^T, PV: 32 heads가 instance 32개인 stage 하나가 되고 batch round 32번으로 실행된다.
     (1024, 1024, 128): PIMConfig(128, 128, 128, 1, 8, 1, 8, 1, 1, 1, 1, 1),
     (1024, 128, 1024): PIMConfig(128, 128, 128, 1, 1, 8, 8, 1, 1, 1, 1, 1),
+    # head 묶음 block-diagonal (PackedAttentionLayer). Block Group이 n·k 전체, tile_m이 m 전체다.
+    # QK^T 2 head: (1024 x 256) @ (256 x 2048)
+    (1024, 2048, 256): PIMConfig(128, 128, 128, 1, 16, 2, 8, 1, 1, 1, 1, 1),
+    # PV 4 head: (1024 x 4096) @ (4096 x 512)
+    (1024, 512, 4096): PIMConfig(128, 128, 128, 1, 4, 32, 8, 1, 1, 1, 1, 1),
 }
-HEAD_SHAPES = ((1024, 1024, 128), (1024, 128, 1024))
+# head GEMM shape -> (이름, 0 블록을 뺀 유효 계산의 mnk)
+HEAD_OPERATIONS = {
+    (1024, 1024, 128): ("QK^T", (1024, 1024, 128)),
+    (1024, 128, 1024): ("PV", (1024, 128, 1024)),
+    (1024, 2048, 256): ("QK^T", (1024, 2048, 128)),
+    (1024, 512, 4096): ("PV", (1024, 512, 1024)),
+}
+HEAD_SHAPES = tuple(HEAD_OPERATIONS)
 
 
 def stage_config(mnk, fpgas, split):
@@ -109,9 +121,9 @@ def benchmark_model(model, inputs, args, *, scope, expected_gemms, expected_weig
         for gemm in gemms:
             if gemm.right.weight_target is not None:
                 operation = gemm.right.weight_target.removesuffix(".weight")
+                logical = (1024, 11008, 4096) if gemm.mnk == (1024, 11264, 4096) else gemm.mnk
             else:
-                operation = {(1024, 1024, 128): "QK^T", (1024, 128, 1024): "PV"}[gemm.mnk]
-            logical = (1024, 11008, 4096) if gemm.mnk == (1024, 11264, 4096) else gemm.mnk
+                operation, logical = HEAD_OPERATIONS[gemm.mnk]
             labels[gemm.node] = {
                 "operation": operation, "mnk": list(logical), "padded_mnk": list(gemm.mnk),
                 "weight": gemm.right.weight_target, "config": asdict(configs[gemm.mnk]),

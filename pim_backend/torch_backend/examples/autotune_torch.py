@@ -88,8 +88,8 @@ def main():
     parser.add_argument("--target", choices=("upmem", "aimx"), default="upmem")
     parser.add_argument("--num-units", type=int, default=0,
                         help="0이면 target 기본값 (UPMEM 2048, AiMX는 보이는 FPGA 수)")
-    parser.add_argument("--dtype", choices=("int8", "float32"), default="int8",
-                        help="int8: _int_mm -> int32, float32: mm -> float32")
+    parser.add_argument("--dtype", choices=("int8", "float32", "bfloat16"), default="int8",
+                        help="int8: _int_mm -> int32, float32/bfloat16: mm -> same dtype")
     args = parser.parse_args()
 
     target = target_spec(args.target, num_units=args.num_units)
@@ -104,10 +104,10 @@ def main():
     else:
         # 실수 경로는 정확도를 검사하지 않는다 (correctness=None). 시간만 비교한다.
         problem = PIMProblem(M=args.m, N=args.n, K=args.k,
-                             input_dtype="float32", output_dtype="float32")
+                             input_dtype=args.dtype, output_dtype=args.dtype)
         operation = pim_mm
-        a = torch.randn(args.m, args.k)
-        b = torch.randn(args.k, args.n)
+        a = torch.randn(args.m, args.k, dtype=getattr(torch, args.dtype))
+        b = torch.randn(args.k, args.n, dtype=getattr(torch, args.dtype))
 
     base = PIMTorchConfig(spec=target)
 

@@ -1,4 +1,4 @@
-"""CPU FP32 mm and INT8 _int_mm lowering to a PIM GEMM template."""
+"""CPU FP32/BF16 mm and INT8 _int_mm lowering to a PIM GEMM template."""
 
 import logging
 
@@ -100,10 +100,16 @@ def generate_pim_gemm_template(mat1, mat2, layout, execution):
     return node
 
 
-def make_pim_gemm_lowering(
-    config: PIMTorchConfig, input_dtype, output_dtype,
-):
+def make_pim_gemm_lowering(config: PIMTorchConfig, output_dtypes):
+    """output_dtypes maps each accepted input dtype to the GEMM output dtype."""
+
     def pim_gemm(mat1, mat2, *, layout=None):
+        input_dtype = mat1.get_dtype()
+        if input_dtype not in output_dtypes:
+            raise UnsupportedPIMGemm(
+                f"mat1 must have one of the dtypes {tuple(output_dtypes)}, got {input_dtype}"
+            )
+        output_dtype = output_dtypes[input_dtype]
         m, n, k, out_layout, mat1_r, mat2_r = mm_args(
             mat1,
             mat2,
@@ -162,15 +168,13 @@ class PIMGemmLowering:
         import torch._inductor.kernel.mm
 
         replacements = {}
-        for operation, input_dtype, output_dtype in (
-            (aten.mm, torch.float32, torch.float32),
-            (aten._int_mm, torch.int8, torch.int32),
+        for operation, output_dtypes in (
+            (aten.mm, {torch.float32: torch.float32, torch.bfloat16: torch.bfloat16}),
+            (aten._int_mm, {torch.int8: torch.int32}),
         ):
             wrapped = _register_lowering(
                 operation.default,
-                make_pim_gemm_lowering(
-                    self.config, input_dtype, output_dtype,
-                ),
+                make_pim_gemm_lowering(self.config, output_dtypes),
                 broadcast=False,
                 type_promotion_kind=None,
                 convert_input_to_bool=False,

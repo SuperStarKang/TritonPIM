@@ -36,7 +36,8 @@ class PIMExecution:
             "BLOCK_M": self.config.block_m,
             "BLOCK_N": self.config.block_n,
             "BLOCK_K": self.config.block_k,
-            "ACC_TYPE": f"tl.{self.problem.output_dtype}",
+            # BF16 출력도 FP32로 누산한다 (Triton은 BF16 누산을 받지 않는다). store가 출력 dtype으로 바꾼다.
+            "ACC_TYPE": "tl.int32" if self.problem.output_dtype == "int32" else "tl.float32",
         }
 
     def backend_options(self):

@@ -46,7 +46,8 @@ _STAGE_NAMES = {
     "upmem": ("prepare", "h2d", "kernel", "d2h", "reduction",
               "buffer_alloc", "buffer_free", "acquire", "buffer_init",
               "layout_a", "layout_b", "layout_other", "layout_c"),
-    "aimx": ("alloc", "build", "stage", "invoke", "unstage"),
+    # AiMXToRuntimeStub.cpp의 TimingSlot과 같은 순서. layout_*는 host 조립, h2d/d2h/desc_h2d는 DMA.
+    "aimx": ("alloc", "build", "desc_h2d", "layout_in", "h2d", "invoke", "d2h", "layout_out"),
 }
 TIMING_STAGES = _STAGE_NAMES["upmem"]
 TIMING_VERSION = UPMEM_TIMING_VERSION

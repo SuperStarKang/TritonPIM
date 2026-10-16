@@ -54,18 +54,72 @@ class AttentionLayer(torch.nn.Module):
         self.register_buffer("sine", angles.sin())
         self.register_buffer("mask", torch.ones(SEQUENCE, SEQUENCE, dtype=torch.bool).triu(1))
 
-    def forward(self, activation):
+    def project(self, activation):
+        """Q/K/V projections and RoPE; each result is [HEADS, SEQUENCE, HEAD_DIM]."""
         query = self.q_proj(activation).reshape(SEQUENCE, HEADS, HEAD_DIM).transpose(0, 1)
         key = self.k_proj(activation).reshape(SEQUENCE, HEADS, HEAD_DIM).transpose(0, 1)
         value = self.v_proj(activation).reshape(SEQUENCE, HEADS, HEAD_DIM).transpose(0, 1).contiguous()
         query = (query * self.cosine + rotate_half(query) * self.sine).contiguous()
         key = (key * self.cosine + rotate_half(key) * self.sine).contiguous()
+        return query, key, value
+
+    def forward(self, activation):
+        query, key, value = self.project(activation)
         outputs = []
         for head in range(HEADS):
             scores = torch.mm(query[head], key[head].t().contiguous()) / math.sqrt(HEAD_DIM)
             probability = torch.softmax(scores.masked_fill(self.mask, float("-inf")), dim=-1)
             outputs.append(torch.mm(probability, value[head]))
         context = torch.stack(outputs).transpose(0, 1).reshape(1, SEQUENCE, HIDDEN)
+        return self.o_proj(context)
+
+
+def block_diagonal(blocks):
+    """Block i at rows/columns i of the result, zeros elsewhere (pad + cat)."""
+    columns = sum(block.shape[1] for block in blocks)
+    rows = []
+    left = 0
+    for block in blocks:
+        rows.append(torch.nn.functional.pad(block, (left, columns - left - block.shape[1])))
+        left += block.shape[1]
+    return torch.cat(rows, dim=0)
+
+
+class PackedAttentionLayer(AttentionLayer):
+    """AttentionLayer with qk_heads / pv_heads heads per block-diagonal GEMM.
+
+    QK^T: [Q_h | Q_h+1 ...] (SEQ x H*D)   @ blockdiag(K_h^T ...) (H*D x H*SEQ)   = [S_h | S_h+1 ...]
+    PV:   [P_h | P_h+1 ...] (SEQ x H*SEQ) @ blockdiag(V_h ...)   (H*SEQ x H*D)   = [O_h | O_h+1 ...]
+    Weights and the input order match AttentionLayer, so the same seed gives the same layer.
+    """
+
+    def __init__(self, qk_heads, pv_heads):
+        super().__init__()
+        if HEADS % qk_heads or HEADS % pv_heads:
+            raise ValueError(f"heads per GEMM must divide {HEADS}: qk {qk_heads}, pv {pv_heads}")
+        self.qk_heads = qk_heads
+        self.pv_heads = pv_heads
+
+    def forward(self, activation):
+        query, key, value = self.project(activation)
+        scores = []
+        for first in range(0, HEADS, self.qk_heads):
+            heads = range(first, first + self.qk_heads)
+            left = torch.cat([query[head] for head in heads], dim=1)
+            right = block_diagonal([key[head].t() for head in heads])
+            scores.append(torch.mm(left, right))
+        # 열 순서가 head, key 위치이므로 [SEQ, HEADS, SEQ]로 보고 head마다 softmax한다.
+        scores = torch.cat(scores, dim=1).reshape(SEQUENCE, HEADS, SEQUENCE) / math.sqrt(HEAD_DIM)
+        probability = torch.softmax(scores.masked_fill(self.mask[:, None, :], float("-inf")), dim=-1)
+        probability = probability.reshape(SEQUENCE, HEADS * SEQUENCE)
+        outputs = []
+        for first in range(0, HEADS, self.pv_heads):
+            heads = range(first, first + self.pv_heads)
+            left = probability[:, first * SEQUENCE:(first + self.pv_heads) * SEQUENCE]
+            right = block_diagonal([value[head] for head in heads])
+            outputs.append(torch.mm(left, right))
+        # [O_h | O_h+1 ...]의 열 순서가 곧 hidden 열 순서 head * HEAD_DIM + d다.
+        context = torch.cat(outputs, dim=1).reshape(1, SEQUENCE, HIDDEN)
         return self.o_proj(context)
 
 

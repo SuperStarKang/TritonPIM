@@ -30,7 +30,11 @@ examples/
     ├── benchmark_aimx_attention_layer.py      # 고정 config (session-first)
     ├── benchmark_aimx_transformer_block.py    # 고정 config (session-first)
     ├── benchmark_aimx_model_compile.py        # policy 우선 model compile
-    └── aimx_model_session.py                  # 작은 session 예제
+    ├── aimx_model_session.py                  # 작은 session 예제
+    ├── verify_bf16_gemm.py                    # BF16 host GEMM = FP32 host 결과 (bit)
+    ├── llama_workloads.py                     # HF Llama-2-7b layer, BF16 GEMM
+    ├── verify_llama_layer.py                  # layer 하나: HF FP32 vs CPU vs AiMX
+    └── benchmark_llama_ttft.py                # 32 layer prefill TTFT, 첫 token
 ```
 
 결과는 각 스크립트 옆의 `*_report/` 디렉터리에 `report.json`, `exported_fx.*`,
@@ -68,6 +72,9 @@ python benchmark_aimx_transformer_block.py --fpgas 1
 # policy 우선 model compile: target과 unit 수는 입력, profile은 backend/target.py에 등록된 값
 python benchmark_aimx_model_compile.py --scope attention   --units 1 --base-fpga 0
 python benchmark_aimx_model_compile.py --scope transformer --units 1 --base-fpga 0
+# HF Llama-2-7b-hf checkpoint (BF16 GEMM, QK^T 2 head / PV 4 head block-diagonal)
+python verify_llama_layer.py   --checkpoint ~/models/Llama-2-7b-hf --prompt-file ../upmem/e2e/prompt.txt --fpgas 2
+python benchmark_llama_ttft.py --checkpoint ~/models/Llama-2-7b-hf --prompt-file ../upmem/e2e/prompt.txt --fpgas 2
 ```
 
 `benchmark_aimx_model_compile.py`의 compile time과 runtime 구조, policy 판정과 config 선택은

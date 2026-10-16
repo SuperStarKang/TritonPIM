@@ -74,6 +74,30 @@ static bool isWrapAroundBuffer(memref::AllocOp alloc) {
   return copyTargets > 1;
 }
 
+// 저장 값이 float 원소 타입만 바꾸는 elementwise linalg.generic(예: FP32 누산 → BF16
+// 출력의 truncf)이면 그 입력을 돌려주고, generic과 그 init을 dead에 넣는다.
+// pim.store/pim.combine은 값을 목적지 buffer의 원소 타입으로 쓰므로 의미가 같고,
+// 누산 결과가 곧 저장 값이 되어 K partial 결합 앞에 epilogue가 끼지 않는다.
+static Value foldFloatConversion(Value value, SmallVectorImpl<Operation *> &dead) {
+  auto generic = value.getDefiningOp<linalg::GenericOp>();
+  if (!generic || generic.getNumDpsInputs() != 1 || generic->getNumResults() != 1 ||
+      !value.hasOneUse() ||
+      !llvm::all_of(generic.getIndexingMapsArray(),
+                    [](AffineMap map) { return map.isIdentity(); }))
+    return value;
+  Block &body = generic.getRegion().front();
+  Operation *convert = body.getTerminator()->getOperand(0).getDefiningOp();
+  if (body.getOperations().size() != 2 || !convert ||
+      !isa<arith::TruncFOp, arith::ExtFOp>(convert) ||
+      convert->getOperand(0) != body.getArgument(0))
+    return value;
+  dead.push_back(generic);
+  if (auto empty = generic.getDpsInits()[0].getDefiningOp<tensor::EmptyOp>())
+    if (empty->hasOneUse())
+      dead.push_back(empty);
+  return generic.getDpsInputs()[0];
+}
+
 struct ConvertTTSharedToPIMPass
     : public mlir::triton::impl::ConvertTTSharedToPIMBase<ConvertTTSharedToPIMPass> {
   using ConvertTTSharedToPIMBase::ConvertTTSharedToPIMBase;
@@ -195,8 +219,9 @@ struct ConvertTTSharedToPIMPass
       Value dest = op->getOperand(1);
       if (auto rc = dest.getDefiningOp<memref::ReinterpretCastOp>()) {
         b.setInsertionPoint(op);
-        b.create<pim::StoreOp>(op->getLoc(), op->getOperand(0), getAccess(rc));
         dead.push_back(op);
+        b.create<pim::StoreOp>(op->getLoc(), foldFloatConversion(op->getOperand(0), dead),
+                               getAccess(rc));
         return;
       }
       auto sub = dest.getDefiningOp<memref::SubViewOp>();
@@ -213,8 +238,8 @@ struct ConvertTTSharedToPIMPass
                            toIndices(b, loc, rc.getMixedStrides()),
                            rc.getStaticSizes(),
                            toIndices(b, loc, es.getMixedSizes()), Value());
-      b.create<pim::StoreOp>(loc, es.getSource(), d);
       dead.append({op, es.getOperation(), sub.getOperation()});
+      b.create<pim::StoreOp>(loc, foldFloatConversion(es.getSource(), dead), d);
       roots.push_back(rc);
     });
 

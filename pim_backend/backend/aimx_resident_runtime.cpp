@@ -200,21 +200,6 @@ extern "C" aimx_resident_context *aimx_model_create(int fpga, size_t slots) {
   return &state->context;
 }
 
-extern "C" void aimx_model_release(aimx_resident_context *context, const int *keep) {
-  auto &state = *static_cast<DeviceState *>(context->owner);
-  for (size_t slot = context->count; slot-- > 0;) {
-    auto &buffer = context->buffers[slot];
-    if (keep[slot] || !buffer.va)
-      continue;
-    pim_free((void *)buffer.va, state.fpga);
-    if (buffer.host)
-      munmap(buffer.host, (size_t)buffer.bytes);
-    buffer = {};
-  }
-  // Freed buffers come back at new physical addresses, so the chain is rebuilt.
-  context->ready = false;
-}
-
 extern "C" void aimx_model_destroy(aimx_resident_context *context) {
   auto *state = static_cast<DeviceState *>(context->owner);
   clear(*state);

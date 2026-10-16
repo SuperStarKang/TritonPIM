@@ -119,10 +119,10 @@ def run_worker(alignment, input_file, output_file):
                     f"{a_pitch(case, alignment)},")
         assert expected in target_ir, f"{case}: A storage pitch is not {a_pitch(case, alignment)}"
         timing = dict(zip(pim_driver.TIMING_STAGES, pim_driver.timing))
-        results[case] = {"outputs": outputs, "stage_ms": timing["stage"],
+        results[case] = {"outputs": outputs, "stage_ms": timing["layout_in"] + timing["h2d"],
                          "invoke_ms": timing["invoke"]}
         print(f"[worker] alignment={alignment} {case} pitch={a_pitch(case, alignment)} "
-              f"stage_ms={timing['stage']:.3f} invoke_ms={timing['invoke']:.3f}", flush=True)
+              f"stage_ms={results[case]['stage_ms']:.3f} invoke_ms={timing['invoke']:.3f}", flush=True)
     torch.save(results, output_file)
 
 
