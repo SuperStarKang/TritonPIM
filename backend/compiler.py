@@ -77,6 +77,9 @@ def _ttsharedir_to_llir(ttsharedir: str):
         ttshared_path = os.path.join(tmpdir, "ttshared.mlir")
         llmlir_path = os.path.join(tmpdir, "ll.mlir")
         llir_path = os.path.join(tmpdir, "ll.ir")
+        # Inductor mm template의 tl.assume은 llvm.intr.assume으로 남는데 memory effect를 선언하지 않아
+        # buffer-deallocation-pipeline이 거부한다. 결과값이 없는 최적화 힌트라 지운다.
+        ttsharedir = re.sub(r"^\s*llvm\.intr\.assume\b.*\n", "", ttsharedir, flags=re.MULTILINE)
         Path(ttshared_path).write_text(ttsharedir)
         # mlir-opt는 tptr dialect를 등록하지 않아 TritonToPtr가 남긴 tptr op를 읽지 못한다.
         # triton-shared-opt는 mlir-opt의 pass를 모두 등록하고 tptr도 읽을 수 있다.
@@ -92,6 +95,9 @@ def _ttsharedir_to_llir(ttsharedir: str):
             # "--eliminate-empty-tensors",
             "--empty-tensor-to-alloc-tensor",
             "--one-shot-bufferize=allow-return-allocs-from-loops=true",
+            # bufferize가 만든 memref.alloc에 대응하는 dealloc을 넣는다.
+            # 없으면 커널 program마다 malloc만 하고 free하지 않아 메모리가 계속 쌓인다.
+            "--buffer-deallocation-pipeline",
             "--lower-affine",
             "--convert-linalg-to-loops",
             "--expand-strided-metadata",
@@ -128,7 +134,8 @@ def _optimize_llir(llir: str):
 
 
 def _llir_to_bin(llir: str, metadata):
-    pattern = r"define void @(\w+)\(.+"
+    # buffer-deallocation-pipeline이 만드는 @dealloc_helper는 커널이 아니므로 제외한다
+    pattern = r"define void @(?!dealloc_helper\()(\w+)\(.+"
     matches = re.findall(pattern, llir)
     assert len(matches) == 1
     metadata["name"] = matches[0]
