@@ -67,7 +67,8 @@ CPU 컴파일 준비에서 계산한 실제 출력으로 다음 block을 분석�
 모든 block의 메모리 요구량을 모은 뒤 adapter가 공통 주소와 native artifact를 확정한다.
 `build_layer_plan()`은 이 과정에서 쓰는 기존 FX 분석 함수로 유지한다.
 Activation/ready table은 만들지 않는다. Weight는 현재 Layer만 device에 상주하며,
-KV API는 우선 CPU 저장소를 제공한다. 정적 shape, UPMEM, `p_k=1`, 동기 실행을 지원한다.
+KV API는 우선 CPU 저장소를 제공한다. 정적 shape, UPMEM, 동기 실행을 지원한다.
+UPMEM 모델 stage의 p_k > 1은 host가 K 부분합을 누적하며, 모델 경로에서 정답 검증은 아직 하지 않았다.
 Resident weight GEMM은 단일 instance·단일 M/N/K round로 제한한다.
 
 설계·상세 범위·검증 명령은 [모델 runtime 설계](../../design/ModelRuntime_Design.md),

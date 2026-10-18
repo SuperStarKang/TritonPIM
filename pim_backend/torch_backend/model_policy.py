@@ -95,11 +95,10 @@ def stage_constraint(key, max_rounds):
 
     max_rounds bounds an activation stage's M/N/K scheduling rounds; without it
     the search would also measure one Block Group per round, thousands of rounds.
+    p_k is left to the target (AiMX rejects p_k > 1 in its mapping_reason).
     """
 
     def check(problem, config):
-        if config.p_k != 1:
-            return "model stages require p_k=1"
         rounds = pim_hierarchy(problem, config).scheduling_rounds
         if key.has_weights and rounds != 1:
             return "weight stages require one M/N/K round"

@@ -129,9 +129,6 @@ def select_layer_config(problem, target, torch_config, instance_count, *, has_we
     # 거부한 후보마다 이유를 남긴다. 모두 거부되면 그대로 보고한다.
     rejected = []
     for config, cost in candidates:
-        if config.p_k != 1:
-            rejected.append((config.key(), "model layers require p_k=1"))
-            continue
         reason = engine.check(config)
         if reason is not None:
             rejected.append((config.key(), reason))

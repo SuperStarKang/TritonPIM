@@ -407,7 +407,7 @@ stage class마다 stage 하나만 담은 Torch module을 만들고, 후보 confi
 
 | 입력 | 값 |
 |---|---|
-| 제약 | `stage_constraint`: `p_k = 1`, weight stage는 M/N/K round 1, activation stage는 round ≤ `max_initial_scheduling_rounds` |
+| 제약 | `stage_constraint`: weight stage는 M/N/K round 1, activation stage는 round ≤ `max_initial_scheduling_rounds`. p_k는 target이 정한다(AiMX는 `mapping_reason`이 p_k = 1만 허용) |
 | 초기 round 패턴 | weight stage는 (1, 1, 1)만 |
 | cache context | `<template>\|model\|<op>\|w<weight mask>\|x<instances>` |
 
