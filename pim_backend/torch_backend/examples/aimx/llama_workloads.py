@@ -2,27 +2,47 @@
 
 The seven projections and the QK^T/PV GEMMs are BF16 x BF16 -> BF16, which is what AiMX
 stores and computes; BF16 host weights also keep the 32 layers (13 GB) inside host memory.
-RMSNorm, RoPE, softmax, SwiGLU and residuals stay FP32 on the CPU. QK^T packs qk_heads and
-PV packs pv_heads heads (default QK_HEADS, PV_HEADS) into one block-diagonal GEMM, as
-fp32_workloads.PackedAttentionLayer; 1 and 1 give one GEMM per head.
+RMSNorm, RoPE, softmax, SwiGLU and residuals stay FP32 on the CPU. The attention is written
+with one QK^T and one PV GEMM per head; the compiler packs them (torch_backend/fx_packing.py).
+qk_heads / pv_heads > 1 pack heads by hand into one block-diagonal GEMM instead.
 """
 
 import copy
+from pathlib import Path
+import sys
 
-from aimx_benchmark_common import CONFIGS, stage_config
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from fp32_workloads import (
-    HEAD_DIM, HEADS, HIDDEN, INTERMEDIATE, PADDED_INTERMEDIATE, SEQUENCE,
-    block_diagonal, rotate_half,
-)
-from torch_backend import PIMTorchConfig
+
+SEQUENCE = 1024
+HIDDEN = 4096
+HEADS = 32
+HEAD_DIM = 128
+INTERMEDIATE = 11008
+# Gate/Up는 UPMEM baseline과 같게 N=11264(=22*512)로 계산하고 11008열만 쓴다.
+PADDED_INTERMEDIATE = 11264
+QK_HEADS = 1
+PV_HEADS = 1
 
 
-QK_HEADS = 2
-PV_HEADS = 4
+def rotate_half(activation):
+    first, second = activation.chunk(2, dim=-1)
+    return torch.cat((-second, first), dim=-1)
+
+
+def block_diagonal(blocks):
+    """Block i at rows/columns i of the result, zeros elsewhere (pad + cat)."""
+    columns = sum(block.shape[1] for block in blocks)
+    rows = []
+    left = 0
+    for block in blocks:
+        rows.append(torch.nn.functional.pad(block, (left, columns - left - block.shape[1])))
+        left += block.shape[1]
+    return torch.cat(rows, dim=0)
 
 
 def load_llama(checkpoint):
@@ -59,15 +79,6 @@ def reference_layer(layer, hidden, cosine, sine):
     mask = torch.full((SEQUENCE, SEQUENCE), torch.finfo(torch.float32).min).triu(1)
     return copy.deepcopy(layer).float()(
         hidden, attention_mask=mask[None, None], position_embeddings=(cosine, sine))
-
-
-def aimx_configure(fpgas):
-    """Fixed configs of aimx_benchmark_common; weight stages split m over the FPGAs."""
-    configs = {mnk: stage_config(mnk, fpgas, "m") for mnk in CONFIGS}
-
-    def configure(gemms, spec):
-        return {gemm.node: PIMTorchConfig(spec=spec, config=configs[gemm.mnk]) for gemm in gemms}
-    return configure
 
 
 class CheckpointLinear(torch.nn.Module):
@@ -112,7 +123,7 @@ class LlamaAimxLayer(torch.nn.Module):
         self.k_proj = CheckpointLinear(layer.self_attn.k_proj)
         self.v_proj = CheckpointLinear(layer.self_attn.v_proj)
         self.o_proj = CheckpointLinear(layer.self_attn.o_proj)
-        # Gate/Up는 aimx_benchmark_common config와 같게 N=11264로 계산하고 11008열만 쓴다.
+        # Gate/Up는 N=11264로 계산하고 11008열만 쓴다.
         self.gate_proj = CheckpointLinear(layer.mlp.gate_proj, PADDED_INTERMEDIATE)
         self.up_proj = CheckpointLinear(layer.mlp.up_proj, PADDED_INTERMEDIATE)
         self.down_proj = CheckpointLinear(layer.mlp.down_proj)

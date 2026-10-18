@@ -9,7 +9,7 @@ import tempfile
 from triton.runtime.cache import get_cache_manager
 
 from .compiler import _run_translate
-from .residency import LAYER, LayerSlots, StageRequirement
+from .residency import SlotOwners, StageRequirement
 from .upmem_artifact import INPUT, MRAM_BASE, OUTPUT, WEIGHT, TransferStats, _artifact_bindings, _build_program
 from .runtime import current_invocation
 
@@ -86,8 +86,9 @@ class UPMEMModelRuntime:
         self.library = adapter.library
         self.stages = []
         self.loaded_program = None
-        self.policy = None
         self.slots = None
+        # place가 정한 MRAM 공유 영역: (weight 영역 끝, input bytes, output bytes)
+        self.scratch = None
         self.totals = {"program_loads": 0, "device_compiles": 0}
         pointer = ctypes.c_void_p
         uint = ctypes.c_uint32
@@ -125,22 +126,21 @@ class UPMEMModelRuntime:
             for plan in plans for stage in plan.stages
         ]
 
-    def place(self, plans, residency):
-        """Lay out MRAM for the chosen policy and link every stage program.
+    def place(self, plans, memory):
+        """Lay out MRAM by slot and link every stage program.
 
-        P-2 (layer) reuses one weight region for every layer; P-1 (model) gives each
-        layer its own weight addresses so nothing is uploaded twice.
+        Each slot owns a weight region. Layers in the same slot get the same weight
+        addresses, so a layer change overwrites only the weights.
         """
-        self.policy = residency.policy
-        self.slots = LayerSlots(residency.policy, [plan.index for plan in plans])
+        self.slots = SlotOwners(memory)
+        slot_start = {}
         weight_region = 0
         input_bytes = 0
         output_bytes = 0
-        offset = 0
         for plan in plans:
-            if self.policy == LAYER:
-                offset = 0
-            start = offset
+            # 새 slot은 앞 slot들의 weight 영역 뒤에서 시작한다.
+            start = slot_start.setdefault(memory.slot_of_layer[plan.index], weight_region)
+            offset = start
             for stage in plan.stages:
                 stage.addresses = {}
                 for binding in stage.bindings:
@@ -153,10 +153,11 @@ class UPMEMModelRuntime:
             plan.weight_bytes_per_unit = offset - start
             weight_region = max(weight_region, offset)
         footprint = weight_region + input_bytes + output_bytes
-        if footprint != residency.bytes_per_unit:
+        if footprint != memory.bytes_per_unit:
             raise RuntimeError(
-                f"MRAM layout needs {footprint} bytes per unit; the residency plan "
-                f"computed {residency.bytes_per_unit}")
+                f"MRAM layout needs {footprint} bytes per unit; the memory plan "
+                f"computed {memory.bytes_per_unit}")
+        self.scratch = (weight_region, input_bytes, output_bytes)
         for plan in plans:
             for stage in plan.stages:
                 offset = weight_region
@@ -168,12 +169,37 @@ class UPMEMModelRuntime:
                         stage.addresses[binding.symbol] = MRAM_BASE + weight_region + input_bytes
                 stage.program = _build_program(stage.bundle, stage.addresses, stats=self.totals)
             plan.backend_plan = {
-                "policy": self.policy,
+                "slot": memory.slot_of_layer[plan.index],
                 "weight_bytes": plan.weight_bytes_per_unit,
                 "input_offset": weight_region,
                 "output_offset": weight_region + input_bytes,
                 "bytes_per_unit": footprint,
             }
+
+    def memory_table(self, plans):
+        """One row per MRAM region of every slot and of the shared scratch; every DPU has this layout."""
+        first = {}
+        layers = {}
+        for plan in plans:
+            slot = self.slots.slot_of_layer[plan.index]
+            first.setdefault(slot, plan)
+            layers.setdefault(slot, []).append(plan.index)
+        rows = []
+        for slot, plan in first.items():
+            for stage in plan.stages:
+                for binding in stage.bindings:
+                    if binding.role == WEIGHT:
+                        rows.append({"slot": slot, "layers": layers[slot], "stage": stage.name,
+                                     "unit": "all", "column": "weight",
+                                     "pa": stage.addresses[binding.symbol], "bytes": binding.size})
+        weight_region, input_bytes, output_bytes = self.scratch
+        everyone = [plan.index for plan in plans]
+        rows.append({"slot": None, "layers": everyone, "stage": "input scratch", "unit": "all",
+                     "column": "activation", "pa": MRAM_BASE + weight_region, "bytes": input_bytes})
+        rows.append({"slot": None, "layers": everyone, "stage": "output scratch", "unit": "all",
+                     "column": "activation", "pa": MRAM_BASE + weight_region + input_bytes,
+                     "bytes": output_bytes})
+        return rows
 
     def bind(self, plans, units):
         """Runtime: create the native handle of every placed stage on the open DPU set."""

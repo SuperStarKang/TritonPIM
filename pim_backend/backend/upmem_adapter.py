@@ -79,14 +79,17 @@ class UPMEMAdapter:
     def requirements(self, plans):
         return self.model.requirements(plans)
 
-    def prepare_model(self, plans, residency):
-        self.model.place(plans, residency)
+    def prepare_model(self, plans, memory):
+        self.model.place(plans, memory)
 
     def bind_model(self, plans):
         self.model.bind(plans, self.num_units)
 
     def weight_table(self, plans):
         return self.model.weight_table(plans)
+
+    def memory_table(self, plans):
+        return self.model.memory_table(plans)
 
     def close(self):
         if self.cleanup is not None:

@@ -3,15 +3,15 @@
 Each stage runs one model stub (--aimx-to-model-stub). Instances are batched over
 FPGAs: job = batch slot * devices + device, and every job owns one context on
 one FPGA. Weights are staged only by upload calls; run calls stage activations.
-Layers that share a residency slot (P-2) share these contexts: buffers and
-descriptor chains are built once, and a layer change uploads only its weights.
+Layers that share a memory slot share these contexts: buffers and descriptor
+chains are built once, and a layer change uploads only its weights.
 """
 
 import ctypes
 import time
 
 from .compiler import _run_translate
-from .residency import LayerSlots, StageRequirement
+from .residency import SlotOwners, StageRequirement
 from .runtime import current_invocation
 
 
@@ -26,6 +26,29 @@ class AiMXModelCall(ctypes.Structure):
         ("arguments", ctypes.c_uint32),
         ("upload", ctypes.c_int),
         ("batch_base", ctypes.c_uint32),
+    ]
+
+
+class AiMXResidentBuffer(ctypes.Structure):
+    # aimx_runtime.h의 aimx_resident_buffer와 같은 배치
+    _fields_ = [
+        ("va", ctypes.c_uint64),
+        ("pa", ctypes.c_uint64),
+        ("next", ctypes.c_uint64),
+        ("host", ctypes.c_void_p),
+        ("bytes", ctypes.c_int64),
+        ("alignment", ctypes.c_int64),
+        ("idx", ctypes.c_uint32),
+        ("kind", ctypes.c_int),
+    ]
+
+
+class AiMXResidentContext(ctypes.Structure):
+    _fields_ = [
+        ("buffers", ctypes.POINTER(AiMXResidentBuffer)),
+        ("count", ctypes.c_size_t),
+        ("ready", ctypes.c_bool),
+        ("owner", ctypes.c_void_p),
     ]
 
 
@@ -133,22 +156,22 @@ class AiMXModelRuntime:
             for plan in plans for stage in plan.stages
         ]
 
-    def place(self, plans, residency):
-        self.slots = LayerSlots(residency.policy, [plan.index for plan in plans])
+    def place(self, plans, memory):
+        self.slots = SlotOwners(memory)
         for plan in plans:
             plan.weight_bytes_per_unit = sum(self._bytes(stage, True) for stage in plan.stages)
             plan.backend_plan = {
-                "policy": residency.policy,
+                "slot": memory.slot_of_layer[plan.index],
                 "weight_bytes": plan.weight_bytes_per_unit,
                 "state_bytes": sum(self._bytes(stage, False) for stage in plan.stages),
-                "bytes_per_unit": residency.bytes_per_unit,
+                "bytes_per_unit": memory.bytes_per_unit,
             }
 
     def bind(self, plans):
-        """Runtime: create the FPGA contexts of every slot; a layer in another layer's slot shares them."""
-        layers = {plan.index: plan for plan in plans}
+        """Runtime: create the FPGA contexts of every slot; the first layer of a slot creates them."""
+        first = {}
         for plan in plans:
-            owner = layers[self.slots.slot[plan.index]]
+            owner = first.setdefault(self.slots.slot_of_layer[plan.index], plan)
             for stage, slot_stage in zip(plan.stages, owner.stages):
                 self._create_stage(stage, slot_stage)
 
@@ -167,7 +190,7 @@ class AiMXModelRuntime:
             if (stage.slot_bytes, stage.slot_weights, jobs) != (
                     slot_stage.slot_bytes, slot_stage.slot_weights, slot_stage.p_b * slot_stage.devices):
                 raise ValueError(f"{stage.name}: slot layout differs from {slot_stage.name} "
-                                 "of the shared residency slot")
+                                 "of the shared memory slot")
             stage.fpgas = slot_stage.fpgas
             stage.contexts = slot_stage.contexts
         stage.pointers = (ctypes.c_void_p * (stage.instance_count * arguments))()
@@ -247,6 +270,35 @@ class AiMXModelRuntime:
                         "fpgas": tuple(stage.fpgas),
                     }
         return table
+
+    def memory_table(self, plans):
+        """One row per allocated buffer of every slot; buffers are allocated on first use."""
+        first = {}
+        layers = {}
+        for plan in plans:
+            slot = self.slots.slot_of_layer[plan.index]
+            first.setdefault(slot, plan)
+            layers.setdefault(slot, []).append(plan.index)
+        rows = []
+        for slot, plan in first.items():
+            for stage in plan.stages:
+                for fpga, context in zip(stage.fpgas, stage.contexts):
+                    resident = ctypes.cast(context, ctypes.POINTER(AiMXResidentContext)).contents
+                    for index in range(resident.count):
+                        buffer = resident.buffers[index]
+                        if not buffer.va:
+                            continue
+                        # kind 1은 descriptor chain, 2는 PMM이다. 나머지는 operand buffer다.
+                        if stage.slot_weights[index]:
+                            column = "weight"
+                        elif buffer.kind in (1, 2):
+                            column = "state"
+                        else:
+                            column = "activation"
+                        rows.append({"slot": slot, "layers": layers[slot], "stage": stage.name,
+                                     "unit": fpga, "buffer": index, "column": column,
+                                     "pa": buffer.pa, "bytes": buffer.bytes})
+        return rows
 
     def stats(self):
         totals = dict(self.totals)

@@ -1,9 +1,10 @@
 """Llama-2-7b-hf prefill (1024 tokens, 32 layers) on AiMX: TTFT and the first token.
 
 One request = tokenize -> embed -> 32 LlamaAimxLayer on AiMX -> norm -> lm_head (CPU) -> argmax.
-The first request includes the weight upload; with P-2 (one layer resident) every request
-uploads each layer. Before preparing AiMX, the Hugging Face layers run in FP32 one at a time
-for the reference logits; each HF layer is released once its BF16 operands are built.
+Configs come from compile_model (one layer tuned with its weights resident). The first request
+includes the weight upload; with P-2 (all layers share one layer's slot) every request uploads
+each layer's weights. Before compiling, the Hugging Face layers run in FP32 one at a time for
+the reference logits; each HF layer is released once its BF16 operands are built.
 
   python benchmark_llama_ttft.py --checkpoint ~/models/Llama-2-7b-hf \
       --prompt-file ../upmem/e2e/prompt.txt --fpgas 2
@@ -15,14 +16,14 @@ import json
 from pathlib import Path
 import time
 
+from experiment_common import add_device_arguments, compile_session, memory_record
 from llama_workloads import (
-    LlamaAimxLayer, aimx_configure, load_llama, position_embeddings, prompt_ids, reference_layer,
+    HIDDEN, SEQUENCE, LlamaAimxLayer, load_llama, position_embeddings, prompt_ids, reference_layer,
 )
 
 import torch
 
-from fp32_workloads import HIDDEN, SEQUENCE
-from torch_backend import PIMSession, target_spec
+from torch_backend._autotuner import DEFAULT_CACHE_PATH
 from triton.backends.pim.driver import _STAGE_NAMES
 
 
@@ -31,8 +32,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--prompt-file", type=Path, required=True)
-    parser.add_argument("--fpgas", type=int, default=1)
-    parser.add_argument("--base-fpga", type=int, default=0)
+    add_device_arguments(parser, DEFAULT_CACHE_PATH)
     parser.add_argument("--repeat", type=int, default=1, help="requests after the first")
     parser.add_argument("--report-dir", type=Path,
                         default=Path(__file__).resolve().with_name("llama_ttft_report"))
@@ -62,16 +62,16 @@ def main():
             blocks.append(LlamaAimxLayer(model.model.layers[index], cosine, sine).eval())
             model.model.layers[index] = torch.nn.Identity()
 
-        with PIMSession(target_spec("aimx", num_units=args.fpgas, base_fpga=args.base_fpga)) as session:
-            start = time.perf_counter_ns()
-            plans = session.prepare(blocks, (torch.zeros(1, SEQUENCE, HIDDEN),),
-                                    configure=aimx_configure(args.fpgas))
-            prepare_ms = (time.perf_counter_ns() - start) / 1e6
-            residency = session.residency
-            print(f"prepare_ms={prepare_ms:.1f} layers={len(plans)} stages/layer={len(plans[0].stages)} "
-                  f"residency={residency.policy} bytes_per_fpga={residency.bytes_per_unit} "
-                  f"capacity={residency.capacity_bytes}", flush=True)
+        start = time.perf_counter_ns()
+        session, config_report = compile_session(blocks, (torch.zeros(1, SEQUENCE, HIDDEN),), args)
+        compile_ms = (time.perf_counter_ns() - start) / 1e6
+        plans = session.layers
+        memory = session.memory
+        print(f"compile_ms={compile_ms:.1f} layers={len(plans)} stages/layer={len(plans[0].stages)} "
+              f"slots={memory.slots} pinned={memory.pinned} bytes_per_fpga={memory.bytes_per_unit} "
+              f"capacity={memory.capacity_bytes}", flush=True)
 
+        with session:
             calls = []
             for phase, count in (("first", 1), ("sample", args.repeat)):
                 for step in range(count):
@@ -142,9 +142,8 @@ def main():
         "gemm_dtype": "bfloat16 host and AiMX", "cpu_dtype": "float32",
         "reference": {"hf_fp32_ms": reference_ms, "token": reference_token,
                       "token_text": tokenizer.decode([reference_token])},
-        "prepare_ms": prepare_ms, "session_open_ms": session.open_ms, "session_close_ms": session.close_ms,
-        "residency": {"policy": str(residency.policy), "bytes_per_fpga": residency.bytes_per_unit,
-                      "capacity_bytes": residency.capacity_bytes},
+        "compile_ms": compile_ms, "config_report": config_report, "session_open_ms": session.open_ms, "session_close_ms": session.close_ms,
+        "memory": memory_record(memory),
         "stages": [{"name": stage.name, "mnk": list(stage.shape), "instances": stage.instance_count,
                     "batch_rounds": stage.batch_rounds} for stage in plans[0].stages],
         "calls": calls, "session_totals": session_totals,

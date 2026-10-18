@@ -1,16 +1,16 @@
 """One Llama-2-7b-hf decoder layer on AiMX: upload every request vs weight-stationary.
 
---residency upload    every request uploads the weights into the kept slot again (P-2 behaviour)
---residency resident  the first request uploads; later requests move only activations (P-1)
---qk-heads/--pv-heads heads per block-diagonal QK^T/PV GEMM; 1 and 1 give one GEMM per head
---config-source       analytical seeds or autotune (compile_model, weights resident, layer_first)
+--residency upload    every request uploads the weights into the kept slot again (as a shared slot)
+--residency resident  the first request uploads; later requests move only activations (own slot)
+--qk-heads/--pv-heads heads per GEMM written in the model; 1 and 1 leave packing to the compiler
+Configs come from compile_model (every stage class tuned with its weights resident).
 
 Each request reports the PIM wall per upload/run phase, the native slots (transfer, layout,
 compute, setup), and the split into weight GEMMs, activation GEMMs and CPU. With upload,
 the samples also give the weight-stationary prediction T(R) = E + U / R over R requests.
 
   python benchmark_layer.py --checkpoint ~/models/Llama-2-7b-hf --prompt-file ../../upmem/e2e/prompt.txt \
-      --config-source analytical --residency upload
+      --residency upload
 """
 
 import argparse
@@ -22,14 +22,17 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from experiment_common import add_config_arguments, compile_session, print_request, request_breakdown, stage_records
-from llama_workloads import LlamaAimxLayer, load_llama, position_embeddings, prompt_ids, reference_layer
+from experiment_common import (
+    add_device_arguments, compile_session, memory_record, print_request, request_breakdown, stage_records,
+)
+from llama_workloads import (
+    HEAD_DIM, HEADS, HIDDEN, SEQUENCE, LlamaAimxLayer, load_llama, position_embeddings, prompt_ids,
+    reference_layer,
+)
 
 import torch
 
-from fp32_workloads import HEAD_DIM, HEADS, HIDDEN, SEQUENCE
 from torch_backend._autotuner import DEFAULT_CACHE_PATH
-from triton.backends.pim.residency import LAYER
 
 
 REQUESTS_PREDICTED = (1, 2, 4, 8, 16, 32, 64)
@@ -38,19 +41,19 @@ REQUESTS_PREDICTED = (1, 2, 4, 8, 16, 32, 64)
 def main():
     torch.set_num_threads(8)
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    add_config_arguments(parser, DEFAULT_CACHE_PATH)
+    add_device_arguments(parser, DEFAULT_CACHE_PATH)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--prompt-file", type=Path, required=True)
     parser.add_argument("--layer", type=int, default=0)
     parser.add_argument("--residency", choices=("upload", "resident"), required=True)
-    parser.add_argument("--qk-heads", type=int, default=2)
-    parser.add_argument("--pv-heads", type=int, default=4)
+    parser.add_argument("--qk-heads", type=int, default=1)
+    parser.add_argument("--pv-heads", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeat", type=int, default=5)
     parser.add_argument("--report-dir", type=Path, default=None)
     args = parser.parse_args()
     report_dir = args.report_dir or Path(__file__).resolve().with_name(
-        f"report_{args.config_source}_{args.residency}_qk{args.qk_heads}_pv{args.pv_heads}_f{args.fpgas}")
+        f"report_{args.residency}_qk{args.qk_heads}_pv{args.pv_heads}_f{args.fpgas}")
     report_dir.mkdir(parents=True, exist_ok=True)
 
     with torch.no_grad():
@@ -64,14 +67,13 @@ def main():
                                args.qk_heads, args.pv_heads).eval()
 
         start = time.perf_counter_ns()
-        session, config_report = compile_session([block], (torch.zeros(1, SEQUENCE, HIDDEN),), args,
-                                                 requests=1 + args.warmup + args.repeat, strategy="layer_first")
+        session, config_report = compile_session([block], (torch.zeros(1, SEQUENCE, HIDDEN),), args)
         compile_ms = (time.perf_counter_ns() - start) / 1e6
         plan, = session.layers
         stages = stage_records(plan)
         weight_stages = {stage["name"] for stage in stages if stage["kind"] == "weight"}
-        print(f"compile_ms={compile_ms:.1f} policy={session.residency.policy} "
-              f"bytes_per_fpga={session.residency.bytes_per_unit}", flush=True)
+        print(f"compile_ms={compile_ms:.1f} slots={session.memory.slots} pinned={session.memory.pinned} "
+              f"bytes_per_fpga={session.memory.bytes_per_unit}", flush=True)
         for stage in stages:
             print(f"  stage={stage['name']} kind={stage['kind']} mnk={tuple(stage['mnk'])} "
                   f"instances={stage['instances']} p_b={stage['p_b']} batch_rounds={stage['batch_rounds']} "
@@ -93,6 +95,8 @@ def main():
                                 output.flatten().double(), reference.flatten().double(), dim=0).item()}
                     calls.append(call)
                     print_request(f"{phase}={step} cosine={call['cosine']:.6f}", call)
+            # slot buffer는 첫 실행에서 할당되므로 요청이 끝난 뒤 읽는다.
+            memory_table = session.memory_table()
 
     samples = [call for call in calls if call["phase"] == "sample"]
     summary = {
@@ -121,13 +125,13 @@ def main():
 
     report = {
         "checkpoint": str(args.checkpoint), "layer": args.layer, "layers": 1, "fpgas": args.fpgas,
-        "base_fpga": args.base_fpga, "sequence": SEQUENCE, "config_source": args.config_source,
-        "residency": args.residency, "policy": LAYER if args.residency == "upload" else session.residency.policy,
+        "base_fpga": args.base_fpga, "sequence": SEQUENCE, "config_source": "autotune",
+        "residency": args.residency,
         "qk_heads": args.qk_heads, "pv_heads": args.pv_heads,
         "compile_ms": compile_ms, "session_open_ms": session.open_ms, "session_close_ms": session.close_ms,
-        "planned": {"policy": session.residency.policy, "bytes_per_fpga": session.residency.bytes_per_unit,
-                    "capacity_bytes": session.residency.capacity_bytes},
-        "config_report": config_report, "stages": stages, "calls": calls, "summary": summary,
+        "memory": memory_record(session.memory),
+        "config_report": config_report, "memory_table": memory_table, "stages": stages,
+        "calls": calls, "summary": summary,
     }
     (report_dir / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(f"report={report_dir / 'report.json'}", flush=True)

@@ -7,7 +7,7 @@ from threading import RLock, get_ident
 import time
 from typing import Protocol
 
-from .residency import plan_residency
+from .residency import plan_memory
 
 
 current_invocation = ContextVar("pim_invocation", default=None)
@@ -21,14 +21,15 @@ class RuntimeBackend(Protocol):
 
     begin_model creates the target model runtime. resources() reports the spec's
     unit count and capacity; requirements(plans) reports per-stage bytes for the
-    common residency policy; prepare_model(plans, residency) places the layers
-    and links native artifacts. None of these touch the device, so a model can
-    be compiled before open().
+    common memory plan; prepare_model(plans, memory) places the layers in their
+    slots and links native artifacts. None of these touch the device, so a model
+    can be compiled before open().
 
     open() allocates the units and exposes num_units. bind_model(plans) creates
-    the per-stage device handles, weight_table(plans) reports weight placement,
-    and the model runtime implements enter_layer/run/exit_layer. stats contains
-    cumulative transfer bytes and launch counts. close releases resources.
+    the device handles of every slot, weight_table(plans) reports weight placement,
+    memory_table(plans) the slot buffers and their addresses, and the model runtime
+    implements enter_layer/run/exit_layer. stats contains cumulative transfer bytes
+    and launch counts. close releases resources.
     """
 
     def open(self): ...
@@ -36,9 +37,10 @@ class RuntimeBackend(Protocol):
     def begin_model(self): ...
     def resources(self): ...
     def requirements(self, plans): ...
-    def prepare_model(self, plans, residency): ...
+    def prepare_model(self, plans, memory): ...
     def bind_model(self, plans): ...
     def weight_table(self, plans): ...
+    def memory_table(self, plans): ...
     def stats(self) -> dict: ...
     def close(self): ...
 
@@ -75,7 +77,7 @@ class PIMSession:
         self.weight_table = {}
         self.kv_table = {}
         self.loaded_layer = None
-        self.residency = None
+        self.memory = None
 
     def __enter__(self):
         if self.phase not in ("new", "compiled") or current_session.get() is not None:
@@ -150,7 +152,7 @@ class PIMSession:
                 plan = build_layer_plan(
                     exported, example_inputs,
                     configs=configure(analyze_fx_gemms(exported, allow_bmm=True), self.spec),
-                    index=index,
+                    index=index, spec=self.spec,
                 )
                 plan.plan_model(self.spec, self.backend.model)
                 outputs = plan.compile_cpu()
@@ -158,9 +160,8 @@ class PIMSession:
                 example_inputs = outputs if isinstance(outputs, tuple) else (outputs,)
 
         self.layers = tuple(plans)
-        self.residency = plan_residency(
-            self.backend.resources(), self.backend.requirements(self.layers))
-        self.backend.prepare_model(self.layers, self.residency)
+        self.memory = plan_memory(self.backend.resources(), self.backend.requirements(self.layers))
+        self.backend.prepare_model(self.layers, self.memory)
 
     def run_model(self, *inputs):
         """Chain prepared blocks; tuple outputs become the next block's inputs."""
@@ -208,6 +209,11 @@ class PIMSession:
     def _check_owner(self):
         if current_session.get() is not self or get_ident() != self.thread:
             raise RuntimeError("PIMSession must be used by its owning thread and context")
+
+    def memory_table(self):
+        """Memory management table rows: slot, its layers, stage, unit, column, PA and bytes."""
+        self._check_owner()
+        return self.backend.memory_table(self.layers)
 
     def stats(self):
         if self.backend is None:

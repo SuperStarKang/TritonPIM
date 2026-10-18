@@ -1,7 +1,7 @@
 """AiMX resources for the PIMSession model path.
 
 The adapter reports real FPGA resources and per-stage needs to the common
-ResidencyPlanner; the chosen policy decides what stays on the FPGAs.
+memory plan; its slots decide what stays on the FPGAs.
 """
 
 import ctypes
@@ -58,14 +58,17 @@ class AiMXAdapter:
     def requirements(self, plans):
         return self.model.requirements(plans)
 
-    def prepare_model(self, plans, residency):
-        self.model.place(plans, residency)
+    def prepare_model(self, plans, memory):
+        self.model.place(plans, memory)
 
     def bind_model(self, plans):
         self.model.bind(plans)
 
     def weight_table(self, plans):
         return self.model.weight_table(plans)
+
+    def memory_table(self, plans):
+        return self.model.memory_table(plans)
 
     def stats(self):
         totals = {"visible_fpgas": self.visible_fpgas, "units": self.num_units}

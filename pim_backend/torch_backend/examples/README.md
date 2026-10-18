@@ -24,15 +24,15 @@ examples/
 │   ├── transformer/           # int8_workloads.py, benchmark_model_transformer_block.py
 │   ├── e2e/                   # llama_workloads.py, benchmark_model_llama_ttft.py, prompt.txt
 │   └── cpu/                   # 같은 INT8 workload의 CPU 전용 실행
-└── aimx/                      # FP32 host, BF16 on AiMX
-    ├── fp32_workloads.py
-    ├── aimx_benchmark_common.py
-    ├── benchmark_aimx_attention_layer.py      # 고정 config (session-first)
-    ├── benchmark_aimx_transformer_block.py    # 고정 config (session-first)
-    ├── benchmark_aimx_model_compile.py        # policy 우선 model compile
-    ├── aimx_model_session.py                  # 작은 session 예제
-    ├── verify_bf16_gemm.py                    # BF16 host GEMM = FP32 host 결과 (bit)
+└── aimx/                      # HF Llama-2-7b, BF16 GEMM on AiMX
     ├── llama_workloads.py                     # HF Llama-2-7b layer, BF16 GEMM
+    ├── experiment_common.py                   # compile_model 호출, 요청별 breakdown
+    ├── gemm/benchmark_gemm.py                 # GEMM 단독 breakdown (analytical / autotune)
+    ├── layer/benchmark_layer.py               # layer 하나: 매 요청 업로드 vs weight-stationary
+    ├── e2e/benchmark_e2e.py                   # 앞쪽 N layer prefill, TTFT
+    ├── summarize_reports.py                   # layer/e2e report → CSV
+    ├── verify_bf16_gemm.py                    # BF16 host GEMM = FP32 host 결과 (bit)
+    ├── verify_k_alignment.py                  # A K pitch 정렬 검증
     ├── verify_llama_layer.py                  # layer 하나: HF FP32 vs CPU vs AiMX
     └── benchmark_llama_ttft.py                # 32 layer prefill TTFT, 첫 token
 ```
@@ -66,19 +66,12 @@ Gate/Up은 물리 N=11264로 계산하고 11008열만 반환한다.
 
 ```bash
 cd .../torch_backend/examples/aimx
-# 고정 config
-python benchmark_aimx_attention_layer.py   --fpgas 1
-python benchmark_aimx_transformer_block.py --fpgas 1
-# policy 우선 model compile: target과 unit 수는 입력, profile은 backend/target.py에 등록된 값
-python benchmark_aimx_model_compile.py --scope attention   --units 1 --base-fpga 0
-python benchmark_aimx_model_compile.py --scope transformer --units 1 --base-fpga 0
 # HF Llama-2-7b-hf checkpoint (BF16 GEMM, QK^T 2 head / PV 4 head block-diagonal)
+# config는 compile_model이 layer 하나를 weight 상주로 튜닝해 고른다 (cache 재사용)
 python verify_llama_layer.py   --checkpoint ~/models/Llama-2-7b-hf --prompt-file ../upmem/e2e/prompt.txt --fpgas 2
 python benchmark_llama_ttft.py --checkpoint ~/models/Llama-2-7b-hf --prompt-file ../upmem/e2e/prompt.txt --fpgas 2
+cd e2e && python benchmark_e2e.py --checkpoint ~/models/Llama-2-7b-hf --prompt-file ../../upmem/e2e/prompt.txt --layers 8
 ```
-
-`benchmark_aimx_model_compile.py`의 compile time과 runtime 구조, policy 판정과 config 선택은
-[Torch integration 설계](../../../design/TorchIntegration.md)에 있다.
 
 ## 공통 autotuning
 
@@ -88,4 +81,4 @@ python autotune_torch.py --m 1024 --n 4096 --k 4096          # UPMEM, INT8
 ```
 
 GEMM 하나를 `torch.compile` 경로로 측정한다. 측정에는 매 호출의 weight 전송이 포함된다.
-weight 상주 모델의 config는 `compile_model`이 policy 제약 안에서 따로 측정한다.
+weight 상주 모델의 config는 `compile_model`이 stage class마다 따로 측정한다.

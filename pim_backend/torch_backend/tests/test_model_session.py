@@ -2,7 +2,6 @@
 
 import pytest
 import torch
-from triton.backends.pim.residency import LAYER
 
 from torch_backend import PIMSession, PIMTorchConfig, target_spec
 from torch_backend._autotuner import PIMConfig
@@ -48,7 +47,8 @@ def test_model_owns_resources_and_kv_across_layer_replacements():
                                        rtol=0, atol=0)
             after = session.stats()
             assert after["launches"] - before["launches"] == 8
-            uploads = invocation == 0 or session.residency.policy == LAYER
+            # 모든 layer가 자기 slot을 가지면 첫 요청에서만 weight를 올린다.
+            uploads = invocation == 0 or session.memory.pinned < len(plans)
             assert after["weight_bytes"] - before["weight_bytes"] == (4096 if uploads else 0)
             assert after["device_compiles"] == prepared["device_compiles"]
             stored_key, stored_value = session.kv_view(0)

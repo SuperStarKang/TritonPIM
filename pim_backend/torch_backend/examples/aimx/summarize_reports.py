@@ -27,7 +27,8 @@ def main():
         report = json.loads(path.read_text(encoding="utf-8"))
         samples = [call for call in report["calls"] if call["phase"] == "sample"]
         layers = report["layers"]
-        row = {"report": path.parent.name, "config_source": report["config_source"], "policy": report["policy"],
+        row = {"report": path.parent.name, "config_source": report["config_source"],
+               "slots": report["memory"]["slots"], "pinned": report["memory"]["pinned"],
                "layers": layers, "qk_heads": report["qk_heads"], "pv_heads": report["pv_heads"],
                "per_layer_ms": statistics.median(call["layers_ms"] for call in samples) / layers}
         for name in samples[0]["kinds"]:

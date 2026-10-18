@@ -24,6 +24,7 @@ from autotuner import (
     PIMProblem,
     PIMTargetSpec,
     SearchBudget,
+    TuningRecord,
     build_config_space,
     heuristic_seeds,
     pim_hierarchy,
@@ -40,7 +41,7 @@ from autotuner.space import axis_values, legal_partitions
 __all__ = [
     "ConstraintEngine", "PIMAccess", "PIMBenchmarkResult", "PIMConfig",
     "PIMConfigCache", "PIMProblem",
-    "PIMTargetSpec", "SearchBudget", "build_config_space",
+    "PIMTargetSpec", "SearchBudget", "TuningRecord", "build_config_space",
     "heuristic_seeds", "pim_hierarchy", "target_spec", "tune",
     "DEFAULT_CACHE_PATH", "pim_launch_options",
     "target_model", "axis_values", "legal_partitions",

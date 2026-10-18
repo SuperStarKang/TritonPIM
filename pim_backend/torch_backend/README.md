@@ -73,11 +73,11 @@ Resident weight GEMM은 단일 instance·단일 M/N/K round로 제한한다.
 설계·상세 범위·검증 명령은 [모델 runtime 설계](../../design/ModelRuntime_Design.md),
 실행 예제는 [torch_model_session.py](examples/upmem/torch_model_session.py)를 참고한다.
 
-## Policy 우선 model compile
+## Model compile
 
-`compile_model()`은 residency policy를 먼저 정하고, 그 policy의 제약 안에서만 stage
-config를 autotuning한 뒤, 장치 할당 없이 모든 stage를 컴파일한다. 반환된 session은
-open할 때 장치를 할당하고 컴파일된 stage를 결합한다. 같은 프로세스에서 실행한다.
+`compile_model()`은 첫 layer를 분석해(GEMM packing 포함) stage class마다 config를
+autotuning하고, 장치 할당 없이 모든 layer를 컴파일한 뒤 메모리 계획(slot)을 세운다.
+반환된 session은 open할 때 장치를 할당하고 slot마다 stage를 결합한다. 같은 프로세스에서 실행한다.
 
 ```python
 compiled = compile_model(layers, example_inputs, target="aimx", units=1,
@@ -87,14 +87,14 @@ with compiled.session as session:
 ```
 
 ```text
-compile time  stage 분석 → 최소 footprint → policy (P-1 모든 layer / P-2 layer 하나)
-              → stage class별 제약 tune() (weight 상주 후 E 측정)
-              → 최속 조합 또는 DP → PIMSession.compile (할당 없음)
-runtime       open (할당, unit 수 확인, stage 결합) → run_model → close
+compile time  첫 layer 분석 (GEMM packing → stage class) → class별 제약 tune() (weight 상주 후 E 측정)
+              → class별 가장 빠른 config → 모든 layer PIMSession.compile (할당 없음)
+              → plan_memory: 모두 들어가면 layer마다 slot, 아니면 고정 slot N−1개 + 공유 slot 1개
+runtime       open (할당, unit 수 확인, slot 결합) → run_model → close
 ```
 
-설계와 식은 [Torch integration 설계](../../design/TorchIntegration.md), 실행 예제는
-[benchmark_aimx_model_compile.py](examples/aimx/benchmark_aimx_model_compile.py)를 참고한다.
+모든 layer는 분석한 layer와 stage 구성이 같아야 한다. 실행 예제는
+[e2e/benchmark_e2e.py](examples/aimx/e2e/benchmark_e2e.py)를 참고한다.
 
 ## Common IR configuration
 
@@ -234,9 +234,11 @@ driver는 네이티브 host의 timing version을 실행 전에 확인하고 버�
 | `backend.py` | `torch.compile` backend entry |
 | `fx_analysis.py` | GEMM shape/dtype, weight 출처 분석 |
 | `fx_normalization.py` | `linear`/`addmm` 정규화와 원본 GEMM 대응 |
-| `model.py` | weight freeze, `LayerPlan`, `build_layer_plan`: FX graph를 CPU/PIM stage partition으로 분할 |
-| `model_policy.py` | stage class 분석, footprint 추정, residency policy 판정과 제약 |
-| `model_compile.py` | 제약 autotuning, stage 측정, config 조합 선택, `compile_model` |
+| `fx_packing.py` | GEMM packing: n 잇기(공유 A), m 쌓기(공유 B), block-diagonal(target model 판정) |
+| `model.py` | weight freeze, packing, `LayerPlan`, `build_layer_plan`: FX graph를 CPU/PIM stage partition으로 분할 |
+| `model_policy.py` | 첫 layer의 stage class 분석과 model stage 제약 |
+| `model_compile.py` | 제약 autotuning, stage 측정, class별 가장 빠른 config, `compile_model` |
+| `../backend/residency.py` | 메모리 계획: slot 수, 고정 slot, layer → slot 대응표 |
 | `../backend/runtime.py` | 공통 `RuntimeBackend` 계약과 요청 단위 `PIMSession` |
 | `../backend/upmem_adapter.py` | UPMEM 모델 경로: stage 배치·program 링크, DPU 할당/해제와 stage 결합 |
 | `../backend/upmem_artifact.py` | UPMEM stage의 MRAM binding 해석과 주소 고정 DPU program 링크 |

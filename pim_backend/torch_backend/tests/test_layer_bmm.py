@@ -98,7 +98,9 @@ def make_plan(module, inputs):
     exported = torch.export.export(module, inputs)
     configs = {gemm.node: PIMTorchConfig(config=SMALL)
                for gemm in analyze_fx_gemms(exported, allow_bmm=True)}
-    return build_layer_plan(exported, inputs, configs=configs, index=0)
+    # UPMEM target model은 block-diagonal의 0을 계산으로 세므로 packing하지 않는다.
+    return build_layer_plan(exported, inputs, configs=configs, index=0,
+                            spec=target_spec("upmem", nr_tasklets=16))
 
 
 def reference_plan(plan, inputs):

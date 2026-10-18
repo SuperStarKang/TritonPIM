@@ -6,7 +6,6 @@ import operator
 import torch
 from torch import fx
 from torch.export.graph_signature import InputKind, OutputKind
-from torch.fx.operator_schemas import normalize_function
 from torch.fx.passes.split_module import split_module
 from torch.utils import _pytree
 
@@ -14,6 +13,7 @@ from ._autotuner import PIMProblem
 from .backend import PIMInductorBackend
 from .execution import select_layer_config
 from .fx_normalization import normalize_fx_gemms
+from .fx_packing import PackedGemm, gemm_operands, pack_gemms
 
 
 # weight에서 출발해 weight만 읽는 view/copy는 freeze 시 미리 계산해 상수로 둔다.
@@ -82,16 +82,6 @@ def _freeze_graph(exported_program):
     return fx.GraphModule(root, graph), frozen
 
 
-def _gemm_operands(node):
-    arguments = normalize_function(
-        node.target, node.args, dict(node.kwargs),
-        normalize_to_only_use_kwargs=True,
-    )
-    if arguments is None:
-        raise ValueError(f"{node.name}: cannot resolve GEMM arguments")
-    return arguments.kwargs["input"], arguments.kwargs["mat2"]
-
-
 @dataclass
 class LayerPlan:
     """One Torch block split into CPU partitions and PIM stages."""
@@ -124,9 +114,13 @@ class LayerPlan:
 
 
 class _LayerGemm(torch.nn.Module):
-    def __init__(self, name, gemms, weights, torch_config):
+    def __init__(self, name, gemms, weights, torch_config, sources, origin):
         super().__init__()
         self.name = name
+        # 이 stage가 계산하는 원래 GEMM 이름 (packing으로 여러 개일 수 있다)
+        self.sources = tuple(sources)
+        # packing으로 이어 붙인 GEMM이면 그 축과 member shape (fx_packing.PackedGemm.origin)
+        self.origin = origin
         self.gemms = tuple(gemms)
         self.weights = tuple(weights)
         self.weight_mask = tuple(weight is not None for weight in weights)
@@ -214,13 +208,14 @@ class CompileModelCPU(fx.Interpreter):
         return compiled(*args, **kwargs)
 
 
-def build_layer_plan(exported_program, example_inputs, *, configs, index):
+def build_layer_plan(exported_program, example_inputs, *, configs, index, spec):
     """Analyze one exported block without compiling it or acquiring hardware.
 
-    PIMSession.prepare calls this after opening the device resources.
-    configs maps original GEMM names to PIMTorchConfig. Independent activation
-    GEMMs of the same shape/config are grouped; weight GEMMs remain stationary
-    single-instance stages. aten.bmm uses its explicit operand batch dimension.
+    configs maps original GEMM names to PIMTorchConfig. GEMMs are first packed on
+    the frozen graph (fx_packing, decided by spec's target model); GEMMs packed
+    together must share one config. Independent activation GEMMs of the same
+    shape/config are then grouped; weight GEMMs remain stationary single-instance
+    stages. aten.bmm uses its explicit operand batch dimension.
     """
     _, specification = _pytree.tree_flatten((example_inputs, {}))
     if specification != exported_program.call_spec.in_spec:
@@ -229,17 +224,22 @@ def build_layer_plan(exported_program, example_inputs, *, configs, index):
     if set(configs) != {mapping.original.node for mapping in mappings}:
         raise ValueError("configs must contain every original GEMM exactly once")
     frozen_graph, frozen = _freeze_graph(normalized)
-    mappings_by_name = {mapping.normalized.node: mapping for mapping in mappings}
+    gemms = pack_gemms(frozen_graph, frozen, {
+        mapping.normalized.node: PackedGemm(mapping, (mapping.original.node,), None) for mapping in mappings
+    }, spec)
+    for entry in gemms.values():
+        if len({configs[source] for source in entry.sources}) != 1:
+            raise ValueError(f"packed GEMMs {entry.sources} must share one config")
     depths = {}
     groups = {}
     group_for_node = {}
     for node in frozen_graph.graph.nodes:
         depth = max((depths[argument] for argument in node.all_input_nodes), default=0)
-        if node.name in mappings_by_name:
-            mapping = mappings_by_name[node.name]
+        if node.name in gemms:
+            mapping = gemms[node.name].mapping
             gemm = mapping.normalized
             depth += 1
-            operands = _gemm_operands(node)
+            operands = gemm_operands(node)
             if any(operand in frozen for operand in operands) or gemm.op == "aten.bmm.default":
                 key = (node.name,)
             else:
@@ -259,14 +259,16 @@ def build_layer_plan(exported_program, example_inputs, *, configs, index):
             return copied[node]
         if node in group_for_node:
             nodes = groups[group_for_node[node]]
-            arguments = tuple(emit(operand) for member in nodes for operand in _gemm_operands(member))
-            mapping = mappings_by_name[nodes[0].name]
-            operands = _gemm_operands(nodes[0])
+            arguments = tuple(emit(operand) for member in nodes for operand in gemm_operands(member))
+            mapping = gemms[nodes[0].name].mapping
+            operands = gemm_operands(nodes[0])
             stage = _LayerGemm(
                 mapping.original.node,
-                tuple(mappings_by_name[member.name].normalized for member in nodes),
+                tuple(gemms[member.name].mapping.normalized for member in nodes),
                 tuple(frozen[operand] if operand in frozen else None for operand in operands),
                 configs[mapping.original.node],
+                tuple(source for member in nodes for source in gemms[member.name].sources),
+                gemms[nodes[0].name].origin,
             )
             name = "pim_stage_" + str(len(stages))
             frozen_graph.add_module(name, stage)

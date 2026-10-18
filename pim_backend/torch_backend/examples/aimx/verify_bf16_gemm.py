@@ -8,16 +8,22 @@ converts on the host in the stub; the BF16 path copies the words.
 """
 
 import argparse
+from pathlib import Path
+import sys
 
-from aimx_benchmark_common import CONFIGS
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 import torch
 
 from torch_backend import PIMInductorBackend, PIMTorchConfig, target_spec
+from torch_backend._autotuner import PIMConfig
 
 
-# projection (weight stage)와 QK^T 2 head block-diagonal (activation stage)
-CASES = ((1024, 4096, 4096), (1024, 2048, 256))
+# (M, N, K) -> FPGA 하나의 config. projection (weight stage)와 QK^T 2 head block-diagonal (activation stage)
+CASES = {
+    (1024, 4096, 4096): PIMConfig(64, 128, 128, 2, 32, 32, 8, 1, 1, 1, 1, 1),
+    (1024, 2048, 256): PIMConfig(128, 128, 128, 1, 16, 2, 8, 1, 1, 1, 1, 1),
+}
 
 
 def pim_mm(a, b):
@@ -30,7 +36,7 @@ def main():
     args = parser.parse_args()
     spec = target_spec("aimx", num_units=1, base_fpga=args.base_fpga)
     generator = torch.Generator().manual_seed(0)
-    for m, n, k in CASES:
+    for (m, n, k), config in CASES.items():
         a = torch.randn((m, k), generator=generator).bfloat16()
         b = torch.randn((k, n), generator=generator).bfloat16()
         outputs = {}
@@ -38,7 +44,7 @@ def main():
             # 같은 shape이면 dynamo가 앞 dtype의 컴파일 결과를 재사용하지 않도록 비운다.
             torch._dynamo.reset()
             compiled = torch.compile(
-                pim_mm, backend=PIMInductorBackend(PIMTorchConfig(spec=spec, config=CONFIGS[(m, n, k)])),
+                pim_mm, backend=PIMInductorBackend(PIMTorchConfig(spec=spec, config=config)),
                 fullgraph=True, dynamic=False,
             )
             outputs[dtype] = compiled(a.to(dtype), b.to(dtype))

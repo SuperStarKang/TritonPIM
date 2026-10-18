@@ -20,7 +20,7 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from experiment_common import SLOT_GROUPS, SLOTS, add_config_arguments, analytical_config
+from experiment_common import CONFIG_SOURCES, SLOT_GROUPS, SLOTS, add_device_arguments, analytical_config
 
 import torch
 import triton.backends.pim.driver as pim_driver
@@ -70,7 +70,8 @@ def measure(spec, config, a, b, *, warmup, repeat):
 def main():
     torch.set_num_threads(8)
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    add_config_arguments(parser, DEFAULT_CACHE_PATH)
+    add_device_arguments(parser, DEFAULT_CACHE_PATH)
+    parser.add_argument("--config-source", choices=CONFIG_SOURCES, required=True)
     parser.add_argument("--shapes", nargs="+", choices=tuple(SHAPES), default=tuple(SHAPES))
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--repeat", type=int, default=10)

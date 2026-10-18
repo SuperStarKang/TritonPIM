@@ -11,7 +11,6 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 import torch
-from triton.backends.pim.residency import LAYER
 
 from torch_backend import PIMSession, PIMTorchConfig, target_spec
 from torch_backend._autotuner import PIMConfig
@@ -47,7 +46,7 @@ def main():
         start = time.perf_counter()
         plans = session.prepare(blocks, (hidden,), configure=configure)
         print(f"prepare_ms={(time.perf_counter() - start) * 1000:.3f} "
-              f"policy={session.residency.policy}")
+              f"slots={session.memory.slots} pinned={session.memory.pinned}")
         for plan in plans:
             print(f"layer={plan.index} stages=" + str([
                 (stage.instance_count, stage.p_b, stage.batch_rounds) for stage in plan.stages]))
@@ -68,8 +67,8 @@ def main():
             torch.testing.assert_close(output, reference, rtol=0, atol=0)
             after = session.stats()
             assert after["launches"] - before["launches"] == 8
-            # P-1은 첫 요청에서만 weight를 올리고, P-2는 매 요청 올린다.
-            uploads = invocation == 0 or session.residency.policy == LAYER
+            # 모든 layer가 자기 slot을 가지면 첫 요청에서만 weight를 올리고, 아니면 매 요청 올린다.
+            uploads = invocation == 0 or session.memory.pinned < len(plans)
             assert after["weight_bytes"] - before["weight_bytes"] == (4096 if uploads else 0)
             assert after["device_compiles"] == prepared["device_compiles"]
             torch.testing.assert_close(session.kv_view(0)[0], preserved_key)
