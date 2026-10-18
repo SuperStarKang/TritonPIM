@@ -78,9 +78,11 @@ def _ttsharedir_to_llir(ttsharedir: str):
         llmlir_path = os.path.join(tmpdir, "ll.mlir")
         llir_path = os.path.join(tmpdir, "ll.ir")
         Path(ttshared_path).write_text(ttsharedir)
-        mlir_opt_path = _get_llvm_bin_path("mlir-opt")
+        # mlir-opt는 tptr dialect를 등록하지 않아 TritonToPtr가 남긴 tptr op를 읽지 못한다.
+        # triton-shared-opt는 mlir-opt의 pass를 모두 등록하고 tptr도 읽을 수 있다.
+        triton_shared_opt_path = _get_triton_shared_opt_path()
         # TritonShared-MLIR to LLVM-MLIR
-        subprocess.check_call([mlir_opt_path, ttshared_path,
+        subprocess.check_call([triton_shared_opt_path, ttshared_path,
             "--convert-linalg-to-affine-loops",
             # Note: eliminate-empty-tensors fails when there are multiple func.return ops
             # in a single kernel which are the results of early returns.
@@ -94,15 +96,11 @@ def _ttsharedir_to_llir(ttsharedir: str):
             "--convert-linalg-to-loops",
             "--expand-strided-metadata",
             "--convert-scf-to-cf",
-            "--convert-arith-to-llvm",
-            "--convert-math-to-llvm",
-            "--convert-complex-to-llvm",
-            "--convert-vector-to-llvm",
-            "--convert-index-to-llvm",
             "--memref-expand",
-            "--finalize-memref-to-llvm",
-            "--convert-func-to-llvm",
-            "--convert-cf-to-llvm",
+            # arith/math/complex/vector/index/finalize-memref/func/cf-to-llvm 패턴을
+            # 한 번의 변환으로 실행한다. memref<Nx!ptr.ptr> 원소 타입을 memref 변환과
+            # 같은 타입 변환기가 !llvm.ptr로 바꿔야 해서 pass를 나눌 수 없다.
+            "--tptr-to-llvm",
             # Lowering memrefs creates more affine.apply ops.
             # Lowering these affine ops again creates further arith ops,
             # so we have to run these two passes again here.
