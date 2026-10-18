@@ -29,6 +29,17 @@ def _get_sanitizer_type():
     
     return sanitizer_type
 
+def _num_threads():
+    # 설정하지 않으면 원본과 같이 grid를 직렬로 실행한다
+    return os.getenv("TRITON_SHARED_NUM_THREADS", "")
+
+def _omp_pragma():
+    if _get_sanitizer_type() == "tsan":
+        return "#pragma omp parallel for collapse(3)"
+    if _num_threads():
+        return f"#pragma omp parallel for collapse(3) num_threads({int(_num_threads())})"
+    return ""
+
 def _sanitizer_available(sanitizer_type):
     if "LD_PRELOAD" not in os.environ:
         return False
@@ -117,8 +128,9 @@ static void _launch(int gridX, int gridY, int gridZ, {arg_decls}) {{
   if (gridX*gridY*gridZ > 0) {{
     // Cast "function" to the real function type.
     // apply parallelization to the triton grid when using ThreadSanitizer (TSan) 
-    // to help detect potential data races across program instances during kernel execution
-    {"#pragma omp parallel for collapse(3)" if _get_sanitizer_type() == "tsan" else ""}
+    // to help detect potential data races across program instances during kernel execution.
+    // TRITON_SHARED_NUM_THREADS also runs the program instances on that many threads.
+    {_omp_pragma()}
     for(int x = 0; x < gridX; x++) {{
       for(int y = 0; y < gridY; y++) {{
         for(int z = 0; z < gridZ; z++) {{
@@ -335,11 +347,14 @@ def compile_module(launcher_src, kernel_placeholder_name):
                       
                       subprocess.check_call(subprocess_args)
                   else:
-                      subprocess.check_call([
+                      subprocess_args = [
                         "g++", "-std=c++17", launcher_src_path, obj_path,
                         f"-I{py_include_dir}", f"-I{include_dir}", f"-L{py_lib_dir}",
                         "-shared", f"-l{py_lib}", "-fPIC", "-o", so_path
-                      ])
+                      ]
+                      if _num_threads():
+                          subprocess_args.append("-fopenmp")
+                      subprocess.check_call(subprocess_args)
 
               with open(so_path, "rb") as f:
                 cache_path = cache.put(f.read(), filename, binary=True)
