@@ -13,6 +13,8 @@ INDUCTOR_OVERRIDES = {
     "max_autotune": False,
     "max_autotune_gemm": False,
     "cpp_wrapper": False,
+    # 생성된 C++ 커널마다 profiler 구간(graph_N_cpp_fused_*)을 남긴다
+    "cpp.enable_kernel_profile": True,
 }
 
 
