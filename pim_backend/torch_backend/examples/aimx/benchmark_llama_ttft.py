@@ -1,4 +1,4 @@
-"""Llama-2-7b-hf prefill (1024 tokens, 32 layers) on AiMX: TTFT and the first token.
+"""Llama-family prefill (1024 tokens, 32 layers) on AiMX: TTFT and the first token.
 
 One request = tokenize -> embed -> 32 LlamaAimxLayer on AiMX -> norm -> lm_head (CPU) -> argmax.
 Configs come from compile_model (one layer tuned with its weights resident). The first request
@@ -18,7 +18,7 @@ import time
 
 from experiment_common import add_device_arguments, compile_session, memory_record
 from llama_workloads import (
-    HIDDEN, SEQUENCE, LlamaAimxLayer, load_llama, position_embeddings, prompt_ids, reference_layer,
+    KV_MODES, SEQUENCE, LlamaAimxLayer, load_llama, position_embeddings, prompt_ids, reference_layer,
 )
 
 import torch
@@ -34,9 +34,11 @@ def main():
     parser.add_argument("--prompt-file", type=Path, required=True)
     add_device_arguments(parser, DEFAULT_CACHE_PATH)
     parser.add_argument("--repeat", type=int, default=1, help="requests after the first")
-    parser.add_argument("--report-dir", type=Path,
-                        default=Path(__file__).resolve().with_name("llama_ttft_report"))
+    parser.add_argument("--kv", choices=KV_MODES, default="share", help="how a query head reads its KV head")
+    parser.add_argument("--report-dir", type=Path, default=None)
     args = parser.parse_args()
+    args.report_dir = args.report_dir or Path(__file__).resolve().with_name(
+        f"llama_ttft_report_{args.checkpoint.name}_{args.kv}")
     args.report_dir.mkdir(parents=True, exist_ok=True)
     prompt = args.prompt_file.read_text(encoding="utf-8")
 
@@ -59,11 +61,12 @@ def main():
 
         blocks = []
         for index in range(len(model.model.layers)):
-            blocks.append(LlamaAimxLayer(model.model.layers[index], cosine, sine).eval())
+            blocks.append(LlamaAimxLayer(model.model.layers[index], cosine, sine, kv=args.kv).eval())
             model.model.layers[index] = torch.nn.Identity()
 
         start = time.perf_counter_ns()
-        session, config_report = compile_session(blocks, (torch.zeros(1, SEQUENCE, HIDDEN),), args)
+        session, config_report = compile_session(
+            blocks, (torch.zeros(1, SEQUENCE, model.config.hidden_size),), args)
         compile_ms = (time.perf_counter_ns() - start) / 1e6
         plans = session.layers
         memory = session.memory
@@ -137,7 +140,7 @@ def main():
             session_totals = session.stats()
 
     report = {
-        "checkpoint": str(args.checkpoint), "fpgas": args.fpgas, "base_fpga": args.base_fpga,
+        "checkpoint": str(args.checkpoint), "kv": args.kv, "fpgas": args.fpgas, "base_fpga": args.base_fpga,
         "sequence": SEQUENCE, "layers": len(blocks),
         "gemm_dtype": "bfloat16 host and AiMX", "cpu_dtype": "float32",
         "reference": {"hf_fp32_ms": reference_ms, "token": reference_token,

@@ -1,8 +1,9 @@
-"""One Llama-2-7b-hf decoder layer on AiMX: upload every request vs weight-stationary.
+"""One Llama-family decoder layer (Llama-2-7b, Llama-3-8B) on AiMX: upload every request vs weight-stationary.
 
 --residency upload    every request uploads the weights into the kept slot again (as a shared slot)
 --residency resident  the first request uploads; later requests move only activations (own slot)
 --qk-heads/--pv-heads heads per GEMM written in the model; 1 and 1 leave packing to the compiler
+--kv share|repeat     query heads of one group read the same KV tensor, or a copy each (repeat_kv)
 Configs come from compile_model (every stage class tuned with its weights resident).
 
 Each request reports the PIM wall per upload/run phase, the native slots (transfer, layout,
@@ -26,8 +27,7 @@ from experiment_common import (
     add_device_arguments, compile_session, memory_record, print_request, request_breakdown, stage_records,
 )
 from llama_workloads import (
-    HEAD_DIM, HEADS, HIDDEN, SEQUENCE, LlamaAimxLayer, load_llama, position_embeddings, prompt_ids,
-    reference_layer,
+    KV_MODES, SEQUENCE, LlamaAimxLayer, load_llama, position_embeddings, prompt_ids, reference_layer,
 )
 
 import torch
@@ -48,12 +48,13 @@ def main():
     parser.add_argument("--residency", choices=("upload", "resident"), required=True)
     parser.add_argument("--qk-heads", type=int, default=1)
     parser.add_argument("--pv-heads", type=int, default=1)
+    parser.add_argument("--kv", choices=KV_MODES, default="share")
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeat", type=int, default=5)
     parser.add_argument("--report-dir", type=Path, default=None)
     args = parser.parse_args()
     report_dir = args.report_dir or Path(__file__).resolve().with_name(
-        f"report_{args.residency}_qk{args.qk_heads}_pv{args.pv_heads}_f{args.fpgas}")
+        f"report_{args.checkpoint.name}_{args.residency}_{args.kv}_qk{args.qk_heads}_pv{args.pv_heads}_f{args.fpgas}")
     report_dir.mkdir(parents=True, exist_ok=True)
 
     with torch.no_grad():
@@ -64,10 +65,11 @@ def main():
             hidden = reference_layer(layer, hidden, cosine, sine)
         reference = reference_layer(model.model.layers[args.layer], hidden, cosine, sine)
         block = LlamaAimxLayer(model.model.layers[args.layer], cosine, sine,
-                               args.qk_heads, args.pv_heads).eval()
+                               args.qk_heads, args.pv_heads, args.kv).eval()
 
         start = time.perf_counter_ns()
-        session, config_report = compile_session([block], (torch.zeros(1, SEQUENCE, HIDDEN),), args)
+        session, config_report = compile_session(
+            [block], (torch.zeros(1, SEQUENCE, model.config.hidden_size),), args)
         compile_ms = (time.perf_counter_ns() - start) / 1e6
         plan, = session.layers
         stages = stage_records(plan)
@@ -107,7 +109,7 @@ def main():
                           for name in samples[0]["phases"][kind]}
                    for kind in samples[0]["phases"]},
         # QK^T와 PV의 유효 연산 수는 묶음과 무관하다. executed_operations와 비교하면 0 블록 계산량이 나온다.
-        "useful_activation_operations": 2 * (2 * SEQUENCE * SEQUENCE * HEAD_DIM * HEADS),
+        "useful_activation_operations": 2 * (2 * SEQUENCE * SEQUENCE * block.head_dim * block.heads),
         "executed_activation_operations": sum(stage["executed_operations"] for stage in stages
                                               if stage["kind"] == "activation"),
     }
@@ -127,7 +129,7 @@ def main():
         "checkpoint": str(args.checkpoint), "layer": args.layer, "layers": 1, "fpgas": args.fpgas,
         "base_fpga": args.base_fpga, "sequence": SEQUENCE, "config_source": "autotune",
         "residency": args.residency,
-        "qk_heads": args.qk_heads, "pv_heads": args.pv_heads,
+        "qk_heads": args.qk_heads, "pv_heads": args.pv_heads, "kv": args.kv,
         "compile_ms": compile_ms, "session_open_ms": session.open_ms, "session_close_ms": session.close_ms,
         "memory": memory_record(session.memory),
         "config_report": config_report, "memory_table": memory_table, "stages": stages,

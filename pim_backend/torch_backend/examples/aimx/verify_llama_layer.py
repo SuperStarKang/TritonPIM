@@ -1,4 +1,4 @@
-"""One Llama-2-7b-hf decoder layer on AiMX against the Hugging Face FP32 layer: a few minutes.
+"""One Llama-family decoder layer (Llama-2-7b, Llama-3-8B) on AiMX against the Hugging Face FP32 layer: a few minutes.
 
 The input is the prompt embedding passed through the HF FP32 layers before --layer.
 Three outputs of that layer are compared with the HF FP32 output:
@@ -17,7 +17,7 @@ import time
 
 from experiment_common import add_device_arguments, compile_session, memory_record
 from llama_workloads import (
-    HIDDEN, SEQUENCE, LlamaAimxLayer, load_llama, position_embeddings, prompt_ids, reference_layer,
+    KV_MODES, SEQUENCE, LlamaAimxLayer, load_llama, position_embeddings, prompt_ids, reference_layer,
 )
 
 import torch
@@ -41,6 +41,7 @@ def main():
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--prompt-file", type=Path, required=True)
     parser.add_argument("--layer", type=int, default=0)
+    parser.add_argument("--kv", choices=KV_MODES, default="share", help="how a query head reads its KV head")
     add_device_arguments(parser, DEFAULT_CACHE_PATH)
     parser.add_argument("--report-dir", type=Path,
                         default=Path(__file__).resolve().with_name("llama_layer_report"))
@@ -57,14 +58,15 @@ def main():
         reference = reference_layer(model.model.layers[args.layer], hidden, cosine, sine)
         reference_ms = (time.perf_counter_ns() - start) / 1e6
 
-        block = LlamaAimxLayer(model.model.layers[args.layer], cosine, sine).eval()
+        block = LlamaAimxLayer(model.model.layers[args.layer], cosine, sine, kv=args.kv).eval()
         start = time.perf_counter_ns()
         cpu = block(hidden)
         cpu_ms = (time.perf_counter_ns() - start) / 1e6
         print(f"layer={args.layer} hf_fp32_ms={reference_ms:.1f} cpu_bf16_gemm_ms={cpu_ms:.1f}", flush=True)
 
         start = time.perf_counter_ns()
-        session, config_report = compile_session([block], (torch.zeros(1, SEQUENCE, HIDDEN),), args)
+        session, config_report = compile_session(
+            [block], (torch.zeros(1, SEQUENCE, model.config.hidden_size),), args)
         compile_ms = (time.perf_counter_ns() - start) / 1e6
         plan, = session.layers
         print(f"compile_ms={compile_ms:.1f} stages={len(plan.stages)} "
@@ -93,7 +95,7 @@ def main():
     for call in calls:
         print(f"aimx {call['phase']} wall_ms={call['wall_ms']:.1f}", flush=True)
     report = {
-        "checkpoint": str(args.checkpoint), "layer": args.layer, "fpgas": args.fpgas,
+        "checkpoint": str(args.checkpoint), "layer": args.layer, "kv": args.kv, "fpgas": args.fpgas,
         "base_fpga": args.base_fpga, "sequence": SEQUENCE,
         "hf_fp32_ms": reference_ms, "cpu_bf16_gemm_ms": cpu_ms, "compile_ms": compile_ms,
         "config_report": config_report,
@@ -102,9 +104,9 @@ def main():
                     "batch_rounds": stage.batch_rounds} for stage in plan.stages],
         "calls": calls, **results,
     }
-    (args.report_dir / f"layer_{args.layer}.json").write_text(json.dumps(report, indent=2) + "\n",
-                                                               encoding="utf-8")
-    print(f"report={args.report_dir / f'layer_{args.layer}.json'}", flush=True)
+    path = args.report_dir / f"{args.checkpoint.name}_layer_{args.layer}_{args.kv}.json"
+    path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    print(f"report={path}", flush=True)
 
 
 if __name__ == "__main__":

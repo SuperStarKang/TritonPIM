@@ -1,10 +1,10 @@
-"""Llama-2-7b-hf prefill through the first --layers decoder layers on AiMX: TTFT and per-layer time.
+"""Llama-family prefill through the first --layers decoder layers on AiMX: TTFT and per-layer time.
 
 One request = tokenize -> embed -> layers on AiMX -> norm -> lm_head (CPU) -> argmax. The reference
 runs the same layers in HF FP32, so the first token is compared for any --layers.
 compile_model tunes one layer and compiles every layer with its configs: P-1 if every layer
 fits, otherwise the first slots keep one layer each and the rest share the last slot.
---qk-heads/--pv-heads as
+--qk-heads/--pv-heads/--kv as
 layer/benchmark_layer.py.
 
   python benchmark_e2e.py --checkpoint ~/models/Llama-2-7b-hf --prompt-file ../../upmem/e2e/prompt.txt \
@@ -25,7 +25,7 @@ from experiment_common import (
     add_device_arguments, compile_session, memory_record, print_request, request_breakdown, stage_records,
 )
 from llama_workloads import (
-    HIDDEN, SEQUENCE, LlamaAimxLayer, load_llama, position_embeddings, prompt_ids, reference_layer,
+    KV_MODES, SEQUENCE, LlamaAimxLayer, load_llama, position_embeddings, prompt_ids, reference_layer,
 )
 
 import torch
@@ -42,11 +42,12 @@ def main():
     parser.add_argument("--layers", type=int, default=32)
     parser.add_argument("--qk-heads", type=int, default=1)
     parser.add_argument("--pv-heads", type=int, default=1)
+    parser.add_argument("--kv", choices=KV_MODES, default="share")
     parser.add_argument("--repeat", type=int, default=3, help="requests after the first")
     parser.add_argument("--report-dir", type=Path, default=None)
     args = parser.parse_args()
     report_dir = args.report_dir or Path(__file__).resolve().with_name(
-        f"report_l{args.layers}_qk{args.qk_heads}_pv{args.pv_heads}_f{args.fpgas}")
+        f"report_{args.checkpoint.name}_l{args.layers}_{args.kv}_qk{args.qk_heads}_pv{args.pv_heads}_f{args.fpgas}")
     report_dir.mkdir(parents=True, exist_ok=True)
     prompt = args.prompt_file.read_text(encoding="utf-8")
 
@@ -70,11 +71,12 @@ def main():
         blocks = []
         for index in range(args.layers):
             blocks.append(LlamaAimxLayer(model.model.layers[index], cosine, sine,
-                                         args.qk_heads, args.pv_heads).eval())
+                                         args.qk_heads, args.pv_heads, args.kv).eval())
             model.model.layers[index] = torch.nn.Identity()
 
         start = time.perf_counter_ns()
-        session, config_report = compile_session(blocks, (torch.zeros(1, SEQUENCE, HIDDEN),), args)
+        session, config_report = compile_session(
+            blocks, (torch.zeros(1, SEQUENCE, model.config.hidden_size),), args)
         compile_ms = (time.perf_counter_ns() - start) / 1e6
         stages = stage_records(session.layers[0])
         weight_stages = {stage["name"] for stage in stages if stage["kind"] == "weight"}
@@ -126,7 +128,7 @@ def main():
     report = {
         "checkpoint": str(args.checkpoint), "layers": args.layers, "fpgas": args.fpgas,
         "base_fpga": args.base_fpga, "sequence": SEQUENCE, "config_source": "autotune",
-        "qk_heads": args.qk_heads, "pv_heads": args.pv_heads,
+        "qk_heads": args.qk_heads, "pv_heads": args.pv_heads, "kv": args.kv,
         "reference": {"token": reference_token, "token_text": tokenizer.decode([reference_token])},
         "compile_ms": compile_ms, "session_open_ms": session.open_ms, "session_close_ms": session.close_ms,
         "memory": memory_record(memory),

@@ -29,7 +29,8 @@ def main():
         layers = report["layers"]
         row = {"report": path.parent.name, "config_source": report["config_source"],
                "slots": report["memory"]["slots"], "pinned": report["memory"]["pinned"],
-               "layers": layers, "qk_heads": report["qk_heads"], "pv_heads": report["pv_heads"],
+               "layers": layers, "kv": report["kv"],
+               "qk_heads": report["qk_heads"], "pv_heads": report["pv_heads"],
                "per_layer_ms": statistics.median(call["layers_ms"] for call in samples) / layers}
         for name in samples[0]["kinds"]:
             row[name] = statistics.median(call["kinds"][name] for call in samples) / layers

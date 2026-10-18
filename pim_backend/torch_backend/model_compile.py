@@ -1,9 +1,9 @@
 """Model compile time: tiling configs of one layer, then every layer compiled with them.
 
 compile_model analyzes the first layer into stage classes (after GEMM packing),
-measures each class with its weights already resident and keeps the fastest
-config, and compiles every layer with those configs without allocating the
-device. plan_memory then fits as many layer slots as one unit holds: every layer
+measures each class with its weights already resident and keeps the smallest
+config among those within FOOTPRINT_TOLERANCE of the fastest, and compiles every
+layer with those configs without allocating the device. plan_memory then fits as many layer slots as one unit holds: every layer
 keeps its own slot if all fit; otherwise the first slots keep one layer each and
 the last slot is shared, so a layer change in it uploads only its weights. The
 returned session allocates, binds and runs at runtime.
@@ -162,6 +162,40 @@ def cache_version(key):
     return f"{TORCH_GEMM_TEMPLATE_VERSION}|model|{key.op}|w{mask}|x{key.instances}"
 
 
+# 실행 시간이 가장 빠른 것보다 이 비율 이내로 느린 후보는 같은 시간대로 보고 footprint가 작은 쪽을 고른다.
+# 측정 E만 보면 저장 padding이 3–4배인 config가 몇 % 빠르다는 이유로 선택된다.
+FOOTPRINT_TOLERANCE = 0.10
+
+
+def smallest_near_fastest(options, time, size):
+    """Option with the smallest size among those within FOOTPRINT_TOLERANCE of the fastest time."""
+    fastest = min(time(option) for option in options)
+    near = [option for option in options if time(option) <= fastest * (1 + FOOTPRINT_TOLERANCE)]
+    return min(near, key=lambda option: (size(option), time(option)))
+
+
+def footprint_bytes(candidate):
+    footprint = candidate.footprint
+    return footprint.weight + footprint.state + footprint.input + footprint.output
+
+
+def fitted_configs(key, spec, cache):
+    """Cached best configs of similar shapes in the same class context, fitted to this shape.
+
+    Each keeps its blocks, groups and partitions; every tile grows or shrinks so the
+    Execution Tiles cover this problem in one M/N/K round.
+    """
+    problem = key.problem
+    configs = []
+    for config in cache.lookup_similar(problem, spec, limit=4):
+        hierarchy = pim_hierarchy(problem, config)
+        partitions = (config.p_m, config.p_n, config.p_k)
+        tiles = [math.ceil(groups / partition)
+                 for groups, partition in zip(hierarchy.total_groups, partitions)]
+        configs.append(replace(config, tile_m=tiles[0], tile_n=tiles[1], tile_k=tiles[2]))
+    return tuple(configs)
+
+
 def widened_configs(stage_class, spec, cache_path):
     """Cached best configs of the GEMMs a packed class concatenated, widened along its axis.
 
@@ -219,19 +253,22 @@ def member_classes(stage_class):
 
 
 def tune_stage_class(stage_class, spec, *, cache_path, search_budget, warmup, repeat, seed):
-    """Fastest measured config of one class and the number of measured candidates."""
+    """Selected config of one class (smallest_near_fastest) and the number of measured candidates."""
     key = stage_class.key
     problem = key.problem
     constraint = stage_constraint(key, max_stage_rounds(problem, spec))
     # target이 k를 device로 나눌 수 없으면(AiMX) seed도 k를 나누지 않는다. instance들이 unit을
     # 나눠 한 batch round에 함께 돌도록 instance 하나가 채울 unit 수를 정한다.
     split_k = target_model(spec).mapping_reason(problem, (1, 1, 2)) is None
+    # instance가 unit보다 많으면(AiMX 2 FPGA의 head stage) instance 하나는 unit 하나를 쓴다.
     overrides = {"partition_axes": (True, True, split_k),
-                 "instance_units": spec.common_profile.num_units // key.instances}
+                 "instance_units": max(1, spec.common_profile.num_units // key.instances)}
     if key.has_weights:
         overrides["initial_round_patterns"] = ((1, 1, 1),)
     cache = PIMConfigCache(cache_path, template_version=cache_version(key))
-    initial = widened_configs(stage_class, spec, cache_path)
+    # packing member의 config를 넓힌 후보, 같은 context의 비슷한 shape config를 이 shape에 맞춘 후보
+    initial = tuple({config.key(): config for config in (
+        widened_configs(stage_class, spec, cache_path) + fitted_configs(key, spec, cache))}.values())
 
     def benchmark_fn(problem, target, config):
         return measure_isolated(stage_class, target, config, warmup=warmup, repeat=repeat)
@@ -263,7 +300,8 @@ def tune_stage_class(stage_class, spec, *, cache_path, search_budget, warmup, re
                                     Footprint(*record["physical_allocations"][0])))
     if not candidates:
         raise ValueError(f"{key.label()}: no measured config satisfies the model-stage constraints")
-    return min(candidates, key=lambda candidate: candidate.execution_ms), len(candidates)
+    return smallest_near_fastest(candidates, lambda candidate: candidate.execution_ms,
+                                 footprint_bytes), len(candidates)
 
 
 @dataclass
@@ -278,9 +316,9 @@ def compile_model(layers, example_inputs, *, target, units, runtime_options=None
     """Compile time of a model whose layers share one structure; the session runs it at runtime.
 
     1. analyze the first layer into stage classes
-    2. tune every class with its weights resident and keep the fastest measured config;
-       a packed class also tunes its members and stays packed only if it is not slower
-       than running its members separately
+    2. tune every class with its weights resident and keep the smallest config within
+       FOOTPRINT_TOLERANCE of the fastest; a packed class also tunes its members and stays
+       packed by the same rule against running its members separately
     3. compile every layer with those configs; plan_memory places them in slots
     """
     layers = tuple(layers)
@@ -318,12 +356,20 @@ def compile_model(layers, example_inputs, *, target, units, runtime_options=None
         tune_once(stage_class)
         packed_ms = stage_class.count * selected[stage_class.key].execution_ms
         separate_ms = sum(member.count * selected[member.key].execution_ms for member in members)
-        packed = packed_ms <= separate_ms
+        packed_bytes = stage_class.count * footprint_bytes(selected[stage_class.key])
+        separate_bytes = sum(member.count * footprint_bytes(selected[member.key]) for member in members)
+        # class 선택과 같은 규칙: 시간이 비슷하면 footprint가 작은 쪽
+        packed = smallest_near_fastest(
+            ((True, packed_ms, packed_bytes), (False, separate_ms, separate_bytes)),
+            lambda option: option[1], lambda option: option[2])[0]
         packing.append({"packed": stage_class.key.label(), "packed_ms": packed_ms,
+                        "packed_bytes": packed_bytes,
                         "members": [member.key.label() for member in members],
-                        "separate_ms": separate_ms, "packed_selected": packed})
-        print(f"[model compile] packing {stage_class.key.label()}: packed {packed_ms:.1f} ms, "
-              f"separate {separate_ms:.1f} ms -> {'pack' if packed else 'separate'}", flush=True)
+                        "separate_ms": separate_ms, "separate_bytes": separate_bytes,
+                        "packed_selected": packed})
+        print(f"[model compile] packing {stage_class.key.label()}: packed {packed_ms:.1f} ms "
+              f"{packed_bytes / 1e6:.0f} MB, separate {separate_ms:.1f} ms {separate_bytes / 1e6:.0f} MB "
+              f"-> {'pack' if packed else 'separate'}", flush=True)
         if packed:
             final.setdefault(stage_class.key, []).append(stage_class)
         else:

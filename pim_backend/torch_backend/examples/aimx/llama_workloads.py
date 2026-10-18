@@ -1,9 +1,14 @@
-"""Llama-2-7b-hf prefill decoder layer on AiMX, built from a Hugging Face checkpoint layer.
+"""Llama-family prefill decoder layer on AiMX, built from a Hugging Face checkpoint layer.
 
-The seven projections and the QK^T/PV GEMMs are BF16 x BF16 -> BF16, which is what AiMX
-stores and computes; BF16 host weights also keep the 32 layers (13 GB) inside host memory.
-RMSNorm, RoPE, softmax, SwiGLU and residuals stay FP32 on the CPU. The attention is written
-with one QK^T and one PV GEMM per head; the compiler packs them (torch_backend/fx_packing.py).
+Sizes come from the checkpoint config, so MHA (Llama-2-7b) and GQA (Llama-3-8B) layers
+share this code. The seven projections and the QK^T/PV GEMMs are BF16 x BF16 -> BF16,
+which is what AiMX stores and computes; BF16 host weights keep the 32 layers inside
+host memory. RMSNorm, RoPE, softmax, SwiGLU and residuals stay FP32 on the CPU.
+
+The attention is written with one QK^T and one PV GEMM per query head; the compiler
+packs them (torch_backend/fx_packing.py). kv selects how a query head reads its KV head:
+  share   head h reads KV head h // group, so heads of one group read the same tensor
+  repeat  the KV heads are copied to every query head first (Hugging Face repeat_kv)
 qk_heads / pv_heads > 1 pack heads by hand into one block-diagonal GEMM instead.
 """
 
@@ -19,14 +24,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 SEQUENCE = 1024
-HIDDEN = 4096
-HEADS = 32
-HEAD_DIM = 128
-INTERMEDIATE = 11008
-# Gate/Up는 UPMEM baseline과 같게 N=11264(=22*512)로 계산하고 11008열만 쓴다.
-PADDED_INTERMEDIATE = 11264
 QK_HEADS = 1
 PV_HEADS = 1
+KV_MODES = ("share", "repeat")
 
 
 def rotate_half(activation):
@@ -46,18 +46,17 @@ def block_diagonal(blocks):
 
 
 def load_llama(checkpoint):
-    """Tokenizer and BF16 model; FP32 would need 27 GB of host memory."""
+    """Tokenizer and BF16 Llama-family model; FP32 would not fit host memory."""
     tokenizer = AutoTokenizer.from_pretrained(str(checkpoint), local_files_only=True)
     model = AutoModelForCausalLM.from_pretrained(
         str(checkpoint), local_files_only=True, dtype=torch.bfloat16,
         attn_implementation="eager",
     ).cpu().eval().requires_grad_(False)
     config = model.config
-    if config.model_type != "llama" or (
-        config.num_hidden_layers, config.hidden_size, config.intermediate_size,
-        config.num_attention_heads, config.num_key_value_heads, config.head_dim,
-    ) != (32, HIDDEN, INTERMEDIATE, HEADS, HEADS, HEAD_DIM):
-        raise ValueError("this experiment requires Llama-2-7b-hf")
+    if config.model_type != "llama" or config.num_attention_heads % config.num_key_value_heads:
+        raise ValueError(f"this experiment requires a Llama-family checkpoint with grouped KV heads; "
+                         f"got {config.model_type} with {config.num_attention_heads} query and "
+                         f"{config.num_key_value_heads} KV heads")
     return tokenizer, model
 
 
@@ -69,8 +68,8 @@ def prompt_ids(tokenizer, prompt):
 
 
 def position_embeddings(model):
-    """RoPE cos/sin of positions 0..SEQUENCE-1, each [1, SEQUENCE, HEAD_DIM] FP32."""
-    return model.model.rotary_emb(torch.zeros(1, SEQUENCE, HIDDEN),
+    """RoPE cos/sin of positions 0..SEQUENCE-1, each [1, SEQUENCE, head_dim] FP32."""
+    return model.model.rotary_emb(torch.zeros(1, SEQUENCE, model.config.hidden_size),
                                   position_ids=torch.arange(SEQUENCE).unsqueeze(0))
 
 
@@ -111,21 +110,30 @@ class CheckpointRMSNorm(torch.nn.Module):
 
 
 class LlamaAimxLayer(torch.nn.Module):
-    def __init__(self, layer, cosine, sine, qk_heads=QK_HEADS, pv_heads=PV_HEADS):
+    def __init__(self, layer, cosine, sine, qk_heads=QK_HEADS, pv_heads=PV_HEADS, kv="share"):
         super().__init__()
-        if HEADS % qk_heads or HEADS % pv_heads:
-            raise ValueError(f"heads per GEMM must divide {HEADS}: qk {qk_heads}, pv {pv_heads}")
+        config = layer.self_attn.config
+        self.hidden = config.hidden_size
+        self.heads = config.num_attention_heads
+        self.kv_heads = config.num_key_value_heads
+        self.head_dim = config.head_dim
+        if self.heads % qk_heads or self.heads % pv_heads:
+            raise ValueError(f"heads per GEMM must divide {self.heads}: qk {qk_heads}, pv {pv_heads}")
+        if kv not in KV_MODES:
+            raise ValueError(f"kv must be one of {KV_MODES}, got {kv!r}")
         self.qk_heads = qk_heads
         self.pv_heads = pv_heads
+        self.kv = kv
         self.input_layernorm = CheckpointRMSNorm(layer.input_layernorm)
         self.post_attention_layernorm = CheckpointRMSNorm(layer.post_attention_layernorm)
         self.q_proj = CheckpointLinear(layer.self_attn.q_proj)
         self.k_proj = CheckpointLinear(layer.self_attn.k_proj)
         self.v_proj = CheckpointLinear(layer.self_attn.v_proj)
         self.o_proj = CheckpointLinear(layer.self_attn.o_proj)
-        # Gate/Up는 N=11264로 계산하고 11008열만 쓴다.
-        self.gate_proj = CheckpointLinear(layer.mlp.gate_proj, PADDED_INTERMEDIATE)
-        self.up_proj = CheckpointLinear(layer.mlp.up_proj, PADDED_INTERMEDIATE)
+        # Gate/Up는 N을 512 단위로 올려 계산하고 앞 열만 쓴다 (Llama-2 11008 → 11264, Llama-3 14336 그대로).
+        padded = -(-config.intermediate_size // 512) * 512
+        self.gate_proj = CheckpointLinear(layer.mlp.gate_proj, padded)
+        self.up_proj = CheckpointLinear(layer.mlp.up_proj, padded)
         self.down_proj = CheckpointLinear(layer.mlp.down_proj)
         self.scaling = layer.self_attn.scaling
         self.register_buffer("cosine", cosine[0].float().contiguous())
@@ -133,29 +141,35 @@ class LlamaAimxLayer(torch.nn.Module):
         self.register_buffer("mask", torch.ones(SEQUENCE, SEQUENCE, dtype=torch.bool).triu(1))
 
     def attention(self, normalized):
-        query = self.q_proj(normalized).reshape(SEQUENCE, HEADS, HEAD_DIM).transpose(0, 1)
-        key = self.k_proj(normalized).reshape(SEQUENCE, HEADS, HEAD_DIM).transpose(0, 1)
-        value = self.v_proj(normalized).reshape(SEQUENCE, HEADS, HEAD_DIM).transpose(0, 1).bfloat16()
+        group = self.heads // self.kv_heads
+        query = self.q_proj(normalized).reshape(SEQUENCE, self.heads, self.head_dim).transpose(0, 1)
+        key = self.k_proj(normalized).reshape(SEQUENCE, self.kv_heads, self.head_dim).transpose(0, 1)
+        value = self.v_proj(normalized).reshape(SEQUENCE, self.kv_heads, self.head_dim).transpose(0, 1).bfloat16()
         query = (query * self.cosine + rotate_half(query) * self.sine).bfloat16()
         key = (key * self.cosine + rotate_half(key) * self.sine).bfloat16()
+        if self.kv == "repeat":
+            # Hugging Face repeat_kv와 같이 KV head를 query head 수만큼 복사한다. head마다 다른 tensor가 된다.
+            key = key.repeat_interleave(group, dim=0)
+            value = value.repeat_interleave(group, dim=0)
+            group = 1
         scores = []
-        for first in range(0, HEADS, self.qk_heads):
+        for first in range(0, self.heads, self.qk_heads):
             heads = range(first, first + self.qk_heads)
             left = torch.cat([query[head] for head in heads], dim=1)
-            right = block_diagonal([key[head].t() for head in heads])
+            right = block_diagonal([key[head // group].t() for head in heads])
             scores.append(torch.mm(left, right))
-        # 열 순서가 head, key 위치이므로 [SEQ, HEADS, SEQ]로 보고 head마다 softmax한다.
-        scores = torch.cat(scores, dim=1).float().reshape(SEQUENCE, HEADS, SEQUENCE) * self.scaling
+        # 열 순서가 head, key 위치이므로 [SEQ, heads, SEQ]로 보고 head마다 softmax한다.
+        scores = torch.cat(scores, dim=1).float().reshape(SEQUENCE, self.heads, SEQUENCE) * self.scaling
         probability = torch.softmax(scores.masked_fill(self.mask[:, None, :], float("-inf")), dim=-1)
-        probability = probability.reshape(SEQUENCE, HEADS * SEQUENCE).bfloat16()
+        probability = probability.reshape(SEQUENCE, self.heads * SEQUENCE).bfloat16()
         outputs = []
-        for first in range(0, HEADS, self.pv_heads):
+        for first in range(0, self.heads, self.pv_heads):
             heads = range(first, first + self.pv_heads)
             left = probability[:, first * SEQUENCE:(first + self.pv_heads) * SEQUENCE]
-            right = block_diagonal([value[head] for head in heads])
+            right = block_diagonal([value[head // group] for head in heads])
             outputs.append(torch.mm(left, right))
-        # [O_h | O_h+1 ...]의 열 순서가 곧 hidden 열 순서 head * HEAD_DIM + d다.
-        context = torch.cat(outputs, dim=1).float().reshape(1, SEQUENCE, HIDDEN)
+        # [O_h | O_h+1 ...]의 열 순서가 곧 hidden 열 순서 head * head_dim + d다.
+        context = torch.cat(outputs, dim=1).float().reshape(1, SEQUENCE, self.heads * self.head_dim)
         return self.o_proj(context)
 
     def forward(self, hidden):

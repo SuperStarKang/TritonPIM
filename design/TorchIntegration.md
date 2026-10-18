@@ -415,9 +415,18 @@ stage class마다 stage 하나만 담은 Torch module을 만들고, 후보 confi
 
 ### 4.2 선택
 
-stage class마다 측정 기록 중 E가 가장 작은 config 하나를 쓴다. 정책별 비용 비교나 knapsack
-DP는 하지 않는다. 측정상 weight stage는 가장 빠른 config가 곧 가장 작은 config였고, layer
-하나의 footprint는 descriptor(∝ m·n·k)와 weight가 대부분이라 config로 바꿀 여지가 작다.
+stage class마다 측정 기록 중 E가 가장 빠른 값의 (1 + `FOOTPRINT_TOLERANCE`, 0.10) 이내인
+config들에서 footprint(weight + state + input + output)가 가장 작은 것을 쓴다. E만 보면 Block
+Group의 n이나 k가 저장 단위(AiMX: n 4096, k 256)보다 작아 weight가 3–4배로 저장되는 config가
+몇 % 빠르다는 이유로 선택된다(Llama-3-8B: layer 3.61 GB). packing을 유지할지(packed vs member)도
+같은 규칙으로 정한다.
+
+튜닝의 초기 후보는 두 가지다.
+
+| 후보 | 재료 | 규칙 |
+|---|---|---|
+| 넓힌 후보 (`widened_configs`) | packing member class의 cache 최선 config | 합친 축의 tile만 packed 크기를 덮도록 키움 (member의 round 유지) |
+| 맞춘 후보 (`fitted_configs`) | 같은 context(op, weight mask, instance 수)의 비슷한 shape cache 최선 config 4개 | block, group, partition 유지. 모든 tile을 이 shape를 1 round로 덮도록 재계산 |
 
 ---
 
