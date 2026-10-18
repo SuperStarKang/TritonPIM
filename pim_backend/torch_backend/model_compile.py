@@ -9,6 +9,7 @@ the last slot is shared, so a layer change in it uploads only its weights. The
 returned session allocates, binds and runs at runtime.
 """
 
+from collections import Counter
 from dataclasses import asdict, dataclass, replace
 import math
 import multiprocessing
@@ -24,7 +25,9 @@ from ._autotuner import (
     SearchBudget, TuningRecord, build_config_space, pim_hierarchy, target_model, target_spec, tune,
 )
 from .config import PIMTorchConfig
-from .model_policy import Footprint, analyze_layer, max_stage_rounds, stage_constraint
+from .model_policy import (
+    Footprint, StageClass, analyze_layer, max_stage_rounds, stage_constraint, stage_key,
+)
 from .template import TORCH_GEMM_TEMPLATE_VERSION
 
 
@@ -185,6 +188,36 @@ def widened_configs(stage_class, spec, cache_path):
     return tuple(configs)
 
 
+def member_classes(stage_class):
+    """Classes the GEMMs of a packed class form when they are not packed, and which class
+    each original GEMM then belongs to."""
+    axis, shapes, instances = stage_class.origin
+    members = {}
+    assignment = {}
+    for sources in stage_class.stage_sources:
+        if axis == "n":
+            # member마다 원래 GEMM 하나이고, 이어 붙인 weight의 열 구간 하나를 쓴다.
+            parts = []
+            start = 0
+            for source, mnk in zip(sources, shapes, strict=True):
+                weights = tuple(None if weight is None else weight[:, start:start + mnk[1]]
+                                for weight in stage_class.weights)
+                parts.append(((source,), mnk, weights))
+                start += mnk[1]
+        else:
+            # 원래 GEMM들이 instance로 묶인 stage 하나가 된다.
+            parts = [(sources, shapes[0], stage_class.weights)]
+        for part_sources, mnk, weights in parts:
+            key = replace(stage_class.key, mnk=mnk, instances=instances)
+            if key not in members:
+                members[key] = StageClass(key, 0, weights, None, [])
+            members[key].count += 1
+            members[key].stage_sources.append(part_sources)
+            for source in part_sources:
+                assignment[source] = key
+    return list(members.values()), assignment
+
+
 def tune_stage_class(stage_class, spec, *, cache_path, search_budget, warmup, repeat, seed):
     """Fastest measured config of one class and the number of measured candidates."""
     key = stage_class.key
@@ -245,7 +278,9 @@ def compile_model(layers, example_inputs, *, target, units, runtime_options=None
     """Compile time of a model whose layers share one structure; the session runs it at runtime.
 
     1. analyze the first layer into stage classes
-    2. tune every class with its weights resident and keep the fastest measured config
+    2. tune every class with its weights resident and keep the fastest measured config;
+       a packed class also tunes its members and stays packed only if it is not slower
+       than running its members separately
     3. compile every layer with those configs; plan_memory places them in slots
     """
     layers = tuple(layers)
@@ -261,10 +296,45 @@ def compile_model(layers, example_inputs, *, target, units, runtime_options=None
     search_budget = SearchBudget(max_generations=max_generations, max_benchmarks=max_benchmarks)
     selected = {}
     measured = {}
+
+    def tune_once(stage_class):
+        if stage_class.key not in selected:
+            selected[stage_class.key], measured[stage_class.key] = tune_stage_class(
+                stage_class, spec, cache_path=cache_path, search_budget=search_budget,
+                warmup=warmup, repeat=repeat, seed=seed)
+
+    final = {}
+    separate = set()
+    packing = []
     for stage_class in classes:
-        selected[stage_class.key], measured[stage_class.key] = tune_stage_class(
-            stage_class, spec, cache_path=cache_path, search_budget=search_budget,
-            warmup=warmup, repeat=repeat, seed=seed)
+        if stage_class.origin is None:
+            tune_once(stage_class)
+            final.setdefault(stage_class.key, []).append(stage_class)
+            continue
+        # member를 먼저 재야 packed class가 member config를 넓혀 탐색을 시작한다(widened_configs).
+        members, member_assignment = member_classes(stage_class)
+        for member in members:
+            tune_once(member)
+        tune_once(stage_class)
+        packed_ms = stage_class.count * selected[stage_class.key].execution_ms
+        separate_ms = sum(member.count * selected[member.key].execution_ms for member in members)
+        packed = packed_ms <= separate_ms
+        packing.append({"packed": stage_class.key.label(), "packed_ms": packed_ms,
+                        "members": [member.key.label() for member in members],
+                        "separate_ms": separate_ms, "packed_selected": packed})
+        print(f"[model compile] packing {stage_class.key.label()}: packed {packed_ms:.1f} ms, "
+              f"separate {separate_ms:.1f} ms -> {'pack' if packed else 'separate'}", flush=True)
+        if packed:
+            final.setdefault(stage_class.key, []).append(stage_class)
+        else:
+            separate.update(member_assignment)
+            assignment.update(member_assignment)
+            for member in members:
+                final.setdefault(member.key, []).append(member)
+    # member key가 packing하지 않은 다른 class와 같으면(q/k/v member와 o) 한 class로 합친다.
+    classes = [StageClass(key, sum(part.count for part in parts), parts[0].weights, parts[0].origin,
+                          [sources for part in parts for sources in part.stage_sources])
+               for key, parts in final.items()]
     tuning_ms = (time.perf_counter_ns() - start) / 1e6
 
     start = time.perf_counter_ns()
@@ -272,11 +342,17 @@ def compile_model(layers, example_inputs, *, target, units, runtime_options=None
 
     # 모든 layer의 GEMM 이름이 분석한 layer와 같다. 없는 이름은 KeyError로 드러난다.
     def configure(gemms, spec):
-        return {gemm.node: PIMTorchConfig(spec=spec, config=selected[assignment[gemm.node]].config)
+        return {gemm.node: PIMTorchConfig(spec=spec, config=selected[assignment[gemm.node]].config,
+                                          pack=gemm.node not in separate)
                 for gemm in gemms}
 
     torch._dynamo.reset()
     session.compile(layers, example_inputs, configure=configure)
+    # packing 판단을 반영한 layer가 측정한 class와 같은 stage들로 나뉘었는지 확인한다.
+    compiled = Counter(stage_key(stage) for stage in session.layers[0].stages)
+    expected = Counter({stage_class.key: stage_class.count for stage_class in classes})
+    if compiled != expected:
+        raise ValueError(f"layer 0 compiled into stages {dict(compiled)}; the tuned classes are {expected}")
     analyzed = [(tuple(stage.shape), stage.instance_count, tuple(stage.weight_mask))
                 for stage in session.layers[0].stages]
     for plan in session.layers[1:]:
@@ -300,6 +376,7 @@ def compile_model(layers, example_inputs, *, target, units, runtime_options=None
         "estimated_execution_ms": len(layers) * sum(
             stage_class.count * selected[stage_class.key].execution_ms for stage_class in classes),
         "analysis_ms": analysis_ms, "tuning_ms": tuning_ms, "compile_ms": compile_ms,
+        "packing": packing,
         "stage_classes": [{
             "label": stage_class.key.label(),
             "mnk": list(stage_class.key.mnk), "op": stage_class.key.op,

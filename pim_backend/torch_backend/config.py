@@ -54,6 +54,10 @@ class PIMTorchConfig:
     #    조용히 seed로 돌아가면 무엇으로 실행됐는지 알 수 없다.
     autotune_cache_path: Optional[str] = None
     # 3) 둘 다 없으면 Common IR 값으로 만든 기본 seed.
+    # ── GEMM packing ──────────────────────────────────────────────────────
+    # False면 fx_packing이 이 GEMM을 다른 GEMM과 묶지 않는다. model compile이
+    # 따로 실행하는 쪽이 더 빠르다고 측정한 GEMM에 쓴다.
+    pack: bool = True
     # ── Triton compile config ─────────────────────────────────────────────
     # PIM은 warp/stage 개념이 없지만 triton.compile 옵션 스키마에는 있어서
     # 채운다. PIMOptions의 기본값(num_warps=0, num_stages=1)과 어긋나지 않게 둔다.

@@ -212,8 +212,8 @@ def build_layer_plan(exported_program, example_inputs, *, configs, index, spec):
     """Analyze one exported block without compiling it or acquiring hardware.
 
     configs maps original GEMM names to PIMTorchConfig. GEMMs are first packed on
-    the frozen graph (fx_packing, decided by spec's target model); GEMMs packed
-    together must share one config. Independent activation GEMMs of the same
+    the frozen graph (fx_packing, decided by spec's target model) unless their
+    config sets pack=False; GEMMs packed together must share one config. Independent activation GEMMs of the same
     shape/config are then grouped; weight GEMMs remain stationary single-instance
     stages. aten.bmm uses its explicit operand batch dimension.
     """
@@ -226,7 +226,7 @@ def build_layer_plan(exported_program, example_inputs, *, configs, index, spec):
     frozen_graph, frozen = _freeze_graph(normalized)
     gemms = pack_gemms(frozen_graph, frozen, {
         mapping.normalized.node: PackedGemm(mapping, (mapping.original.node,), None) for mapping in mappings
-    }, spec)
+    }, spec, frozenset(name for name, config in configs.items() if not config.pack))
     for entry in gemms.values():
         if len({configs[source] for source in entry.sources}) != 1:
             raise ValueError(f"packed GEMMs {entry.sources} must share one config")

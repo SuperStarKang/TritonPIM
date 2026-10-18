@@ -13,7 +13,7 @@ holds when the zero blocks fill padding the target computes anyway.
 
 gemms maps a GEMM node name to a PackedGemm. Packed nodes take a member's mapping
 and the members' sources, and record their origin so that tuning can start from
-the members' configs.
+the members' configs. GEMMs whose original name is in separate are not packed.
 """
 
 from dataclasses import dataclass, replace
@@ -54,13 +54,13 @@ def gemm_operands(node):
     return arguments.kwargs["input"], arguments.kwargs["mat2"]
 
 
-def pack_gemms(graph_module, frozen, gemms, spec):
+def pack_gemms(graph_module, frozen, gemms, spec, separate):
     graph = graph_module.graph
     _eliminate_common_subexpressions(graph, gemms)
-    _concatenate_weights(graph_module, frozen, gemms)
+    _concatenate_weights(graph_module, frozen, gemms, separate)
     _reorder(graph)
     for transform in (_stack_shared_rights, _block_diagonal):
-        for members in _instance_groups(graph, frozen, gemms):
+        for members in _instance_groups(graph, frozen, gemms, separate):
             transform(graph, gemms, members, spec)
         _reorder(graph)
     graph.lint()
@@ -153,12 +153,13 @@ def _packed_entry(gemms, members, node, mnk, left, right, weight_target, origin)
     gemms[node.name] = PackedGemm(GemmNormalization(mapping.original, normalized), sources, origin)
 
 
-def _concatenate_weights(graph_module, frozen, gemms):
+def _concatenate_weights(graph_module, frozen, gemms, separate):
     """(2) Weight GEMMs that read the same activation become one GEMM over [W1 | W2 | ...]."""
     graph = graph_module.graph
     groups = {}
     for node in graph.nodes:
-        if node.name not in gemms or node.target == aten.bmm.default:
+        if (node.name not in gemms or node.target == aten.bmm.default
+                or separate.intersection(gemms[node.name].sources)):
             continue
         left, right = gemm_operands(node)
         if left in frozen or right not in frozen:
@@ -189,7 +190,7 @@ def _concatenate_weights(graph_module, frozen, gemms):
                 graph.erase_node(right)
 
 
-def _instance_groups(graph, frozen, gemms):
+def _instance_groups(graph, frozen, gemms, separate):
     """Independent activation GEMMs of the same depth, shape and dtype (build_layer_plan groups)."""
     depths = {}
     groups = {}
@@ -198,7 +199,8 @@ def _instance_groups(graph, frozen, gemms):
         if node.name in gemms:
             depth += 1
             left, right = gemm_operands(node)
-            if node.target != aten.bmm.default and left not in frozen and right not in frozen:
+            if (node.target != aten.bmm.default and left not in frozen and right not in frozen
+                    and not separate.intersection(gemms[node.name].sources)):
                 info = gemms[node.name].mapping.normalized
                 groups.setdefault((depth, node.target, info.mnk, info.left.dtype, info.right.dtype),
                                   []).append(node)

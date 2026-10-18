@@ -47,6 +47,8 @@ class StageClass:
     weights: tuple
     # packing으로 이어 붙인 class면 (축, member (m, n, k)들, member stage의 instance 수), 아니면 None
     origin: tuple | None
+    # stage마다 그 stage가 계산하는 원래 GEMM 이름들
+    stage_sources: list
 
 
 @dataclass(frozen=True)
@@ -57,6 +59,17 @@ class Footprint:
     state: int
     input: int
     output: int
+
+
+def stage_key(stage):
+    return StageKey(
+        mnk=tuple(stage.shape),
+        input_dtype=str(stage.input_dtype).removeprefix("torch."),
+        output_dtype=str(stage.output_dtype).removeprefix("torch."),
+        op=stage.gemms[0].op,
+        weight_mask=tuple(stage.weight_mask),
+        instances=stage.instance_count,
+    )
 
 
 def analyze_layer(layer, example_inputs, spec):
@@ -74,17 +87,11 @@ def analyze_layer(layer, example_inputs, spec):
         plan = build_layer_plan(exported, example_inputs,
                                 configs={gemm.node: placeholder for gemm in gemms}, index=0, spec=spec)
         for stage in plan.stages:
-            key = StageKey(
-                mnk=tuple(stage.shape),
-                input_dtype=str(stage.input_dtype).removeprefix("torch."),
-                output_dtype=str(stage.output_dtype).removeprefix("torch."),
-                op=stage.gemms[0].op,
-                weight_mask=tuple(stage.weight_mask),
-                instances=stage.instance_count,
-            )
+            key = stage_key(stage)
             if key not in classes:
-                classes[key] = StageClass(key, 0, tuple(stage.weights), stage.origin)
+                classes[key] = StageClass(key, 0, tuple(stage.weights), stage.origin, [])
             classes[key].count += 1
+            classes[key].stage_sources.append(tuple(stage.sources))
             for source in stage.sources:
                 assignment[source] = key
     return list(classes.values()), assignment
