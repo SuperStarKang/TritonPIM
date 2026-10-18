@@ -44,6 +44,10 @@ class PIMConfigSpace:
     group_values: tuple = GROUP_VALUES
     tile_values: tuple = TILE_VALUES
     partition_values: tuple = (1,)
+    # m/n/k 중 device로 나눌 수 있는 축. False인 축의 partition은 1뿐이다.
+    partition_axes: tuple = (True, True, True)
+    # seed와 tile ladder가 instance 하나로 채우려는 unit 수 (build_config_space가 정한다)
+    instance_units: int = 0
     block_group_top_k: int = 3
     max_ladder_steps: int = 4
     initial_round_patterns: tuple = INITIAL_ROUND_PATTERNS
@@ -56,6 +60,8 @@ class PIMConfigSpace:
 def axis_values(problem, spec, kind, axis):
     """Values for one hierarchy level, fixing unused logical axes to one."""
     if problem.axis_extents[axis] == 1:
+        return (1,)
+    if kind == "partition" and not spec.partition_axes[axis]:
         return (1,)
     values = {
         "block": spec.block_values,
@@ -70,6 +76,7 @@ def build_config_space(problem, target, **overrides):
     fields = {
         "partition_values": _powers_of_two(
             target.common_profile.num_units),
+        "instance_units": target.common_profile.num_units,
     }
     fields.update(overrides)
     return PIMConfigSpace(**fields)
@@ -101,14 +108,14 @@ def _partitions(config):
 
 
 def legal_partitions(problem, target, spec):
-    """Every ``[p_m,p_n,p_k]`` within ``num_units`` the target can lower."""
+    """Every ``[p_m,p_n,p_k]`` within ``spec.instance_units`` the target can lower."""
     model = target_model(target)
     return [
         partitions
         for partitions in product(*(
             axis_values(problem, spec, "partition", axis)
             for axis in range(3)))
-        if prod(partitions) <= model.num_units
+        if prod(partitions) <= spec.instance_units
         and model.mapping_reason(problem, partitions) is None
     ]
 
@@ -197,9 +204,9 @@ def tile_ladder(problem, target, blocks, groups, spec):
             + sum(model.overhead_allocations(problem, config).values()))
         return Fraction(prod(config.execution_extent), resident)
 
-    def moved(tiles, offset):
+    def moved(tiles, offset, axes=range(3)):
         configs = []
-        for axis in range(3):
+        for axis in axes:
             index = steps[axis].index(tiles[axis]) + offset
             if not 0 <= index < len(steps[axis]):
                 continue
@@ -222,11 +229,14 @@ def tile_ladder(problem, target, blocks, groups, spec):
 
     ladder = [tiles]
     target_units = reachable_units(total_groups, partitions)
+    # 나눌 수 없는 축을 줄이면 unit은 늘지 않고 round만 는다
+    split_axes = [axis for axis in range(3)
+                  if axis_values(problem, spec, "partition", axis) != (1,)]
     # 모든 unit을 한 round에 채울 수 있을 때까지 compute/byte 손실이 가장 작은 축을 줄인다
     while reachable_units(
             _execution_tiles(problem, blocks, groups, tiles),
             partitions) < target_units:
-        tiles = _tiles(max(moved(tiles, -1), key=compute_per_byte))
+        tiles = _tiles(max(moved(tiles, -1, split_axes), key=compute_per_byte))
         ladder.append(tiles)
     return ladder
 

@@ -21,7 +21,7 @@ from triton.backends.pim.runtime import PIMSession
 
 from ._autotuner import (
     DEFAULT_CACHE_PATH, ConstraintEngine, PIMBenchmarkResult, PIMConfig, PIMConfigCache,
-    SearchBudget, TuningRecord, build_config_space, pim_hierarchy, target_spec, tune,
+    SearchBudget, TuningRecord, build_config_space, pim_hierarchy, target_model, target_spec, tune,
 )
 from .config import PIMTorchConfig
 from .model_policy import Footprint, analyze_layer, max_stage_rounds, stage_constraint
@@ -190,7 +190,13 @@ def tune_stage_class(stage_class, spec, *, cache_path, search_budget, warmup, re
     key = stage_class.key
     problem = key.problem
     constraint = stage_constraint(key, max_stage_rounds(problem, spec))
-    overrides = {"initial_round_patterns": ((1, 1, 1),)} if key.has_weights else {}
+    # target이 k를 device로 나눌 수 없으면(AiMX) seed도 k를 나누지 않는다. instance들이 unit을
+    # 나눠 한 batch round에 함께 돌도록 instance 하나가 채울 unit 수를 정한다.
+    split_k = target_model(spec).mapping_reason(problem, (1, 1, 2)) is None
+    overrides = {"partition_axes": (True, True, split_k),
+                 "instance_units": spec.common_profile.num_units // key.instances}
+    if key.has_weights:
+        overrides["initial_round_patterns"] = ((1, 1, 1),)
     cache = PIMConfigCache(cache_path, template_version=cache_version(key))
     initial = widened_configs(stage_class, spec, cache_path)
 
