@@ -1916,6 +1916,61 @@ struct MinMaxConverter : public OpRewritePattern<CmpOp> {
   }
 };
 
+// Inductor의 triton_helpers.maximum/minimum은 NaN을 전파하려고
+//   select(ori(cmpf ogt|olt a, b, cmpf une a, a), a, b)
+// 형태를 만든다. MinMaxConverter는 cmpf가 select에 바로 쓰이는 형태만 보므로,
+// 이 형태를 maximumf/minimumf 하나로 바꿔 ReduceConverter가 처리할 수 있게 한다.
+// maximumf/minimumf도 NaN을 전파하며, 차이는 +0/-0 비교 결과뿐이다.
+struct NanPropagatingMinMaxConverter
+    : public OpRewritePattern<arith::SelectOp> {
+  NanPropagatingMinMaxConverter(MLIRContext *context)
+      : OpRewritePattern<arith::SelectOp>(context, /*benefit=*/10) {}
+
+  LogicalResult matchAndRewrite(arith::SelectOp selectOp,
+                                PatternRewriter &rewriter) const final {
+    auto orOp = selectOp.getCondition().getDefiningOp<arith::OrIOp>();
+    if (!orOp) {
+      return failure();
+    }
+    Value lhs = selectOp.getTrueValue();
+    Value rhs = selectOp.getFalseValue();
+
+    auto isNanCheck = [&](Value value) {
+      auto cmpOp = value.getDefiningOp<arith::CmpFOp>();
+      return cmpOp && cmpOp.getPredicate() == arith::CmpFPredicate::UNE &&
+             cmpOp.getLhs() == lhs && cmpOp.getRhs() == lhs;
+    };
+    auto orderCmp = [&](Value value) -> arith::CmpFOp {
+      auto cmpOp = value.getDefiningOp<arith::CmpFOp>();
+      if (cmpOp && cmpOp.getLhs() == lhs && cmpOp.getRhs() == rhs) {
+        return cmpOp;
+      }
+      return nullptr;
+    };
+
+    arith::CmpFOp cmpOp;
+    if (isNanCheck(orOp.getRhs())) {
+      cmpOp = orderCmp(orOp.getLhs());
+    } else if (isNanCheck(orOp.getLhs())) {
+      cmpOp = orderCmp(orOp.getRhs());
+    }
+    if (!cmpOp) {
+      return failure();
+    }
+
+    switch (cmpOp.getPredicate()) {
+    case arith::CmpFPredicate::OGT:
+      rewriter.replaceOpWithNewOp<arith::MaximumFOp>(selectOp, lhs, rhs);
+      return success();
+    case arith::CmpFPredicate::OLT:
+      rewriter.replaceOpWithNewOp<arith::MinimumFOp>(selectOp, lhs, rhs);
+      return success();
+    default:
+      return failure();
+    }
+  }
+};
+
 struct DenseConstantConverter : public OpConversionPattern<arith::ConstantOp> {
   using OpConversionPattern<arith::ConstantOp>::OpConversionPattern;
   LogicalResult

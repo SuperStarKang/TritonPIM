@@ -36,8 +36,8 @@ using namespace triton;
 
 void mlir::triton::populateTritonArithToLinalgCanonicalizationPatterns(
     RewritePatternSet &patterns) {
-  patterns.add<MinMaxConverter<arith::CmpFOp>, MinMaxConverter<arith::CmpIOp>>(
-      patterns.getContext());
+  patterns.add<MinMaxConverter<arith::CmpFOp>, MinMaxConverter<arith::CmpIOp>,
+               NanPropagatingMinMaxConverter>(patterns.getContext());
 }
 
 void mlir::triton::populateTritonTensorPtrConversionPatterns(
