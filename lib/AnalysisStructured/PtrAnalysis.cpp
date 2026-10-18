@@ -1310,6 +1310,10 @@ LogicalResult PtrAnalysis::rewriteAddptrOp(triton::AddPtrOp op) {
     return failure();
   }
 
+  // 1D wraparound pointer는 StructuredToMemref가 2D만 지원하므로 unstructured 경로로 넘긴다
+  if (state.getRank() == 1 && state.hasModulo())
+    return failure();
+
   knownPtrs[op.getResult()] = state;
 
   if (isa<RankedTensorType>(op.getPtr().getType())) {
