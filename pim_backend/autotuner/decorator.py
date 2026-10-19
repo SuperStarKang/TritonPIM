@@ -9,17 +9,15 @@ import torch
 import triton.backends.pim.driver as pim_driver
 
 from .cache import PIMConfigCache
+from .artifacts import DEFAULT_CACHE_PATH
 from .constraints import ConstraintEngine
+from .model import target_model
+from .performance import PIMUnitTiming, calibrate_performance
 from .search import tune
 from .space import build_config_space, heuristic_seeds
 from .targets import AiMXRuntimeConfig, UPMEMRuntimeConfig, target_spec
 from .types import PIMBenchmarkResult, PIMProblem
 
-
-DEFAULT_CACHE_PATH = os.path.join(
-    os.environ.get("TRITON_CACHE_DIR", os.path.expanduser("~/.triton")),
-    "pim_autotune_cache.json",
-)
 
 TORCH_DTYPE_NAMES = {
     torch.int8: "int8",
@@ -49,9 +47,10 @@ def problem_from_tensors(a, b):
     )
 
 
-def default_config(problem, target, space):
+def default_config(problem, target, space, *, performance, kernel_version):
     engine = ConstraintEngine(problem, target)
-    for config in heuristic_seeds(problem, target, space):
+    for config in heuristic_seeds(problem, target, space, performance=performance,
+                                  kernel_version=kernel_version, engine=engine):
         if engine.valid(config):
             return config
     raise ValueError("유효한 seed configuration이 없습니다")
@@ -110,7 +109,7 @@ def pim_autotune(target=None, spec=None, cache_path=DEFAULT_CACHE_PATH,
                  seed=0, search=True, retune=False, verbose=True,
                  rtol=0.0, atol=0.0,
                  template_version="pim-common-ir-semantic-schedule-v1",
-                 check_correctness=True):
+                 check_correctness=True, performance=None, profile_fn=None):
     """Autotune ``fn(a, b, *, config)`` with Common IR configurations."""
     selected_target = spec if spec is not None else target_spec(target)
     overrides = space_overrides if space_overrides is not None else {}
@@ -150,7 +149,11 @@ def pim_autotune(target=None, spec=None, cache_path=DEFAULT_CACHE_PATH,
             space = build_config_space(
                 problem, selected_target, **overrides)
             if not (do_search or do_retune):
-                config = default_config(problem, selected_target, space)
+                seed_performance = performance
+                if seed_performance is None and profile_fn is not None:
+                    seed_performance = profile_fn(problem, selected_target, space)
+                config = default_config(problem, selected_target, space,
+                                        performance=seed_performance, kernel_version=template_version)
                 if verbose:
                     print(
                         f"[autotuner] search disabled: "
@@ -253,11 +256,37 @@ def pim_autotune(target=None, spec=None, cache_path=DEFAULT_CACHE_PATH,
 
             result = tune(
                 problem, selected_target, benchmark_fn,
+                performance=performance, kernel_version=template_version,
+                profile_fn=profile_fn,
                 space=space, cache=cache, budget=budget, seed=seed,
                 retune=do_retune, verbose=verbose,
             )
             return fn(a, b, config=result.best.config)
 
+        def calibrate(a, b, *, sweep_extents):
+            if reps < 1:
+                raise ValueError("calibration reps must be positive")
+            problem = problem_from_tensors(a, b)
+
+            def measure_unit(local_problem, single_target, config):
+                left = torch.ones((local_problem.M, local_problem.K), dtype=a.dtype)
+                right = torch.ones((local_problem.K, local_problem.N), dtype=b.dtype)
+                fn(left, right, config=config)
+                samples = []
+                for _ in range(reps):
+                    fn(left, right, config=config)
+                    timings = dict(zip(pim_driver.TIMING_STAGES, pim_driver.timing))
+                    samples.append(timings[target_model(single_target).launch_timing_name])
+                print(f"[single-unit] extent={config.execution_extent} "
+                      f"launch_ms={statistics.median(samples):.6f}", flush=True)
+                return PIMUnitTiming(launch_ms=statistics.median(samples))
+
+            return calibrate_performance(
+                [(problem, build_config_space(problem, selected_target, **overrides))],
+                selected_target, measure_unit, kernel_version=template_version,
+                sweep_extents=sweep_extents)
+
+        wrapper.calibrate = calibrate
         return wrapper
 
     return decorate

@@ -2,12 +2,29 @@ import unittest
 from math import prod
 
 from .constraints import ConstraintEngine
+from .performance import (
+    PIMPerformanceProfile, PIMSaturationCurve, PIMSaturationSample, PIMUnitTiming,
+    performance_context,
+)
 from .space import (
     build_config_space, heuristic_seeds, legal_partitions, make_config,
     rank_block_groups, tile_ladder,
 )
 from .targets import target_spec
 from .types import PIMConfig, PIMProblem, pim_hierarchy
+
+
+def saturated_profile(problem, target, space):
+    """Synthetic constant-throughput curves, never hardware calibration data."""
+    curves = []
+    for blocks, groups in rank_block_groups(problem, target, space)[:space.block_group_top_k]:
+        extent = tuple(block * group for block, group in zip(blocks, groups))
+        curves.append(PIMSaturationCurve(
+            performance_context(problem, target), blocks, groups,
+            tuple(PIMSaturationSample(
+                (extent[0] * scale, extent[1], extent[2]),
+                PIMUnitTiming(prod(extent) * scale / 1e6)) for scale in (1, 2, 4))))
+    return PIMPerformanceProfile("synthetic-test-kernel", tuple(curves))
 
 
 class AiMXFrontierTest(unittest.TestCase):
@@ -32,18 +49,29 @@ class AiMXFrontierTest(unittest.TestCase):
 
         self.assertEqual(ladder, [(4, 1, 1), (2, 1, 1), (1, 1, 1)])
 
-    def test_frontier_seeds_most_parallel_first(self):
-        seeds = heuristic_seeds(self.problem, self.target, self.space)
+    def test_tile_ladder_does_not_shrink_an_unlowerable_partition_axis(self):
+        ladder = tile_ladder(
+            self.problem, self.target, (128, 128, 128), (8, 32, 16), self.space)
 
-        self.assertEqual(seeds[:3], [
-            make_config((128, 128, 128), (8, 32, 32), (1, 1, 1), (4, 1, 1)),
-            make_config((128, 128, 128), (8, 32, 32), (2, 1, 1), (2, 1, 1)),
-            make_config((128, 128, 128), (8, 32, 32), (4, 1, 1), (1, 1, 1)),
-        ])
+        self.assertEqual(ladder, [(4, 1, 2), (2, 1, 2), (1, 1, 2)])
+
+    def test_frontier_seeds_most_parallel_first(self):
+        seeds = heuristic_seeds(
+            self.problem, self.target, self.space,
+            performance=saturated_profile(self.problem, self.target, self.space),
+            kernel_version="synthetic-test-kernel")
+
+        self.assertEqual(seeds[0],
+                         make_config((128, 128, 128), (8, 32, 32), (1, 1, 1), (4, 1, 1)))
+        self.assertTrue(all(config.p_m * config.p_n == 4 for config in seeds[:3]))
+        self.assertFalse(any(config.p_m * config.p_n == 1 for config in seeds))
 
     def test_unlowerable_mappings_are_never_generated(self):
         partitions = legal_partitions(self.problem, self.target, self.space)
-        seeds = heuristic_seeds(self.problem, self.target, self.space)
+        seeds = heuristic_seeds(
+            self.problem, self.target, self.space,
+            performance=saturated_profile(self.problem, self.target, self.space),
+            kernel_version="synthetic-test-kernel")
         engine = ConstraintEngine(self.problem, self.target)
 
         self.assertTrue(all(p[2] == 1 for p in partitions))
@@ -60,20 +88,23 @@ class UPMEMFrontierTest(unittest.TestCase):
         blocks, groups = rank_block_groups(
             self.problem, self.target, self.space)[0]
 
-        # extent (64,64,256): A 16 KiB + B 16 KiB + C 16 KiB = 48 KiB local
+        # extent (64,64,128): A 8 KiB + B 8 KiB + C 16 KiB = 32 KiB local
         self.assertEqual(blocks, (64, 64, 128))
-        self.assertEqual(groups, (1, 1, 2))
+        self.assertEqual(groups, (1, 1, 1))
 
     def test_ladder_ends_when_every_unit_can_work(self):
         ladder = tile_ladder(
-            self.problem, self.target, (64, 64, 128), (1, 1, 2), self.space)
-        last = make_config((64, 64, 128), (1, 1, 2), ladder[-1], (1, 1, 1))
+            self.problem, self.target, (64, 64, 128), (1, 1, 1), self.space)
+        last = make_config((64, 64, 128), (1, 1, 1), ladder[-1], (1, 1, 1))
 
         self.assertGreaterEqual(
             pim_hierarchy(self.problem, last).useful_execution_tiles, 2048)
 
     def test_first_seed_uses_every_unit(self):
-        seeds = heuristic_seeds(self.problem, self.target, self.space)
+        seeds = heuristic_seeds(
+            self.problem, self.target, self.space,
+            performance=saturated_profile(self.problem, self.target, self.space),
+            kernel_version="synthetic-test-kernel")
         engine = ConstraintEngine(self.problem, self.target)
         first = seeds[0]
 

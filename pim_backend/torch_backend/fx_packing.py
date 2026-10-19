@@ -25,7 +25,8 @@ from torch import fx
 from torch.fx.operator_schemas import normalize_function
 
 from ._autotuner import (
-    ConstraintEngine, PIMProblem, build_config_space, heuristic_seeds, pim_hierarchy, target_model,
+    ConstraintEngine, PIMProblem, best_partitions, build_config_space, legal_partitions,
+    make_config, pim_hierarchy, rank_block_groups, target_model, tile_ladder,
 )
 from .fx_normalization import GemmNormalization
 
@@ -229,11 +230,17 @@ def _stack_shared_rights(graph, gemms, members, spec):
 # 모든 layer가 같은 판정을 하므로 (spec, problem)마다 한 번만 계산한다.
 @cache
 def _cost(spec, problem):
-    """Scheduled compute and allocated bytes of one GEMM under the target's first valid seed."""
+    """Static packing cost at the most parallel frontier point; no execution seed is selected."""
     engine = ConstraintEngine(problem, spec)
     model = target_model(spec)
-    for config in heuristic_seeds(problem, spec, build_config_space(problem, spec)):
-        if engine.valid(config):
+    space = build_config_space(problem, spec)
+    partitions = legal_partitions(problem, spec, space)
+    for blocks, groups in rank_block_groups(problem, spec, space)[:space.block_group_top_k]:
+        ladder = tile_ladder(problem, spec, blocks, groups, space)
+        if not ladder:
+            continue
+        for partition in best_partitions(problem, spec, blocks, groups, ladder[-1], partitions, engine):
+            config = make_config(blocks, groups, ladder[-1], partition)
             tiles = pim_hierarchy(problem, config).useful_execution_tiles
             return (tiles * model.scheduled_compute(problem, config),
                     tiles * sum(model.access_allocations(problem, config)))

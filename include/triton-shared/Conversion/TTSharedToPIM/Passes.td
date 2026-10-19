@@ -109,7 +109,7 @@ def PIMSetTargetProfile : Pass<"pim-set-target-profile", "mlir::ModuleOp"> {
     Option<"bankCapacityLimitBytes", "bank-capacity-limit-bytes", "int64_t",
            "62914560", "bank 하나가 담을 수 있는 최대 byte 수.">,
     Option<"localCapacityLimitBytes", "local-capacity-limit-bytes", "int64_t",
-           "49152", "PIM Core local storage의 최대 byte 수.">,
+           "46680", "PIM Core local storage의 최대 byte 수.">,
   ];
   let dependentDialects = ["mlir::pim::PIMDialect"];
 }

@@ -226,12 +226,16 @@ def rank_with_diversity_penalty(scored, count, diversity_weight):
     return selected
 
 
-def tune(problem, target, benchmark_fn, *, space=None, cache=None,
+def tune(problem, target, benchmark_fn, *, performance, kernel_version, space=None, cache=None,
          budget=None, seed=0, initial_random=6, search_copies=5,
          select_per_generation=8, good_quantile=0.1,
          diversity_weight=0.2, retune=False, verbose=False,
-         constraint=None, initial=()):
-    """constraint는 ConstraintEngine에 더하는 검사, initial은 가장 먼저 측정할 config들이다."""
+         constraint=None, initial=(), profile_fn=None):
+    """profile_fn(problem, target, space) collects performance before a new search.
+
+    Profiling runs only when performance is not supplied and a cache hit did
+    not finish the request. Its measurements are outside the search budget.
+    """
     spec = space if space is not None else build_config_space(problem, target)
     budget = budget if budget is not None else SearchBudget()
     engine = ConstraintEngine(problem, target, constraint=constraint)
@@ -239,7 +243,6 @@ def tune(problem, target, benchmark_fn, *, space=None, cache=None,
     partitions = legal_partitions(problem, target, spec)
     rng = random.Random(seed)
     names = feature_names()
-    start_time = time.monotonic()
 
     if cache is not None and not retune:
         hit = cache.lookup_result(problem, target)
@@ -279,13 +282,13 @@ def tune(problem, target, benchmark_fn, *, space=None, cache=None,
             >= budget.max_autotune_seconds
         )
 
-    def measure(config, features):
+    def measure(config, features, origin):
         nonlocal benchmarks_run
         if verbose:
             extent = config.execution_extent
             hierarchy = pim_hierarchy(problem, config)
             print(
-                f"[autotuner] "
+                f"[autotuner] source={origin} "
                 f"B=({config.block_m},{config.block_n},{config.block_k}) "
                 f"G=({config.group_m},{config.group_n},{config.group_k}) "
                 f"tile=({config.tile_m},{config.tile_n},{config.tile_k}) "
@@ -333,19 +336,34 @@ def tune(problem, target, benchmark_fn, *, space=None, cache=None,
             return None
         return min(record.result.total_ms for record in ok)
 
-    seeds = heuristic_seeds(problem, target, spec)
+    if performance is None and profile_fn is not None:
+        if verbose:
+            print("[autotuner] profiling one unit before seed generation", flush=True)
+        performance = profile_fn(problem, target, spec)
+    if performance is not None:
+        spec = replace(spec, measured_block_shapes=tuple(
+            blocks for blocks, _, _ in performance.seed_families(
+                problem, target, spec.block_group_top_k)))
+    start_time = time.monotonic()
+    seeds = heuristic_seeds(problem, target, spec, performance=performance,
+                            kernel_version=kernel_version, engine=engine)
     structured_configs = structured_valid_configs(
         problem, target, spec, initial_random, rng, engine)
     warm = cache.lookup_similar(problem, target) if cache is not None else []
-    population = list(initial) + seeds[:1] + warm + seeds[1:] + structured_configs
+    population = (
+        [(config, "initial") for config in initial]
+        + [(config, "saturation") for config in seeds[:1]]
+        + [(config, "warm-cache") for config in warm]
+        + [(config, "saturation") for config in seeds[1:]]
+        + [(config, "structured") for config in structured_configs])
 
-    for config in population:
+    for config, origin in population:
         if config.key() in seen or not engine.valid(config):
             continue
         seen.add(config.key())
         if config.key() not in measured and out_of_budget():
             continue
-        measure(config, extract_features(problem, target, config))
+        measure(config, extract_features(problem, target, config), origin)
 
     generation = 0
     stale_generations = 0
@@ -400,7 +418,7 @@ def tune(problem, target, benchmark_fn, *, space=None, cache=None,
             if candidate.config.key() not in measured and out_of_budget():
                 continue
             seen.add(candidate.config.key())
-            measure(candidate.config, candidate.features)
+            measure(candidate.config, candidate.features, "LFBO")
 
         new_best = best_ms()
         improvement = (previous_best - new_best) / previous_best

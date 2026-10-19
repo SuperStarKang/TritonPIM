@@ -1,7 +1,7 @@
 # GEMV(y = A·x, int32)의 최적 config를 PIM autotuner로 찾고, 그 config로 다시 측정한다.
 #
 # 실행:
-#   ./cmd.sh autotune_gemv.py --m 4096 --k 4096 --max-benchmarks 30
+#   python autotune_gemv.py --m 4096 --k 4096 --max-benchmarks 30
 #     cache에 이 shape가 있으면 탐색 없이 그 best를 측정한다. --retune이면 다시 탐색한다.
 #
 # 탐색 objective는 autotuner 기본값인 end-to-end wall time(매 호출 A 전송 포함, reps의 median)이다.
@@ -24,9 +24,11 @@ import triton.backends.pim.driver as pim_driver  # noqa: E402
 from triton.backends.pim.driver import PIMDriver  # noqa: E402
 
 from gemv import gemv_kernel  # noqa: E402
-from autotuner import (PIMBenchmarkResult, PIMConfigCache, PIMProblem,  # noqa: E402
-                       SearchBudget, build_config_space, target_spec, tune)
+from autotuner import (PIMBenchmarkResult, PIMConfigCache, PIMPerformanceProfile, PIMProblem,  # noqa: E402
+                       PIMUnitTiming, SearchBudget, build_config_space, profile_single_unit, target_spec, tune)
+from autotuner.artifacts import RESULTS_ROOT, prepare_run_directory, project_path  # noqa: E402
 from autotuner.decorator import pim_launch_options  # noqa: E402
+from autotuner.model import target_model  # noqa: E402
 
 
 def main():
@@ -42,27 +44,34 @@ def main():
     parser.add_argument("--repeat", type=int, default=10, help="best config 최종 측정 횟수 (median)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--retune", action="store_true", help="cache가 있어도 다시 탐색")
-    parser.add_argument("--cache", type=str,
-                        default=str(Path(__file__).resolve().parent / "gemv_results" / "gemv_autotune_cache.json"))
+    parser.add_argument("--cache", type=str)
+    parser.add_argument("--output-dir", default=str(RESULTS_ROOT / "upmem_gemv"))
+    parser.add_argument("--performance", help="single-unit saturation JSON for gemv-int32-v1")
+    profiling = parser.add_mutually_exclusive_group()
+    profiling.add_argument("--profile-only", action="store_true")
+    profiling.add_argument("--calibrate-performance", nargs=2, type=int, metavar=("M", "K"),
+                           help="측정 상한을 지정해 profiling 후 종료")
     args = parser.parse_args()
+    if args.reps < 1 or args.repeat < 1:
+        parser.error("--reps and --repeat must be positive")
+    output_dir = prepare_run_directory(args.output_dir)
+    cache_path = project_path(args.cache) if args.cache is not None else output_dir / "autotune_cache.json"
+    performance = None
+    if not args.profile_only and args.calibrate_performance is None and args.performance is not None:
+        performance = PIMPerformanceProfile.load(args.performance, kernel_version="gemv-int32-v1")
 
     triton.runtime.driver.set_active(PIMDriver())
-    Path(args.cache).parent.mkdir(parents=True, exist_ok=True)
 
-    target =target_spec("upmem", num_units=args.num_units, nr_tasklets=args.nr_tasklets)
+    target = target_spec("upmem", num_units=args.num_units, nr_tasklets=args.nr_tasklets)
     problem = PIMProblem.matvec(args.m, args.k, input_dtype="int32", output_dtype="int32")
 
-    torch.manual_seed(0)
-    a = torch.randint(0, 50, (args.m, args.k), dtype=torch.int32)
-    x = torch.randint(0, 50, (args.k,), dtype=torch.int32)
-    reference = torch.mv(a, x)
-
-    def run(config):
-        y = torch.empty((args.m,), dtype=torch.int32)
-        gemv_kernel[(triton.cdiv(args.m, config.block_m),)](
+    def run(a, x, target, config):
+        m, k = a.shape
+        y = torch.empty((m,), dtype=torch.int32)
+        gemv_kernel[(triton.cdiv(m, config.block_m),)](
             a,
             x, y,
-            args.m, args.k,
+            m, k,
             a.stride(0), a.stride(1),
             x.stride(0), y.stride(0),
             BLOCK_M=config.block_m, BLOCK_K=config.block_k,
@@ -70,14 +79,52 @@ def main():
         )
         return y
 
+    def measure_unit(problem, single_target, config):
+        left = torch.ones((problem.M, problem.K), dtype=torch.int32)
+        right = torch.ones((problem.K,), dtype=torch.int32)
+        output = run(left, right, single_target, config)
+        if not torch.equal(output, torch.full_like(output, problem.K)):
+            raise ValueError(f"single-device GEMV correctness failed: config={config.key()}")
+        samples = []
+        for _ in range(args.reps):
+            run(left, right, single_target, config)
+            samples.append(dict(zip(pim_driver.TIMING_STAGES, pim_driver.timing))[
+                target_model(single_target).launch_timing_name])
+        return PIMUnitTiming(statistics.median(samples))
+
+    def collect_performance(problem, target, space):
+        if not args.profile_only and args.calibrate_performance is None:
+            path = output_dir / "performance.json"
+            if path.exists():
+                measured = PIMPerformanceProfile.load(path, kernel_version="gemv-int32-v1")
+                measured.seed_families(problem, target, space.block_group_top_k)
+                print(f"[single-unit] loaded: {path}", flush=True)
+                return measured
+        limits = args.calibrate_performance
+        return profile_single_unit(
+            [(problem, space)], target, measure_unit, kernel_version="gemv-int32-v1",
+            output_dir=output_dir,
+            sweep_extents=(args.m, 1, args.k) if limits is None else (limits[0], 1, limits[1]))
+
+    if args.profile_only or args.calibrate_performance is not None:
+        measured = collect_performance(problem, target, build_config_space(problem, target))
+        if args.performance is not None:
+            measured.save(args.performance)
+        return
+
+    torch.manual_seed(0)
+    a = torch.randint(0, 50, (args.m, args.k), dtype=torch.int32)
+    x = torch.randint(0, 50, (args.k,), dtype=torch.int32)
+    reference = torch.mv(a, x)
+
     def measure(config, reps):
         # 첫 호출에는 device.elf 컴파일과 DPU 예약이 섞이므로 측정에서 뺀다
-        run(config)
+        run(a, x, target, config)
         walls = []
         stages = []
         for _ in range(reps):
             start = time.perf_counter_ns()
-            y = run(config)
+            y = run(a, x, target, config)
             walls.append((time.perf_counter_ns() - start) / 1e6)
             stages.append(list(pim_driver.timing))
         return PIMBenchmarkResult(
@@ -90,8 +137,10 @@ def main():
     result = tune(
         problem, target,
         lambda problem, target, config: measure(config, args.reps),
+        performance=performance, kernel_version="gemv-int32-v1",
+        profile_fn=collect_performance,
         space=build_config_space(problem, target),
-        cache=PIMConfigCache(args.cache, template_version="gemv-int32-v1"),
+        cache=PIMConfigCache(str(cache_path), template_version="gemv-int32-v1"),
         budget=SearchBudget(max_generations=args.max_generations,
                             max_benchmarks=args.max_benchmarks,
                             max_autotune_seconds=args.max_seconds),

@@ -25,7 +25,7 @@ from experiment_common import CONFIG_SOURCES, SLOT_GROUPS, SLOTS, add_device_arg
 import torch
 import triton.backends.pim.driver as pim_driver
 
-from torch_backend import PIMInductorBackend, PIMTorchConfig, target_spec
+from torch_backend import PIMInductorBackend, PIMPerformanceProfile, PIMTorchConfig, target_spec
 from torch_backend._autotuner import (
     DEFAULT_CACHE_PATH, PIMBenchmarkResult, PIMConfigCache, PIMProblem, SearchBudget,
     build_config_space, tune,
@@ -79,6 +79,9 @@ def main():
     parser.add_argument("--max-generations", type=int, default=10)
     parser.add_argument("--report-dir", type=Path, default=None)
     args = parser.parse_args()
+    performance = None
+    if args.performance is not None:
+        performance = PIMPerformanceProfile.load(args.performance, kernel_version=TORCH_GEMM_TEMPLATE_VERSION)
     report_dir = args.report_dir or Path(__file__).resolve().with_name(
         f"report_{args.config_source}_f{args.fpgas}")
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -97,12 +100,13 @@ def main():
                 return PIMBenchmarkResult(total_ms=wall_ms, correctness=None, timings=tuple(slots.items()))
 
             config = tune(problem, spec, benchmark_fn, space=build_config_space(problem, spec),
+                          performance=performance, kernel_version=TORCH_GEMM_TEMPLATE_VERSION,
                           cache=PIMConfigCache(args.cache, template_version=TORCH_GEMM_TEMPLATE_VERSION),
                           budget=SearchBudget(max_generations=args.max_generations,
                                               max_benchmarks=args.max_benchmarks),
                           verbose=True).best.config
         else:
-            config = analytical_config(problem, spec, build_config_space(problem, spec))
+            config = analytical_config(problem, spec, build_config_space(problem, spec), performance)
         wall_ms, native = measure(spec, config, a, b, warmup=args.warmup, repeat=args.repeat)
         # native는 FPGA thread마다 잰 시간의 합이므로 device 수로 나눠 wall과 같은 척도로 둔다.
         devices = config.p_m * config.p_n * config.p_k

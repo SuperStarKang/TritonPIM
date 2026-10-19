@@ -1,3 +1,4 @@
+import argparse
 import statistics
 import time
 import sys
@@ -5,13 +6,14 @@ from pathlib import Path
 
 sys.path.insert(
     0,
-    str(Path(__file__).resolve().parent.parent),
+    str(Path(__file__).resolve().parents[2]),
 )
 
 import torch
 import triton
 import triton.language as tl
 from triton.backends.pim.driver import PIMDriver
+import triton.backends.pim.driver as pim_driver
 
 triton.runtime.driver.set_active(PIMDriver())
 
@@ -19,8 +21,11 @@ from autotuner import (
     PIMBenchmarkResult,
     PIMConfigCache,
     PIMProblem,
+    PIMPerformanceProfile,
+    PIMUnitTiming,
     SearchBudget,
     build_config_space,
+    calibrate_performance,
     target_spec,
     tune,
 )
@@ -44,6 +49,15 @@ def add_kernel(
     tl.store(out + offsets, xv + yv, mask=mask)
 
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--performance", help="single-unit saturation JSON for elementwise-add-v1")
+parser.add_argument("--calibrate-performance", type=int, metavar="M",
+                    help="measure up to this extent and write --performance, then exit")
+args = parser.parse_args()
+performance = None
+if args.calibrate_performance is None and args.performance is not None:
+    performance = PIMPerformanceProfile.load(args.performance, kernel_version="elementwise-add-v1")
+
 size = 1 << 20
 x = torch.randn(size)
 y = torch.randn(size)
@@ -58,15 +72,15 @@ space = build_config_space(problem, target)
 cache = PIMConfigCache("/home/dlrkdals/TritonPIM/workspace/autotune_cache.json")
 
 
-def run(config):
+def run(x, y, target, config):
     out = torch.empty_like(x)
-    grid = (triton.cdiv(size, config.block_m),)
+    grid = (triton.cdiv(x.numel(), config.block_m),)
 
     add_kernel[grid](
         x,
         y,
         out,
-        size,
+        x.numel(),
         BLOCK_M=config.block_m,
         **pim_launch_options(config, target),
     )
@@ -74,13 +88,13 @@ def run(config):
 
 
 def benchmark_fn(problem, target, config):
-    run(config)
+    run(x, y, target, config)
 
     samples = []
     out = None
     for _ in range(3):
         start = time.perf_counter_ns()
-        out = run(config)
+        out = run(x, y, target, config)
         samples.append((time.perf_counter_ns() - start) / 1e6)
 
     return PIMBenchmarkResult(
@@ -89,10 +103,32 @@ def benchmark_fn(problem, target, config):
     )
 
 
+if args.calibrate_performance is not None:
+    if args.performance is None:
+        parser.error("--calibrate-performance requires --performance as its output path")
+
+    def measure_unit(problem, single_target, config):
+        left = torch.ones(problem.M)
+        right = torch.ones(problem.M)
+        run(left, right, single_target, config)
+        samples = []
+        for _ in range(3):
+            run(left, right, single_target, config)
+            samples.append(dict(zip(pim_driver.TIMING_STAGES, pim_driver.timing))["kernel"])
+        return PIMUnitTiming(statistics.median(samples))
+
+    calibrate_performance(
+        [(problem, space)], target, measure_unit, kernel_version="elementwise-add-v1",
+        sweep_extents=(args.calibrate_performance, 1, 1)).save(args.performance)
+    raise SystemExit(0)
+
+
 result = tune(
     problem,
     target,
     benchmark_fn,
+    performance=performance,
+    kernel_version="elementwise-add-v1",
     space=space,
     cache=cache,
     budget=SearchBudget(max_benchmarks=30),

@@ -22,10 +22,13 @@ from autotuner import (
     PIMConfigCache,
     PIMAccess,
     PIMProblem,
+    PIMPerformanceProfile,
+    PIMUnitTiming,
     PIMTargetSpec,
     SearchBudget,
     TuningRecord,
     build_config_space,
+    calibrate_performance,
     heuristic_seeds,
     pim_hierarchy,
     target_spec,
@@ -36,13 +39,17 @@ from autotuner.decorator import (
     pim_launch_options,
 )
 from autotuner.model import target_model
-from autotuner.space import axis_values, legal_partitions
+from autotuner.space import (
+    axis_values, best_partitions, legal_partitions, make_config, rank_block_groups, tile_ladder,
+)
 
 __all__ = [
     "ConstraintEngine", "PIMAccess", "PIMBenchmarkResult", "PIMConfig",
-    "PIMConfigCache", "PIMProblem",
+    "PIMConfigCache", "PIMProblem", "PIMPerformanceProfile", "PIMUnitTiming",
+    "calibrate_performance",
     "PIMTargetSpec", "SearchBudget", "TuningRecord", "build_config_space",
     "heuristic_seeds", "pim_hierarchy", "target_spec", "tune",
     "DEFAULT_CACHE_PATH", "pim_launch_options",
     "target_model", "axis_values", "legal_partitions",
+    "best_partitions", "make_config", "rank_block_groups", "tile_ladder",
 ]

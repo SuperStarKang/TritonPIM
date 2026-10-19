@@ -13,7 +13,8 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from torch_backend import compile_model
+from torch_backend import PIMPerformanceProfile, compile_model
+from torch_backend.template import TORCH_GEMM_TEMPLATE_VERSION
 from torch_backend._autotuner import ConstraintEngine, heuristic_seeds
 from triton.backends.pim.driver import _STAGE_NAMES
 
@@ -30,9 +31,10 @@ SLOT_GROUPS = {
 }
 
 
-def analytical_config(problem, spec, space):
+def analytical_config(problem, spec, space, performance):
     engine = ConstraintEngine(problem, spec)
-    for config in heuristic_seeds(problem, spec, space):
+    for config in heuristic_seeds(problem, spec, space, performance=performance,
+                                  kernel_version=TORCH_GEMM_TEMPLATE_VERSION, engine=engine):
         if engine.valid(config):
             return config
     raise ValueError(f"({problem.M},{problem.N},{problem.K}): no heuristic seed passes the constraints")
@@ -40,8 +42,12 @@ def analytical_config(problem, spec, space):
 
 def compile_session(layers, example_inputs, args):
     """compile_model on the experiment's FPGAs: the unopened session and its config report."""
+    performance = None
+    if args.performance is not None:
+        performance = PIMPerformanceProfile.load(args.performance, kernel_version=TORCH_GEMM_TEMPLATE_VERSION)
     compiled = compile_model(
         layers, example_inputs, target="aimx", units=args.fpgas,
+        performance=performance,
         runtime_options={"base_fpga": args.base_fpga},
         cache_path=args.cache, max_benchmarks=args.max_benchmarks,
     )
@@ -58,6 +64,7 @@ def add_device_arguments(parser, cache_path):
     parser.add_argument("--fpgas", type=int, default=2)
     parser.add_argument("--base-fpga", type=int, default=0)
     parser.add_argument("--cache", default=cache_path, help="autotune cache JSON")
+    parser.add_argument("--performance", help="single-unit saturation JSON")
     parser.add_argument("--max-benchmarks", type=int, default=20, help="autotune: per GEMM or stage class")
 
 

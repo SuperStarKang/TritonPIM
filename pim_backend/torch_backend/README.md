@@ -81,7 +81,13 @@ autotuning하고, 장치 할당 없이 모든 layer를 컴파일한 뒤 메모�
 반환된 session은 open할 때 장치를 할당하고 slot마다 stage를 결합한다. 같은 프로세스에서 실행한다.
 
 ```python
+from torch_backend import PIMPerformanceProfile, compile_model
+from torch_backend.template import TORCH_GEMM_TEMPLATE_VERSION
+
+performance = PIMPerformanceProfile.load("model-performance.json",
+                                         kernel_version=TORCH_GEMM_TEMPLATE_VERSION)
 compiled = compile_model(layers, example_inputs, target="aimx", units=1,
+                         performance=performance,
                          runtime_options={"base_fpga": 0})
 with compiled.session as session:
     output = session.run_model(*inputs)
@@ -96,6 +102,23 @@ runtime       open (할당, unit 수 확인, slot 결합) → run_model → clos
 
 모든 layer는 분석한 layer와 stage 구성이 같아야 한다. 실행 예제는
 [e2e/benchmark_e2e.py](examples/aimx/e2e/benchmark_e2e.py)를 참고한다.
+
+새 seed에 필요한 단일 unit 자료는 같은 모델의 첫 layer에서 생성할 수 있다.
+`calibrate_model()`은 packing된 stage와 분리 실행할 member stage의 Block/Group
+조합을 모두 수집한다. 실제 튜닝과 같은 runtime 옵션과 unit 수를 전달한다.
+측정은 단일 unit에서 수행하며, 포화점을 확인하지 못하면 오류를 낸다.
+
+```python
+from torch_backend import calibrate_model
+
+performance = calibrate_model(layers[0], example_inputs, target="aimx", units=1,
+                              runtime_options={"base_fpga": 0},
+                              sweep_extents=(8192, 8192, 8192), repeat=3)
+performance.save("model-performance.json")
+```
+
+FX packing의 비용 비교는 정적인 연산량·메모리 계산이다. 실행 seed를 고르지 않으므로
+실측 자료를 요구하지 않는다. 실행 config를 선택할 때부터 포화점 규칙을 적용한다.
 
 ## Common IR configuration
 
@@ -130,11 +153,14 @@ partial sum이 없다.
 ```text
 PIMTorchConfig(config=...)                 직접 지정
 PIMTorchConfig(autotune_cache_path=...)    Torch 경로에서 측정한 best
-PIMTorchConfig()                           heuristic seed
+PIMTorchConfig(performance=performance)    실측 포화점에 따른 heuristic seed
 ```
 
 세 경로 모두 `ConstraintEngine`을 통과한다. 직접 지정하거나 cache에서 읽은 값을
 Torch lowering이 보정하지 않는다.
+명시 config와 cache가 모두 없을 때 `performance`도 없으면 오류를 낸다.
+직접 Triton GEMM의 자료와 Torch template의 자료는 커널 버전이 달라 공유하지 않는다.
+측정·seed 규칙 및 실행 명령은 [autotuner 문서](../autotuner/README.md#단일-unit-자료-생성)를 참고한다.
 
 Torch cache context는 `torch-gemm-semantic-k-v2` template version을 사용한다.
 직접 Triton 예제와 같은 JSON 파일을 쓸 수 있지만 측정 objective가 다르므로 entry는

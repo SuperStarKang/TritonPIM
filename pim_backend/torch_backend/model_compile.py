@@ -252,11 +252,8 @@ def member_classes(stage_class):
     return list(members.values()), assignment
 
 
-def tune_stage_class(stage_class, spec, *, cache_path, search_budget, warmup, repeat, seed):
-    """Selected config of one class (smallest_near_fastest) and the number of measured candidates."""
-    key = stage_class.key
+def stage_config_space(key, spec):
     problem = key.problem
-    constraint = stage_constraint(key, max_stage_rounds(problem, spec))
     # target이 k를 device로 나눌 수 없으면(AiMX) seed도 k를 나누지 않는다. instance들이 unit을
     # 나눠 한 batch round에 함께 돌도록 instance 하나가 채울 unit 수를 정한다.
     split_k = target_model(spec).mapping_reason(problem, (1, 1, 2)) is None
@@ -265,6 +262,30 @@ def tune_stage_class(stage_class, spec, *, cache_path, search_budget, warmup, re
                  "instance_units": max(1, spec.common_profile.num_units // key.instances)}
     if key.has_weights:
         overrides["initial_round_patterns"] = ((1, 1, 1),)
+    return build_config_space(problem, spec, **overrides)
+
+
+def calibrate_model(layer, example_inputs, *, target, units, sweep_extents,
+                    runtime_options, repeat=3):
+    """Measure every packed/unpacked stage family needed by compile_model."""
+    from .calibration import calibrate_gemms
+
+    spec = target_spec(target, num_units=units, **runtime_options)
+    classes, _ = analyze_layer(layer, example_inputs, spec)
+    cases = []
+    for stage_class in classes:
+        cases.append((stage_class.key.problem, stage_config_space(stage_class.key, spec)))
+        if stage_class.origin is not None:
+            members, _ = member_classes(stage_class)
+            cases.extend((member.key.problem, stage_config_space(member.key, spec)) for member in members)
+    return calibrate_gemms(cases, spec, sweep_extents=sweep_extents, repeat=repeat)
+
+
+def tune_stage_class(stage_class, spec, *, performance, cache_path, search_budget, warmup, repeat, seed):
+    """Selected config of one class (smallest_near_fastest) and the number of measured candidates."""
+    key = stage_class.key
+    problem = key.problem
+    constraint = stage_constraint(key, max_stage_rounds(problem, spec))
     cache = PIMConfigCache(cache_path, template_version=cache_version(key))
     # packing member의 config를 넓힌 후보, 같은 context의 비슷한 shape config를 이 shape에 맞춘 후보
     initial = tuple({config.key(): config for config in (
@@ -274,7 +295,8 @@ def tune_stage_class(stage_class, spec, *, cache_path, search_budget, warmup, re
         return measure_isolated(stage_class, target, config, warmup=warmup, repeat=repeat)
 
     print(f"[model compile] tune {key.label()} initial={[config.key() for config in initial]}", flush=True)
-    tune(problem, spec, benchmark_fn, space=build_config_space(problem, spec, **overrides),
+    tune(problem, spec, benchmark_fn, space=stage_config_space(key, spec),
+         performance=performance, kernel_version=TORCH_GEMM_TEMPLATE_VERSION,
          cache=cache, budget=search_budget, seed=seed, verbose=True, constraint=constraint,
          initial=initial)
     # cache에는 다른 제약으로 잰 기록도 있을 수 있으므로 지금 제약으로 다시 거른다.
@@ -310,7 +332,7 @@ class CompiledModel:
     report: dict
 
 
-def compile_model(layers, example_inputs, *, target, units, runtime_options=None,
+def compile_model(layers, example_inputs, *, target, units, performance, runtime_options=None,
                   cache_path=DEFAULT_CACHE_PATH, max_benchmarks=20, max_generations=10,
                   warmup=1, repeat=3, seed=0):
     """Compile time of a model whose layers share one structure; the session runs it at runtime.
@@ -338,7 +360,7 @@ def compile_model(layers, example_inputs, *, target, units, runtime_options=None
     def tune_once(stage_class):
         if stage_class.key not in selected:
             selected[stage_class.key], measured[stage_class.key] = tune_stage_class(
-                stage_class, spec, cache_path=cache_path, search_budget=search_budget,
+                stage_class, spec, performance=performance, cache_path=cache_path, search_budget=search_budget,
                 warmup=warmup, repeat=repeat, seed=seed)
 
     final = {}

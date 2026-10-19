@@ -1,9 +1,8 @@
 """Search space and target-neutral seeds over the PIM Common IR hierarchy.
 
 Seeds follow Triton Block -> Block Group -> Execution Tile -> Device
-Partition. Each level reads only ``TargetModel`` numbers: the Block Group
-saturates one device's compute, the Execution Tile fills one device's banks,
-and the partition spreads Execution Tiles over devices.
+Partition. Resource limits determine legality; measured single-unit
+saturation determines which points of the legal frontier start the search.
 """
 
 from dataclasses import dataclass
@@ -46,7 +45,7 @@ class PIMConfigSpace:
     partition_values: tuple = (1,)
     # m/n/k 중 device로 나눌 수 있는 축. False인 축의 partition은 1뿐이다.
     partition_axes: tuple = (True, True, True)
-    # seed와 tile ladder가 instance 하나로 채우려는 unit 수 (build_config_space가 정한다)
+    # instance 하나가 사용할 unit 수 상한 (build_config_space가 정한다)
     instance_units: int = 0
     block_group_top_k: int = 3
     max_ladder_steps: int = 4
@@ -55,6 +54,7 @@ class PIMConfigSpace:
     max_initial_padding_ratio: float = 0.5
     max_initial_scheduling_rounds: int = 4
     max_initial_reduction_contributions: int = 64
+    measured_block_shapes: tuple = ()
 
 
 def axis_values(problem, spec, kind, axis):
@@ -63,6 +63,9 @@ def axis_values(problem, spec, kind, axis):
         return (1,)
     if kind == "partition" and not spec.partition_axes[axis]:
         return (1,)
+    if kind == "block" and spec.measured_block_shapes:
+        return tuple(sorted(set(spec.block_values) | {
+            blocks[axis] for blocks in spec.measured_block_shapes}))
     values = {
         "block": spec.block_values,
         "group": spec.group_values,
@@ -115,7 +118,7 @@ def legal_partitions(problem, target, spec):
         for partitions in product(*(
             axis_values(problem, spec, "partition", axis)
             for axis in range(3)))
-        if prod(partitions) <= spec.instance_units
+        if prod(partitions) <= min(spec.instance_units, model.num_units)
         and model.mapping_reason(problem, partitions) is None
     ]
 
@@ -183,65 +186,75 @@ def rank_block_groups(problem, target, spec):
     return [(blocks, groups) for _, blocks, groups in ranked]
 
 
-def tile_ladder(problem, target, blocks, groups, spec):
-    """Execution Tiles from the largest one device holds to the smallest
-    whose grid lets every reachable unit work in one round.
-
-    Returns [] when a single Block Group does not fit one device.
-    """
-    model = target_model(target)
-    engine = ConstraintEngine(problem, target)
-    partitions = legal_partitions(problem, target, spec)
+def _tile_moves(problem, target, blocks, groups, tiles, spec, offset, axes):
     total_groups = _execution_tiles(problem, blocks, groups, (1, 1, 1))
     steps = [
         [value for value in spec.tile_values if value < total] + [total]
         for total in total_groups
     ]
+    engine = ConstraintEngine(problem, target)
+    configs = []
+    for axis in axes:
+        index = steps[axis].index(tiles[axis]) + offset
+        if not 0 <= index < len(steps[axis]):
+            continue
+        new = list(tiles)
+        new[axis] = steps[axis][index]
+        config = make_config(blocks, groups, tuple(new), (1, 1, 1))
+        if engine.valid(config):
+            configs.append(config)
+    return configs
 
-    def compute_per_byte(config):
-        resident = (
-            sum(model.access_allocations(problem, config))
-            + sum(model.overhead_allocations(problem, config).values()))
-        return Fraction(prod(config.execution_extent), resident)
 
-    def moved(tiles, offset, axes=range(3)):
-        configs = []
-        for axis in axes:
-            index = steps[axis].index(tiles[axis]) + offset
-            if not 0 <= index < len(steps[axis]):
-                continue
-            new = list(tiles)
-            new[axis] = steps[axis][index]
-            config = make_config(blocks, groups, tuple(new), (1, 1, 1))
-            if engine.valid(config):
-                configs.append(config)
-        return configs
+def _compute_per_byte(problem, target, config):
+    model = target_model(target)
+    resident = (sum(model.access_allocations(problem, config))
+                + sum(model.overhead_allocations(problem, config).values()))
+    return Fraction(prod(config.execution_extent), resident)
 
+
+def tile_growth(problem, target, blocks, groups, spec):
+    """Single-unit calibration tiles from one Block Group to capacity."""
     tiles = (1, 1, 1)
-    if not engine.valid(make_config(blocks, groups, tiles, (1, 1, 1))):
+    if not ConstraintEngine(problem, target).valid(
+            make_config(blocks, groups, tiles, (1, 1, 1))):
         return []
+    growth = [tiles]
     # bank 용량이 허용하는 동안 compute/byte가 가장 좋은 축을 키운다
     while True:
-        options = moved(tiles, 1)
+        options = _tile_moves(problem, target, blocks, groups, tiles, spec, 1, range(3))
         if not options:
             break
-        tiles = _tiles(max(options, key=compute_per_byte))
+        tiles = _tiles(max(options, key=lambda config: _compute_per_byte(problem, target, config)))
+        growth.append(tiles)
+    return growth
 
+
+def tile_ladder(problem, target, blocks, groups, spec):
+    """Capacity-to-parallelism frontier, retained in full for LFBO mutation."""
+    growth = tile_growth(problem, target, blocks, groups, spec)
+    if not growth:
+        return []
+    tiles = growth[-1]
     ladder = [tiles]
+    partitions = legal_partitions(problem, target, spec)
+    total_groups = _execution_tiles(problem, blocks, groups, (1, 1, 1))
     target_units = reachable_units(total_groups, partitions)
     # 나눌 수 없는 축을 줄이면 unit은 늘지 않고 round만 는다
     split_axes = [axis for axis in range(3)
-                  if axis_values(problem, spec, "partition", axis) != (1,)]
+                  if any(p[axis] > 1 for p in partitions)]
     # 모든 unit을 한 round에 채울 수 있을 때까지 compute/byte 손실이 가장 작은 축을 줄인다
     while reachable_units(
             _execution_tiles(problem, blocks, groups, tiles),
             partitions) < target_units:
-        tiles = _tiles(max(moved(tiles, -1, split_axes), key=compute_per_byte))
+        tiles = _tiles(max(
+            _tile_moves(problem, target, blocks, groups, tiles, spec, -1, split_axes),
+            key=lambda config: _compute_per_byte(problem, target, config)))
         ladder.append(tiles)
     return ladder
 
 
-def best_partitions(problem, target, blocks, groups, tiles, partitions):
+def best_partitions(problem, target, blocks, groups, tiles, partitions, engine=None):
     """At most two partitions with the most active units over the grid.
 
     Ties prefer fewer rounds, then fewer reduction bytes, then fewer staged
@@ -255,37 +268,76 @@ def best_partitions(problem, target, blocks, groups, tiles, partitions):
         return (features.scheduling_rounds, features.reduction_bytes,
                 features.stage_bytes)
 
-    return sorted(most_active(grid, partitions), key=cost)[:2]
+    eligible = [p for p in partitions
+                if all(p[axis] <= grid[axis] for axis in range(3))]
+    if engine is not None:
+        eligible = [p for p in eligible
+                    if engine.valid(make_config(blocks, groups, tiles, p))]
+    if not eligible:
+        return []
+    return sorted(most_active(grid, eligible), key=cost)[:2]
 
 
-def _sample(ladder, count):
-    """At most ``count`` ladder points, both ends included."""
-    if len(ladder) <= count:
-        return ladder
-    return [
-        ladder[round(index * (len(ladder) - 1) / (count - 1))]
-        for index in range(count)
-    ]
+def _saturation_points(problem, candidates, saturation_work):
+    """Center, nearest more/fewer units, and maximum parallelism; no endpoint quota."""
+    def units(config):
+        return prod(_partitions(config))
+
+    def work(config):
+        # 경계 타일의 padding을 빼고 타일 한 개가 처리하는 평균 유효 작업량을 쓴다.
+        return Fraction(prod(problem.axis_extents),
+                        pim_hierarchy(problem, config).useful_execution_tiles)
+
+    saturated = [config for config in candidates if work(config) >= saturation_work]
+    if saturated:
+        center = max(saturated, key=lambda config: (units(config), -work(config)))
+    else:
+        # 모든 후보가 포화점 아래인 작은 문제는 가장 많은 유효 작업을 맡는 지점을 중심으로 삼는다.
+        center = max(candidates, key=lambda config: (work(config), units(config)))
+    points = [center]
+    more = [config for config in candidates if units(config) > units(center)]
+    fewer = [config for config in candidates if units(config) < units(center)]
+    if more:
+        points.append(min(more, key=lambda config: (units(config), -work(config))))
+    if fewer:
+        points.append(max(fewer, key=lambda config: (units(config), -work(config))))
+    most_parallel = max(candidates, key=lambda config: (units(config), work(config)))
+    if all(units(config) != units(most_parallel) for config in points):
+        points.append(most_parallel)
+    return list(dict.fromkeys(points))
 
 
-def heuristic_seeds(problem, target, spec):
-    """Frontier seeds: top Block Groups x Execution Tile ladder x partitions.
+def heuristic_seeds(problem, target, spec, *, performance, kernel_version, engine=None):
+    """Measured saturation centers first across families, then their neighbors.
 
-    Per Block Group the ladder runs from the most parallel point to the most
-    work per device, so the first seed is the default without search.
+    Only seed choice changes: full ladders, external initial candidates,
+    structured exploration, and cached/LFBO candidates keep their own rules.
     """
+    if performance is None:
+        raise ValueError("heuristic seeds require measured single-unit performance")
+    performance.validate_kernel(kernel_version)
+    if spec.max_ladder_steps < 1:
+        raise ValueError("max_ladder_steps must be positive")
+    if engine is None:
+        engine = ConstraintEngine(problem, target)
     partitions = legal_partitions(problem, target, spec)
-    seeds = []
-    for blocks, groups in rank_block_groups(
-            problem, target, spec)[:spec.block_group_top_k]:
-        ladder = _sample(
-            tile_ladder(problem, target, blocks, groups, spec),
-            spec.max_ladder_steps)
-        for tiles in reversed(ladder):
+    families = []
+    for blocks, groups, reference_work in performance.seed_families(
+            problem, target, spec.block_group_top_k):
+        candidates = []
+        for tiles in tile_ladder(problem, target, blocks, groups, spec):
             for p in best_partitions(
-                    problem, target, blocks, groups, tiles, partitions):
-                seeds.append(make_config(blocks, groups, tiles, p))
-    return seeds
+                    problem, target, blocks, groups, tiles, partitions, engine):
+                candidates.append(make_config(blocks, groups, tiles, p))
+        if candidates:
+            families.append(_saturation_points(
+                problem, candidates,
+                reference_work
+            )[:spec.max_ladder_steps])
+    return list(dict.fromkeys(
+        family[index]
+        for index in range(spec.max_ladder_steps)
+        for family in families if index < len(family)))
 
 
 def _closest_step(problem, ladder, blocks, groups, config):

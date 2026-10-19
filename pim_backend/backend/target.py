@@ -63,6 +63,31 @@ class PIMTargetSpec:
     runtime_config: PIMTargetRuntimeConfig
 
 
+@dataclass(frozen=True)
+class PIMGemmProfileSpec:
+    """Backend-provided starting shape and dtypes for the common GEMM profiler."""
+
+    block_shape: tuple
+    input_dtype: str
+    output_dtype: str
+    group_shape: tuple
+
+    def __post_init__(self):
+        if len(self.block_shape) != 3 or any(
+                value < 1 or value & (value - 1) for value in self.block_shape):
+            raise ValueError(
+                f"GEMM profiling Block dimensions must be positive powers of two: {self.block_shape}")
+        if len(self.group_shape) != 3 or min(self.group_shape) < 1:
+            raise ValueError("GEMM profiling Group dimensions must be positive")
+
+    @property
+    def block_candidates(self):
+        # 행·열의 기본 눈금과 그 배수를 비교하고, 누산 눈금은 유지한다.
+        return tuple(
+            (self.block_shape[0] * rows, self.block_shape[1] * columns, self.block_shape[2])
+            for rows in (1, 2, 4) for columns in (1, 2))
+
+
 def aimx_unit_count():
     """Return the number of AiMX units visible to the runtime."""
     count = len(glob.glob("/dev/pl_dma[0-9]*"))
@@ -88,7 +113,7 @@ def upmem_target_spec(*, num_units=0, banks_per_unit=0,
             bank_capacity_limit_bytes=(bank_capacity_limit_bytes
                                        or 60 * 1024 * 1024),
             local_capacity_limit_bytes=(local_capacity_limit_bytes
-                                        or 48 * 1024),
+                                        or 46680),
         ),
         runtime_config=UPMEMRuntimeConfig(
             nr_tasklets=nr_tasklets,

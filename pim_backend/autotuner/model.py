@@ -6,7 +6,7 @@ target-specific rule lives in one subclass below.
 
 from math import prod
 
-from .targets import AiMXRuntimeConfig, UPMEMRuntimeConfig
+from .targets import AiMXRuntimeConfig, PIMGemmProfileSpec, UPMEMRuntimeConfig
 from .types import ceil_div
 
 
@@ -84,6 +84,14 @@ class TargetModel:
     # False면 stage마다 자기 buffer를 가져 state로 상주한다.
     shared_activation_scratch = False
 
+    @property
+    def launch_timing_name(self):
+        raise NotImplementedError("target must name its synchronous device invocation timing")
+
+    @property
+    def gemm_profile_spec(self):
+        raise NotImplementedError("target must provide its GEMM profiling shape and dtypes")
+
     def __init__(self, target):
         self.target = target
         self.profile = target.common_profile
@@ -140,8 +148,25 @@ class TargetModel:
 
 
 class UPMEMModel(TargetModel):
+    launch_timing_name = "kernel"
     # 모든 stage가 MRAM의 같은 input/output 영역을 쓴다 (upmem_model.place).
     shared_activation_scratch = True
+
+    @property
+    def gemm_profile_spec(self):
+        runtime = self.target.runtime_config
+        assert isinstance(runtime, UPMEMRuntimeConfig)
+        group_rows = runtime.nr_tasklets or self.profile.lanes_per_core
+        if group_rows < 1:
+            raise ValueError("UPMEM profiling requires a positive active tasklet count")
+        block_rows = 1
+        # Triton Block은 2의 거듭제곱으로 두고 남는 tasklet 배수는 Group에 둔다.
+        while group_rows % 2 == 0:
+            block_rows *= 2
+            group_rows //= 2
+        # SingleUtil의 열·누산 크기를 출발점으로, 활성 tasklet마다 출력 한 행을 준다.
+        return PIMGemmProfileSpec(
+            (block_rows, 32, 16), "int8", "int32", (group_rows, 1, 1))
 
     def group_reason(self, problem, extent):
         runtime = self.target.runtime_config
@@ -156,6 +181,18 @@ class UPMEMModel(TargetModel):
 
 
 class AiMXModel(TargetModel):
+    launch_timing_name = "invoke"
+
+    @property
+    def gemm_profile_spec(self):
+        runtime = self.target.runtime_config
+        assert isinstance(runtime, AiMXRuntimeConfig)
+        if runtime.batch not in (1, 2, 4, 8):
+            raise ValueError("AiMX batch must be 1, 2, 4, or 8")
+        return PIMGemmProfileSpec(
+            (runtime.batch, 4096 // runtime.batch, 256 // runtime.batch),
+            "float16", "float32", (1, 1, 1))
+
     def problem_reason(self, problem):
         if problem.compute_kind != "matmul":
             return "현재 AiMX lowering은 matmul만 지원한다"

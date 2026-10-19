@@ -2,6 +2,16 @@
 
 from .cache import PIMConfigCache
 from .constraints import ConstraintEngine
+from .performance import (
+    PIMPerformanceProfile,
+    PIMGroupCurve,
+    PIMGroupSample,
+    PIMSaturationCurve,
+    PIMSaturationSample,
+    PIMUnitTiming,
+    calibrate_performance,
+    profile_single_unit,
+)
 from .search import (
     SearchBudget,
     TuningRecord,
@@ -16,6 +26,7 @@ from .space import (
 from .targets import (
     AiMXRuntimeConfig,
     PIMTargetProfile,
+    PIMGemmProfileSpec,
     PIMTargetRuntimeConfig,
     PIMTargetSpec,
     UPMEMRuntimeConfig,

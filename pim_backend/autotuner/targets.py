@@ -2,6 +2,7 @@
 
 from triton.backends.pim.target import (
     AiMXRuntimeConfig,
+    PIMGemmProfileSpec,
     PIMTargetProfile,
     PIMTargetRuntimeConfig,
     PIMTargetSpec,
@@ -16,6 +17,7 @@ def target_spec(target, **options):
 
 __all__ = [
     "AiMXRuntimeConfig",
+    "PIMGemmProfileSpec",
     "PIMTargetProfile",
     "PIMTargetRuntimeConfig",
     "PIMTargetSpec",
