@@ -6,7 +6,7 @@ target-specific rule lives in one subclass below.
 
 from math import prod
 
-from .targets import AiMXRuntimeConfig, PIMGemmProfileSpec, UPMEMRuntimeConfig
+from .targets import AiMXRuntimeConfig, PIMGemmProfileSpec, PIMGemvProfileSpec, UPMEMRuntimeConfig
 from .types import ceil_div
 
 
@@ -92,6 +92,10 @@ class TargetModel:
     def gemm_profile_spec(self):
         raise NotImplementedError("target must provide its GEMM profiling shape and dtypes")
 
+    @property
+    def gemv_profile_spec(self):
+        raise NotImplementedError("target must provide its GEMV profiling shape and dtypes")
+
     def __init__(self, target):
         self.target = target
         self.profile = target.common_profile
@@ -152,8 +156,7 @@ class UPMEMModel(TargetModel):
     # 모든 stage가 MRAM의 같은 input/output 영역을 쓴다 (upmem_model.place).
     shared_activation_scratch = True
 
-    @property
-    def gemm_profile_spec(self):
+    def _profile_rows(self):
         runtime = self.target.runtime_config
         assert isinstance(runtime, UPMEMRuntimeConfig)
         group_rows = runtime.nr_tasklets or self.profile.lanes_per_core
@@ -164,9 +167,21 @@ class UPMEMModel(TargetModel):
         while group_rows % 2 == 0:
             block_rows *= 2
             group_rows //= 2
+        return block_rows, group_rows
+
+    @property
+    def gemm_profile_spec(self):
+        block_rows, group_rows = self._profile_rows()
         # SingleUtil의 열·누산 크기를 출발점으로, 활성 tasklet마다 출력 한 행을 준다.
         return PIMGemmProfileSpec(
             (block_rows, 32, 16), "int8", "int32", (group_rows, 1, 1))
+
+    @property
+    def gemv_profile_spec(self):
+        block_rows, group_rows = self._profile_rows()
+        # 기존 GEMV 커널의 누산 크기 64를 출발점으로 비교한다.
+        return PIMGemvProfileSpec(
+            (block_rows, 1, 64), "int32", "int32", (group_rows, 1, 1))
 
     def group_reason(self, problem, extent):
         runtime = self.target.runtime_config

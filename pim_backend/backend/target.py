@@ -88,6 +88,32 @@ class PIMGemmProfileSpec:
             for rows in (1, 2, 4) for columns in (1, 2))
 
 
+@dataclass(frozen=True)
+class PIMGemvProfileSpec:
+    """Starting shape and dtypes for single-device GEMV profiling."""
+
+    block_shape: tuple
+    input_dtype: str
+    output_dtype: str
+    group_shape: tuple
+
+    def __post_init__(self):
+        if len(self.block_shape) != 3 or any(
+                value < 1 or value & (value - 1) for value in self.block_shape):
+            raise ValueError(
+                f"GEMV profiling Block dimensions must be positive powers of two: {self.block_shape}")
+        if len(self.group_shape) != 3 or min(self.group_shape) < 1:
+            raise ValueError("GEMV profiling Group dimensions must be positive")
+        if self.block_shape[1] != 1 or self.group_shape[1] != 1:
+            raise ValueError("GEMV profiling must keep the unused column axis at one")
+
+    @property
+    def block_candidates(self):
+        return tuple(
+            (self.block_shape[0] * rows, 1, self.block_shape[2] * reduction)
+            for rows in (1, 2, 4) for reduction in (1, 2))
+
+
 def aimx_unit_count():
     """Return the number of AiMX units visible to the runtime."""
     count = len(glob.glob("/dev/pl_dma[0-9]*"))

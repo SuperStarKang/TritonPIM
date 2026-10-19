@@ -178,8 +178,45 @@ workspace/Experiment/Autotuner/upmem_gemm/
 위 폴더 아래로 지정한다. 결과·성능 자료·명시적 cache 경로는 프로젝트 내부만 허용한다.
 이는 실행 프로세스에만 적용하며 셸 설정 파일이나 시스템 환경을 변경하지 않는다.
 
-GEMV 예제도 자료가 없으면 실제 GEMV 커널을 먼저 측정하며 `--profile-only`를 지원한다.
-GEMV·elementwise의 측정은 해당 연산의 기존 측정 범위를 사용한다. GEMM 기준 자료를
+### UPMEM GEMV
+
+`autotuner/gemv.py`의 INT32 GEMV 커널을 profiling과 autotuning에서 함께 사용한다.
+`profile_gemv(target, output_dir=...)`는 target 정보로 측정 대상을 구성하고,
+일반 실행은 `ensure_gemv_profile` callback으로 자료가 없을 때 먼저 측정한다.
+완료된 tuning cache가 있으면 profiling을 생략한다. 현재 GEMV의 이 경로는 UPMEM만 지원한다.
+
+`UPMEMModel.gemv_profile_spec`은 활성 tasklet마다 출력 한 행을 주는 행 눈금과
+기존 GEMV 커널의 누산 크기 64를 출발점으로 삼는다. 행 크기 1·2·4배와 누산 크기
+1·2배를 조합한 여섯 Block 후보를 비교한다. 16 tasklet이면 행 16·32·64와
+누산 64·128의 조합이다. 홀수 tasklet 인자는 GEMM과 마찬가지로 Group 행에 둔다.
+사용하지 않는 열 방향은 Block·Group·Tile·device partition 모두 1이다.
+
+각 Block에서 Tile을 하나로 두고 Group의 누산 방향을 늘려 측정한다. 실측 처리량이
+가장 좋은 Group을 선택한 뒤, 그 Group을 고정하고 Tile의 누산 방향을 늘린다.
+출력 행 수는 각 곡선에서 고정된다. GEMM과 같은 안정성·95% 포화점 기준을 사용하고,
+포화 전에 용량 한도에 도달하면 CSV를 남기고 오류를 전달한다.
+기본 profiling 범위는 실제 GEMV 입력 크기가 아니라 target의 WRAM·MRAM 한도다.
+WRAM 버퍼 기본 한도는 46,680바이트다.
+
+```bash
+cd /home/dlrkdals/TritonPIM/triton_shared/pim_backend/examples/upmem
+
+./cmd.sh autotune_gemv.py --m 4096 --k 4096 --num-units 2048 --nr-tasklets 16 \
+  --reps 5 --max-benchmarks 50 \
+  --output-dir /home/dlrkdals/TritonPIM/workspace/Experiment/Autotuner/upmem_gemv_v2
+```
+
+`--profile-only`는 profiling만 새로 수행한다. `--calibrate-performance M K`는
+선택적으로 측정 크기 상한을 지정하고 종료한다. `--retune`은 저장된 단일-device
+자료로 tuning을 다시 수행한다. 최종 후보는 전체 출력 벡터를 기준 결과와 비교한다.
+기존 `HEADER`·`RESULT` CSV 출력 형식은 유지한다.
+
+GEMV 커널 버전은 `pim-upmem-gemv-v2`이며 이전 `gemv-int32-v1` 자료·tuning 결과와
+구분한다. 이전 자료가 있는 폴더 대신 새 출력 폴더에서 측정한다.
+GEMV 측정 정책도 성능 기록의 context에 포함한다. 기존 GEMM context는 유지하므로
+이번 변경 때문에 GEMM 자료를 다시 측정할 필요는 없다.
+
+elementwise 측정은 해당 연산의 기존 측정 범위를 사용한다. GEMM 기준 자료를
 다른 연산이나 dtype의 실측값처럼 사용하지 않는다. Torch 경로의 calibration callback은
 같은 Group 선택·Tile 측정 절차에서 Torch template을 실행하며, 커널 버전이 달라 직접
 GEMM 예제 자료와 섞지 않는다.
@@ -193,7 +230,8 @@ GEMM 예제 자료와 섞지 않는다.
 ```bash
 cd /home/dlrkdals/TritonPIM/triton_shared
 python -m unittest pim_backend.autotuner.test_saturation_seeds \
-  pim_backend.autotuner.test_seed_frontier pim_backend.autotuner.test_aimx_capacity
+  pim_backend.autotuner.test_gemv_saturation pim_backend.autotuner.test_seed_frontier \
+  pim_backend.autotuner.test_aimx_capacity
 ```
 
 ## 탐색 흐름

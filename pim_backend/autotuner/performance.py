@@ -18,7 +18,7 @@ SATURATION_FRACTION = 0.95
 def performance_context(problem, target):
     hardware = asdict(target.common_profile)
     del hardware["num_units"]
-    return json.dumps({
+    context = {
         "hardware": hardware,
         "runtime_type": type(target.runtime_config).__name__,
         "runtime": asdict(target.runtime_config),
@@ -28,7 +28,10 @@ def performance_context(problem, target):
         "accesses": [asdict(access) for access in problem.accesses],
         "gemm_profile": (asdict(target_model(target).gemm_profile_spec)
                          if problem.compute_kind == "matmul" else None),
-    }, sort_keys=True)
+    }
+    if problem.compute_kind == "matvec":
+        context["gemv_profile"] = asdict(target_model(target).gemv_profile_spec)
+    return json.dumps(context, sort_keys=True)
 
 
 @dataclass(frozen=True)
@@ -272,13 +275,16 @@ def _measure_sample(problem, target, config, measure_fn, record_fn, stage):
     return PIMSaturationSample(config.execution_extent, timing)
 
 
-def _calibrate_gemm(problem, target, measure_fn, sweep_extents, record_fn):
+def _calibrate_group_tiles(problem, target, measure_fn, sweep_extents, record_fn):
     from .space import make_config
 
     curves = []
     group_curves = []
     context = performance_context(problem, target)
-    spec = target_model(target).gemm_profile_spec
+    if problem.compute_kind == "matmul":
+        spec = target_model(target).gemm_profile_spec
+    else:
+        spec = target_model(target).gemv_profile_spec
     for blocks in spec.block_candidates:
         points = []
         group_k = 1
@@ -333,7 +339,8 @@ def _calibrate_gemm(problem, target, measure_fn, sweep_extents, record_fn):
         group_curves.append(PIMGroupCurve(context, blocks, tuple(points), group_stop))
         curves.append(PIMSaturationCurve(context, blocks, selected.groups, tuple(samples), tile_stop))
     if not curves:
-        raise ValueError("no legal GEMM profiling Block for this target and measurement limits")
+        raise ValueError(
+            f"no legal {problem.compute_kind} profiling Block for this target and measurement limits")
     return curves, group_curves
 
 
@@ -344,9 +351,9 @@ def calibrate_performance(cases, target, measure_fn, *, kernel_version, sweep_ex
     cases contains (problem, config_space) pairs whose seed families are needed.
     measure_fn(local_problem, single_unit_target, config) must execute the
     actual kernel with new inputs for local_problem and return PIMUnitTiming.
-    GEMM sweeps the target's Blocks, selects the fastest measured Group for
-    each Block, then grows only Tile K. Other operations retain their explicit
-    sweep domain. sweep_extents optionally bounds GEMM's capacity-based sweep.
+    GEMM and GEMV sweep the target's Blocks, select the fastest measured Group
+    for each Block, then grow only Tile K. Other operations retain their explicit
+    sweep domain. sweep_extents optionally bounds the capacity-based sweep.
     No timing is inferred when a Tile sweep does not reach a stable plateau.
     """
     from .space import make_config, rank_block_groups, tile_growth
@@ -362,11 +369,11 @@ def calibrate_performance(cases, target, measure_fn, *, kernel_version, sweep_ex
     group_curves = []
     measured = set()
     for problem, space in cases:
-        if problem.compute_kind == "matmul":
+        if problem.compute_kind in ("matmul", "matvec"):
             context = performance_context(problem, target)
             if context in measured:
                 continue
-            measured_curves, measured_groups = _calibrate_gemm(
+            measured_curves, measured_groups = _calibrate_group_tiles(
                 problem, single_target, measure_fn, sweep_extents, record_fn)
             curves.extend(measured_curves)
             group_curves.extend(measured_groups)

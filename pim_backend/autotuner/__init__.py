@@ -27,6 +27,7 @@ from .targets import (
     AiMXRuntimeConfig,
     PIMTargetProfile,
     PIMGemmProfileSpec,
+    PIMGemvProfileSpec,
     PIMTargetRuntimeConfig,
     PIMTargetSpec,
     UPMEMRuntimeConfig,
