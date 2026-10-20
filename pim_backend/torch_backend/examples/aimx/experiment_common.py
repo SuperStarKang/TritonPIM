@@ -56,7 +56,7 @@ def compile_session(layers, example_inputs, args):
 
 def memory_record(memory):
     """The session's memory plan for a report: slots, layers kept in their own slot, bytes."""
-    return {"slots": memory.slots, "pinned": memory.pinned, "slot_of_layer": memory.slot_of_layer,
+    return {"slots": memory.slots, "groups": memory.groups, "slot_of_layer": memory.slot_of_layer,
             "bytes_per_fpga": memory.bytes_per_unit, "capacity_bytes": memory.capacity_bytes}
 
 

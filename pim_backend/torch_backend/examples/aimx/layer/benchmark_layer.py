@@ -74,7 +74,7 @@ def main():
         plan, = session.layers
         stages = stage_records(plan)
         weight_stages = {stage["name"] for stage in stages if stage["kind"] == "weight"}
-        print(f"compile_ms={compile_ms:.1f} slots={session.memory.slots} pinned={session.memory.pinned} "
+        print(f"compile_ms={compile_ms:.1f} slots={session.memory.slots} groups={session.memory.groups} "
               f"bytes_per_fpga={session.memory.bytes_per_unit}", flush=True)
         for stage in stages:
             print(f"  stage={stage['name']} kind={stage['kind']} mnk={tuple(stage['mnk'])} "

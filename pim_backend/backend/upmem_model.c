@@ -69,6 +69,9 @@ static int model_active(struct upmem_model_kernel *kernel, uint32_t physical) {
 
 void upmem_model_transfer(struct upmem_model_kernel *kernel, uint32_t binding,
                           int output) {
+    // PACK은 prepare 시점에 pool만 채운다. 전송은 layer group 단위로 한다.
+    if (kernel->upload_weights == UPMEM_MODEL_PACK)
+        return;
     if (output ? kernel->upload_weights : !upmem_model_wants(kernel, binding))
         return;
     struct dpu_symbol_t symbol = {kernel->addresses[binding], kernel->sizes[binding]};
@@ -157,4 +160,74 @@ void upmem_model_close(struct upmem_model_kernel *kernel) {
     free(kernel->active);
     free(kernel->dpus);
     free(kernel);
+}
+
+struct upmem_model_group *upmem_model_group_create(uint32_t capacity, uint32_t zero_bytes) {
+    struct upmem_model_group *group = model_allocate(sizeof(*group));
+    group->set = upmem_session_devices();
+    group->units = upmem_session_num_units();
+    group->capacity = capacity;
+    group->zero_bytes = zero_bytes;
+    group->addresses = model_allocate((size_t)group->units * capacity * sizeof(*group->addresses));
+    group->lengths = model_allocate(capacity * sizeof(*group->lengths));
+    group->zeros = model_allocate(zero_bytes);
+    return group;
+}
+
+void upmem_model_group_add(struct upmem_model_group *group, struct upmem_model_kernel *kernel) {
+    // pool은 batch slot 하나 분량만 weight를 담으므로 weight stage는 batch 하나여야 한다.
+    if (kernel->instances > kernel->batch_size) {
+        fprintf(stderr, "UPMEM model group: weight stage spans %u instances in batches of %u\n",
+                kernel->instances, kernel->batch_size);
+        abort();
+    }
+    for (uint32_t binding = 0; binding < 3; ++binding) {
+        if (kernel->roles[binding] != UPMEM_RESIDENT_WEIGHT)
+            continue;
+        if (group->blocks == 0)
+            group->base = kernel->addresses[binding];
+        if (group->blocks == group->capacity || kernel->sizes[binding] > group->zero_bytes
+                || kernel->addresses[binding] != group->base + group->bytes) {
+            fprintf(stderr, "UPMEM model group: weight block %u at 0x%x does not follow 0x%x\n",
+                    group->blocks, kernel->addresses[binding], group->base + group->bytes);
+            abort();
+        }
+        for (uint32_t physical = 0; physical < group->units; ++physical) {
+            uint32_t logical = kernel->mapping[physical];
+            int active = logical != UINT32_MAX && logical / kernel->logical_units < kernel->instances;
+            group->addresses[(size_t)physical * group->capacity + group->blocks] =
+                active ? kernel->pointers[binding][logical] : group->zeros;
+        }
+        group->lengths[group->blocks++] = kernel->sizes[binding];
+        group->bytes += kernel->sizes[binding];
+    }
+}
+
+static bool model_group_block(struct sg_block_info *out, uint32_t dpu, uint32_t block, void *args) {
+    struct upmem_model_group *group = args;
+    if (block >= group->blocks)
+        return false;
+    out->addr = group->addresses[(size_t)dpu * group->capacity + block];
+    out->length = group->lengths[block];
+    return true;
+}
+
+void upmem_model_group_push(struct upmem_model_group *group) {
+    struct dpu_symbol_t symbol = {group->base, group->bytes};
+    get_block_t blocks = {model_group_block, group, sizeof(*group)};
+    DPU_ASSERT(dpu_push_sg_xfer_symbol(group->set, DPU_XFER_TO_DPU, symbol, 0, group->bytes,
+                                       &blocks, DPU_SG_XFER_DEFAULT));
+    group->stats.weight_bytes += (uint64_t)group->units * group->bytes;
+}
+
+void upmem_model_group_stats(struct upmem_model_group *group,
+                             struct upmem_resident_stats *stats) {
+    *stats = group->stats;
+}
+
+void upmem_model_group_close(struct upmem_model_group *group) {
+    free(group->zeros);
+    free(group->lengths);
+    free(group->addresses);
+    free(group);
 }

@@ -71,7 +71,7 @@ def main():
         plans = session.layers
         memory = session.memory
         print(f"compile_ms={compile_ms:.1f} layers={len(plans)} stages/layer={len(plans[0].stages)} "
-              f"slots={memory.slots} pinned={memory.pinned} bytes_per_fpga={memory.bytes_per_unit} "
+              f"slots={memory.slots} groups={memory.groups} bytes_per_fpga={memory.bytes_per_unit} "
               f"capacity={memory.capacity_bytes}", flush=True)
 
         with session:

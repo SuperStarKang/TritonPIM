@@ -7,6 +7,9 @@
 extern "C" {
 #endif
 
+// upmem_model_arguments의 upload_weights 값. PACK은 weight를 pool에 배치만 하고 보내지 않는다.
+#define UPMEM_MODEL_PACK 2
+
 struct upmem_model_kernel {
     struct dpu_set_t set;
     struct dpu_set_t *dpus;
@@ -31,6 +34,22 @@ struct upmem_model_kernel {
     struct upmem_resident_stats stats;
 };
 
+// 한 layer group의 weight를 MRAM 연속 영역 [base, base + bytes)로 한 번에 보내는 block 표.
+// block은 MRAM 주소 순서이고, DPU마다 stage pool의 배치된 weight 또는 zeros를 가리킨다.
+struct upmem_model_group {
+    struct dpu_set_t set;
+    uint32_t units;
+    uint32_t capacity;
+    uint32_t blocks;
+    uint32_t base;
+    uint32_t bytes;
+    uint32_t zero_bytes;
+    void **addresses;   // [units * capacity]
+    uint32_t *lengths;  // [capacity], 모든 DPU에서 같다
+    void *zeros;
+    struct upmem_resident_stats stats;
+};
+
 struct upmem_model_kernel *upmem_model_create(
     uint32_t instances, uint32_t batch_size, const uint32_t *partitions,
     const uint32_t *device_mapping, const uint32_t *roles,
@@ -48,6 +67,12 @@ void upmem_model_stats(struct upmem_model_kernel *kernel,
                        struct upmem_resident_stats *stats);
 void upmem_model_mapping(struct upmem_model_kernel *kernel, uint32_t *mapping);
 void upmem_model_close(struct upmem_model_kernel *kernel);
+struct upmem_model_group *upmem_model_group_create(uint32_t capacity, uint32_t zero_bytes);
+void upmem_model_group_add(struct upmem_model_group *group, struct upmem_model_kernel *kernel);
+void upmem_model_group_push(struct upmem_model_group *group);
+void upmem_model_group_stats(struct upmem_model_group *group,
+                             struct upmem_resident_stats *stats);
+void upmem_model_group_close(struct upmem_model_group *group);
 
 #ifdef __cplusplus
 }

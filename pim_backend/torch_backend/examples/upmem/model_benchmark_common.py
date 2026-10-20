@@ -136,7 +136,7 @@ def benchmark_model(model, inputs, args, *, scope, heads, expected_gemms, expect
             before = session.stats()
             start = time.perf_counter_ns()
             # Use the session's weight loader once, matching the legacy layer benchmark boundary.
-            session.backend.model.load_weights(plan)
+            session.backend.model.enter_layer(plan)
             session.loaded_layer = plan.index
             weight_load_ms = (time.perf_counter_ns() - start) / 1e6
             after = session.stats()

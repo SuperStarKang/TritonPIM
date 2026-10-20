@@ -4,8 +4,8 @@ Run 1024 tokens, every layer, 2048 DPUs and 16 tasklets. --kv share|repeat as
 e2e/llama_workloads.py. compile_model tunes every
 stage class of the first layer, compiles all layers and plans the MRAM slots
 before the DPUs are opened. Two identical requests follow: cold TTFT includes
-the first weight upload at each layer entry; warm TTFT uploads again only the
-layers of the shared slot. Compile and resource open/close are excluded. CPU
+one weight push per layer group; warm TTFT pushes again only when there is more
+than one group. Compile and resource open/close are excluded. CPU
 FP32 KV tensors are retained through the first token. No calibration or
 accuracy comparison is performed.
 """
@@ -26,7 +26,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
 import triton
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from triton.backends.pim.upmem_artifact import WEIGHT
 
 from torch_backend import PIMPerformanceProfile, compile_model
 from torch_backend.template import TORCH_GEMM_TEMPLATE_VERSION
@@ -105,7 +104,7 @@ def main():
         )
         compile_report = compiled.report
         memory = compiled.session.memory
-        print(f"slots={memory.slots} pinned={memory.pinned} "
+        print(f"slots={memory.slots} groups={memory.groups} "
               f"bytes_per_unit={memory.bytes_per_unit} capacity={memory.capacity_bytes} "
               f"tuning_ms={compile_report['tuning_ms']:.1f} "
               f"compile_ms={compile_report['compile_ms']:.1f}", flush=True)
@@ -135,15 +134,12 @@ def main():
                 layer_plans.append({
                     "layer": plan.index, "stages": stages,
                     "expected_launches": sum(stage["expected_launches"] for stage in stages),
-                    # upload 한 번에 weight를 받는 DPU 수(p_m*p_n*p_k)만큼 전송된다.
-                    "upload_bytes": sum(
-                        binding.size * stage.config.p_m * stage.config.p_n * stage.config.p_k
-                        for stage in plan.stages for binding in stage.bindings
-                        if binding.role == WEIGHT),
+                    # group 전송은 모든 DPU에 slot 크기만큼 보낸다(stage에 참여하지 않는 DPU에는 0).
+                    "upload_bytes": session.num_units * plan.weight_bytes_per_unit,
                     "memory": plan.backend_plan,
                 })
             expected_launches = sum(layer["expected_launches"] for layer in layer_plans)
-            print(f"slots={memory.slots} pinned={memory.pinned} open_ms={session.open_ms:.3f} "
+            print(f"slots={memory.slots} groups={memory.groups} open_ms={session.open_ms:.3f} "
                   f"expected_launches={expected_launches}", flush=True)
 
             preparation_transfers = session.stats()
@@ -190,14 +186,14 @@ def main():
                           f"weight_bytes={requests[-1]['transfers']['weight_bytes']}", flush=True)
 
         weight_bytes = sum(layer["upload_bytes"] for layer in layer_plans)
-        # 공유 slot이 있으면(pinned < slots) 그 slot의 layer들은 요청마다 서로를 덮어쓴다.
-        shared_layers = [layer["layer"] for layer in layer_plans
-                         if memory.pinned < memory.slots and layer["memory"]["slot"] == memory.pinned]
-        warm_weight_bytes = sum(layer["upload_bytes"] for layer in layer_plans
-                                if layer["layer"] in shared_layers)
+        # group이 하나면 두 번째 요청에서 weight가 이미 올라와 있다. 아니면 매 요청 모든 group을 올린다.
+        warm_pushes = memory.groups if memory.groups > 1 else 0
+        warm_weight_bytes = weight_bytes if memory.groups > 1 else 0
         cold, warm = requests
         assert cold["transfers"]["weight_bytes"] == weight_bytes
         assert warm["transfers"]["weight_bytes"] == warm_weight_bytes
+        assert cold["transfers"]["weight_pushes"] == memory.groups
+        assert warm["transfers"]["weight_pushes"] == warm_pushes
         for request in requests:
             assert request["transfers"]["launches"] == expected_launches
             assert request["transfers"]["device_compiles"] == request["transfers"]["activation_hits"] == 0
@@ -209,8 +205,8 @@ def main():
             "prompt_file": str(args.prompt_file.resolve()),
             "scope": "two identical prefill requests to the first greedy token ID; no decode steps",
             "measurement_scope": (
-                "per request: tokenize, embedding, weight upload at layer entry when its slot "
-                "holds another layer, execution, KV registration, last-token norm/lm_head/argmax; "
+                "per request: tokenize, embedding, one weight push per layer group when another "
+                "group is resident, execution, KV registration, last-token norm/lm_head/argmax; "
                 "excludes model compile and resource open/close"
             ),
             "batch_size": 1, "sequence_length": 1024, "layers": layers,
@@ -223,7 +219,7 @@ def main():
                 "activation_scale": ACTIVATION_SCALE,
                 "probability": "per-row max/127", "calibration": "none",
             },
-            "shared_slot_layers": shared_layers,
+            "groups": memory.groups, "group_of_layer": memory.group_of_layer,
             "activation_transfer_policy": "always",
             "kv_cache_location": "cpu", "kv_cache_dtype": "float32", "kv_cache_bytes": expected_kv_bytes,
             "cpu_threads": torch.get_num_threads(),
@@ -244,7 +240,7 @@ def main():
         for plan in plans:
             write_fx_graph(plan.exported_graph, args.report_dir / f"layer_{plan.index}_export", {})
             write_fx_graph(plan.graph, args.report_dir / f"layer_{plan.index}_partitions", {})
-        print(f"slots={memory.slots} pinned={memory.pinned} cold_TTFT_ms={cold['ttft_ms']:.3f} "
+        print(f"slots={memory.slots} groups={memory.groups} cold_TTFT_ms={cold['ttft_ms']:.3f} "
               f"warm_TTFT_ms={warm['ttft_ms']:.3f} cold_weight_bytes={cold['transfers']['weight_bytes']} "
               f"warm_weight_bytes={warm['transfers']['weight_bytes']} resources=1/1", flush=True)
         print(f"Execution report saved to {args.report_dir.resolve() / 'report.json'}", flush=True)

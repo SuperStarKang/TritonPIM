@@ -30,6 +30,7 @@ class UPMEMAdapter:
         self.totals = {name: 0 for name, _ in TransferStats._fields_}
         self.totals.update(resource_opens=0, resource_closes=0)
         self.totals["device_compiles"] = 0
+        self.totals["weight_pushes"] = 0
         self.cleanup = None
 
     def open(self):

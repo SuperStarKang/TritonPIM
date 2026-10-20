@@ -96,7 +96,7 @@ with compiled.session as session:
 ```text
 compile time  첫 layer 분석 (GEMM packing → stage class) → class별 제약 tune() (weight 상주 후 E 측정)
               → class별 가장 빠른 config → 모든 layer PIMSession.compile (할당 없음)
-              → plan_memory: 모두 들어가면 layer마다 slot, 아니면 고정 slot N−1개 + 공유 slot 1개
+              → plan_memory: 모두 들어가면 layer마다 slot, 아니면 layer i는 slot i mod N, group i // N 단위로 함께 업로드
 runtime       open (할당, unit 수 확인, slot 결합) → run_model → close
 ```
 

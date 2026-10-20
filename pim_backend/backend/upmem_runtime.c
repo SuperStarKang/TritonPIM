@@ -129,7 +129,8 @@ struct dpu_set_t upmem_runtime_reserve(uint32_t num_units) {
 
     // 처음이거나 num_units이 다르면 기존 set을 비우고 새로 예약+적재.
     upmem_free_set();
-    DPU_ASSERT(dpu_alloc(num_units, NULL, &g_set));
+    // layer group의 weight는 DPU마다 여러 host block을 MRAM 연속 영역으로 보낸다(dpu_push_sg_xfer).
+    DPU_ASSERT(dpu_alloc(num_units, "sgXferEnable=true,sgXferMaxBlocksPerDpu=1024", &g_set));
     DPU_ASSERT(dpu_get_nr_dpus(g_set, &g_num_units));
     g_loaded[0] = '\0';
     g_have = 1;

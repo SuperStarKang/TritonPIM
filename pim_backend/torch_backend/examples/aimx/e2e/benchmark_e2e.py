@@ -81,7 +81,7 @@ def main():
         stages = stage_records(session.layers[0])
         weight_stages = {stage["name"] for stage in stages if stage["kind"] == "weight"}
         memory = session.memory
-        print(f"compile_ms={compile_ms:.1f} layers={args.layers} slots={memory.slots} pinned={memory.pinned} "
+        print(f"compile_ms={compile_ms:.1f} layers={args.layers} slots={memory.slots} groups={memory.groups} "
               f"bytes_per_fpga={memory.bytes_per_unit} capacity={memory.capacity_bytes}", flush=True)
         for stage_class in config_report["stage_classes"]:
             print(f"  {stage_class['label']}: config={tuple(stage_class['selected']['config'].values())}", flush=True)
@@ -123,7 +123,7 @@ def main():
     summary["kinds"] = {name: statistics.median(call["kinds"][name] for call in samples)
                         for name in samples[0]["kinds"]}
     print(f"summary ttft_ms={summary['ttft_ms']:.1f} per_layer_ms={summary['per_layer_ms']:.1f} "
-          f"slots={memory.slots} pinned={memory.pinned}", flush=True)
+          f"slots={memory.slots} groups={memory.groups}", flush=True)
 
     report = {
         "checkpoint": str(args.checkpoint), "layers": args.layers, "fpgas": args.fpgas,

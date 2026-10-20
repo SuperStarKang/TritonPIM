@@ -14,20 +14,20 @@ def _layers(count, weight, state):
 def test_small_model_keeps_every_layer():
     plan = plan_memory(UnitResources(2, 8 * GIB), _layers(4, GIB // 4, GIB // 8))
 
-    assert (plan.slots, plan.pinned) == (4, 4)
+    assert (plan.slots, plan.groups) == (4, 1)
     assert plan.slot_of_layer == {0: 0, 1: 1, 2: 2, 3: 3}
     assert plan.bytes_per_unit == 4 * (GIB // 4 + GIB // 8)
 
 
-def test_large_model_pins_layers_and_shares_the_last_slot():
+def test_large_model_cycles_layers_through_slots():
     layer = 420 * (1 << 20) + 900 * (1 << 20)
     plan = plan_memory(UnitResources(1, 8 * GIB), _layers(32, 420 * (1 << 20), 900 * (1 << 20)))
 
     assert plan.slots == 8 * GIB // layer
-    assert plan.pinned == plan.slots - 1
+    assert plan.groups == -(-32 // plan.slots)
     assert [plan.slot_of_layer[index] for index in range(plan.slots + 1)] == (
-        list(range(plan.pinned)) + [plan.pinned, plan.pinned])
-    assert plan.slot_of_layer[31] == plan.pinned
+        list(range(plan.slots)) + [0])
+    assert plan.group_of_layer[31] == 31 // plan.slots
 
 
 def test_shared_scratch_counts_once():

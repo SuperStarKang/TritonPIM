@@ -4,8 +4,8 @@ compile_model analyzes the first layer into stage classes (after GEMM packing),
 measures each class with its weights already resident and keeps the smallest
 config among those within FOOTPRINT_TOLERANCE of the fastest, and compiles every
 layer with those configs without allocating the device. plan_memory then fits as many layer slots as one unit holds: every layer
-keeps its own slot if all fit; otherwise the first slots keep one layer each and
-the last slot is shared, so a layer change in it uploads only its weights. The
+keeps its own slot if all fit; otherwise layer i takes slot i mod slots and the
+layers of one group are uploaded together, overwriting only the weights. The
 returned session allocates, binds and runs at runtime.
 """
 
@@ -13,6 +13,7 @@ from collections import Counter
 from dataclasses import asdict, dataclass, replace
 import math
 import multiprocessing
+from pathlib import Path
 import statistics
 import time
 
@@ -22,7 +23,8 @@ from triton.backends.pim.runtime import PIMSession
 
 from ._autotuner import (
     DEFAULT_CACHE_PATH, ConstraintEngine, PIMBenchmarkResult, PIMConfig, PIMConfigCache,
-    SearchBudget, TuningRecord, build_config_space, pim_hierarchy, target_model, target_spec, tune,
+    PIMPerformanceProfile, SearchBudget, TuningRecord, build_config_space, performance_context,
+    pim_hierarchy, target_model, target_spec, tune,
 )
 from .config import PIMTorchConfig
 from .model_policy import (
@@ -283,6 +285,8 @@ def calibrate_model(layer, example_inputs, *, target, units, sweep_extents,
 
 def tune_stage_class(stage_class, spec, *, performance, cache_path, search_budget, warmup, repeat, seed):
     """Selected config of one class (smallest_near_fastest) and the number of measured candidates."""
+    from .calibration import calibrate_gemms
+
     key = stage_class.key
     problem = key.problem
     constraint = stage_constraint(key, max_stage_rounds(problem, spec))
@@ -294,11 +298,28 @@ def tune_stage_class(stage_class, spec, *, performance, cache_path, search_budge
     def benchmark_fn(problem, target, config):
         return measure_isolated(stage_class, target, config, warmup=warmup, repeat=repeat)
 
+    # 단일 unit 측정 자료는 cache 옆 파일에 context별로 모은다. 측정 key에는 M/N/K가 없으므로
+    # 같은 context는 한 번만 재고 이후 모든 problem이 그 기록을 쓴다.
+    def profile_fn(problem, target, space):
+        path = Path(cache_path).with_name("torch_performance.json")
+        stored = (PIMPerformanceProfile.load(path, kernel_version=TORCH_GEMM_TEMPLATE_VERSION)
+                  if path.exists() else PIMPerformanceProfile(TORCH_GEMM_TEMPLATE_VERSION, ()))
+        if any(curve.context == performance_context(problem, target) for curve in stored.curves):
+            print(f"[model compile] single-unit profile loaded: {path}", flush=True)
+            return stored
+        measured = calibrate_gemms([(problem, space)], target, sweep_extents=None, repeat=repeat)
+        merged = PIMPerformanceProfile(TORCH_GEMM_TEMPLATE_VERSION,
+                                       stored.curves + measured.curves,
+                                       stored.group_curves + measured.group_curves)
+        merged.save(path)
+        print(f"[model compile] single-unit profile saved: {path}", flush=True)
+        return merged
+
     print(f"[model compile] tune {key.label()} initial={[config.key() for config in initial]}", flush=True)
     tune(problem, spec, benchmark_fn, space=stage_config_space(key, spec),
          performance=performance, kernel_version=TORCH_GEMM_TEMPLATE_VERSION,
          cache=cache, budget=search_budget, seed=seed, verbose=True, constraint=constraint,
-         initial=initial)
+         initial=initial, profile_fn=profile_fn)
     # cache에는 다른 제약으로 잰 기록도 있을 수 있으므로 지금 제약으로 다시 거른다.
     engine = ConstraintEngine(problem, spec, constraint=constraint)
     # cache hit이면 tune은 탐색하지 않는다. 아직 재지 않은 initial 후보는 여기서 재서 기록에 더한다.
@@ -430,14 +451,15 @@ def compile_model(layers, example_inputs, *, target, units, performance, runtime
             raise ValueError(f"layer {plan.index} has stages {stages}; the analyzed layer has {analyzed}")
     compile_ms = (time.perf_counter_ns() - start) / 1e6
     memory = session.memory
-    print(f"[model compile] slots={memory.slots} pinned={memory.pinned} "
+    print(f"[model compile] slots={memory.slots} groups={memory.groups} "
           f"bytes_per_unit={memory.bytes_per_unit} capacity={memory.capacity_bytes} "
           f"analysis_ms={analysis_ms:.1f} tuning_ms={tuning_ms:.1f} compile_ms={compile_ms:.1f}", flush=True)
 
     report = {
         "target": target, "units": units, "spec": asdict(spec), "layers": len(layers),
-        "memory": {"slots": memory.slots, "pinned": memory.pinned,
-                   "slot_of_layer": memory.slot_of_layer, "slot_bytes": list(memory.slot_bytes),
+        "memory": {"slots": memory.slots, "groups": memory.groups,
+                   "slot_of_layer": memory.slot_of_layer, "group_of_layer": memory.group_of_layer,
+                   "slot_bytes": list(memory.slot_bytes),
                    "scratch_bytes": memory.scratch_bytes, "bytes_per_unit": memory.bytes_per_unit,
                    "capacity_bytes": memory.capacity_bytes},
         # weight 상주 실행 시간만 더한 값. weight 업로드와 CPU 시간은 들어가지 않는다.
@@ -454,7 +476,7 @@ def compile_model(layers, example_inputs, *, target, units, performance, runtime
             "measured": measured[stage_class.key],
             "selected": {"config": asdict(selected[stage_class.key].config),
                          "execution_ms": selected[stage_class.key].execution_ms,
-                         # 격리 측정의 첫 업로드 (할당과 descriptor 생성 포함)
+                         # 격리 측정의 첫 업로드. UPMEM은 bind에서 weight를 배치하므로 전송만 들어간다.
                          "first_upload_ms": selected[stage_class.key].upload_ms,
                          "footprint": asdict(selected[stage_class.key].footprint)},
         } for stage_class in classes],
