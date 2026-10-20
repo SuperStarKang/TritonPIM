@@ -28,13 +28,15 @@ class RuntimeBackend(Protocol):
     open() allocates the units and exposes num_units. bind_model(plans) creates
     the device handles of every slot, weight_table(plans) reports weight placement,
     memory_table(plans) the slot buffers and their addresses, and the model runtime
-    implements enter_layer/run/exit_layer. stats contains cumulative transfer bytes
-    and launch counts. close releases resources.
+    implements enter_layer/run/exit_layer. end_model releases the model runtime
+    while the units stay allocated, so begin_model can follow. stats contains
+    cumulative transfer bytes and launch counts. close releases resources.
     """
 
     def open(self): ...
     num_units: int
     def begin_model(self): ...
+    def end_model(self): ...
     def resources(self): ...
     def requirements(self, plans): ...
     def prepare_model(self, plans, memory): ...
@@ -175,6 +177,15 @@ class PIMSession:
             self.backend.model.exit_layer(plan)
             inputs = outputs if isinstance(outputs, tuple) else (outputs,)
         return outputs
+
+    def release(self):
+        """Release the prepared layers and keep the units allocated; prepare() can follow."""
+        self._check_owner()
+        self.backend.end_model()
+        self.layers = ()
+        self.weight_table = {}
+        self.memory = None
+        self.loaded_layer = None
 
     def reserve_kv(self, layer_id, shape, dtype):
         """Reserve CPU KV storage once; sequence capacity is the penultimate axis."""

@@ -19,13 +19,13 @@ runtime의 Python 코드(`backend/runtime.py`, `backend/residency.py`, `backend/
 ═══════════════════════ COMPILE TIME (장치 할당 없음) ═══════════════════════════
  1. Target spec        등록 profile + unit 수 → PIMTargetSpec, 용량 C
  2. FX 분석            첫 layer torch.export → normalize → packing (§2) → stage 묶음
- 3. 튜닝               stage class마다 weight 상주 E 측정 → 가장 빠른 config
+ 3. 튜닝               stage class마다 weight 상주 E 측정 → 가장 빠른 E의 10% 이내에서 footprint 최소
  4. layer 테이블       layer 하나의 영역 크기: weight, KV, activation, state (§3)
- 5. slot 수와 대응표   N = min(L, ⌊(C − 공유 영역) / layer 크기⌋), layer → slot
+ 5. slot과 group       모두 들어가면 layer마다 slot, 아니면 slot(l) = l mod N, group(l) = l div N
  6. 컴파일             모든 layer를 같은 config로 컴파일, 테이블 배치
 ═══════════════════════ RUNTIME ═════════════════════════════════════════════════
  7. open / bind        장치 할당, slot마다 한 번 할당하고 PA를 테이블에 기록
- 8. run                layer 진입: slot의 주인이 다르면 weight(와 KV)만 올림, 해제 없음
+ 8. run                layer 진입: group이 바뀌면 그 group의 weight를 함께 올림, 해제 없음
  9. close              해제
 ```
 
@@ -41,9 +41,10 @@ runtime의 Python 코드(`backend/runtime.py`, `backend/residency.py`, `backend/
 | stage class | `(m, n, k)`, dtype, op, weight mask, instance 수가 같은 stage의 모음. 튜닝과 config의 단위 |
 | packing | 독립 GEMM 여러 개를 GEMM 하나로 합치는 FX 변환 (§2) |
 | slot | layer 하나가 unit에 차지하는 영역 묶음(weight, KV, activation, state). 물리 주소가 고정됨 |
-| 대응표 | layer → slot. 고정 slot과 교체 slot으로 이루어짐 |
+| 대응표 | layer → slot (`slot_of_layer`)과 layer → group (`group_of_layer`) |
+| group | 함께 상주하고 함께 업로드되는 layer 묶음. layer l은 group ⌊l / N⌋ |
 | E | weight가 상주한 상태에서 layer(또는 stage) 한 번의 실행 시간 |
-| U | slot에 다른 layer의 weight를 올리는 시간 |
+| U | group 하나의 weight를 올리는 시간 |
 | C | unit 하나의 용량 = `banks_per_unit × bank_capacity_limit_bytes` |
 
 ---
@@ -103,10 +104,11 @@ q (H, S, D) → view (H/g, g·S, D)            k (H/g, D, S)  (repeat 없음)
 bmm → (H/g, g·S, S) → view (H, S, S)
 ```
 
-**판정.** B operand에서 view 계열 op(`view`, `reshape`, `expand`, `transpose`, `slice`,
-`select`, `unsqueeze`, `contiguous`, `clone`)를 따라 올라가 원본 tensor와 영역을 비교한다.
-Hugging Face의 `repeat_kv`는 `unsqueeze → expand(…, n_rep, …) → reshape`이므로, `expand`가
-늘린 차원에서 "instance h는 원본 KV ⌊h / g⌋를 쓴다"는 구조가 그래프에 그대로 나타난다.
+**판정.** 같은 depth·shape·dtype의 독립 activation GEMM 묶음(`_instance_groups`) 안에서
+B operand가 **같은 FX node**인 GEMM들을 쌓는다(`_stack_shared_rights`). view 계열 op를 따라
+올라가 원본을 비교하지 않는다. 따라서 모델이 query head마다 같은 KV node를 쓰면(e2e 예제의
+`--kv share`) 쌓이고, Hugging Face `repeat_kv`처럼 head마다 별도의 B node를 만들면(`--kv repeat`)
+쌓이지 않는다. `bmm`은 묶음 대상이 아니다.
 
 ### 2.4 ② n 잇기 (q/k/v, gate/up)
 
@@ -145,16 +147,18 @@ A'와 B'는 CPU partition에서 만든다(`pad` + `cat`).
 
 ### 2.6 적용 판정: target model
 
-①과 ②는 계산이 늘지 않으므로 공유가 있으면 항상 적용한다. ③의 묶음 수 p는 autotuner의
-공개 API로 정한다. autotuner는 바꾸지 않는다.
+①과 ②는 계산이 늘지 않으므로 공유가 있으면 항상 적용한다(`PIMTorchConfig(pack=False)`인
+GEMM은 제외). ③의 묶음 수 p는 autotuner의 공개 API로 계산한 정적 비용으로 정한다
+(`fx_packing._cost`). 실행 seed를 고르지 않으며 측정도 하지 않는다.
 
 ```text
 for p in instance 수의 약수:
     problem_p  = PIMProblem(m, p·n, p·k, dtype)
-    config_p   = heuristic_seeds(problem_p, spec)의 첫 유효 config
-    compute(p) = (I / p) · target_model(spec).scheduled_compute(problem_p, config_p)
-    bytes(p)   = (I / p) · Σ target_model(spec).access_allocations(problem_p, config_p)
-p* = argmin (bytes(p), I / p)     단, compute(p) ≤ compute(1)
+    config_p   = rank_block_groups 상위 Block Group의 tile_ladder 마지막 점(최대 병렬)
+                 + best_partitions 첫 partition
+    compute(p) = (I / p) · useful_tiles · scheduled_compute(problem_p, config_p)
+    bytes(p)   = (I / p) · useful_tiles · Σ access_allocations(problem_p, config_p)
+p* = argmin (bytes(p), −p)     단, compute(p) ≤ compute(1)
 ```
 
 | target | `scheduled_compute` | ③ 결과 (head_dim 128, S = 1024) |
@@ -200,18 +204,19 @@ x ──② [Wq | Wk | Wv]──▶ q (32 head), k (8), v (8) ── RoPE (CPU)
 ### 2.9 UPMEM에서의 실행
 
 UPMEM은 DPU를 instance 수만큼 나눠 한 round에 실행한다. instance 하나가 쓰는 DPU 수는
-config의 `p_m·p_n`이고, 동시에 실행되는 instance 수는
+config의 `p_m·p_n·p_k`이고, 동시에 실행되는 instance 수는
 `p_b = min(instances, units / (p_m·p_n·p_k))`이다(`execution.py` `select_layer_config`).
 DPU 하나는 Execution Tile 하나를 맡고, 그 안에서 tasklet이 행을 나눈다.
 
 ```text
-Llama-2 QKᵀ (1024, 1024, 128) × 32,  config p = (8, 8, 1), Execution Tile (128, 128, 128)
-DPU 2048 = 32 instance × 64 DPU  → p_b = 32, 1 round
+Llama-3 QKᵀ (4096, 1024, 128) × 8 (① 뒤),  2026-10-20 선택 config
+  B (8,16,16) G (4,4,1) T (4,2,8) P (32,8,1) → Execution Tile (128, 128, 128)
+DPU 2048 = 8 instance × 256 DPU  → p_b = 8, 1 round
 
-┌── head 0: 64 DPU ──┐┌── head 1 ──┐ … ┌── head 31 ──┐
-│ 8 × 8 출력 조각     ││            │   │             │
-│ DPU 하나 = 128×128  ││            │   │             │
-└────────────────────┘└────────────┘   └─────────────┘
+┌── KV head 0: 256 DPU ──┐┌── KV head 1 ──┐ … ┌── KV head 7 ──┐
+│ 32 × 8 출력 조각        ││               │   │               │
+│ DPU 하나 = 128×128      ││               │   │               │
+└────────────────────────┘└───────────────┘   └───────────────┘
 ```
 
 세 변환 뒤에도 같은 규칙이 적용된다. 바뀌는 것은 instance 수와 instance당 DPU 수이다.
@@ -269,32 +274,26 @@ target model의 `shared_activation_scratch`가 Activation 열의 공유 여부�
 AiMX는 할당 하나의 최대 크기가 `1023 × 2 MiB`이고, descriptor가 33-bit 물리 주소를 쓴다.
 그래서 slot은 물리 연속인 할당 여러 개로 구성되며, 테이블은 할당마다의 PA를 기록한다.
 
-### 3.2 slot 수와 대응표
+### 3.2 slot, group과 대응표
 
-layer 하나의 크기에서 slot 수를 정하고, layer를 slot에 대응시킨다.
+layer 하나의 크기에서 slot 수를 정하고, layer를 slot과 group에 대응시킨다
+(`backend/residency.py:plan_memory`).
 
 ```text
-F  = Σ_stage (weight + KV_capacity + activation_private + state)    layer 하나
-Sh = 공유 영역 (UPMEM scratch, AiMX 0)
-N  = min(L, ⌊(C − Sh) / F⌋)                                         N = 0이면 예외
+F_l = Σ_stage (weight + state)                     layer l (KV는 아직 CPU, §3.4)
+Sh  = max input bytes + max output bytes           공유 scratch (stage 최대값)
 
-N ≥ L   모든 layer 고정                     slot(l) = l
-N < L   R개 교체 slot, K = N − R개 고정      slot(l) = l                 (l < K)
-                                                     = K + (l − K) mod R  (l ≥ K)
-        R = 1 (기본), R = 2 (prefetch를 쓸 때)
+Σ_l F_l + Sh ≤ C   모든 layer 상주     N = L, slot_bytes = (F_0, …, F_{L−1})
+그 밖             N = ⌊(C − Sh) / F_0⌋  N < 1이면 예외
+                   모든 layer의 stage별 크기가 layer 0과 같아야 한다 (다르면 예외)
+
+slot(l)  = l mod N
+group(l) = ⌊l / N⌋        groups = ⌈L / N⌉
 ```
 
-이전의 두 정책은 양 끝의 특수한 경우로 들어간다.
-
-| 경우 | 대응표 | 이전 이름 |
-|---|---|---|
-| N ≥ L | 모든 layer 고정 | P-1 |
-| N = 1 | 모든 layer가 slot 하나 공유 | P-2 |
-| 1 < N < L | 고정 K + 교체 R | (새로 생김) |
-
-순환 배치(`slot(l) = l mod N`)는 쓰지 않는다. 요청은 layer 0 → L−1을 차례로 접근하므로,
-N < L인 cache에 순환 배치하면 hit가 0이다. 순환 접근에서 최적 교체(Belady)의 miss 수는
-`L − N + 1`이고, 이는 "고정 N−1 + 교체 1"과 같다.
+한 group의 layer들은 모든 slot을 채우고 함께 올라간다. 다음 group은 같은 slot의 weight만
+덮어쓰고, buffer와 명령(descriptor, program)은 그대로 둔다. groups = 1이면 첫 요청에서 한 번만
+올리고, 이후 요청은 업로드가 없다.
 
 ### 3.3 runtime 동작
 
@@ -303,21 +302,28 @@ open / bind
   slot마다 한 번 할당
     AiMX : stage마다 context 묶음(aimx_model_create). slot을 쓰는 layer의 같은 위치
            stage는 같은 context를 공유. 처음 실행할 때 buffer 할당과 descriptor 생성
-    UPMEM: MRAM offset으로 weight 영역 배치, stage program을 그 주소로 link
+    UPMEM: compile 때 MRAM offset으로 weight 영역을 배치하고 stage program을 그 주소로 link.
+           bind에서 stage handle을 만들고, weight를 stage pool에 배치만 한다(PACK, 전송 없음).
+           group마다 MRAM 주소 순서의 분산-수집(SG) block 표를 만든다
   bind 후 PA를 테이블에 기록
 
 run_model (요청마다)
   layer l 진입:
-    slot(l)의 주인 == l  → 바로 실행
-    slot(l)의 주인 != l  → weight 업로드 (KV를 쓰면 KV도) → 주인 = l
+    group(l) == 올라와 있는 group  → 바로 실행
+    group(l) != 올라와 있는 group  → group(l)의 모든 weight 업로드 → 올라와 있는 group = group(l)
+      AiMX : group의 모든 layer, 모든 weight stage를 upload=True로 invoke
+      UPMEM: program 적재 후 dpu_push_sg_xfer_symbol 1회 (group당 전송 1회)
   layer l 퇴장: 해제 없음
 
+release (측정 경로, §4.1)
+  model runtime만 해제 (stage handle, group, context). 장치는 할당된 채로 남고 다시 prepare할 수 있다
+
 close
-  slot 해제
+  slot 해제, 장치 반납
 ```
 
-같은 slot을 쓰는 layer는 slot 표(slot별 크기, 정렬, 종류)가 같아야 한다. 다르면 bind에서
-예외가 난다. AiMX runtime도 같은 slot에 다른 크기를 할당하면 예외를 낸다
+같은 slot을 쓰는 layer는 stage별 크기(weight, state, input, output)가 같아야 한다. 다르면
+`plan_memory`가 compile 때 예외를 낸다. AiMX runtime도 같은 slot에 다른 크기를 할당하면 예외를 낸다
 (`aimx_resident_alloc`: "resident allocation signature changed").
 
 ### 3.4 KV 규칙
@@ -328,8 +334,8 @@ device의 slot 내용은 항상 host 원본의 사본으로 둔다.
 - KV: RoPE가 CPU에 있으므로 새 K, V는 host에서 먼저 만들어진다. host의 `kv_table`이 원본이고,
   device에는 token마다 append한다.
 
-그래서 slot을 비울 때 다시 써 보낼 필요가 없다. 교체 slot에 들어오는 layer는 weight와 함께
-그 layer의 KV 전체를 다시 올린다. 이 비용은 KV 길이에 비례한다(token당 layer당 K, V 각
+그래서 slot을 비울 때 다시 써 보낼 필요가 없다. KV를 device에 두게 되면, group이 바뀌어 다시
+올라오는 layer는 weight와 함께 그 layer의 KV 전체를 다시 올린다. 이 비용은 KV 길이에 비례한다(token당 layer당 K, V 각
 `hidden × dtype bytes`). KV 영역은 capacity 크기로 잡고, 명령은 capacity 기준으로 만든다.
 
 | attention (decode) | KV 길이가 놓이는 축 | 고정 명령으로 처리하는 법 |
@@ -338,7 +344,8 @@ device의 slot 내용은 항상 host 원본의 사본으로 둔다.
 | PV | k (MAC의 안쪽 loop) | capacity 전체를 계산하고 len 뒤의 P를 0으로 두거나, KV block마다 chain을 두고 부분합을 host에서 더함 |
 
 KV의 부분 append는 stub의 범위 staging이 필요하다. 이는 lowering 변경이므로 이 문서의
-범위 밖이다. 그동안 KV는 activation처럼 매 실행 staging한다.
+범위 밖이다. 현재 KV는 CPU `kv_table`에 FP32로 두고, attention GEMM의 operand로 activation처럼
+매 실행 staging한다.
 
 ### 3.5 prefill과 decode
 
@@ -358,31 +365,22 @@ q/k/v/o weight를 줄이지 못한다.
 
 ### 3.6 성능 식
 
-E는 layer 실행(PIM + CPU), U는 weight 교체, L은 layer 수이다.
+E는 layer 실행(PIM + CPU), U_g는 group g의 weight 업로드, L은 layer 수, G는 group 수이다.
 
 ```text
-요청당 업로드 = L − K
-T_request    = L·E + (L − K)·U − (겹쳐 숨긴 업로드)
-
-고정 slot의 이득    Δ = K·U / (L·(E + U))
-겹침의 상한         Δ ≤ U / (E + U)          (교체 slot 2개와 prefetch, DMA와 PIM 실행의 동시 동작 필요)
+G = 1   첫 요청   T = L·E + U_0          이후 요청   T = L·E
+G > 1   매 요청   T = L·E + Σ_g U_g      (group 업로드 G회)
 ```
 
-| AiMX 2 FPGA, Llama-2-7B prefill (E = 1.351 s, U = 0.166 s, F = 1.64 GB) | 요청당 업로드 | T |
-|---|---:|---:|
-| N = 1 (이전 P-2, slot 공유) | 32 | 48.5 s |
-| N = 5, 고정 4 + 교체 1 | 28 | 47.9 s |
-| N = 5, 고정 3 + 교체 2, 완전 겹침 | 29 | 43.4 s |
-| 상한 (업로드 0) | 0 | 43.2 s |
+group 업로드와 계산을 겹치는 경로는 없다(§6).
 
-| 측정 (Llama-2-7B, AiMX FPGA 2개) | 이전 P-2 (layer마다 해제) | slot 공유 |
-|---|---:|---:|
-| layer 하나의 업로드 U | 848 ms | 166 ms |
-| layer 하나 (요청당) | 2261 ms | 1517 ms |
-| 32 layer TTFT | 77.5 s | 52.4 s |
+| 측정 (UPMEM 2048 DPU, prefill 1024 token, 2026-10-20) | slots / groups | cold TTFT | warm TTFT | first token |
+|---|---|---:|---:|---:|
+| Llama-2-7b | 32 / 1 | 80.8 s | 77.9 s | 29949 |
+| Llama-3-8B (`--kv share`) | 32 / 1 | 83.3 s | 77.6 s | 1404 |
 
-slot을 공유하면 layer가 바뀔 때 alloc, descriptor 생성, descriptor 전송, 해제가 사라지고
-weight 전송만 남는다.
+두 측정은 Block (8,16,16) 이전의 config로 실행했다. G > 1인 회전 경로는 Llama에서 아직
+실행하지 않았다.
 
 ---
 
@@ -392,34 +390,54 @@ weight 전송만 남는다.
 compile_model(layers, example_inputs, target, units, runtime_options, cache_path, …)
   1. spec = target_spec(target, num_units=units, **runtime_options)
   2. analyze_layer(layers[0])         첫 layer만 export, packing, stage class
-  3. tune_stage_class                 class마다 tune(), weight 상주 측정, 가장 빠른 E의 config
-  4. layer 테이블 크기, N, 대응표       (§3.2)
-  5. PIMSession.compile               모든 layer를 같은 config로 컴파일
-                                      모든 layer의 stage 구성이 분석한 layer와 같은지 검사
-  6. CompiledModel(session, table, report)
+  3. tune_stage_class                 class마다 tune(), weight 상주 측정 (§4.1), 선택 (§4.2)
+                                      packed class는 member class를 먼저 tune하고 packing 유지 여부를 정함
+  4. PIMSession.compile               모든 layer를 같은 config로 컴파일 (장치 할당 없음)
+                                      layer 0이 tune한 class와 같은 stage로 나뉘었는지,
+                                      모든 layer의 stage 구성이 layer 0과 같은지 검사
+  5. plan_memory                      slot, group, 대응표 (§3.2)
+  6. CompiledModel(session, report)
 ```
 
 ### 4.1 측정
 
-stage class마다 stage 하나만 담은 Torch module을 만들고, 후보 config마다 새 프로세스에서
-측정한다(`measure_isolated`). 측정값은 E(weight 상주 후 반복 실행), 첫 업로드 시간,
-실측 footprint이다. 실패한 후보는 `correctness=False`로 기록하고 선택에서 제외한다.
+stage class마다 stage 하나만 담은 Torch module(`StageModule`)을 만들고, class 하나의 후보들을
+측정 프로세스 하나에서 잰다(`StageMeasurer`). 측정 프로세스는 spawn으로 띄우고, 장치(UPMEM DPU set,
+AiMX FPGA)를 한 번만 연다. 후보마다 다음을 반복한다.
 
-| 입력 | 값 |
+```text
+측정 프로세스 (class마다 1개, 첫 measure 호출에서 시작)
+  weight 난수 생성 1회, PIMSession open 1회
+  후보마다 (Pipe로 config 수신)
+    torch._dynamo.reset → session.prepare (export, Inductor, lowering, native 빌드, bind)
+    enter_layer (첫 업로드, U 기록)
+    run_model × warmup(기본 1) → run_model × repeat(기본 3) → 중앙값 = E
+    session.release (model runtime 해제, 장치 유지) → 결과 송신
+  config = None 수신 → close
+```
+
+| 항목 | 값 |
 |---|---|
-| 제약 | `stage_constraint`: weight stage는 M/N/K round 1, activation stage는 round ≤ `max_initial_scheduling_rounds`. p_k는 target이 정한다(AiMX는 `mapping_reason`이 p_k = 1만 허용) |
+| 측정값 | E(weight 상주 후 실행의 중앙값), 첫 업로드 시간(`weight_upload`), 실측 footprint(`physical_allocations`) |
+| 실패 | 결과를 보내기 전에 측정 프로세스가 끝나면(`wait([connection, sentinel])`) 그 후보를 `correctness=False`, `exit_code`로 기록하고 선택에서 제외한다. 다음 후보는 새 측정 프로세스에서 잰다 |
+| 제약 | `stage_constraint`: weight stage는 M/N/K round 1, activation stage는 round ≤ `max_initial_scheduling_rounds`(4). p_k는 target이 정한다(AiMX는 `mapping_reason`이 p_k = 1만 허용) |
 | seed 공간 | `partition_axes`: target이 k를 나눌 수 없으면 k partition은 1뿐이다. `instance_units = units / instances`: instance 하나가 채울 unit 수 |
 | 초기 round 패턴 | weight stage는 (1, 1, 1)만 |
-| packing 판단 | packed class와 member class를 모두 재고, packed E ≤ Σ member E일 때만 packing을 유지한다. 아니면 `PIMTorchConfig(pack=False)`로 분리한다 |
-| cache context | `<template>\|model\|<op>\|w<weight mask>\|x<instances>` |
+| budget | class마다 `max_benchmarks`(기본 20), `max_generations`(기본 10) |
+| cache | 경로는 `compile_model(cache_path=…)`, 기본은 `workspace/Experiment/Autotuner/autotune_cache.json`. context는 `<template>\|model\|<op>\|w<weight mask>\|x<instances>` |
+
+cache에 있는 후보만 쓰면(cache hit) 측정 프로세스를 띄우지 않는다. 컴파일은 config마다 다르므로
+후보마다 남는다. 측정 프로세스 안에는 후보별 host 라이브러리(`ctypes.CDLL`)와 Inductor 결과가 쌓인다.
 
 ### 4.2 선택
 
 stage class마다 측정 기록 중 E가 가장 빠른 값의 (1 + `FOOTPRINT_TOLERANCE`, 0.10) 이내인
 config들에서 footprint(weight + state + input + output)가 가장 작은 것을 쓴다. E만 보면 Block
 Group의 n이나 k가 저장 단위(AiMX: n 4096, k 256)보다 작아 weight가 3–4배로 저장되는 config가
-몇 % 빠르다는 이유로 선택된다(Llama-3-8B: layer 3.61 GB). packing을 유지할지(packed vs member)도
-같은 규칙으로 정한다.
+몇 % 빠르다는 이유로 선택된다(Llama-3-8B: layer 3.61 GB). packing 유지 여부도 같은 규칙으로 정한다.
+packed 쪽은 `count × E_packed`와 packed footprint, 분리 쪽은 `Σ member count × E_member`와 member
+footprint 합을 비교한다. 분리를 고르면 그 GEMM들에 `PIMTorchConfig(pack=False)`를 주고, 결과는
+`report["packing"]`에 남는다.
 
 튜닝의 초기 후보는 두 가지다.
 
@@ -441,7 +459,7 @@ compiled = compile_model(
     layers, example_inputs, target="aimx", units=2,
     runtime_options={"base_fpga": 0}, cache_path=..., max_benchmarks=20,
 )
-compiled.report       # stage class별 선택, memory (slot 수, 고정 slot 수, 대응표)
+compiled.report       # stage class별 선택, packing 판단, memory (slots, groups, slot_of_layer, group_of_layer)
 with compiled.session as session:
     output = session.run_model(*inputs)
     rows = session.memory_table()   # slot, layers, stage, unit, column, pa, bytes
@@ -451,16 +469,17 @@ with compiled.session as session:
 
 | 메서드 | 시점 | 하는 일 |
 |---|---|---|
-| `begin_model()` | compile | target model runtime 생성 |
+| `begin_model()` | compile | target model runtime 생성 (session마다 동시에 하나) |
+| `end_model()` | runtime | model runtime 해제, 장치는 유지. `PIMSession.release()`가 부르고 다음 `prepare`를 허용 |
 | `compile_invocation(stage, inputs)` | compile | Target IR → host/stub 라이브러리 (lowering 경로, 변경 없음) |
 | `resources()` | compile | unit 수와 용량 C |
 | `requirements(plans)` | compile | stage별 weight, state, input, output bytes |
 | `prepare_model(plans, memory)` | compile | 메모리 계획(slot, 대응표) 기록. UPMEM은 MRAM offset 배치와 program link |
 | `open()` | runtime | 장치 확보, 실제 unit 수 확인 |
-| `bind_model(plans)` | runtime | slot마다 context/handle 생성, 같은 slot의 stage는 공유 |
+| `bind_model(plans)` | runtime | slot마다 context/handle 생성, 같은 slot의 stage는 공유. UPMEM은 weight를 pool에 배치하고 group SG 표 생성 |
 | `memory_table(plans)` | runtime | slot·stage·unit·열·PA·bytes 행 (AiMX는 할당된 buffer만) |
-| `enter_layer` / `run` / `exit_layer` | runtime | slot 주인이 다를 때만 업로드, 실행, 해제 없음 |
-| `close()` | runtime | slot 해제 |
+| `enter_layer` / `run` / `exit_layer` | runtime | group이 바뀔 때만 group 전체 업로드, 실행, 해제 없음 |
+| `close()` | runtime | model runtime과 slot 해제, 장치 반납 |
 
 ### 5.3 모듈
 
@@ -469,11 +488,12 @@ with compiled.session as session:
 | `torch_backend/fx_packing.py` | CSE, ② n 잇기, ① m 쌓기, ③ block-diagonal과 target model 판정 | 구현됨 (`mm`/`_int_mm` instance, `bmm`은 예정) |
 | `torch_backend/model.py` | `build_layer_plan(spec=…)`: freeze 뒤 packing, stage의 `sources` | 구현됨 |
 | `torch_backend/model_policy.py` | `analyze_layer`(packing 포함), `stage_constraint` | 구현됨 |
-| `torch_backend/model_compile.py` | 측정, class별 가장 빠른 config, `compile_model` | 구현됨 |
-| `backend/residency.py` | `plan_memory`: slot 수, 고정 slot 수, layer → slot. `SlotOwners`: slot 주인 | 구현됨 (교체 slot R = 1) |
-| `backend/runtime.py` | `PIMSession.memory`, `PIMSession.memory_table()` | 구현됨 |
-| `backend/aimx_model.py`, `upmem_model.py` | slot별 bind/배치, 주인이 바뀔 때만 업로드, `memory_table` (AiMX는 context의 PA, UPMEM은 MRAM 주소) | 구현됨 |
-| 교체 slot 2개와 prefetch | 업로드와 계산 겹치기 | 예정 (DMA·PIM 동시 동작 측정 후) |
+| `torch_backend/model_compile.py` | `StageMeasurer` 측정, class별 선택, packing 판단, `compile_model` | 구현됨 |
+| `backend/residency.py` | `plan_memory`: slot 수, group 수, layer → slot/group | 구현됨 |
+| `backend/runtime.py` | `PIMSession.memory`, `memory_table()`, `release()` | 구현됨 |
+| `backend/upmem_adapter.py`, `aimx_adapter.py` | 장치 open/close, `begin_model`/`end_model` | 구현됨 |
+| `backend/aimx_model.py`, `upmem_model.py` | slot별 bind/배치, group이 바뀔 때만 업로드, `memory_table` (AiMX는 context의 PA, UPMEM은 MRAM 주소) | 구현됨 |
+| group 업로드와 계산 겹치기 | prefetch | 예정 (DMA·PIM 동시 동작 측정 후) |
 | KV 열 | decode의 KV slot | 예정 (부분 append는 lowering 변경 필요) |
 
 ---
@@ -483,6 +503,9 @@ with compiled.session as session:
 - 모든 layer는 분석한 첫 layer와 stage 구성이 같아야 한다.
 - stage class 단위로 config를 고른다. 같은 class의 stage는 같은 config를 쓴다.
 - 측정은 stage를 하나씩 실행한다. stage 사이의 host 작업 겹침은 반영하지 않는다.
-- 교체 slot의 prefetch는 DMA와 PIM 실행이 동시에 진행되는지 측정한 뒤 적용한다.
+- group 업로드의 prefetch는 DMA와 PIM 실행이 동시에 진행되는지 측정한 뒤 적용한다.
+- UPMEM group 전송(`dpu_push_sg_xfer_symbol`)은 rank 전체를 할당했을 때만 정답이 확인되었다.
+  rank 일부(예: 8 DPU)만 할당하면 첫 전송 조각만 MRAM에 쓰인다.
+- groups > 1인 회전 경로는 Llama 모델에서 아직 실행하지 않았다.
 - KV의 부분 append는 lowering 변경이 필요하므로 이 설계 밖이다.
 - compile 결과는 프로세스 메모리에 있다. 프로세스 사이의 저장은 지원하지 않는다.

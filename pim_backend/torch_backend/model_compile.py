@@ -13,6 +13,7 @@ from collections import Counter
 from dataclasses import asdict, dataclass, replace
 import math
 import multiprocessing
+from multiprocessing.connection import wait
 import statistics
 import time
 
@@ -82,8 +83,11 @@ def stage_inputs(key):
     return tuple(operand for _ in range(key.instances) for operand in (tensor(m, k), tensor(k, n)))
 
 
-def measure_stage(key, weights, spec, config, *, warmup, repeat):
-    """E with the weights already resident, U of one upload, and measured footprint."""
+def measure_stage(key, weights, session, config, *, warmup, repeat):
+    """E with the weights already resident, U of one upload, and measured footprint.
+
+    session is open; the prepared stage is released afterwards and the units stay allocated.
+    """
     module = StageModule(key, weights).eval()
     inputs = stage_inputs(key)
 
@@ -92,7 +96,7 @@ def measure_stage(key, weights, spec, config, *, warmup, repeat):
 
     # 후보마다 새로 컴파일한다. dynamo가 앞 후보의 컴파일 결과를 돌려주지 않게 한다.
     torch._dynamo.reset()
-    with torch.no_grad(), PIMSession(spec) as session:
+    with torch.no_grad():
         plan, = session.prepare([module], inputs, configure=configure)
         stage, = plan.stages
         # packing이 측정할 stage의 shape를 바꾸지 않았는지 확인한다.
@@ -110,6 +114,7 @@ def measure_stage(key, weights, spec, config, *, warmup, repeat):
             start = time.perf_counter_ns()
             session.run_model(*inputs)
             samples.append((time.perf_counter_ns() - start) / 1e6)
+    session.release()
     return PIMBenchmarkResult(
         total_ms=statistics.median(samples),
         correctness=None,
@@ -119,34 +124,60 @@ def measure_stage(key, weights, spec, config, *, warmup, repeat):
     )
 
 
-def _measure_child(queue, key, weight_shapes, spec, config, warmup, repeat):
+def _measure_worker(connection, key, weight_shapes, spec, warmup, repeat):
     weights = tuple(None if shape is None else random_tensor(key.input_dtype, shape)
                     for shape in weight_shapes)
-    queue.put(measure_stage(key, weights, spec, config, warmup=warmup, repeat=repeat))
+    with PIMSession(spec) as session:
+        while (config := connection.recv()) is not None:
+            connection.send(measure_stage(key, weights, session, config,
+                                          warmup=warmup, repeat=repeat))
 
 
-def measure_isolated(stage_class, spec, config, *, warmup, repeat):
-    """Measure one candidate in a fresh process.
+class StageMeasurer:
+    """Measure the candidates of one class in one process that keeps the units allocated.
 
-    Native runtime state (device contexts, stub libraries, host DMA buffers) dies
-    with the process, so candidates do not accumulate it. A runtime failure ends
-    only that process; the candidate is recorded as failed (correctness=False,
-    exit code in timings) and the search continues without it.
+    The device is opened once per process, not once per candidate. A runtime failure
+    ends the process; that candidate is recorded as failed (correctness=False, exit
+    code in timings) and the next candidate starts a new process.
     """
-    context = multiprocessing.get_context("spawn")
-    queue = context.Queue()
-    weight_shapes = tuple(None if weight is None else tuple(weight.shape)
-                          for weight in stage_class.weights)
-    process = context.Process(target=_measure_child, args=(
-        queue, stage_class.key, weight_shapes, spec, config, warmup, repeat))
-    process.start()
-    process.join()
-    if process.exitcode != 0:
+
+    def __init__(self, stage_class, spec, *, warmup, repeat):
+        weight_shapes = tuple(None if weight is None else tuple(weight.shape)
+                              for weight in stage_class.weights)
+        self.args = (stage_class.key, weight_shapes, spec, warmup, repeat)
+        self.process = None
+
+    def _start(self):
+        context = multiprocessing.get_context("spawn")
+        self.connection, child = context.Pipe()
+        self.process = context.Process(target=_measure_worker, args=(child, *self.args))
+        self.process.start()
+        child.close()
+
+    def measure(self, config):
+        if self.process is None:
+            self._start()
+        self.connection.send(config)
+        # 결과가 오거나 측정 프로세스가 끝날 때까지 기다린다.
+        ready = wait([self.connection, self.process.sentinel])
+        if self.connection in ready:
+            return self.connection.recv()
+        self.process.join()
         print(f"\n[model compile] candidate {config.key()} failed: measurement process "
-              f"exit code {process.exitcode}", flush=True)
-        return PIMBenchmarkResult(total_ms=math.inf, correctness=False,
-                                  timings=(("exit_code", process.exitcode),))
-    return queue.get()
+              f"exit code {self.process.exitcode}", flush=True)
+        result = PIMBenchmarkResult(total_ms=math.inf, correctness=False,
+                                    timings=(("exit_code", self.process.exitcode),))
+        self.process = None
+        return result
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exception_type, exception, traceback):
+        if self.process is not None:
+            self.connection.send(None)
+            self.process.join()
+        return False
 
 
 @dataclass(frozen=True)
@@ -276,20 +307,18 @@ def tune_stage_class(stage_class, spec, *, cache_path, search_budget, warmup, re
     initial = tuple({config.key(): config for config in (
         widened_configs(stage_class, spec, cache_path) + fitted_configs(key, spec, cache))}.values())
 
-    def benchmark_fn(problem, target, config):
-        return measure_isolated(stage_class, target, config, warmup=warmup, repeat=repeat)
-
     print(f"[model compile] tune {key.label()} initial={[config.key() for config in initial]}", flush=True)
-    tune(problem, spec, benchmark_fn, space=stage_config_space(key, spec),
-         cache=cache, budget=search_budget, seed=seed, verbose=True, constraint=constraint,
-         initial=initial)
-    # cache에는 다른 제약으로 잰 기록도 있을 수 있으므로 지금 제약으로 다시 거른다.
-    engine = ConstraintEngine(problem, spec, constraint=constraint)
-    # cache hit이면 tune은 탐색하지 않는다. 아직 재지 않은 initial 후보는 여기서 재서 기록에 더한다.
-    measured = cache.measured_results(problem, spec)
-    added = [TuningRecord(config, None, measure_isolated(stage_class, spec, config,
-                                                        warmup=warmup, repeat=repeat))
-             for config in initial if config.key() not in measured and engine.valid(config)]
+    # cache에 있는 후보만 쓰면 측정 프로세스를 띄우지 않는다(measure가 처음 불릴 때 띄운다).
+    with StageMeasurer(stage_class, spec, warmup=warmup, repeat=repeat) as measurer:
+        tune(problem, spec, lambda problem, target, config: measurer.measure(config),
+             space=stage_config_space(key, spec), cache=cache, budget=search_budget, seed=seed,
+             verbose=True, constraint=constraint, initial=initial)
+        # cache에는 다른 제약으로 잰 기록도 있을 수 있으므로 지금 제약으로 다시 거른다.
+        engine = ConstraintEngine(problem, spec, constraint=constraint)
+        # cache hit이면 tune은 탐색하지 않는다. 아직 재지 않은 initial 후보는 여기서 재서 기록에 더한다.
+        measured = cache.measured_results(problem, spec)
+        added = [TuningRecord(config, None, measurer.measure(config))
+                 for config in initial if config.key() not in measured and engine.valid(config)]
     if added:
         config, result = cache.lookup_result(problem, spec)
         best = min([TuningRecord(config, None, result)] + [record for record in added if record.result.ok],

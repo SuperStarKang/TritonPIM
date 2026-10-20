@@ -55,6 +55,11 @@ class AiMXAdapter:
             raise RuntimeError("prepare one model per session")
         self.model = AiMXModelRuntime(self)
 
+    def end_model(self):
+        # FPGA는 열어 둔 채 stage context만 해제한다.
+        self.model.close()
+        self.model = None
+
     def requirements(self, plans):
         return self.model.requirements(plans)
 

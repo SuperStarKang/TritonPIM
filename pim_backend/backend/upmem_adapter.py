@@ -70,6 +70,10 @@ class UPMEMAdapter:
             raise RuntimeError("prepare one model per session")
         self.model = UPMEMModelRuntime(self)
 
+    def end_model(self):
+        # DPU set은 유지하고 stage handle과 group만 해제한다. stats는 totals에 남는다.
+        self._close_model()
+
     def resources(self):
         # compile time에도 부른다. unit 수는 spec이 정한다. session-first 경로는 open
         # 뒤 spec을 실제 unit 수로 바꾸므로 두 경로 모두 실제 수와 같다.
