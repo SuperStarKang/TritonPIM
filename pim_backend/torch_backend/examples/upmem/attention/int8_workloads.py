@@ -33,21 +33,23 @@ class Int8Linear(torch.nn.Module):
 
 
 class AttentionKernel(torch.nn.Module):
-    def __init__(self, heads):
+    def __init__(self, heads, group=1):
         super().__init__()
         self.heads = heads
+        self.group = group
         self.register_buffer("mask", torch.ones(SEQUENCE, SEQUENCE, dtype=torch.bool).triu(1))
 
     def forward(self, query, key, value):
         outputs = []
         for head in range(self.heads):
-            scores = torch._int_mm(query[head], key[head].t().contiguous())
+            # group개의 query head가 같은 KV head를 읽는다 (MHA는 group 1).
+            scores = torch._int_mm(query[head], key[head // self.group].t().contiguous())
             scores = scores.float() * (ACTIVATION_SCALE ** 2 / math.sqrt(HEAD_DIM))
             probability = torch.softmax(scores.masked_fill(self.mask, float("-inf")), dim=-1)
             # Row scaling preserves small probabilities at sequence length 1024.
             probability_scale = probability.amax(dim=-1, keepdim=True) / 127.0
             quantized = (probability / probability_scale).round().clamp(0, 127).to(torch.int8)
-            output = torch._int_mm(quantized, value[head])
+            output = torch._int_mm(quantized, value[head // self.group])
             outputs.append(output.float() * probability_scale * ACTIVATION_SCALE)
         return torch.stack(outputs)
 

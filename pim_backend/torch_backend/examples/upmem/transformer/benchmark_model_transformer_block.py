@@ -18,13 +18,15 @@ from transformer.int8_workloads import TransformerBlock
 class PaddedFFNProjection(torch.nn.Module):
     def __init__(self, projection):
         super().__init__()
-        self.register_buffer("weight", torch.nn.functional.pad(projection.weight, (0, 256)))
+        # N을 1024 단위로 올린다 (Llama-2 11008 → 11264, Llama-3 14336 그대로).
+        padding = -(-projection.out_features // 1024) * 1024 - projection.out_features
+        self.register_buffer("weight", torch.nn.functional.pad(projection.weight, (0, padding)))
         self.output_scale = projection.output_scale
         self.out_features = projection.out_features
 
     def forward(self, activation):
         output = torch._int_mm(activation.reshape(-1, activation.shape[-1]), self.weight)
-        # 물리 11264열(zero padding)로 계산하고 논리 11008열만 반환한다.
+        # 물리 padding 열로 계산하고 논리 out_features 열만 반환한다.
         output = output[:, :self.out_features].contiguous().float() * self.output_scale
         return output.reshape(*activation.shape[:-1], self.out_features)
 
