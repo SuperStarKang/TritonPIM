@@ -7,10 +7,10 @@ import triton
 import triton.language as tl
 import triton.backends.pim.driver as pim_driver
 
-from .artifacts import prepare_run_directory, project_path
+from .artifacts import prepare_run_directory
 from .decorator import pim_launch_options
 from .model import target_model
-from .performance import PIMPerformanceProfile, PIMUnitTiming, profile_single_unit
+from .performance import PIMUnitTiming, profile_single_unit
 from .space import build_config_space
 from .types import PIMProblem
 
@@ -96,14 +96,3 @@ def profile_gemm(target, *, output_dir, repeat=5, problem=None, sweep_extents=No
     return profile_single_unit(
         [(problem, build_config_space(problem, target))], target, measure,
         kernel_version=GEMM_KERNEL_VERSION, output_dir=output_dir, sweep_extents=sweep_extents)
-
-
-def ensure_gemm_profile(problem, target, space, *, output_dir, repeat=5):
-    """A tuning callback: reuse a validated record or measure before generating seeds."""
-    path = project_path(output_dir) / "performance.json"
-    if path.exists():
-        performance = PIMPerformanceProfile.load(path, kernel_version=GEMM_KERNEL_VERSION)
-        performance.seed_families(problem, target, space.block_group_top_k)
-        print(f"[single-unit] loaded: {path}", flush=True)
-        return performance
-    return profile_gemm(target, output_dir=output_dir, repeat=repeat, problem=problem)

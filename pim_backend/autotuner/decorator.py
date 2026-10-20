@@ -47,10 +47,9 @@ def problem_from_tensors(a, b):
     )
 
 
-def default_config(problem, target, space, *, performance, kernel_version):
+def default_config(problem, target, space):
     engine = ConstraintEngine(problem, target)
-    for config in heuristic_seeds(problem, target, space, performance=performance,
-                                  kernel_version=kernel_version, engine=engine):
+    for config in heuristic_seeds(problem, target, space, engine):
         if engine.valid(config):
             return config
     raise ValueError("유효한 seed configuration이 없습니다")
@@ -109,7 +108,7 @@ def pim_autotune(target=None, spec=None, cache_path=DEFAULT_CACHE_PATH,
                  seed=0, search=True, retune=False, verbose=True,
                  rtol=0.0, atol=0.0,
                  template_version="pim-common-ir-semantic-schedule-v1",
-                 check_correctness=True, performance=None, profile_fn=None):
+                 check_correctness=True):
     """Autotune ``fn(a, b, *, config)`` with Common IR configurations."""
     selected_target = spec if spec is not None else target_spec(target)
     overrides = space_overrides if space_overrides is not None else {}
@@ -149,11 +148,7 @@ def pim_autotune(target=None, spec=None, cache_path=DEFAULT_CACHE_PATH,
             space = build_config_space(
                 problem, selected_target, **overrides)
             if not (do_search or do_retune):
-                seed_performance = performance
-                if seed_performance is None and profile_fn is not None:
-                    seed_performance = profile_fn(problem, selected_target, space)
-                config = default_config(problem, selected_target, space,
-                                        performance=seed_performance, kernel_version=template_version)
+                config = default_config(problem, selected_target, space)
                 if verbose:
                     print(
                         f"[autotuner] search disabled: "
@@ -256,8 +251,6 @@ def pim_autotune(target=None, spec=None, cache_path=DEFAULT_CACHE_PATH,
 
             result = tune(
                 problem, selected_target, benchmark_fn,
-                performance=performance, kernel_version=template_version,
-                profile_fn=profile_fn,
                 space=space, cache=cache, budget=budget, seed=seed,
                 retune=do_retune, verbose=verbose,
             )

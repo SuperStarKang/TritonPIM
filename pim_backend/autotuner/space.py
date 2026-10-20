@@ -1,8 +1,8 @@
 """Search space and target-neutral seeds over the PIM Common IR hierarchy.
 
 Seeds follow Triton Block -> Block Group -> Execution Tile -> Device
-Partition. Resource limits determine legality; measured single-unit
-saturation determines which points of the legal frontier start the search.
+Partition. Resource limits determine legality; seeds step through device
+parallelism levels so the measured search starts spread over that axis.
 """
 
 from dataclasses import dataclass
@@ -13,11 +13,10 @@ from math import log2, prod
 from .constraints import ConstraintEngine
 from .features import extract_features
 from .model import target_model
-from .types import PIMConfig, pim_hierarchy
+from .types import TRITON_BLOCK, PIMConfig, ceil_div, pim_hierarchy
 
 
-BLOCK_VALUES = (16, 32, 64, 128)
-GROUP_VALUES = (1, 2, 4, 8, 16, 32)
+GROUP_VALUES = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
 TILE_VALUES = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024)
 INITIAL_ROUND_PATTERNS = (
     (1, 1, 1),
@@ -39,7 +38,8 @@ def _powers_of_two(limit):
 
 @dataclass(frozen=True)
 class PIMConfigSpace:
-    block_values: tuple = BLOCK_VALUES
+    # 축마다 Block 하나 (m, n, k)
+    block_values: tuple = TRITON_BLOCK
     group_values: tuple = GROUP_VALUES
     tile_values: tuple = TILE_VALUES
     partition_values: tuple = (1,)
@@ -47,14 +47,15 @@ class PIMConfigSpace:
     partition_axes: tuple = (True, True, True)
     # instance 하나가 사용할 unit 수 상한 (build_config_space가 정한다)
     instance_units: int = 0
-    block_group_top_k: int = 3
-    max_ladder_steps: int = 4
+    block_group_top_k: int = 2
+    # seed의 병렬도 단계 수와 하한: 활성 unit을 A_max, A_max/2, ... A_max/parallel_floor까지 둔다.
+    parallel_levels: int = 5
+    parallel_floor: int = 16
     initial_round_patterns: tuple = INITIAL_ROUND_PATTERNS
     min_initial_schedule_utilization: float = 0.5
     max_initial_padding_ratio: float = 0.5
     max_initial_scheduling_rounds: int = 4
     max_initial_reduction_contributions: int = 64
-    measured_block_shapes: tuple = ()
 
 
 def axis_values(problem, spec, kind, axis):
@@ -63,11 +64,9 @@ def axis_values(problem, spec, kind, axis):
         return (1,)
     if kind == "partition" and not spec.partition_axes[axis]:
         return (1,)
-    if kind == "block" and spec.measured_block_shapes:
-        return tuple(sorted(set(spec.block_values) | {
-            blocks[axis] for blocks in spec.measured_block_shapes}))
+    if kind == "block":
+        return (spec.block_values[axis],)
     values = {
-        "block": spec.block_values,
         "group": spec.group_values,
         "tile": spec.tile_values,
         "partition": spec.partition_values,
@@ -278,65 +277,52 @@ def best_partitions(problem, target, blocks, groups, tiles, partitions, engine=N
     return sorted(most_active(grid, eligible), key=cost)[:2]
 
 
-def _saturation_points(problem, candidates, saturation_work):
-    """Center, nearest more/fewer units, and maximum parallelism; no endpoint quota."""
-    def units(config):
-        return prod(_partitions(config))
+def heuristic_seeds(problem, target, spec, engine=None):
+    """Seeds spread over device parallelism; nothing is measured.
 
-    def work(config):
-        # 경계 타일의 padding을 빼고 타일 한 개가 처리하는 평균 유효 작업량을 쓴다.
-        return Fraction(prod(problem.axis_extents),
-                        pim_hierarchy(problem, config).useful_execution_tiles)
-
-    saturated = [config for config in candidates if work(config) >= saturation_work]
-    if saturated:
-        center = max(saturated, key=lambda config: (units(config), -work(config)))
-    else:
-        # 모든 후보가 포화점 아래인 작은 문제는 가장 많은 유효 작업을 맡는 지점을 중심으로 삼는다.
-        center = max(candidates, key=lambda config: (work(config), units(config)))
-    points = [center]
-    more = [config for config in candidates if units(config) > units(center)]
-    fewer = [config for config in candidates if units(config) < units(center)]
-    if more:
-        points.append(min(more, key=lambda config: (units(config), -work(config))))
-    if fewer:
-        points.append(max(fewer, key=lambda config: (units(config), -work(config))))
-    most_parallel = max(candidates, key=lambda config: (units(config), work(config)))
-    if all(units(config) != units(most_parallel) for config in points):
-        points.append(most_parallel)
-    return list(dict.fromkeys(points))
-
-
-def heuristic_seeds(problem, target, spec, *, performance, kernel_version, engine=None):
-    """Measured saturation centers first across families, then their neighbors.
-
-    Only seed choice changes: full ladders, external initial candidates,
-    structured exploration, and cached/LFBO candidates keep their own rules.
+    For each of the top Block Groups, the active units step down from the most
+    the Block Group grid reaches (A_max, A_max/2, ...) to A_max/parallel_floor.
+    Each level covers the problem in one round, or in two at A_max when the
+    round patterns allow it, keeps the partitions with the fewest rounds,
+    reduction and staged bytes, and drops schedules that leave devices idle or
+    padded (_safe_initial_schedule). Seeds alternate between Block Groups
+    level by level.
     """
-    if performance is None:
-        raise ValueError("heuristic seeds require measured single-unit performance")
-    performance.validate_kernel(kernel_version)
-    if spec.max_ladder_steps < 1:
-        raise ValueError("max_ladder_steps must be positive")
     if engine is None:
         engine = ConstraintEngine(problem, target)
     partitions = legal_partitions(problem, target, spec)
+
+    def cost(config):
+        features = extract_features(problem, target, config)
+        return (features.scheduling_rounds, features.reduction_bytes, features.stage_bytes)
+
     families = []
-    for blocks, groups, reference_work in performance.seed_families(
-            problem, target, spec.block_group_top_k):
-        candidates = []
-        for tiles in tile_ladder(problem, target, blocks, groups, spec):
-            for p in best_partitions(
-                    problem, target, blocks, groups, tiles, partitions, engine):
-                candidates.append(make_config(blocks, groups, tiles, p))
-        if candidates:
-            families.append(_saturation_points(
-                problem, candidates,
-                reference_work
-            )[:spec.max_ladder_steps])
+    for blocks, groups in rank_block_groups(problem, target, spec)[:spec.block_group_top_k]:
+        total_groups = _execution_tiles(problem, blocks, groups, (1, 1, 1))
+        most = reachable_units(total_groups, partitions)
+        family = []
+        for level in range(spec.parallel_levels):
+            units = most >> level
+            # 모든 데이터를 소수의 device에 몰지 않도록 병렬도에 하한을 둔다.
+            if units < 1 or (level and units < most // spec.parallel_floor):
+                break
+            for rounds in spec.initial_round_patterns:
+                if prod(rounds) > (2 if level == 0 else 1):
+                    continue
+                configs = []
+                for p in partitions:
+                    if prod(p) != units or any(p[axis] > total_groups[axis] for axis in range(3)):
+                        continue
+                    tiles = tuple(ceil_div(total_groups[axis], p[axis] * rounds[axis])
+                                  for axis in range(3))
+                    config = make_config(blocks, groups, tiles, p)
+                    if engine.valid(config) and _safe_initial_schedule(problem, target, config, spec):
+                        configs.append(config)
+                family.extend(sorted(configs, key=cost)[:2 if level == 0 and prod(rounds) == 1 else 1])
+        families.append(list(dict.fromkeys(family)))
     return list(dict.fromkeys(
         family[index]
-        for index in range(spec.max_ladder_steps)
+        for index in range(max((len(family) for family in families), default=0))
         for family in families if index < len(family)))
 
 

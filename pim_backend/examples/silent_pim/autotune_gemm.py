@@ -10,7 +10,6 @@
 # backend 공통 launch 옵션은 pim_launch_options helper가 조립한다.
 
 import argparse
-from functools import partial
 import sys
 import time
 from pathlib import Path
@@ -22,11 +21,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # autotuner
 
 from triton.backends.pim.driver import PIMDriver  # noqa: E402
 
-from autotuner import PIMPerformanceProfile, SearchBudget  # noqa: E402
+from autotuner import SearchBudget  # noqa: E402
 from autotuner.artifacts import RESULTS_ROOT, prepare_run_directory, project_path  # noqa: E402
 from autotuner.decorator import pim_autotune  # noqa: E402
-from autotuner.gemm import (GEMM_KERNEL_VERSION, ensure_gemm_profile,  # noqa: E402
-                            profile_gemm, run_gemm)
+from autotuner.gemm import GEMM_KERNEL_VERSION, profile_gemm, run_gemm  # noqa: E402
 from autotuner.model import target_model  # noqa: E402
 from autotuner.targets import target_spec  # noqa: E402
 
@@ -49,7 +47,7 @@ def main():
     parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--base-fpga", type=int, default=0)
     parser.add_argument("--retune", action="store_true")
-    parser.add_argument("--performance", help="single-unit saturation JSON")
+    parser.add_argument("--performance", help="profiling 결과를 저장할 JSON")
     profiling = parser.add_mutually_exclusive_group()
     profiling.add_argument("--profile-only", action="store_true")
     profiling.add_argument("--calibrate-performance", nargs=3, type=int, metavar=("M", "N", "K"),
@@ -84,14 +82,9 @@ def main():
         max_autotune_seconds=args.max_seconds,
     )
 
-    performance = None
-    if args.performance is not None:
-        performance = PIMPerformanceProfile.load(args.performance, kernel_version=GEMM_KERNEL_VERSION)
-
     gemm_spec = target_model(hardware).gemm_profile_spec
 
-    @pim_autotune(spec=hardware, cache_path=str(cache_path), budget=budget, performance=performance,
-                  profile_fn=partial(ensure_gemm_profile, output_dir=output_dir, repeat=args.reps),
+    @pim_autotune(spec=hardware, cache_path=str(cache_path), budget=budget,
                   reps=args.reps, seed=args.seed,
                   rtol=args.rtol, atol=args.atol,
                   check_correctness=args.check_correctness,

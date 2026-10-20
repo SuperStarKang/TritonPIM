@@ -21,7 +21,6 @@ from autotuner import (
     PIMBenchmarkResult,
     PIMConfigCache,
     PIMProblem,
-    PIMPerformanceProfile,
     PIMUnitTiming,
     SearchBudget,
     build_config_space,
@@ -50,13 +49,10 @@ def add_kernel(
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--performance", help="single-unit saturation JSON for elementwise-add-v1")
+parser.add_argument("--performance", help="--calibrate-performance 결과를 저장할 JSON")
 parser.add_argument("--calibrate-performance", type=int, metavar="M",
                     help="measure up to this extent and write --performance, then exit")
 args = parser.parse_args()
-performance = None
-if args.calibrate_performance is None and args.performance is not None:
-    performance = PIMPerformanceProfile.load(args.performance, kernel_version="elementwise-add-v1")
 
 size = 1 << 20
 x = torch.randn(size)
@@ -127,8 +123,6 @@ result = tune(
     problem,
     target,
     benchmark_fn,
-    performance=performance,
-    kernel_version="elementwise-add-v1",
     space=space,
     cache=cache,
     budget=SearchBudget(max_benchmarks=30),

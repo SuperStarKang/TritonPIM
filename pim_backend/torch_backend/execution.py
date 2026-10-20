@@ -61,11 +61,10 @@ class PIMExecution:
             f"rounds={hierarchy.rounds}")
 
 
-def _seed_config(problem, target, performance):
+def _seed_config(problem, target):
     space = build_config_space(problem, target)
     engine = ConstraintEngine(problem, target)
-    for config in heuristic_seeds(problem, target, space, performance=performance,
-                                  kernel_version=TORCH_GEMM_TEMPLATE_VERSION, engine=engine):
+    for config in heuristic_seeds(problem, target, space, engine):
         if engine.valid(config):
             return config
     raise UnsupportedPIMGemm("no valid Common IR seed")
@@ -99,7 +98,7 @@ def resolve_execution(torch_config, problem):
     elif torch_config.autotune_cache_path is not None:
         config = _cached_config(problem, target, torch_config)
     else:
-        config = _seed_config(problem, target, torch_config.performance)
+        config = _seed_config(problem, target)
 
     reason = ConstraintEngine(problem, target).check(config)
     if reason is not None:

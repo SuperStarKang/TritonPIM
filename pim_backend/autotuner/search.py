@@ -226,15 +226,16 @@ def rank_with_diversity_penalty(scored, count, diversity_weight):
     return selected
 
 
-def tune(problem, target, benchmark_fn, *, performance, kernel_version, space=None, cache=None,
-         budget=None, seed=0, initial_random=6, search_copies=5,
+def tune(problem, target, benchmark_fn, *, space=None, cache=None,
+         budget=None, seed=0, search_copies=5,
          select_per_generation=8, good_quantile=0.1,
          diversity_weight=0.2, retune=False, verbose=False,
-         constraint=None, initial=(), profile_fn=None):
-    """profile_fn(problem, target, space) collects performance before a new search.
+         constraint=None, initial=()):
+    """Measure initial candidates, then search with LFBO until the budget ends.
 
-    Profiling runs only when performance is not supplied and a cache hit did
-    not finish the request. Its measurements are outside the search budget.
+    The initial candidates are ``initial``, the parallelism-level seeds (up to
+    half of the benchmark budget), similar cached configs, and structured
+    random configs (a quarter of the budget). LFBO uses the rest.
     """
     spec = space if space is not None else build_config_space(problem, target)
     budget = budget if budget is not None else SearchBudget()
@@ -336,25 +337,16 @@ def tune(problem, target, benchmark_fn, *, performance, kernel_version, space=No
             return None
         return min(record.result.total_ms for record in ok)
 
-    if performance is None and profile_fn is not None:
-        if verbose:
-            print("[autotuner] profiling one unit before seed generation", flush=True)
-        performance = profile_fn(problem, target, spec)
-    if performance is not None:
-        spec = replace(spec, measured_block_shapes=tuple(
-            blocks for blocks, _, _ in performance.seed_families(
-                problem, target, spec.block_group_top_k)))
     start_time = time.monotonic()
-    seeds = heuristic_seeds(problem, target, spec, performance=performance,
-                            kernel_version=kernel_version, engine=engine)
+    seeds = heuristic_seeds(problem, target, spec, engine)[:max(1, budget.max_benchmarks // 2)]
     structured_configs = structured_valid_configs(
-        problem, target, spec, initial_random, rng, engine)
+        problem, target, spec, max(1, budget.max_benchmarks // 4), rng, engine)
     warm = cache.lookup_similar(problem, target) if cache is not None else []
     population = (
         [(config, "initial") for config in initial]
-        + [(config, "saturation") for config in seeds[:1]]
+        + [(config, "seed") for config in seeds[:1]]
         + [(config, "warm-cache") for config in warm]
-        + [(config, "saturation") for config in seeds[1:]]
+        + [(config, "seed") for config in seeds[1:]]
         + [(config, "structured") for config in structured_configs])
 
     for config, origin in population:

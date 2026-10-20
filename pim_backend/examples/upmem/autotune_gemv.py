@@ -10,7 +10,6 @@
 #   RESULT,...
 
 import argparse
-from functools import partial
 import statistics
 import sys
 import time
@@ -24,11 +23,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # autotuner
 import triton.backends.pim.driver as pim_driver  # noqa: E402
 from triton.backends.pim.driver import PIMDriver  # noqa: E402
 
-from autotuner import (PIMBenchmarkResult, PIMConfigCache, PIMPerformanceProfile, PIMProblem,  # noqa: E402
+from autotuner import (PIMBenchmarkResult, PIMConfigCache, PIMProblem,  # noqa: E402
                        SearchBudget, build_config_space, target_spec, tune)
 from autotuner.artifacts import RESULTS_ROOT, prepare_run_directory, project_path  # noqa: E402
-from autotuner.gemv import (GEMV_KERNEL_VERSION, ensure_gemv_profile,  # noqa: E402
-                            profile_gemv, run_gemv)
+from autotuner.gemv import GEMV_KERNEL_VERSION, profile_gemv, run_gemv  # noqa: E402
 
 
 def main():
@@ -46,7 +44,7 @@ def main():
     parser.add_argument("--retune", action="store_true", help="cache가 있어도 다시 탐색")
     parser.add_argument("--cache", type=str)
     parser.add_argument("--output-dir", default=str(RESULTS_ROOT / "upmem_gemv"))
-    parser.add_argument("--performance", help="UPMEM GEMV single-unit saturation JSON")
+    parser.add_argument("--performance", help="profiling 결과를 저장할 JSON")
     profiling = parser.add_mutually_exclusive_group()
     profiling.add_argument("--profile-only", action="store_true")
     profiling.add_argument("--calibrate-performance", nargs=2, type=int, metavar=("M", "K"),
@@ -56,9 +54,6 @@ def main():
         parser.error("--reps and --repeat must be positive")
     output_dir = prepare_run_directory(args.output_dir)
     cache_path = project_path(args.cache) if args.cache is not None else output_dir / "autotune_cache.json"
-    performance = None
-    if not args.profile_only and args.calibrate_performance is None and args.performance is not None:
-        performance = PIMPerformanceProfile.load(args.performance, kernel_version=GEMV_KERNEL_VERSION)
 
     triton.runtime.driver.set_active(PIMDriver())
 
@@ -104,8 +99,6 @@ def main():
     result = tune(
         problem, target,
         lambda problem, target, config: measure(config, args.reps),
-        performance=performance, kernel_version=GEMV_KERNEL_VERSION,
-        profile_fn=partial(ensure_gemv_profile, output_dir=output_dir, repeat=args.reps),
         space=build_config_space(problem, target),
         cache=PIMConfigCache(str(cache_path), template_version=GEMV_KERNEL_VERSION),
         budget=SearchBudget(max_generations=args.max_generations,

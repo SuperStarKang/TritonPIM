@@ -27,8 +27,7 @@ import torch
 import triton
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from torch_backend import PIMPerformanceProfile, compile_model
-from torch_backend.template import TORCH_GEMM_TEMPLATE_VERSION
+from torch_backend import compile_model
 from torch_backend._autotuner import DEFAULT_CACHE_PATH
 from attention.int8_workloads import ACTIVATION_SCALE
 from e2e.llama_workloads import KV_MODES, LlamaPrefillLayer
@@ -55,15 +54,11 @@ def main():
     parser.add_argument("--report-dir", type=Path, required=True)
     parser.add_argument("--kv", choices=KV_MODES, default="share", help="how a query head reads its KV head")
     parser.add_argument("--cache", default=DEFAULT_CACHE_PATH)
-    parser.add_argument("--performance", help="single-unit saturation JSON")
     parser.add_argument("--max-benchmarks", type=int, default=20, help="per stage class")
     parser.add_argument("--max-generations", type=int, default=10)
     parser.add_argument("--local-capacity-limit-bytes", type=int, required=True,
                         help="WRAM bytes per DPU for Block Group buffers; the rest holds tasklet stacks")
     args = parser.parse_args()
-    performance = None
-    if args.performance is not None:
-        performance = PIMPerformanceProfile.load(args.performance, kernel_version=TORCH_GEMM_TEMPLATE_VERSION)
     logging.basicConfig(level=logging.INFO)
     args.report_dir.mkdir(parents=True, exist_ok=True)
     prompt = args.prompt_file.read_text(encoding="utf-8")
@@ -96,7 +91,6 @@ def main():
               flush=True)
         compiled = compile_model(
             blocks, (example, ()), target="upmem", units=2048,
-            performance=performance,
             runtime_options={"nr_tasklets": 16,
                              "local_capacity_limit_bytes": args.local_capacity_limit_bytes},
             cache_path=args.cache,

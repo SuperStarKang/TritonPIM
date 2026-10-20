@@ -25,8 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from torch_backend import PIMPerformanceProfile, compile_model
-from torch_backend.template import TORCH_GEMM_TEMPLATE_VERSION
+from torch_backend import compile_model
 from torch_backend._autotuner import DEFAULT_CACHE_PATH
 from e2e.benchmark_model_llama_ttft import ModelPrefillLayer
 from e2e.llama_workloads import KV_MODES
@@ -49,7 +48,6 @@ def main():
     parser.add_argument("--layer", type=int, default=0)
     parser.add_argument("--kv", choices=KV_MODES, default="share", help="how a query head reads its KV head")
     parser.add_argument("--cache", default=DEFAULT_CACHE_PATH)
-    parser.add_argument("--performance", help="single-unit saturation JSON")
     parser.add_argument("--max-benchmarks", type=int, default=20, help="per stage class")
     parser.add_argument("--max-generations", type=int, default=10)
     parser.add_argument("--local-capacity-limit-bytes", type=int, required=True,
@@ -57,9 +55,6 @@ def main():
     parser.add_argument("--report-dir", type=Path,
                         default=Path(__file__).resolve().with_name("llama_layer_report"))
     args = parser.parse_args()
-    performance = None
-    if args.performance is not None:
-        performance = PIMPerformanceProfile.load(args.performance, kernel_version=TORCH_GEMM_TEMPLATE_VERSION)
     args.report_dir.mkdir(parents=True, exist_ok=True)
 
     with torch.no_grad():
@@ -97,7 +92,6 @@ def main():
         start = time.perf_counter_ns()
         compiled = compile_model(
             [block], (torch.zeros_like(hidden), ()), target="upmem", units=2048,
-            performance=performance,
             runtime_options={"nr_tasklets": 16,
                              "local_capacity_limit_bytes": args.local_capacity_limit_bytes},
             cache_path=args.cache,

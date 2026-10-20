@@ -7,7 +7,7 @@ target-specific rule lives in one subclass below.
 from math import prod
 
 from .targets import AiMXRuntimeConfig, PIMGemmProfileSpec, PIMGemvProfileSpec, UPMEMRuntimeConfig
-from .types import ceil_div
+from .types import TRITON_BLOCK, ceil_div
 
 
 AIMX_PMM_BYTES = 0x30000
@@ -171,10 +171,13 @@ class UPMEMModel(TargetModel):
 
     @property
     def gemm_profile_spec(self):
-        block_rows, group_rows = self._profile_rows()
-        # SingleUtil의 열·누산 크기를 출발점으로, 활성 tasklet마다 출력 한 행을 준다.
+        runtime = self.target.runtime_config
+        assert isinstance(runtime, UPMEMRuntimeConfig)
+        tasklets = runtime.nr_tasklets or self.profile.lanes_per_core
+        # SingleUtil의 열·누산 크기(32, 16)를 출발점으로, 활성 tasklet마다 출력 한 행을 준다.
         return PIMGemmProfileSpec(
-            (block_rows, 32, 16), "int8", "int32", (group_rows, 1, 1))
+            TRITON_BLOCK, "int8", "int32",
+            (tasklets // TRITON_BLOCK[0], 32 // TRITON_BLOCK[1], 16 // TRITON_BLOCK[2]))
 
     @property
     def gemv_profile_spec(self):
@@ -198,15 +201,33 @@ class UPMEMModel(TargetModel):
 class AiMXModel(TargetModel):
     launch_timing_name = "invoke"
 
-    @property
-    def gemm_profile_spec(self):
+    def _compute_unit(self):
+        """Block Group extent one device computes without storage padding.
+
+        B/C panels store n 4096 wide, Arel/B store k in 256 and A in matmul_k_alignment.
+        """
         runtime = self.target.runtime_config
         assert isinstance(runtime, AiMXRuntimeConfig)
         if runtime.batch not in (1, 2, 4, 8):
             raise ValueError("AiMX batch must be 1, 2, 4, or 8")
+        return (runtime.batch, 4096,
+                max(256, runtime.matmul_k_alignment or 4096 // runtime.batch))
+
+    @property
+    def gemm_profile_spec(self):
+        unit = self._compute_unit()
         return PIMGemmProfileSpec(
-            (runtime.batch, 4096 // runtime.batch, 256 // runtime.batch),
-            "float16", "float32", (1, 1, 1))
+            TRITON_BLOCK, "float16", "float32",
+            tuple(size // block for size, block in zip(unit, TRITON_BLOCK)))
+
+    def group_reason(self, problem, extent):
+        unit = self._compute_unit()
+        # Block Group은 연산 단위까지만 키운다. 그보다 큰 범위는 Execution Tile이 bank에 상주시킨다.
+        if any(size > bound for size, bound in zip(extent, unit)):
+            return (
+                f"AiMX Block Group extent {extent}가 연산 단위 {unit}를 넘는다; "
+                "Execution Tile을 키운다")
+        return None
 
     def problem_reason(self, problem):
         if problem.compute_kind != "matmul":

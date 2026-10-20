@@ -82,10 +82,8 @@ class PIMGemmProfileSpec:
 
     @property
     def block_candidates(self):
-        # 행·열의 기본 눈금과 그 배수를 비교하고, 누산 눈금은 유지한다.
-        return tuple(
-            (self.block_shape[0] * rows, self.block_shape[1] * columns, self.block_shape[2])
-            for rows in (1, 2, 4) for columns in (1, 2))
+        # Block은 모든 target이 함께 쓰는 Triton Block 하나다. 크기 비교는 Group이 맡는다.
+        return (self.block_shape,)
 
 
 @dataclass(frozen=True)

@@ -34,7 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import torch
 import triton.backends.pim.driver as pim_driver
 
-from torch_backend import PIMInductorBackend, PIMPerformanceProfile, PIMTorchConfig, calibrate_gemms
+from torch_backend import PIMInductorBackend, PIMTorchConfig, calibrate_gemms
 from torch_backend.template import TORCH_GEMM_TEMPLATE_VERSION
 from torch_backend._autotuner import (
     DEFAULT_CACHE_PATH,
@@ -82,7 +82,7 @@ def main():
     parser.add_argument("--max-generations", type=int, default=10)
     parser.add_argument("--max-seconds", type=float, default=None)
     parser.add_argument("--cache", default=DEFAULT_CACHE_PATH)
-    parser.add_argument("--performance", help="single-unit saturation JSON")
+    parser.add_argument("--performance", help="--calibrate-performance 결과를 저장할 JSON")
     parser.add_argument("--calibrate-performance", nargs=3, type=int, metavar=("M", "N", "K"),
                         help="measure up to these extents and write --performance, then exit")
     parser.add_argument("--retune", action="store_true",
@@ -121,9 +121,6 @@ def main():
             [(problem, build_config_space(problem, target))], target,
             sweep_extents=args.calibrate_performance, repeat=args.reps).save(args.performance)
         return
-    performance = None
-    if args.performance is not None:
-        performance = PIMPerformanceProfile.load(args.performance, kernel_version=TORCH_GEMM_TEMPLATE_VERSION)
 
     def benchmark_fn(problem, target, config):
         # config마다 새로 컴파일한다. reset이 없으면 dynamo가 앞 config로
@@ -174,7 +171,6 @@ def main():
     print(f"cache: {args.cache}")
 
     result = tune(problem, target, benchmark_fn, space=space, cache=cache,
-                  performance=performance, kernel_version=TORCH_GEMM_TEMPLATE_VERSION,
                   budget=budget, seed=args.seed, retune=args.retune,
                   verbose=True)
 

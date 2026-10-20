@@ -13,7 +13,6 @@ from collections import Counter
 from dataclasses import asdict, dataclass, replace
 import math
 import multiprocessing
-from pathlib import Path
 import statistics
 import time
 
@@ -23,7 +22,7 @@ from triton.backends.pim.runtime import PIMSession
 
 from ._autotuner import (
     DEFAULT_CACHE_PATH, ConstraintEngine, PIMBenchmarkResult, PIMConfig, PIMConfigCache,
-    PIMPerformanceProfile, SearchBudget, TuningRecord, build_config_space, performance_context,
+    SearchBudget, TuningRecord, build_config_space,
     pim_hierarchy, target_model, target_spec, tune,
 )
 from .config import PIMTorchConfig
@@ -267,26 +266,8 @@ def stage_config_space(key, spec):
     return build_config_space(problem, spec, **overrides)
 
 
-def calibrate_model(layer, example_inputs, *, target, units, sweep_extents,
-                    runtime_options, repeat=3):
-    """Measure every packed/unpacked stage family needed by compile_model."""
-    from .calibration import calibrate_gemms
-
-    spec = target_spec(target, num_units=units, **runtime_options)
-    classes, _ = analyze_layer(layer, example_inputs, spec)
-    cases = []
-    for stage_class in classes:
-        cases.append((stage_class.key.problem, stage_config_space(stage_class.key, spec)))
-        if stage_class.origin is not None:
-            members, _ = member_classes(stage_class)
-            cases.extend((member.key.problem, stage_config_space(member.key, spec)) for member in members)
-    return calibrate_gemms(cases, spec, sweep_extents=sweep_extents, repeat=repeat)
-
-
-def tune_stage_class(stage_class, spec, *, performance, cache_path, search_budget, warmup, repeat, seed):
+def tune_stage_class(stage_class, spec, *, cache_path, search_budget, warmup, repeat, seed):
     """Selected config of one class (smallest_near_fastest) and the number of measured candidates."""
-    from .calibration import calibrate_gemms
-
     key = stage_class.key
     problem = key.problem
     constraint = stage_constraint(key, max_stage_rounds(problem, spec))
@@ -298,28 +279,10 @@ def tune_stage_class(stage_class, spec, *, performance, cache_path, search_budge
     def benchmark_fn(problem, target, config):
         return measure_isolated(stage_class, target, config, warmup=warmup, repeat=repeat)
 
-    # 단일 unit 측정 자료는 cache 옆 파일에 context별로 모은다. 측정 key에는 M/N/K가 없으므로
-    # 같은 context는 한 번만 재고 이후 모든 problem이 그 기록을 쓴다.
-    def profile_fn(problem, target, space):
-        path = Path(cache_path).with_name("torch_performance.json")
-        stored = (PIMPerformanceProfile.load(path, kernel_version=TORCH_GEMM_TEMPLATE_VERSION)
-                  if path.exists() else PIMPerformanceProfile(TORCH_GEMM_TEMPLATE_VERSION, ()))
-        if any(curve.context == performance_context(problem, target) for curve in stored.curves):
-            print(f"[model compile] single-unit profile loaded: {path}", flush=True)
-            return stored
-        measured = calibrate_gemms([(problem, space)], target, sweep_extents=None, repeat=repeat)
-        merged = PIMPerformanceProfile(TORCH_GEMM_TEMPLATE_VERSION,
-                                       stored.curves + measured.curves,
-                                       stored.group_curves + measured.group_curves)
-        merged.save(path)
-        print(f"[model compile] single-unit profile saved: {path}", flush=True)
-        return merged
-
     print(f"[model compile] tune {key.label()} initial={[config.key() for config in initial]}", flush=True)
     tune(problem, spec, benchmark_fn, space=stage_config_space(key, spec),
-         performance=performance, kernel_version=TORCH_GEMM_TEMPLATE_VERSION,
          cache=cache, budget=search_budget, seed=seed, verbose=True, constraint=constraint,
-         initial=initial, profile_fn=profile_fn)
+         initial=initial)
     # cache에는 다른 제약으로 잰 기록도 있을 수 있으므로 지금 제약으로 다시 거른다.
     engine = ConstraintEngine(problem, spec, constraint=constraint)
     # cache hit이면 tune은 탐색하지 않는다. 아직 재지 않은 initial 후보는 여기서 재서 기록에 더한다.
@@ -353,7 +316,7 @@ class CompiledModel:
     report: dict
 
 
-def compile_model(layers, example_inputs, *, target, units, performance, runtime_options=None,
+def compile_model(layers, example_inputs, *, target, units, runtime_options=None,
                   cache_path=DEFAULT_CACHE_PATH, max_benchmarks=20, max_generations=10,
                   warmup=1, repeat=3, seed=0):
     """Compile time of a model whose layers share one structure; the session runs it at runtime.
@@ -381,7 +344,7 @@ def compile_model(layers, example_inputs, *, target, units, performance, runtime
     def tune_once(stage_class):
         if stage_class.key not in selected:
             selected[stage_class.key], measured[stage_class.key] = tune_stage_class(
-                stage_class, spec, performance=performance, cache_path=cache_path, search_budget=search_budget,
+                stage_class, spec, cache_path=cache_path, search_budget=search_budget,
                 warmup=warmup, repeat=repeat, seed=seed)
 
     final = {}

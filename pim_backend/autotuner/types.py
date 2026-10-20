@@ -15,6 +15,11 @@ DTYPE_BYTES = {
 }
 
 
+# 모든 target이 함께 쓰는 Triton Block (m, n, k). target의 연산 폭은 Block Group이,
+# bank 용량은 Execution Tile이 이 Block 위에 만든다.
+TRITON_BLOCK = (8, 16, 16)
+
+
 def ceil_div(value, divisor):
     return -(-value // divisor)
 

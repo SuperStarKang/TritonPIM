@@ -12,7 +12,6 @@
 # backend 공통 launch 옵션은 pim_launch_options helper가 조립한다.
 
 import argparse
-from functools import partial
 import sys
 import time
 from pathlib import Path
@@ -24,11 +23,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # autotuner
 
 from triton.backends.pim.driver import PIMDriver  # noqa: E402
 
-from autotuner import PIMPerformanceProfile, SearchBudget  # noqa: E402
+from autotuner import SearchBudget  # noqa: E402
 from autotuner.artifacts import RESULTS_ROOT, prepare_run_directory, project_path  # noqa: E402
 from autotuner.decorator import pim_autotune  # noqa: E402
-from autotuner.gemm import (GEMM_KERNEL_VERSION, ensure_gemm_profile,  # noqa: E402
-                            profile_gemm, run_gemm)
+from autotuner.gemm import GEMM_KERNEL_VERSION, profile_gemm, run_gemm  # noqa: E402
 from autotuner.model import target_model  # noqa: E402
 from autotuner.targets import target_spec  # noqa: E402
 
@@ -48,7 +46,7 @@ def main():
     parser.add_argument("--cache", type=str)
     parser.add_argument("--output-dir", default=str(RESULTS_ROOT / "upmem_gemm"))
     parser.add_argument("--retune", action="store_true", help="기존 tuning cache가 있어도 재탐색")
-    parser.add_argument("--performance", help="single-unit saturation JSON")
+    parser.add_argument("--performance", help="profiling 결과를 저장할 JSON")
     profiling = parser.add_mutually_exclusive_group()
     profiling.add_argument("--profile-only", action="store_true",
                            help="target 용량 안에서 단일-device profiling 후 종료")
@@ -100,14 +98,9 @@ def main():
         max_autotune_seconds=args.max_seconds,
     )
 
-    performance = None
-    if args.performance is not None:
-        performance = PIMPerformanceProfile.load(args.performance, kernel_version=GEMM_KERNEL_VERSION)
-
     gemm_spec = target_model(target).gemm_profile_spec
 
-    @pim_autotune(spec=target, cache_path=str(cache_path), budget=budget, performance=performance,
-                  profile_fn=partial(ensure_gemm_profile, output_dir=output_dir, repeat=args.reps),
+    @pim_autotune(spec=target, cache_path=str(cache_path), budget=budget,
                   reps=args.reps, seed=args.seed, retune=args.retune,
                   template_version=GEMM_KERNEL_VERSION)
     def gemm(a, b, *, config):

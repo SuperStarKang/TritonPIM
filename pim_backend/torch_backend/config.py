@@ -11,7 +11,7 @@
 from dataclasses import dataclass
 from typing import Optional
 
-from ._autotuner import PIMConfig, PIMPerformanceProfile, PIMTargetSpec
+from ._autotuner import PIMConfig, PIMTargetSpec
 
 
 class UnsupportedPIMGemm(RuntimeError):
@@ -53,8 +53,7 @@ class PIMTorchConfig:
     # 2) offline autotune cache의 best (단계 B). cache miss는 fail-fast다 —
     #    조용히 seed로 돌아가면 무엇으로 실행됐는지 알 수 없다.
     autotune_cache_path: Optional[str] = None
-    # 3) 둘 다 없으면 단일 unit 실측 포화점으로 고른 seed.
-    performance: Optional[PIMPerformanceProfile] = None
+    # 3) 둘 다 없으면 병렬도 단계 seed 규칙(heuristic_seeds)의 첫 후보.
     # ── GEMM packing ──────────────────────────────────────────────────────
     # False면 fx_packing이 이 GEMM을 다른 GEMM과 묶지 않는다. model compile이
     # 따로 실행하는 쪽이 더 빠르다고 측정한 GEMM에 쓴다.

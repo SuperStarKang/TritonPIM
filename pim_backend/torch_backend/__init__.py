@@ -26,7 +26,7 @@ from .runtime_compat import set_driver_to_backend
 from .scheduling import PIMCombinedScheduling
 from .template import pim_gemm_template
 from .model import LayerPlan, build_layer_plan
-from .model_compile import CompiledModel, calibrate_model, compile_model
+from .model_compile import CompiledModel, compile_model
 from .calibration import calibrate_gemms
 from triton.backends.pim.runtime import PIMSession
 
@@ -49,6 +49,5 @@ __all__ = [
     "build_layer_plan",
     "CompiledModel",
     "compile_model",
-    "calibrate_model",
     "calibrate_gemms",
 ]
