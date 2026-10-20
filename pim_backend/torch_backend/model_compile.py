@@ -1,15 +1,16 @@
 """Model compile time: tiling configs of one layer, then every layer compiled with them.
 
 compile_model analyzes the first layer into stage classes (after GEMM packing),
-measures each class with its weights already resident and keeps the smallest
-config among those within FOOTPRINT_TOLERANCE of the fastest, and compiles every
-layer with those configs without allocating the device. plan_memory then fits as many layer slots as one unit holds: every layer
+measures each class with its weights already resident, chooses the packing and one
+measured config per class together (select_configs), and compiles every layer with
+those configs without allocating the device. plan_memory then fits as many layer slots as one unit holds: every layer
 keeps its own slot if all fit; otherwise layer i takes slot i mod slots and the
 layers of one group are uploaded together, overwriting only the weights. The
 returned session allocates, binds and runs at runtime.
 """
 
 from collections import Counter
+from itertools import product
 from dataclasses import asdict, dataclass, replace
 import math
 import multiprocessing
@@ -194,21 +195,39 @@ def cache_version(key):
     return f"{TORCH_GEMM_TEMPLATE_VERSION}|model|{key.op}|w{mask}|x{key.instances}"
 
 
-# 실행 시간이 가장 빠른 것보다 이 비율 이내로 느린 후보는 같은 시간대로 보고 footprint가 작은 쪽을 고른다.
-# 측정 E만 보면 저장 padding이 3–4배인 config가 몇 % 빠르다는 이유로 선택된다.
-FOOTPRINT_TOLERANCE = 0.10
+def select_configs(classes, candidates, capacity_bytes):
+    """One measured candidate per class with the smallest E + U of one layer that fits one unit.
 
-
-def smallest_near_fastest(options, time, size):
-    """Option with the smallest size among those within FOOTPRINT_TOLERANCE of the fastest time."""
-    fastest = min(time(option) for option in options)
-    near = [option for option in options if time(option) <= fastest * (1 + FOOTPRINT_TOLERANCE)]
-    return min(near, key=lambda option: (size(option), time(option)))
-
-
-def footprint_bytes(candidate):
-    footprint = candidate.footprint
-    return footprint.weight + footprint.state + footprint.input + footprint.output
+    classes maps a stage class key to its stage count in the layer. A cold request
+    runs every layer once and uploads its weights once, so the slot/group plan does
+    not change the time; a layer only has to fit one unit with the scratch. The slot
+    bytes add up over the stages, the scratch is the largest input plus the largest
+    output, so the search keeps every partial choice that no other choice beats in
+    slot bytes, input, output and time together (multiple-choice knapsack).
+    Returns (time_ms, slot_bytes, scratch_bytes, {key: candidate}) or None.
+    """
+    # (slot bytes, 최대 input, 최대 output, 시간, 고른 후보)
+    frontier = [(0, 0, 0, 0.0, {})]
+    for key, count in classes.items():
+        extended = [(slot + count * (candidate.footprint.weight + candidate.footprint.state),
+                     max(largest_input, candidate.footprint.input),
+                     max(largest_output, candidate.footprint.output),
+                     elapsed + count * (candidate.execution_ms + candidate.upload_ms),
+                     {**chosen, key: candidate})
+                    for slot, largest_input, largest_output, elapsed, chosen in frontier
+                    for candidate in candidates[key]]
+        extended.sort(key=lambda option: (option[3], option[0]))
+        frontier = []
+        for option in extended:
+            # 시간이 더 짧은 선택이 bytes도 모두 같거나 작으면 이 선택은 쓸 일이 없다.
+            if not any(all(kept[axis] <= option[axis] for axis in range(3)) for kept in frontier):
+                frontier.append(option)
+    feasible = [option for option in frontier
+                if option[0] + option[1] + option[2] <= capacity_bytes]
+    if not feasible:
+        return None
+    slot, largest_input, largest_output, elapsed, chosen = feasible[0]
+    return elapsed, slot, largest_input + largest_output, chosen
 
 
 def fitted_configs(key, spec, cache):
@@ -298,7 +317,7 @@ def stage_config_space(key, spec):
 
 
 def tune_stage_class(stage_class, spec, *, cache_path, search_budget, warmup, repeat, seed):
-    """Selected config of one class (smallest_near_fastest) and the number of measured candidates."""
+    """Measured candidates of one class that satisfy the model-stage constraints."""
     key = stage_class.key
     problem = key.problem
     constraint = stage_constraint(key, max_stage_rounds(problem, spec))
@@ -335,8 +354,7 @@ def tune_stage_class(stage_class, spec, *, cache_path, search_budget, warmup, re
                                     Footprint(*record["physical_allocations"][0])))
     if not candidates:
         raise ValueError(f"{key.label()}: no measured config satisfies the model-stage constraints")
-    return smallest_near_fastest(candidates, lambda candidate: candidate.execution_ms,
-                                 footprint_bytes), len(candidates)
+    return candidates
 
 
 @dataclass
@@ -351,10 +369,10 @@ def compile_model(layers, example_inputs, *, target, units, runtime_options=None
     """Compile time of a model whose layers share one structure; the session runs it at runtime.
 
     1. analyze the first layer into stage classes
-    2. tune every class with its weights resident and keep the smallest config within
-       FOOTPRINT_TOLERANCE of the fastest; a packed class also tunes its members and stays
-       packed by the same rule against running its members separately
-    3. compile every layer with those configs; plan_memory places them in slots
+    2. tune every class with its weights resident; a packed class also tunes its members
+    3. for every pack/separate choice of the packed classes, select_configs picks one
+       candidate per class; the choice with the smallest E + U of one layer wins
+    4. compile every layer with those configs; plan_memory places them in slots
     """
     layers = tuple(layers)
     spec = target_spec(target, num_units=units, **(runtime_options or {}))
@@ -367,55 +385,59 @@ def compile_model(layers, example_inputs, *, target, units, runtime_options=None
 
     start = time.perf_counter_ns()
     search_budget = SearchBudget(max_generations=max_generations, max_benchmarks=max_benchmarks)
-    selected = {}
-    measured = {}
+    candidates = {}
 
     def tune_once(stage_class):
-        if stage_class.key not in selected:
-            selected[stage_class.key], measured[stage_class.key] = tune_stage_class(
+        if stage_class.key not in candidates:
+            candidates[stage_class.key] = tune_stage_class(
                 stage_class, spec, cache_path=cache_path, search_budget=search_budget,
                 warmup=warmup, repeat=repeat, seed=seed)
 
-    final = {}
-    separate = set()
-    packing = []
+    members = {}
     for stage_class in classes:
-        if stage_class.origin is None:
-            tune_once(stage_class)
-            final.setdefault(stage_class.key, []).append(stage_class)
-            continue
         # member를 먼저 재야 packed class가 member config를 넓혀 탐색을 시작한다(widened_configs).
-        members, member_assignment = member_classes(stage_class)
-        for member in members:
-            tune_once(member)
+        if stage_class.origin is not None:
+            members[stage_class.key] = member_classes(stage_class)
+            for member in members[stage_class.key][0]:
+                tune_once(member)
         tune_once(stage_class)
-        packed_ms = stage_class.count * selected[stage_class.key].execution_ms
-        separate_ms = sum(member.count * selected[member.key].execution_ms for member in members)
-        packed_bytes = stage_class.count * footprint_bytes(selected[stage_class.key])
-        separate_bytes = sum(member.count * footprint_bytes(selected[member.key]) for member in members)
-        # class 선택과 같은 규칙: 시간이 비슷하면 footprint가 작은 쪽
-        packed = smallest_near_fastest(
-            ((True, packed_ms, packed_bytes), (False, separate_ms, separate_bytes)),
-            lambda option: option[1], lambda option: option[2])[0]
-        packing.append({"packed": stage_class.key.label(), "packed_ms": packed_ms,
-                        "packed_bytes": packed_bytes,
-                        "members": [member.key.label() for member in members],
-                        "separate_ms": separate_ms, "separate_bytes": separate_bytes,
-                        "packed_selected": packed})
-        print(f"[model compile] packing {stage_class.key.label()}: packed {packed_ms:.1f} ms "
-              f"{packed_bytes / 1e6:.0f} MB, separate {separate_ms:.1f} ms {separate_bytes / 1e6:.0f} MB "
-              f"-> {'pack' if packed else 'separate'}", flush=True)
-        if packed:
-            final.setdefault(stage_class.key, []).append(stage_class)
-        else:
-            separate.update(member_assignment)
-            assignment.update(member_assignment)
-            for member in members:
-                final.setdefault(member.key, []).append(member)
-    # member key가 packing하지 않은 다른 class와 같으면(q/k/v member와 o) 한 class로 합친다.
-    classes = [StageClass(key, sum(part.count for part in parts), parts[0].weights, parts[0].origin,
-                          [sources for part in parts for sources in part.stage_sources])
-               for key, parts in final.items()]
+
+    capacity_bytes = spec.common_profile.banks_per_unit * spec.common_profile.bank_capacity_limit_bytes
+    packed_classes = [stage_class for stage_class in classes if stage_class.origin is not None]
+    best = None
+    packing = []
+    for decision in product((True, False), repeat=len(packed_classes)):
+        separated = {stage_class.key for stage_class, packed in zip(packed_classes, decision)
+                     if not packed}
+        # member key가 packing하지 않은 다른 class와 같으면(q/k/v member와 o) 한 class로 합친다.
+        parts = {}
+        for stage_class in classes:
+            for part in (members[stage_class.key][0] if stage_class.key in separated
+                         else [stage_class]):
+                parts.setdefault(part.key, []).append(part)
+        counts = {key: sum(part.count for part in group) for key, group in parts.items()}
+        selection = select_configs(counts, candidates, capacity_bytes)
+        packing.append({"separated": [key.label() for key in separated],
+                        "layer_ms": None if selection is None else selection[0],
+                        "slot_bytes": None if selection is None else selection[1],
+                        "scratch_bytes": None if selection is None else selection[2]})
+        print(f"[model compile] separate={[key.label() for key in separated]} -> "
+              + ("no layer fits one unit" if selection is None else
+                 f"E+U {selection[0]:.1f} ms/layer, slot {selection[1]} B, scratch {selection[2]} B"),
+              flush=True)
+        if selection is not None and (best is None or selection[0] < best[0][0]):
+            best = (selection, separated, parts)
+    if best is None:
+        raise ValueError(f"no choice of measured configs fits one layer in {capacity_bytes} bytes")
+    (_, _, _, selected), separated_keys, parts = best
+    separate = set()
+    for key in separated_keys:
+        member_assignment = members[key][1]
+        separate.update(member_assignment)
+        assignment.update(member_assignment)
+    classes = [StageClass(key, sum(part.count for part in group), group[0].weights, group[0].origin,
+                          [sources for part in group for sources in part.stage_sources])
+               for key, group in parts.items()]
     tuning_ms = (time.perf_counter_ns() - start) / 1e6
 
     start = time.perf_counter_ns()
@@ -465,7 +487,7 @@ def compile_model(layers, example_inputs, *, target, units, runtime_options=None
             "weight_mask": list(stage_class.key.weight_mask),
             "instances": stage_class.key.instances,
             "stages_per_layer": stage_class.count,
-            "measured": measured[stage_class.key],
+            "measured": len(candidates[stage_class.key]),
             "selected": {"config": asdict(selected[stage_class.key].config),
                          "execution_ms": selected[stage_class.key].execution_ms,
                          # 격리 측정의 첫 업로드. UPMEM은 bind에서 weight를 배치하므로 전송만 들어간다.
