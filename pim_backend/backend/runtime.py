@@ -20,14 +20,14 @@ class RuntimeBackend(Protocol):
     """Synchronous adapter contract of the model path.
 
     begin_model creates the target model runtime. resources() reports the spec's
-    unit count and capacity; requirements(plans) reports per-stage bytes for the
-    common memory plan; prepare_model(plans, memory) places the layers in their
-    slots and links native artifacts. None of these touch the device, so a model
+    unit count and capacity; requirements(plans) reports per-operand bytes for the
+    common memory table; prepare_model(plans, memory) places the layers at the
+    table's offsets and links native artifacts. None of these touch the device, so a model
     can be compiled before open().
 
     open() allocates the units and exposes num_units. bind_model(plans) creates
     the device handles of every slot, weight_table(plans) reports weight placement,
-    memory_table(plans) the slot buffers and their addresses, and the model runtime
+    memory_table(plans) the table rows with their device addresses, and the model runtime
     implements enter_layer/run/exit_layer. end_model releases the model runtime
     while the units stay allocated, so begin_model can follow. stats contains
     cumulative transfer bytes and launch counts. close releases resources.
@@ -222,7 +222,7 @@ class PIMSession:
             raise RuntimeError("PIMSession must be used by its owning thread and context")
 
     def memory_table(self):
-        """Memory management table rows: slot, its layers, stage, unit, column, PA and bytes."""
+        """Memory table rows with device addresses: UPMEM the planned MRAM offsets, AiMX its allocated buffers."""
         self._check_owner()
         return self.backend.memory_table(self.layers)
 

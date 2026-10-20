@@ -9,10 +9,14 @@ import tempfile
 from triton.runtime.cache import get_cache_manager
 
 from .compiler import _run_translate
-from .residency import StageRequirement
+from .residency import INPUT as INPUT_KIND, OUTPUT as OUTPUT_KIND, WEIGHT as WEIGHT_KIND
+from .residency import OperandRequirement, StageRequirement
 from .upmem_artifact import INPUT, MRAM_BASE, OUTPUT, WEIGHT, TransferStats, _artifact_bindings, _build_program
 from .runtime import current_invocation
 
+
+# binding role -> memory table 종류
+ROLE_KINDS = {WEIGHT: WEIGHT_KIND, INPUT: INPUT_KIND, OUTPUT: OUTPUT_KIND}
 
 # upmem_model.h UPMEM_MODEL_PACK: weight를 pool에 배치만 하고 보내지 않는다.
 PACK = 2
@@ -94,8 +98,6 @@ class UPMEMModelRuntime:
         # group index -> native block 표. bind가 만들고 enter_layer가 보낸다.
         self.groups = {}
         self.loaded_group = None
-        # place가 정한 MRAM 공유 영역: (weight 영역 끝, input bytes, output bytes)
-        self.scratch = None
         self.totals = {"program_loads": 0, "device_compiles": 0, "weight_pushes": 0}
         pointer = ctypes.c_void_p
         uint = ctypes.c_uint32
@@ -123,96 +125,45 @@ class UPMEMModelRuntime:
     def compile_invocation(self, stage, physical_inputs):
         return ModelCompileInvocation(self, stage, physical_inputs)
 
-    @staticmethod
-    def _role_bytes(stage, role):
-        return sum(binding.size for binding in stage.bindings if binding.role == role)
-
     def requirements(self, plans):
         # 프로그램은 IRAM에 적재되므로 MRAM state는 없다. 입력·출력 scratch는 모든
-        # stage가 같은 영역을 쓰고, 출력은 stage마다 slot 하나다.
+        # stage가 같은 영역을 처음부터 쓴다.
         return [
-            StageRequirement(plan.index, stage.name, self._role_bytes(stage, WEIGHT), 0,
-                             self._role_bytes(stage, INPUT),
-                             max(binding.size for binding in stage.bindings
-                                 if binding.role == OUTPUT))
+            StageRequirement(plan.index, stage.name, tuple(
+                OperandRequirement(index, ROLE_KINDS[binding.role], binding.size)
+                for index, binding in enumerate(stage.bindings)))
             for plan in plans for stage in plan.stages
         ]
 
     def place(self, plans, memory):
-        """Lay out MRAM by slot and link every stage program.
+        """Link every stage program at the MRAM offsets of the memory table.
 
-        Each slot owns a weight region and the slots are contiguous, so one layer
-        group fills the weight regions with one transfer. Layers in the same slot
-        get the same weight addresses, so a group change overwrites only the weights.
+        The slots are contiguous, so one layer group fills the weight regions with
+        one transfer. Layers in the same slot get the same weight addresses, so a
+        group change overwrites only the weights.
         """
         self.memory = memory
-        slot_start = {}
-        weight_region = 0
-        input_bytes = 0
-        output_bytes = 0
-        for plan in plans:
-            # 새 slot은 앞 slot들의 weight 영역 뒤에서 시작한다.
-            start = slot_start.setdefault(memory.slot_of_layer[plan.index], weight_region)
-            offset = start
-            for stage in plan.stages:
-                stage.addresses = {}
-                for binding in stage.bindings:
-                    if binding.role == WEIGHT:
-                        stage.addresses[binding.symbol] = MRAM_BASE + offset
-                        offset += binding.size
-                input_bytes = max(input_bytes, self._role_bytes(stage, INPUT))
-                output_bytes = max(output_bytes, *(binding.size for binding in stage.bindings
-                                                   if binding.role == OUTPUT))
-            plan.weight_bytes_per_unit = offset - start
-            weight_region = max(weight_region, offset)
-        footprint = weight_region + input_bytes + output_bytes
-        if footprint != memory.bytes_per_unit:
-            raise RuntimeError(
-                f"MRAM layout needs {footprint} bytes per unit; the memory plan "
-                f"computed {memory.bytes_per_unit}")
-        self.scratch = (weight_region, input_bytes, output_bytes)
         for plan in plans:
             for stage in plan.stages:
-                offset = weight_region
-                for binding in stage.bindings:
-                    if binding.role == INPUT:
-                        stage.addresses[binding.symbol] = MRAM_BASE + offset
-                        offset += binding.size
-                    elif binding.role == OUTPUT:
-                        stage.addresses[binding.symbol] = MRAM_BASE + weight_region + input_bytes
+                stage.addresses = {
+                    binding.symbol: MRAM_BASE + memory.entries[(plan.index, stage.name, index)].offset
+                    for index, binding in enumerate(stage.bindings)}
                 stage.program = _build_program(stage.bundle, stage.addresses, stats=self.totals)
+            plan.weight_bytes_per_unit = sum(binding.size for stage in plan.stages
+                                             for binding in stage.bindings if binding.role == WEIGHT)
             plan.backend_plan = {
                 "slot": memory.slot_of_layer[plan.index],
+                "group": memory.group_of_layer[plan.index],
                 "weight_bytes": plan.weight_bytes_per_unit,
-                "input_offset": weight_region,
-                "output_offset": weight_region + input_bytes,
-                "bytes_per_unit": footprint,
+                "bytes_per_unit": memory.bytes_per_unit,
             }
 
     def memory_table(self, plans):
-        """One row per MRAM region of every slot and of the shared scratch; every DPU has this layout."""
-        first = {}
-        layers = {}
-        for plan in plans:
-            slot = self.memory.slot_of_layer[plan.index]
-            first.setdefault(slot, plan)
-            layers.setdefault(slot, []).append(plan.index)
-        rows = []
-        for slot, plan in first.items():
-            for stage in plan.stages:
-                for binding in stage.bindings:
-                    if binding.role == WEIGHT:
-                        rows.append({"slot": slot, "layers": layers[slot], "stage": stage.name,
-                                     "unit": "all", "column": "weight",
-                                     "pa": stage.addresses[binding.symbol], "bytes": binding.size})
-        weight_region, input_bytes, output_bytes = self.scratch
-        everyone = [plan.index for plan in plans]
-        rows.append({"slot": None, "layers": everyone, "stage": "input scratch", "unit": "all",
-                     "column": "activation", "pa": MRAM_BASE + weight_region, "bytes": input_bytes})
-        rows.append({"slot": None, "layers": everyone, "stage": "output scratch", "unit": "all",
-                     "column": "activation", "pa": MRAM_BASE + weight_region + input_bytes,
-                     "bytes": output_bytes})
-        return rows
+        """The memory table rows with MRAM addresses; every DPU has this layout."""
+        return [{"kind": entry.kind, "layer": entry.layer, "stage": entry.stage,
+                 "operand": entry.operand, "slot": entry.slot, "group": entry.group,
+                 "pa": MRAM_BASE + entry.offset, "bytes": entry.bytes}
+                for entry in self.memory.entries.values()]
 
     def bind(self, plans, units):
         """Runtime: create the native handle of every placed stage on the open DPU set,

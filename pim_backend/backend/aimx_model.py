@@ -12,7 +12,7 @@ import ctypes
 import time
 
 from .compiler import _run_translate
-from .residency import StageRequirement
+from .residency import STATE, WEIGHT, OperandRequirement, StageRequirement
 from .runtime import current_invocation
 
 
@@ -154,9 +154,11 @@ class AiMXModelRuntime:
 
     def requirements(self, plans):
         # stage마다 자기 activation buffer를 가지므로 공용 scratch는 없고 state에 들어간다.
+        # 실제 주소는 vendor 할당이 정하므로 memory table의 offset은 쓰지 않는다.
         return [
-            StageRequirement(plan.index, stage.name,
-                             self._bytes(stage, True), self._bytes(stage, False), 0, 0)
+            StageRequirement(plan.index, stage.name, tuple(
+                OperandRequirement(index, WEIGHT if weight else STATE, size)
+                for index, (size, weight) in enumerate(zip(stage.slot_bytes, stage.slot_weights))))
             for plan in plans for stage in plan.stages
         ]
 
