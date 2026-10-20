@@ -86,8 +86,8 @@ def main():
             for phase, count in (("first", 1), ("warmup", args.warmup), ("sample", args.repeat)):
                 for step in range(count):
                     if args.residency == "upload":
-                        # layer 하나는 planner가 P-1을 고른다. slot을 비워 P-2처럼 매 요청 weight를 다시 올린다.
-                        session.backend.model.slots.owner.clear()
+                        # layer 하나는 group 하나다. 적재된 group을 잊게 해 매 요청 weight를 다시 올린다.
+                        session.backend.model.loaded_group = None
                     before = session.stats()
                     start = time.perf_counter_ns()
                     output = session.run_model(hidden)

@@ -4,14 +4,15 @@ Each stage runs one model stub (--aimx-to-model-stub). Instances are batched ove
 FPGAs: job = batch slot * devices + device, and every job owns one context on
 one FPGA. Weights are staged only by upload calls; run calls stage activations.
 Layers that share a memory slot share these contexts: buffers and descriptor
-chains are built once, and a layer change uploads only its weights.
+chains are built once. Entering the first layer of a layer group uploads the
+weights of every layer in the group, which then run without further uploads.
 """
 
 import ctypes
 import time
 
 from .compiler import _run_translate
-from .residency import SlotOwners, StageRequirement
+from .residency import StageRequirement
 from .runtime import current_invocation
 
 
@@ -133,7 +134,10 @@ class AiMXModelRuntime:
         self.units = adapter.spec.common_profile.num_units
         # context를 가진 stage. slot을 공유하는 다른 layer의 stage는 여기 없다.
         self.stages = []
-        self.slots = None
+        self.memory = None
+        # group index -> 그 group의 layer plan들 (실행 순서). place가 만들고 enter_layer가 올린다.
+        self.plans_of_group = {}
+        self.loaded_group = None
         self.loaded_program = None
         self.totals = {"weight_uploads": 0, "weight_bytes": 0, "invocations": 0,
                        "upload_wall_ms": 0.0, "run_wall_ms": 0.0}
@@ -157,8 +161,9 @@ class AiMXModelRuntime:
         ]
 
     def place(self, plans, memory):
-        self.slots = SlotOwners(memory)
+        self.memory = memory
         for plan in plans:
+            self.plans_of_group.setdefault(memory.group_of_layer[plan.index], []).append(plan)
             plan.weight_bytes_per_unit = sum(self._bytes(stage, True) for stage in plan.stages)
             plan.backend_plan = {
                 "slot": memory.slot_of_layer[plan.index],
@@ -171,7 +176,7 @@ class AiMXModelRuntime:
         """Runtime: create the FPGA contexts of every slot; the first layer of a slot creates them."""
         first = {}
         for plan in plans:
-            owner = first.setdefault(self.slots.slot_of_layer[plan.index], plan)
+            owner = first.setdefault(self.memory.slot_of_layer[plan.index], plan)
             for stage, slot_stage in zip(plan.stages, owner.stages):
                 self._create_stage(stage, slot_stage)
 
@@ -237,18 +242,21 @@ class AiMXModelRuntime:
         self.totals[f"{phase}_wall_ms"] += wall_ms
 
     def enter_layer(self, plan):
-        # slot이 이미 이 layer의 weight를 담고 있으면 올리지 않는다. 아니면 weight만 덮어쓴다.
-        if not self.slots.enter(plan.index):
+        # group이 이미 올라와 있으면 보내지 않는다. 아니면 group의 모든 layer weight를 먼저 올린다.
+        group = self.memory.group_of_layer[plan.index]
+        if group == self.loaded_group:
             return
-        for stage in plan.stages:
-            if any(stage.weight_mask):
-                self.invoke(stage, stage.preparation_matrices, stage.preparation_output,
-                            upload=True)
-                self.totals["weight_uploads"] += 1
-                self.totals["weight_bytes"] += self._bytes(stage, True) * len(stage.fpgas)
+        for member in self.plans_of_group[group]:
+            for stage in member.stages:
+                if any(stage.weight_mask):
+                    self.invoke(stage, stage.preparation_matrices, stage.preparation_output,
+                                upload=True)
+                    self.totals["weight_uploads"] += 1
+                    self.totals["weight_bytes"] += self._bytes(stage, True) * len(stage.fpgas)
+        self.loaded_group = group
 
     def exit_layer(self, plan):
-        """Slots stay allocated; under P-2 the next layer overwrites only the weights."""
+        """Slots stay allocated; the next group overwrites only the weights."""
 
     def run(self, stage, matrices, output):
         self.invoke(stage, matrices, output, upload=False)
@@ -276,7 +284,7 @@ class AiMXModelRuntime:
         first = {}
         layers = {}
         for plan in plans:
-            slot = self.slots.slot_of_layer[plan.index]
+            slot = self.memory.slot_of_layer[plan.index]
             first.setdefault(slot, plan)
             layers.setdefault(slot, []).append(plan.index)
         rows = []
