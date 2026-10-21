@@ -3,7 +3,7 @@
 from contextlib import ExitStack
 from contextvars import ContextVar
 from dataclasses import replace
-from threading import RLock, get_ident
+from threading import RLock, Thread, get_ident
 import time
 from typing import Protocol
 
@@ -45,6 +45,90 @@ class RuntimeBackend(Protocol):
     def memory_table(self, plans): ...
     def stats(self) -> dict: ...
     def close(self): ...
+
+
+# GroupLoader가 누적하는 통계 이름. adapter가 model 통계를 합칠 때도 같은 이름을 쓴다.
+GROUP_LOAD_STATS = ("weight_uploads", "pack_wall_ms", "background_pack_ms", "upload_wall_ms",
+                    "group0_pack_ms", "group0_upload_ms")
+
+
+class GroupLoader:
+    """Upload the weights of one layer group when the group is entered, for one request.
+
+    pack(group) lays a group's weights out in host memory and returns them; it never
+    touches the device, so it runs on a background thread while the previous group
+    computes (computation and transfers to one device cannot overlap). push(packed)
+    uploads them and release(packed) frees the host memory. Entering group g takes its
+    packed weights (waiting for the background pack, or packing now), pushes and releases
+    them, then starts packing g + 1. Group 0 has nothing to hide behind, so its pack and
+    push are also accumulated apart, to be subtracted from a request time.
+    """
+
+    def __init__(self, groups, pack, push, release):
+        self.groups = groups
+        self.pack = pack
+        self.push = push
+        self.release = release
+        self.loaded = None
+        # 다음 group을 pack하는 background 작업: (group, thread, 결과)
+        self.prefetch = None
+        # weight_uploads는 group 업로드 횟수다. pack_wall_ms는 요청 경로에서 pack에 쓴 시간
+        # (직접 pack하거나 background pack을 기다린 시간), background_pack_ms는 실행과 겹쳐 돈
+        # pack 시간, upload_wall_ms는 push 시간이다.
+        self.totals = dict.fromkeys(GROUP_LOAD_STATS, 0)
+
+    def _start_prefetch(self, group):
+        result = {}
+
+        def work():
+            start = time.perf_counter_ns()
+            result["packed"] = self.pack(group)
+            result["ms"] = (time.perf_counter_ns() - start) / 1e6
+
+        thread = Thread(target=work, name=f"pim-pack-group{group}")
+        thread.start()
+        self.prefetch = (group, thread, result)
+
+    def _join_prefetch(self):
+        group, thread, result = self.prefetch
+        thread.join()
+        self.prefetch = None
+        self.totals["background_pack_ms"] += result["ms"]
+        return group, result["packed"]
+
+    def enter(self, group):
+        if group == self.loaded:
+            return
+        start = time.perf_counter_ns()
+        packed = None
+        if self.prefetch is not None:
+            prefetched, packed = self._join_prefetch()
+            if prefetched != group:
+                self.release(packed)
+                packed = None
+        if packed is None:
+            packed = self.pack(group)
+        pack_ms = (time.perf_counter_ns() - start) / 1e6
+        start = time.perf_counter_ns()
+        self.push(packed)
+        upload_ms = (time.perf_counter_ns() - start) / 1e6
+        # 보낸 weight는 이번 요청에서 다시 쓰지 않는다.
+        self.release(packed)
+        self.totals["pack_wall_ms"] += pack_ms
+        self.totals["upload_wall_ms"] += upload_ms
+        self.totals["weight_uploads"] += 1
+        if group == 0:
+            self.totals["group0_pack_ms"] += pack_ms
+            self.totals["group0_upload_ms"] += upload_ms
+        self.loaded = group
+        # 이 group이 실행되는 동안 다음 group을 host에서 미리 pack한다.
+        if group + 1 < self.groups:
+            self._start_prefetch(group + 1)
+
+    def close(self):
+        """Finish a background pack and free what it packed; call before freeing its stages."""
+        if self.prefetch is not None:
+            self.release(self._join_prefetch()[1])
 
 
 def create_runtime(spec) -> RuntimeBackend:

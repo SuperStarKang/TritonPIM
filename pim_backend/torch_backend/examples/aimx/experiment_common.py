@@ -85,26 +85,32 @@ def request_breakdown(before, after, weight_stages, layers_ms):
     breakdown = {key: {field: value - before["breakdown"][key][field]
                        for field, value in record.items() if field != "jobs"}
                  for key, record in after["breakdown"].items()}
-    wall = {name: after[name] - before[name] for name in ("upload_wall_ms", "run_wall_ms")}
+    wall = {name: after[name] - before[name] for name in ("pack_wall_ms", "upload_wall_ms", "run_wall_ms")}
     phases = {kind: slot_totals([record for key, record in breakdown.items() if key.startswith(kind + ":")])
-              for kind in ("upload", "run")}
+              for kind in ("run",)}
     weight_run_ms = sum(record["wall_ms"] for key, record in breakdown.items()
                         if key.startswith("run:") and key.removeprefix("run:") in weight_stages)
-    # 업로드는 weight를 올리는 비용이므로 weight GEMM에 넣는다.
+    # weight의 pack과 업로드는 weight를 올리는 비용이므로 weight GEMM에 넣는다.
     kinds = {
-        "weight_gemm_ms": weight_run_ms + wall["upload_wall_ms"],
+        "weight_gemm_ms": weight_run_ms + wall["pack_wall_ms"] + wall["upload_wall_ms"],
         "activation_gemm_ms": wall["run_wall_ms"] - weight_run_ms,
         "cpu_ms": layers_ms - sum(wall.values()),
     }
     return {
-        **{name: after[name] - before[name] for name in ("weight_uploads", "weight_bytes", "invocations")},
+        **{name: after[name] - before[name]
+           for name in ("weight_uploads", "weight_bytes", "invocations", "background_pack_ms")},
+        # 이번 요청이 group 0을 올렸다면 그 pack + push 시간. 요청 시간에서 빼면 group 0이 미리
+        # 상주한 경우의 시간이 된다.
+        "group0_load_ms": (after["group0_pack_ms"] - before["group0_pack_ms"]
+                           + after["group0_upload_ms"] - before["group0_upload_ms"]),
         "layers_ms": layers_ms, **wall, "kinds": kinds, "phases": phases, "breakdown": breakdown,
     }
 
 
 def print_request(label, record):
     print(f"{label} layers_ms={record['layers_ms']:.1f} weight_uploads={record['weight_uploads']} "
-          f"weight_bytes={record['weight_bytes']} invocations={record['invocations']}", flush=True)
+          f"weight_bytes={record['weight_bytes']} group0_load_ms={record['group0_load_ms']:.1f} "
+          f"invocations={record['invocations']}", flush=True)
     print("  kinds   " + " ".join(f"{name}={value:.1f}" for name, value in record["kinds"].items()), flush=True)
     for kind, totals in record["phases"].items():
         print(f"  {kind:<7} " + " ".join(f"{name}={value:.1f}" for name, value in totals.items()), flush=True)

@@ -110,8 +110,11 @@ def main():
                             logits.flatten().double(), reference_logits.flatten().double(), dim=0).item(),
                     }
                     call["per_layer_ms"] = call["layers_ms"] / args.layers
+                    call["ttft_without_group0_load_ms"] = ttft_ms - call["group0_load_ms"]
                     calls.append(call)
-                    print_request(f"{phase}={step} ttft_ms={ttft_ms:.1f} per_layer_ms={call['per_layer_ms']:.1f} "
+                    print_request(f"{phase}={step} ttft_ms={ttft_ms:.1f} "
+                                  f"ttft_without_group0_load_ms={call['ttft_without_group0_load_ms']:.1f} "
+                                  f"per_layer_ms={call['per_layer_ms']:.1f} "
                                   f"token={token} matches={call['token_matches_reference']} "
                                   f"logits_cosine={call['logits_cosine']:.6f}", call)
             # slot buffer는 첫 실행에서 할당되므로 요청이 끝난 뒤 읽는다.
@@ -124,6 +127,12 @@ def main():
                         for name in samples[0]["kinds"]}
     print(f"summary ttft_ms={summary['ttft_ms']:.1f} per_layer_ms={summary['per_layer_ms']:.1f} "
           f"slots={memory.slots} groups={memory.groups}", flush=True)
+    # 단일 요청: 첫 요청이 group 0을 포함한 모든 weight 업로드를 한다
+    first = next(call for call in calls if call["phase"] == "first")
+    summary["first"] = {name: first[name] for name in
+                        ("ttft_ms", "group0_load_ms", "ttft_without_group0_load_ms", "layers_ms")}
+    print(f"first ttft_ms={first['ttft_ms']:.1f} group0_load_ms={first['group0_load_ms']:.1f} "
+          f"ttft_without_group0_load_ms={first['ttft_without_group0_load_ms']:.1f}", flush=True)
 
     report = {
         "checkpoint": str(args.checkpoint), "layers": args.layers, "fpgas": args.fpgas,

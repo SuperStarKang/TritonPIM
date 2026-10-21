@@ -9,7 +9,7 @@ from contextlib import ExitStack
 import ctypes
 
 from .residency import UnitResources
-from .runtime import resident_lock
+from .runtime import GROUP_LOAD_STATS, resident_lock
 from .upmem_artifact import TransferStats
 
 
@@ -31,6 +31,7 @@ class UPMEMAdapter:
         self.totals.update(resource_opens=0, resource_closes=0)
         self.totals["device_compiles"] = 0
         self.totals["weight_pushes"] = 0
+        self.totals.update(dict.fromkeys(GROUP_LOAD_STATS, 0))
         self.cleanup = None
 
     def open(self):

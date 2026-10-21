@@ -25,7 +25,9 @@ struct upmem_model_kernel {
     uint32_t addresses[3];
     uint32_t sizes[3];
     void **pointers[3];
+    // host 조립 pool. upmem_model_pools_acquire가 잡고 release가 놓는다 (그 사이에만 stage 호출 가능).
     void **pools;
+    uint64_t *pool_bytes;
     uint32_t pool_count;
     void *metadata;
     uint32_t metadata_bytes;
@@ -66,6 +68,8 @@ void upmem_model_launch(struct upmem_model_kernel *kernel);
 void upmem_model_stats(struct upmem_model_kernel *kernel,
                        struct upmem_resident_stats *stats);
 void upmem_model_mapping(struct upmem_model_kernel *kernel, uint32_t *mapping);
+void upmem_model_pools_acquire(struct upmem_model_kernel *kernel);
+void upmem_model_pools_release(struct upmem_model_kernel *kernel);
 void upmem_model_close(struct upmem_model_kernel *kernel);
 struct upmem_model_group *upmem_model_group_create(uint32_t capacity, uint32_t zero_bytes);
 void upmem_model_group_add(struct upmem_model_group *group, struct upmem_model_kernel *kernel);

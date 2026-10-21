@@ -138,10 +138,30 @@ struct aimx_model_call {
   void *const *pointers;            // [instances * arguments], host tensors per instance
   const int *weights;               // [arguments], 1 when the argument is a resident weight
   uint32_t instances, batch_size, arguments;
-  int upload;                       // 1: stage weights and build chains, no invoke/unstage
+  // 0: run (stage activations, invoke, unstage). 1: stage weights to the device.
+  // 2: pack, stage weights into pack_hosts instead of the device. 1 and 2 build
+  // chains but never invoke or unstage.
+  int upload;
   uint32_t batch_base;
+  // pack only: per job, the host image of the job's weight range and the device
+  // VA that image starts at. A weight buffer at VA v lands at host + (v - va).
+  void *const *pack_hosts;          // [batch_size * devices]
+  const uint64_t *pack_vas;         // [batch_size * devices]
 };
-// One memory-table weight slot on one FPGA: a single physically linear pim_malloc.
+
+// Stage copy of a model stage: the device, or the job's pack image when upload is 2.
+static inline int aimx_model_copy_to_pim(const aimx_model_call *model, uint32_t job,
+                                         void *pim_dst, const void *host_src, size_t bytes,
+                                         int fpga) {
+  if (model->upload != 2)
+    return aimx_copy_to_pim(pim_dst, host_src, bytes, fpga);
+  memcpy((char *)model->pack_hosts[job] + ((uint64_t)pim_dst - model->pack_vas[job]),
+         host_src, bytes);
+  return 0;
+}
+
+// One memory-table region on one FPGA (a weight slot or the scratch): a single
+// physically linear pim_malloc.
 struct aimx_model_region {
   int fpga;
   uint64_t va, pa;
@@ -150,17 +170,20 @@ struct aimx_model_region {
 extern "C" {
 // Opens every physical FPGA once and returns how many exist.
 int aimx_model_open();
-// The region of one memory-table slot; alignment is its start alignment in bytes.
+// alignment is the region's start alignment in bytes.
 aimx_model_region *aimx_model_region_create(int fpga, int64_t bytes, int64_t alignment);
 // Destroy the contexts placed in a region first.
 void aimx_model_region_destroy(aimx_model_region *region);
+// Copy hosts[i] to the start of regions[i] (bytes[i]); one thread per FPGA.
+void aimx_model_push(size_t count, aimx_model_region *const *regions, void *const *hosts,
+                     const int64_t *bytes);
 // Session-owned contexts. Never replaced implicitly; slots are allocated by the
 // stage stub on first use and stay until destroy. Layers that share a residency
 // slot share the context, so its buffers and descriptor chain are built once.
-// Buffer i (the PMM included) is placed at region->va + offsets[i], the memory
-// table offset from the start of the slot.
-aimx_resident_context *aimx_model_create(aimx_model_region *region, size_t slots,
-                                         const int64_t *offsets);
+// Buffer i (the PMM included) is placed at va[i], its memory-table address in a
+// region of this FPGA, and may use at most capacity[i] bytes.
+aimx_resident_context *aimx_model_create(int fpga, size_t slots, const uint64_t *va,
+                                         const int64_t *capacity);
 void aimx_model_destroy(aimx_resident_context *context);
 int64_t aimx_model_live_bytes(aimx_resident_context *context);
 }
@@ -194,34 +217,16 @@ static inline void aimx_patch_descriptor_addresses(pim_isa_32_t *code,
 // memset 도 하지 않는다. MAP_ANONYMOUS 는 0 으로 채운 페이지를 주고, 재사용분은 stage 가
 // 쓰는 자리와 padding 을 0 으로 채우는 자리가 합쳐 buffer 전체를 덮으므로 남는 값이 없다
 // (chain 은 실제로 쓴 record 까지만 datacopy 한다).
-#ifndef AIMX_HOST_BUFFER_SLOTS
-#define AIMX_HOST_BUFFER_SLOTS 8
-#endif
-static __thread void *aimx_hb_ptr[AIMX_HOST_BUFFER_SLOTS];
-static __thread size_t aimx_hb_bytes[AIMX_HOST_BUFFER_SLOTS];
-
-// 칸이 비었는지는 포인터로 판단한다. 크기로 판단하면 0 byte 요청이 빈 칸과 같아진다.
-static inline void *aimx_host_buffer(size_t bytes) {
-  for (int i = 0; i < AIMX_HOST_BUFFER_SLOTS; i++)
-    if (aimx_hb_ptr[i] && aimx_hb_bytes[i] == bytes) {
-      void *p = aimx_hb_ptr[i];
-      aimx_hb_ptr[i] = NULL;
-      return p;
-    }
-  void *p = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
-                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  aimx_require(p != MAP_FAILED, "host buffer mmap failed");
-  return p;
-}
-
-static inline void aimx_host_free(void *p, size_t bytes) {
-  for (int i = 0; i < AIMX_HOST_BUFFER_SLOTS; i++)
-    if (!aimx_hb_ptr[i]) {
-      aimx_hb_ptr[i] = p;
-      aimx_hb_bytes[i] = bytes;
-      return;
-    }
-  munmap(p, bytes);
+//
+// cache 는 libaimx_resident 하나에 있어 모든 커널 DSO 가 함께 쓴다. DSO 마다 따로 두면
+// autotuning 처럼 후보마다 새 DSO 를 올릴 때 DSO 수만큼 buffer 가 쌓인다.
+// aimx_host_cache_clear 는 모든 thread 의 cache 를 돌려준다 (커널이 돌지 않을 때만 부른다).
+// aimx_host_cache_clear_thread 는 부른 thread 의 cache 만 돌려준다 (다른 thread 가 돌아도 된다).
+extern "C" {
+void *aimx_host_buffer(size_t bytes);
+void aimx_host_free(void *p, size_t bytes);
+void aimx_host_cache_clear();
+void aimx_host_cache_clear_thread();
 }
 
 // round-to-nearest-even bfloat16 변환. PIM 의 누산기는 표준 bf16 이 아니지만

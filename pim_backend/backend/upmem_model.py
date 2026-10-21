@@ -12,7 +12,7 @@ from .compiler import _run_translate
 from .residency import INPUT as INPUT_KIND, OUTPUT as OUTPUT_KIND, WEIGHT as WEIGHT_KIND
 from .residency import OperandRequirement, StageRequirement
 from .upmem_artifact import INPUT, MRAM_BASE, OUTPUT, WEIGHT, TransferStats, _artifact_bindings, _build_program
-from .runtime import current_invocation
+from .runtime import GroupLoader, current_invocation
 
 
 # binding role -> memory table 종류
@@ -95,9 +95,12 @@ class UPMEMModelRuntime:
         self.stages = []
         self.loaded_program = None
         self.memory = None
-        # group index -> native block 표. bind가 만들고 enter_layer가 보낸다.
-        self.groups = {}
-        self.loaded_group = None
+        # group index -> 그 group의 layer plan들 (실행 순서). place가 만들고 group 업로드가 쓴다.
+        self.plans_of_group = {}
+        # group 업로드 순서와 background pack (runtime.GroupLoader). place가 만든다.
+        self.loader = None
+        # 해제한 group 표들의 전송 통계
+        self.group_stats = {name: 0 for name, _ in TransferStats._fields_}
         self.totals = {"program_loads": 0, "device_compiles": 0, "weight_pushes": 0}
         pointer = ctypes.c_void_p
         uint = ctypes.c_uint32
@@ -109,6 +112,8 @@ class UPMEMModelRuntime:
             "stats": ([pointer, ctypes.POINTER(TransferStats)], None),
             "mapping": ([pointer, uints], None),
             "close": ([pointer], None),
+            "pools_acquire": ([pointer], None),
+            "pools_release": ([pointer], None),
             "group_create": ([uint, uint], pointer),
             "group_add": ([pointer, pointer], None),
             "group_push": ([pointer], None),
@@ -143,7 +148,9 @@ class UPMEMModelRuntime:
         group change overwrites only the weights.
         """
         self.memory = memory
+        self.loader = GroupLoader(memory.groups, self._pack_group, self._push_group, self._release_group)
         for plan in plans:
+            self.plans_of_group.setdefault(memory.group_of_layer[plan.index], []).append(plan)
             for stage in plan.stages:
                 stage.addresses = {
                     binding.symbol: MRAM_BASE + memory.entries[(plan.index, stage.name, index)].offset
@@ -166,24 +173,51 @@ class UPMEMModelRuntime:
                 for entry in self.memory.entries.values()]
 
     def bind(self, plans, units):
-        """Runtime: create the native handle of every placed stage on the open DPU set,
-        lay out every weight in its stage pool once, and record each group's block table."""
+        """Runtime: create the native handle of every placed stage on the open DPU set.
+        Weights move only when a group is entered."""
         for plan in plans:
             for stage in plan.stages:
                 self._create_stage(stage, units)
-        stages_of_group = {}
-        for plan in plans:
-            for stage in plan.stages:
-                if any(stage.weight_mask):
-                    stages_of_group.setdefault(self.memory.group_of_layer[plan.index], []).append(stage)
-        for group, stages in stages_of_group.items():
-            sizes = [binding.size for stage in stages for binding in stage.bindings
-                     if binding.role == WEIGHT]
-            self.groups[group] = self.library.upmem_model_group_create(len(sizes), max(sizes))
-            for stage in stages:
-                self.invoke(stage, stage.preparation_matrices, stage.preparation_output,
-                            upload_weights=PACK)
-                self.library.upmem_model_group_add(self.groups[group], stage.handle)
+
+    def _pack_group(self, group):
+        """Lay the group's weights out in the stage pools and build its block table.
+
+        PACK calls only fill host pools (no DPU access), so this may run while DPUs compute.
+        The table covers the group's weights, which are contiguous in MRAM.
+        """
+        plans = self.plans_of_group[group]
+        stages = [stage for plan in plans for stage in plan.stages if any(stage.weight_mask)]
+        if not stages:
+            return None
+        sizes = [binding.size for stage in stages for binding in stage.bindings
+                 if binding.role == WEIGHT]
+        table = self.library.upmem_model_group_create(len(sizes), max(sizes))
+        for stage in stages:
+            self.library.upmem_model_pools_acquire(stage.handle)
+            self.invoke(stage, stage.preparation_matrices, stage.preparation_output,
+                        upload_weights=PACK)
+            self.library.upmem_model_group_add(table, stage.handle)
+        return table, stages, plans[0].stages[0]
+
+    def _push_group(self, packed):
+        if packed is None:
+            return
+        table, _, first = packed
+        self.load_program(first)
+        self.library.upmem_model_group_push(table)
+        self.totals["weight_pushes"] += 1
+
+    def _release_group(self, packed):
+        if packed is None:
+            return
+        table, stages, _ = packed
+        stats = TransferStats()
+        self.library.upmem_model_group_stats(table, ctypes.byref(stats))
+        for name in self.group_stats:
+            self.group_stats[name] += getattr(stats, name)
+        self.library.upmem_model_group_close(table)
+        for stage in stages:
+            self.library.upmem_model_pools_release(stage.handle)
 
     def _create_stage(self, stage, units):
         uint = ctypes.c_uint32
@@ -219,17 +253,13 @@ class UPMEMModelRuntime:
         stage.function(stage.handle, *stage.scalar_arguments)
 
     def enter_layer(self, plan):
-        # group이 이미 올라와 있으면 보내지 않는다. 아니면 group 전체 weight를 한 번에 보낸다.
-        group = self.memory.group_of_layer[plan.index]
-        if group == self.loaded_group or group not in self.groups:
-            return
-        self.load_program(plan.stages[0])
-        self.library.upmem_model_group_push(self.groups[group])
-        self.totals["weight_pushes"] += 1
-        self.loaded_group = group
+        # group이 바뀔 때만 그 group 전체 weight를 한 번에 보낸다 (pack은 대개 앞 group 실행 중에 끝나 있다).
+        self.loader.enter(self.memory.group_of_layer[plan.index])
 
     def exit_layer(self, plan):
-        """다음 group이 같은 weight 영역을 덮어쓴다. 해제할 device 상태는 없다."""
+        """다음 group이 같은 weight 영역을 덮어쓴다. 이번 요청에서 다시 돌지 않는 layer의 host pool을 놓는다."""
+        for stage in plan.stages:
+            self.library.upmem_model_pools_release(stage.handle)
 
     def weight_table(self, plans):
         table = {}
@@ -246,6 +276,7 @@ class UPMEMModelRuntime:
         return table
 
     def run(self, stage, matrices, output):
+        self.library.upmem_model_pools_acquire(stage.handle)
         self.load_program(stage)
         self.invoke(stage, matrices, output)
 
@@ -256,18 +287,16 @@ class UPMEMModelRuntime:
             self.library.upmem_model_stats(stage.handle, ctypes.byref(stats))
             for name in totals:
                 totals[name] += getattr(stats, name)
-        for group in self.groups.values():
-            stats = TransferStats()
-            self.library.upmem_model_group_stats(group, ctypes.byref(stats))
-            for name in totals:
-                totals[name] += getattr(stats, name)
+        for name in totals:
+            totals[name] += self.group_stats[name]
         totals.update(self.totals)
+        totals.update(self.loader.totals)
         return totals
 
     def close(self):
+        # background pack이 stage pool을 쓰고 있을 수 있으므로 먼저 끝낸다.
+        if self.loader is not None:
+            self.loader.close()
         for stage in self.stages:
             self.library.upmem_model_close(stage.handle)
         self.stages.clear()
-        for group in self.groups.values():
-            self.library.upmem_model_group_close(group)
-        self.groups.clear()

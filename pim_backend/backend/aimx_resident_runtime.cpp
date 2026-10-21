@@ -6,6 +6,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -18,9 +19,9 @@ struct DeviceState {
   std::string plan;
   std::vector<aimx_resident_buffer> buffers;
   aimx_resident_context context{};
-  // model context만 쓴다. buffer i는 region 시작에서 offsets[i]에 놓인다 (memory table).
-  aimx_model_region *region = nullptr;
-  std::vector<int64_t> offsets;
+  // model context만 쓴다. buffer i는 memory table 주소 va[i]에 놓이고 capacity[i]까지 쓴다.
+  std::vector<uint64_t> placed_va;
+  std::vector<int64_t> placed_capacity;
 };
 struct Registry {
   std::mutex mutex;
@@ -45,7 +46,7 @@ void checkProcess(Registry &r) {
 void clear(DeviceState &state) {
   for (auto it = state.buffers.rbegin(); it != state.buffers.rend(); ++it) {
     // region 안의 buffer는 따로 할당하지 않았으므로 region을 해제할 때 함께 사라진다.
-    if (it->va && !state.region)
+    if (it->va && state.placed_va.empty())
       pim_free((void *)it->va, state.fpga);
     if (it->host)
       munmap(it->host, (size_t)it->bytes);
@@ -54,7 +55,76 @@ void clear(DeviceState &state) {
   state.plan.clear();
   state.context = {};
 }
+
+// host 조립 buffer cache (aimx_runtime.h). thread마다 칸을 두어 get/put에는 lock이 없고,
+// 모든 thread의 칸을 비울 수 있도록 처음 쓸 때 전역 목록에 등록한다.
+constexpr int kHostBufferSlots = 8;
+struct HostBufferCache {
+  void *ptr[kHostBufferSlots] = {};
+  size_t bytes[kHostBufferSlots] = {};
+};
+std::mutex &hostCacheMutex() {
+  static auto *value = new std::mutex;
+  return *value;
+}
+std::vector<HostBufferCache *> &hostCaches() {
+  static auto *value = new std::vector<HostBufferCache *>;
+  return *value;
+}
+HostBufferCache &hostCache() {
+  thread_local HostBufferCache *cache = nullptr;
+  if (!cache) {
+    cache = new HostBufferCache;
+    std::lock_guard<std::mutex> lock(hostCacheMutex());
+    hostCaches().push_back(cache);
+  }
+  return *cache;
+}
 } // namespace
+
+// 칸이 비었는지는 포인터로 판단한다. 크기로 판단하면 0 byte 요청이 빈 칸과 같아진다.
+extern "C" void *aimx_host_buffer(size_t bytes) {
+  HostBufferCache &cache = hostCache();
+  for (int i = 0; i < kHostBufferSlots; i++)
+    if (cache.ptr[i] && cache.bytes[i] == bytes) {
+      void *p = cache.ptr[i];
+      cache.ptr[i] = nullptr;
+      return p;
+    }
+  void *p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  aimx_require(p != MAP_FAILED, "host buffer mmap failed");
+  return p;
+}
+
+extern "C" void aimx_host_free(void *p, size_t bytes) {
+  HostBufferCache &cache = hostCache();
+  for (int i = 0; i < kHostBufferSlots; i++)
+    if (!cache.ptr[i]) {
+      cache.ptr[i] = p;
+      cache.bytes[i] = bytes;
+      return;
+    }
+  munmap(p, bytes);
+}
+
+extern "C" void aimx_host_cache_clear() {
+  std::lock_guard<std::mutex> lock(hostCacheMutex());
+  for (HostBufferCache *cache : hostCaches())
+    for (int i = 0; i < kHostBufferSlots; i++)
+      if (cache->ptr[i]) {
+        munmap(cache->ptr[i], cache->bytes[i]);
+        cache->ptr[i] = nullptr;
+      }
+}
+
+extern "C" void aimx_host_cache_clear_thread() {
+  HostBufferCache &cache = hostCache();
+  for (int i = 0; i < kHostBufferSlots; i++)
+    if (cache.ptr[i]) {
+      munmap(cache.ptr[i], cache.bytes[i]);
+      cache.ptr[i] = nullptr;
+    }
+}
 
 extern "C" int aimx_runtime_init(int base_fpga, int num_fpga) {
   Registry &r = registry();
@@ -121,11 +191,11 @@ extern "C" aimx_resident_buffer *aimx_resident_alloc(
   buffer.bytes = bytes;
   buffer.alignment = alignment;
   buffer.kind = kind;
-  if (state.region) {
-    // memory table이 정한 자리. PMM을 포함한 모든 buffer가 slot region 안에 놓인다.
-    aimx_require(state.offsets[slot] >= 0 && state.offsets[slot] + bytes <= state.region->bytes,
-                 "resident buffer exceeds its memory-table region");
-    buffer.va = state.region->va + (uint64_t)state.offsets[slot];
+  if (!state.placed_va.empty()) {
+    // memory table이 정한 자리. PMM을 포함한 모든 buffer가 region 안에 놓인다.
+    aimx_require(bytes <= state.placed_capacity[slot],
+                 "resident buffer exceeds its memory-table entry");
+    buffer.va = state.placed_va[slot];
   } else {
     // Own PMM explicitly. Vendor private_pool.c keys its cached PMM by thread ID,
     // which is not a stable ownership key for a persistent physical-device plan.
@@ -226,14 +296,42 @@ extern "C" void aimx_model_region_destroy(aimx_model_region *region) {
   delete region;
 }
 
-extern "C" aimx_resident_context *aimx_model_create(aimx_model_region *region, size_t slots,
-                                                    const int64_t *offsets) {
-  aimx_require(region && slots > 0 && offsets, "a model context needs a region and buffer offsets");
+extern "C" void aimx_model_push(size_t count, aimx_model_region *const *regions,
+                                void *const *hosts, const int64_t *bytes) {
+  // FPGA마다 thread 하나가 자기 FPGA의 region들을 차례로 보낸다.
+  std::map<int, std::vector<size_t>> byFpga;
+  for (size_t i = 0; i < count; ++i) {
+    aimx_require(bytes[i] > 0 && bytes[i] <= regions[i]->bytes, "push exceeds its region");
+    byFpga[regions[i]->fpga].push_back(i);
+  }
+  std::vector<std::thread> threads;
+  for (const auto &entry : byFpga) {
+    int fpga = entry.first;
+    const std::vector<size_t> &items = entry.second;
+    threads.emplace_back([regions, hosts, bytes, fpga, &items] {
+      for (size_t i : items)
+        aimx_require(aimx_copy_to_pim((void *)regions[i]->va, hosts[i], (size_t)bytes[i], fpga) >= 0,
+                     "weight push failed");
+    });
+  }
+  for (auto &thread : threads)
+    thread.join();
+}
+
+extern "C" aimx_resident_context *aimx_model_create(int fpga, size_t slots, const uint64_t *va,
+                                                    const int64_t *capacity) {
+  Registry &r = registry();
+  checkProcess(r);
+  {
+    std::lock_guard<std::mutex> lock(r.mutex);
+    aimx_require(r.devices.count(fpga) == 1, "model context on an unopened FPGA");
+  }
+  aimx_require(slots > 0 && va && capacity, "a model context needs buffer addresses");
   auto *state = new DeviceState;
-  state->fpga = region->fpga;
+  state->fpga = fpga;
   state->plan = "model";
-  state->region = region;
-  state->offsets.assign(offsets, offsets + slots);
+  state->placed_va.assign(va, va + slots);
+  state->placed_capacity.assign(capacity, capacity + slots);
   state->buffers.resize(slots);
   state->context = {state->buffers.data(), slots, false, state};
   return &state->context;

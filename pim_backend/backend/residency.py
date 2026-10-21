@@ -4,20 +4,24 @@ Adapters report only numbers: their actual units, the capacity of one unit and
 the per-unit bytes of every stage operand. The planner never sees vendor handles.
 
 Every unit has the same layout, so one table of offsets from the unit's memory
-base serves all units. Weight slots come first: one slot holds the weights and
-state of one layer's stages, layer i takes slot i mod slots and belongs to
-group i // slots. If every layer fits there is one group; otherwise the layers
-of one group fill every slot and are uploaded together, overwriting only the
-weights of the previous group while buffers and instructions stay in place.
-The input and output scratch follow the slots; every stage uses them from
-their start, so each is as large as its largest stage.
+base serves all units. One slot holds the weights and state of one layer's
+stages; layer i takes slot i mod slots and belongs to group i // slots. If every
+layer fits there is one group; otherwise the layers of one group fill every slot
+and are uploaded together, overwriting only the weights of the previous group
+while buffers and instructions stay in place.
+
+The unit is laid out as three areas: the weights of every slot, then the state
+of every slot, then the input and output scratch. The weights of one group are
+therefore one contiguous range from the unit base, so a group upload is one
+transfer per unit. Every stage uses the scratch from its start, so each scratch
+part is as large as its largest stage.
 """
 
 from dataclasses import dataclass
 
 
 WEIGHT = "weight"
-# weight가 아닌 장치 상주 memory (descriptor chain, stage 전용 activation buffer)
+# weight가 아닌 장치 상주 memory (실행 사이에 남아야 하는 descriptor chain, PMM 등)
 STATE = "state"
 INPUT = "input"
 OUTPUT = "output"
@@ -92,6 +96,9 @@ class MemoryTable:
     group_of_layer: dict
     # slot마다 weight + state bytes
     slot_bytes: tuple
+    # slot마다 weight bytes와 state bytes. weight 영역은 unit 시작, state 영역은 그 뒤다.
+    slot_weight_bytes: tuple
+    slot_state_bytes: tuple
     scratch_bytes: int
     bytes_per_unit: int
     # (layer, stage, operand) -> MemoryEntry
@@ -107,14 +114,16 @@ def plan_memory(resources, requirements):
     layers = sorted({requirement.layer for requirement in requirements})
     stages = {layer: [requirement for requirement in requirements if requirement.layer == layer]
               for layer in layers}
-    layer_bytes = {layer: sum(requirement.weight_bytes + requirement.state_bytes
-                              for requirement in stages[layer])
+    layer_weight = {layer: sum(requirement.weight_bytes for requirement in stages[layer])
+                    for layer in layers}
+    layer_state = {layer: sum(requirement.state_bytes for requirement in stages[layer])
                    for layer in layers}
     input_bytes = max(requirement.input_bytes for requirement in requirements)
     output_bytes = max(requirement.output_bytes for requirement in requirements)
     scratch = input_bytes + output_bytes
-    if sum(layer_bytes.values()) + scratch <= resources.capacity_bytes:
-        slot_bytes = tuple(layer_bytes[layer] for layer in layers)
+    if sum(layer_weight.values()) + sum(layer_state.values()) + scratch <= resources.capacity_bytes:
+        slot_weight_bytes = tuple(layer_weight[layer] for layer in layers)
+        slot_state_bytes = tuple(layer_state[layer] for layer in layers)
     else:
         # 한 slot에 여러 layer가 차례로 들어가므로 operand별 크기가 모두 같아야 한다.
         layouts = {layer: [(operand.kind, operand.bytes) for requirement in stages[layer]
@@ -125,40 +134,38 @@ def plan_memory(resources, requirements):
                 raise ValueError(
                     f"layers share a slot; layer {layer} operands need {layouts[layer]} bytes, "
                     f"layer {layers[0]} operands {layouts[layers[0]]}")
-        slots = (resources.capacity_bytes - scratch) // layer_bytes[layers[0]]
+        layer_bytes = layer_weight[layers[0]] + layer_state[layers[0]]
+        slots = (resources.capacity_bytes - scratch) // layer_bytes
         if slots < 1:
             raise ValueError(
-                f"one layer does not fit one unit: it needs {layer_bytes[layers[0]]} bytes "
+                f"one layer does not fit one unit: it needs {layer_bytes} bytes "
                 f"and scratch {scratch}, capacity is {resources.capacity_bytes}")
-        slot_bytes = (layer_bytes[layers[0]],) * slots
+        slot_weight_bytes = (layer_weight[layers[0]],) * slots
+        slot_state_bytes = (layer_state[layers[0]],) * slots
+    slot_bytes = tuple(weight + state for weight, state in zip(slot_weight_bytes, slot_state_bytes))
     slots = len(slot_bytes)
     slot_of_layer = {layer: position % slots for position, layer in enumerate(layers)}
     group_of_layer = {layer: position // slots for position, layer in enumerate(layers)}
 
-    weight_end = sum(slot_bytes)
+    weight_end = sum(slot_weight_bytes)
+    state_end = weight_end + sum(slot_state_bytes)
     entries = {}
     for layer in layers:
         slot = slot_of_layer[layer]
-        # slot은 앞 slot들의 영역 바로 뒤에서 시작한다. 같은 slot의 layer는 같은 offset을 받는다.
-        offset = sum(slot_bytes[:slot])
+        # 같은 slot의 layer는 같은 offset을 받는다. weight는 weight 영역, state는 state 영역의
+        # 앞 slot들 바로 뒤에서 시작한다.
+        offsets = {WEIGHT: sum(slot_weight_bytes[:slot]), STATE: weight_end + sum(slot_state_bytes[:slot])}
         for requirement in stages[layer]:
-            input_offset = weight_end
-            output_offset = weight_end + input_bytes
+            offsets[INPUT] = state_end
+            offsets[OUTPUT] = state_end + input_bytes
             for operand in requirement.operands:
-                key = (layer, requirement.stage, operand.operand)
-                if operand.kind in (WEIGHT, STATE):
-                    entries[key] = MemoryEntry(operand.kind, layer, requirement.stage,
-                                               operand.operand, slot, group_of_layer[layer],
-                                               offset, operand.bytes)
-                    offset += operand.bytes
-                elif operand.kind == INPUT:
-                    entries[key] = MemoryEntry(INPUT, layer, requirement.stage, operand.operand,
-                                               None, None, input_offset, operand.bytes)
-                    input_offset += operand.bytes
-                else:
-                    entries[key] = MemoryEntry(OUTPUT, layer, requirement.stage, operand.operand,
-                                               None, None, output_offset, operand.bytes)
-                    output_offset += operand.bytes
+                resident = operand.kind in (WEIGHT, STATE)
+                entries[(layer, requirement.stage, operand.operand)] = MemoryEntry(
+                    operand.kind, layer, requirement.stage, operand.operand,
+                    slot if resident else None, group_of_layer[layer] if resident else None,
+                    offsets[operand.kind], operand.bytes)
+                offsets[operand.kind] += operand.bytes
     return MemoryTable(resources.units, resources.capacity_bytes, slots,
                        max(group_of_layer.values()) + 1, slot_of_layer, group_of_layer,
-                       slot_bytes, scratch, weight_end + scratch, entries)
+                       slot_bytes, slot_weight_bytes, slot_state_bytes, scratch,
+                       state_end + scratch, entries)

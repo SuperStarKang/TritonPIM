@@ -490,7 +490,7 @@ def compile_model(layers, example_inputs, *, target, units, runtime_options=None
             "measured": len(candidates[stage_class.key]),
             "selected": {"config": asdict(selected[stage_class.key].config),
                          "execution_ms": selected[stage_class.key].execution_ms,
-                         # 격리 측정의 첫 업로드. UPMEM은 bind에서 weight를 배치하므로 전송만 들어간다.
+                         # 격리 측정의 첫 업로드. group 진입 때 pack과 전송이 함께 일어나므로 둘 다 들어간다.
                          "first_upload_ms": selected[stage_class.key].upload_ms,
                          "footprint": asdict(selected[stage_class.key].footprint)},
         } for stage_class in classes],

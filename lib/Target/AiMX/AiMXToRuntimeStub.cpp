@@ -50,6 +50,8 @@ struct StubEmitter {
   // model stage 가 Python 에 내보내는 표. slot 마다 크기와 그 slot 을 채우거나 비우는 host 인자.
   SmallVector<int64_t> slotBytes;
   SmallVector<int64_t> slotInput, slotOutput;
+  // slot 마다 aimx::AllocKind (0 data, 1 descriptor, 2 PMM). adapter 가 memory table 종류를 정한다.
+  SmallVector<int64_t> slotKinds;
   int64_t modelDevices = 0;
   unsigned modelPlans = 0;
 
@@ -218,6 +220,9 @@ struct StubEmitter {
     os() << "};\n// slot 을 unstage 로 비우는 host 인자 번호, 없으면 -1\n"
          << "extern \"C\" const int64_t pim_model_slot_output[" << slotBytes.size() << "] = {";
     list(slotOutput);
+    os() << "};\n// slot 의 aimx::AllocKind: 0 data, 1 descriptor chain, 2 PMM\n"
+         << "extern \"C\" const int64_t pim_model_slot_kind[" << slotBytes.size() << "] = {";
+    list(slotKinds);
     os() << "};\n";
   }
 
@@ -276,8 +281,19 @@ struct StubEmitter {
       e.bind(global.getResult(), ("(&aimx_data_" + global.getName() + ")").str());
       return success();
     }
-    if (auto region = dyn_cast<scf::ExecuteRegionOp>(op))
-      return emitConstruction(region, depth);
+    if (auto region = dyn_cast<scf::ExecuteRegionOp>(op)) {
+      if (!model)
+        return emitConstruction(region, depth);
+      // model stage 의 pack(2) 호출은 host image 만 채운다. device 에 아무것도 보내지 않아야
+      // 다른 stage 가 PIM 연산을 하는 동안 background 에서 돌 수 있다 (연산과 DMA 는 겹칠 수 없다).
+      e.indent(depth);
+      os() << "if (_model->upload != 2) {\n";
+      if (failed(emitConstruction(region, depth + 1)))
+        return failure();
+      e.indent(depth);
+      os() << "}\n";
+      return success();
+    }
     if (auto fd = dyn_cast<aimx::ForeachDeviceOp>(op))
       return emitForeachDevice(fd, depth);
     // PIM_TIMING: 단계 하나가 끝날 때마다 그 칸에 더한다. 칸 이름은 driver.py 에 있다.
@@ -300,7 +316,7 @@ struct StubEmitter {
         mark(kH2D, depth);
         return success();
       }
-      // weight 는 upload 호출에서만, activation 과 상수는 실행 호출에서만 올린다.
+      // weight 는 upload(1)·pack(2) 호출에서만, activation 과 상수는 실행 호출에서만 올린다.
       int64_t argument = hostArgument(st.getSrc());
       int slot = buffers.lookup(st.getDst()).slot;
       if (slot < 0)
@@ -308,7 +324,7 @@ struct StubEmitter {
       slotInput[slot] = argument;
       e.indent(depth);
       if (argument >= 0)
-        os() << "if (_model->weights[" << argument << "] == _model->upload) {\n";
+        os() << "if (_model->weights[" << argument << "] == (_model->upload != 0)) {\n";
       else
         os() << "if (!_model->upload) {\n";
       if (failed(emitStage(st, depth + 1)))
@@ -561,6 +577,7 @@ struct StubEmitter {
         slotBytes.push_back(b.bytes);
         slotInput.push_back(-1);
         slotOutput.push_back(-1);
+        slotKinds.push_back(static_cast<int64_t>(b.kind));
       }
       e.indent(depth);
       os() << "aimx_resident_buffer &" << n
@@ -1135,9 +1152,15 @@ struct StubEmitter {
     // 공유 slot 이면 먼저 온 thread 가 조립하는 동안 기다린 시간도 여기 들어간다.
     mark(kLayoutIn, depth + 1);
     e.indent(depth + 1);
-    os() << "aimx_require(aimx_copy_to_pim((void*)" << b.va << ", " << host
-         << ", (size_t)" << padRows << " * (size_t)" << pitch << " * "
-         << bytes << ", _fpga) >= 0, \"input upload failed\");\n";
+    // model stage 는 pack 호출이면 device 대신 job 의 pack host 영역에 쓴다.
+    if (model)
+      os() << "aimx_require(aimx_model_copy_to_pim(_model, (uint32_t)_job, (void*)" << b.va
+           << ", " << host << ", (size_t)" << padRows << " * (size_t)" << pitch << " * "
+           << bytes << ", _fpga) >= 0, \"input upload failed\");\n";
+    else
+      os() << "aimx_require(aimx_copy_to_pim((void*)" << b.va << ", " << host
+           << ", (size_t)" << padRows << " * (size_t)" << pitch << " * "
+           << bytes << ", _fpga) >= 0, \"input upload failed\");\n";
     e.indent(depth);
     os() << "}\n";
     return success();

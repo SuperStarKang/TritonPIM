@@ -2,27 +2,34 @@
 
 Each stage runs one model stub (--aimx-to-model-stub). Instances are batched over
 FPGAs: job = batch slot * devices + device, and every job owns one context on
-one FPGA. Weights are staged only by upload calls; run calls stage activations.
-Layers that share a memory slot share these contexts: buffers and descriptor
-chains are built once. Entering the first layer of a layer group uploads the
-weights of every layer in the group, which then run without further uploads.
+one FPGA. Run calls stage activations; weights are staged only by pack calls,
+which write a group's weights into one host image per FPGA laid out like the
+group's weight range. Entering the first layer of a group copies its images with
+one transfer per (region, FPGA) and drops them; the group's layers then run
+without further uploads. While a group runs, a background thread packs the next
+group: pack calls write host memory only, since PIM computation and DMA to the
+same FPGA cannot overlap.
 
-Buffer addresses come from the memory table: every slot is one region (one
-pim_malloc) per FPGA, and every buffer of a context, the PMM included, sits at
-its table offset from the start of the slot.
+Buffer addresses come from the memory table, laid out as the weights of every
+slot, the state of every slot (descriptor chain, PMM), then the activation
+scratch. The table is cut at slot boundaries into regions of at most one vendor
+allocation, one pim_malloc per region and FPGA.
 """
 
+import bisect
 import ctypes
 import time
 
 from .compiler import _run_translate
-from .residency import STATE, WEIGHT, OperandRequirement, StageRequirement
-from .runtime import current_invocation
+from .residency import INPUT, OUTPUT, STATE, WEIGHT, OperandRequirement, StageRequirement
+from .runtime import GroupLoader, current_invocation
 
 # operand 시작 주소 정렬. data buffer는 16 KB 정렬이 필요하고(8 KB면 결과가 틀린다, batch 8 실측),
 # PMM은 256 KB 정렬이 필요하다(AiMXDialect kPMMAlign). 모든 operand를 이 배수로 보고하므로
 # table의 offset은 모두 두 조건을 함께 만족한다.
 OPERAND_ALIGNMENT = 256 * 1024
+# vendor multi_mmap_drv(int size)가 2 GiB에서 overflow하므로 region(pim_malloc) 하나의 상한이다.
+MAX_REGION_BYTES = 1023 * 2 * 1024 * 1024
 
 
 class AiMXModelRegion(ctypes.Structure):
@@ -46,6 +53,8 @@ class AiMXModelCall(ctypes.Structure):
         ("arguments", ctypes.c_uint32),
         ("upload", ctypes.c_int),
         ("batch_base", ctypes.c_uint32),
+        ("pack_hosts", ctypes.POINTER(ctypes.c_void_p)),
+        ("pack_vas", ctypes.POINTER(ctypes.c_uint64)),
     ]
 
 
@@ -121,6 +130,8 @@ class ModelCompileInvocation:
             raise RuntimeError(f"{stage.name}: model stub devices differ from [p_m,p_n,p_k]")
         stage.slot_bytes = tuple((ctypes.c_int64 * slots).in_dll(library, "pim_model_slot_bytes"))
         slot_input = tuple((ctypes.c_int64 * slots).in_dll(library, "pim_model_slot_input"))
+        slot_output = tuple((ctypes.c_int64 * slots).in_dll(library, "pim_model_slot_output"))
+        slot_kinds = tuple((ctypes.c_int64 * slots).in_dll(library, "pim_model_slot_kind"))
 
         # 포인터 인자가 어느 GEMM operand인지: 0/1은 입력, 2는 출력.
         stage.scalar_arguments = []
@@ -144,6 +155,11 @@ class ModelCompileInvocation:
         stage.slot_weights = tuple(
             argument >= 0 and stage.argument_weights[argument] == 1
             for argument in slot_input)
+        # memory table 종류: weight, state(descriptor chain 1, PMM 2: 실행 사이에 남아야 한다),
+        # output(unstage로 비우는 buffer), 나머지는 실행마다 다시 채우는 input(activation, 상수 등)
+        stage.slot_table_kinds = tuple(
+            WEIGHT if weight else STATE if kind in (1, 2) else OUTPUT if output >= 0 else INPUT
+            for weight, kind, output in zip(stage.slot_weights, slot_kinds, slot_output))
 
 
 class AiMXModelRuntime:
@@ -154,84 +170,105 @@ class AiMXModelRuntime:
         # context를 가진 stage. slot을 공유하는 다른 layer의 stage는 여기 없다.
         self.stages = []
         self.memory = None
-        # (memory slot, FPGA) -> aimx_model_region. bind가 만들고 close가 context 다음에 해제한다.
+        # table을 자른 region들의 (시작 offset, bytes). place가 만들고 bind가 FPGA마다 할당한다.
+        self.chunks = []
+        # (chunk index, FPGA) -> aimx_model_region. close가 context 다음에 해제한다.
         self.regions = {}
-        # group index -> 그 group의 layer plan들 (실행 순서). place가 만들고 enter_layer가 올린다.
+        # group index -> 그 group의 layer plan들 (실행 순서). place가 만들고 group 업로드가 쓴다.
         self.plans_of_group = {}
-        self.loaded_group = None
-        self.loaded_program = None
-        self.totals = {"weight_uploads": 0, "weight_bytes": 0, "invocations": 0,
-                       "upload_wall_ms": 0.0, "run_wall_ms": 0.0}
-        # "upload:mm" 처럼 (호출 종류, stage 이름)마다 layer를 합친 호출 수, wall time, native 칸별 시간.
+        # group 업로드 순서와 background pack (runtime.GroupLoader). place가 만든다.
+        self.loader = None
+        self.totals = {"weight_bytes": 0, "invocations": 0, "run_wall_ms": 0.0}
+        # "run:mm" 처럼 stage 이름마다 layer를 합친 호출 수, wall time, native 칸별 시간.
         self.breakdown = {}
 
     def compile_invocation(self, stage, physical_inputs):
         return ModelCompileInvocation(self, stage, physical_inputs)
 
     @staticmethod
-    def _bytes(stage, weights):
-        return sum(size for size, weight in zip(stage.slot_bytes, stage.slot_weights)
-                   if weight == weights)
+    def _bytes(stage, kind):
+        return sum(size for size, table_kind in zip(stage.slot_bytes, stage.slot_table_kinds)
+                   if table_kind == kind)
 
     def requirements(self, plans):
-        # stage마다 자기 activation buffer를 가지므로 공용 scratch는 없고 state에 들어간다.
-        # PMM(buffer 0)도 state다. bytes를 OPERAND_ALIGNMENT 배수로 올려 모든 offset을 정렬한다.
+        # weight와 state(descriptor chain, PMM)는 layer의 slot에, activation(input/output)은 모든
+        # stage가 처음부터 함께 쓰는 scratch에 놓인다. bytes를 OPERAND_ALIGNMENT 배수로 올려
+        # 모든 offset을 정렬한다.
         return [
             StageRequirement(plan.index, stage.name, tuple(
-                OperandRequirement(index, WEIGHT if weight else STATE,
+                OperandRequirement(index, kind,
                                    (size + OPERAND_ALIGNMENT - 1) // OPERAND_ALIGNMENT * OPERAND_ALIGNMENT)
-                for index, (size, weight) in enumerate(zip(stage.slot_bytes, stage.slot_weights))))
+                for index, (size, kind) in enumerate(zip(stage.slot_bytes, stage.slot_table_kinds))))
             for plan in plans for stage in plan.stages
         ]
 
     def place(self, plans, memory):
         self.memory = memory
         for plan in plans:
-            slot = memory.slot_of_layer[plan.index]
-            slot_start = sum(memory.slot_bytes[:slot])
-            for stage in plan.stages:
-                # slot 시작부터의 offset. FPGA마다 slot 하나가 region 하나다.
-                stage.offsets = tuple(memory.entries[(plan.index, stage.name, index)].offset - slot_start
-                                      for index in range(len(stage.slot_bytes)))
             self.plans_of_group.setdefault(memory.group_of_layer[plan.index], []).append(plan)
-            plan.weight_bytes_per_unit = sum(self._bytes(stage, True) for stage in plan.stages)
+            plan.weight_bytes_per_unit = sum(self._bytes(stage, WEIGHT) for stage in plan.stages)
             plan.backend_plan = {
                 "slot": memory.slot_of_layer[plan.index],
+                "group": memory.group_of_layer[plan.index],
                 "weight_bytes": plan.weight_bytes_per_unit,
-                "state_bytes": sum(self._bytes(stage, False) for stage in plan.stages),
+                "state_bytes": sum(self._bytes(stage, STATE) for stage in plan.stages),
+                "scratch_bytes": memory.scratch_bytes,
                 "bytes_per_unit": memory.bytes_per_unit,
             }
+        self.loader = GroupLoader(memory.groups, self._pack_group, self._push_group, lambda packed: None)
+        # slot의 weight, slot의 state, scratch 순서로 이어진 조각을 region 상한까지 묶는다.
+        # 조각 하나는 나누지 않으므로 한 slot의 weight는 언제나 한 region 안에 있다.
+        start = 0
+        for size in (*memory.slot_weight_bytes, *memory.slot_state_bytes, memory.scratch_bytes):
+            if size > MAX_REGION_BYTES:
+                raise ValueError(f"a memory-table piece of {size} bytes exceeds one AiMX region "
+                                 f"({MAX_REGION_BYTES} bytes)")
+            if self.chunks and self.chunks[-1][1] + size <= MAX_REGION_BYTES:
+                self.chunks[-1] = (self.chunks[-1][0], self.chunks[-1][1] + size)
+            elif size:
+                self.chunks.append((start, size))
+            start += size
+
+    def _address(self, entry, fpga, field):
+        """va or pa of a table entry on one FPGA: the region holding its offset."""
+        index = bisect.bisect_right([chunk_start for chunk_start, _ in self.chunks], entry.offset) - 1
+        region = ctypes.cast(self.regions[(index, fpga)], ctypes.POINTER(AiMXModelRegion)).contents
+        return getattr(region, field) + entry.offset - self.chunks[index][0]
 
     def bind(self, plans):
-        """Runtime: one region per memory slot on every FPGA, then the contexts of every slot
-        at the table offsets; the first layer of a slot creates them."""
-        for slot, slot_bytes in enumerate(self.memory.slot_bytes):
-            for fpga in range(self.base_fpga, self.base_fpga + self.units):
-                self.regions[(slot, fpga)] = self.library.aimx_model_region_create(
-                    fpga, slot_bytes, OPERAND_ALIGNMENT)
+        """Runtime: the regions on every FPGA, then the contexts at the table addresses; the
+        first layer of a slot creates them. Weights move only when a group is entered."""
+        for fpga in range(self.base_fpga, self.base_fpga + self.units):
+            for index, (_, size) in enumerate(self.chunks):
+                self.regions[(index, fpga)] = self.library.aimx_model_region_create(
+                    fpga, size, OPERAND_ALIGNMENT)
         first = {}
         for plan in plans:
-            slot = self.memory.slot_of_layer[plan.index]
-            owner = first.setdefault(slot, plan)
+            owner = first.setdefault(self.memory.slot_of_layer[plan.index], plan)
             for stage, slot_stage in zip(plan.stages, owner.stages):
-                self._create_stage(stage, slot_stage, slot)
+                self._create_stage(plan, stage, slot_stage)
 
-    def _create_stage(self, stage, slot_stage, slot):
+    def _create_stage(self, plan, stage, slot_stage):
         jobs = stage.p_b * stage.devices
         if jobs > self.units:
             raise ValueError(f"{stage.name}: {jobs} jobs exceed {self.units} FPGAs")
         arguments = len(stage.scalar_arguments)
+        entries = [self.memory.entries[(plan.index, stage.name, index)]
+                   for index in range(len(stage.slot_bytes))]
+        stage.offsets = tuple(entry.offset for entry in entries)
         if slot_stage is stage:
             stage.fpgas = (ctypes.c_int * jobs)(*(self.base_fpga + job for job in range(jobs)))
-            offsets = (ctypes.c_int64 * len(stage.offsets))(*stage.offsets)
             stage.contexts = (ctypes.c_void_p * jobs)(*(
-                self.library.aimx_model_create(self.regions[(slot, fpga)], len(stage.offsets), offsets)
+                self.library.aimx_model_create(
+                    fpga, len(entries),
+                    (ctypes.c_uint64 * len(entries))(*(self._address(entry, fpga, "va") for entry in entries)),
+                    (ctypes.c_int64 * len(entries))(*(entry.bytes for entry in entries)))
                 for fpga in stage.fpgas))
             self.stages.append(stage)
         else:
-            # 같은 slot의 context(device buffer, descriptor chain)를 쓰므로 slot 표가 같아야 한다.
-            if (stage.slot_bytes, stage.slot_weights, stage.offsets, jobs) != (
-                    slot_stage.slot_bytes, slot_stage.slot_weights, slot_stage.offsets,
+            # 같은 slot의 context(device buffer, descriptor chain)를 쓰므로 배치가 같아야 한다.
+            if (stage.slot_bytes, stage.slot_table_kinds, stage.offsets, jobs) != (
+                    slot_stage.slot_bytes, slot_stage.slot_table_kinds, slot_stage.offsets,
                     slot_stage.p_b * slot_stage.devices):
                 raise ValueError(f"{stage.name}: slot layout differs from {slot_stage.name} "
                                  "of the shared memory slot")
@@ -244,14 +281,13 @@ class AiMXModelRuntime:
             ctypes.cast(stage.fpgas, ctypes.POINTER(ctypes.c_int)),
             ctypes.cast(stage.pointers, ctypes.POINTER(ctypes.c_void_p)),
             ctypes.cast(stage.weight_flags, ctypes.POINTER(ctypes.c_int)),
-            stage.instance_count, stage.p_b, arguments, 0, 0,
+            stage.instance_count, stage.p_b, arguments, 0, 0, None, None,
         )
-        for phase in ("upload", "run"):
-            self.breakdown.setdefault(f"{phase}:{stage.name}", {
-                "calls": 0, "jobs": jobs, "wall_ms": 0.0,
-                **dict.fromkeys(stage.timing_names, 0.0)})
+        self.breakdown.setdefault(f"run:{stage.name}", {
+            "calls": 0, "jobs": jobs, "wall_ms": 0.0, **dict.fromkeys(stage.timing_names, 0.0)})
 
-    def invoke(self, stage, matrices, output, *, upload):
+    def _call(self, stage, matrices, output, upload):
+        """One stub call; upload 0 runs the stage, 2 packs its weights into stage.pack_hosts."""
         arguments = len(stage.scalar_arguments)
         for instance in range(stage.instance_count):
             tensors = (*matrices[instance], output[instance])
@@ -262,43 +298,76 @@ class AiMXModelRuntime:
             ctypes.c_void_p(stage.pointers[index]) if value is None else value
             for index, value in enumerate(stage.scalar_arguments)
         ]
-        stage.call.upload = int(upload)
-        start = time.perf_counter_ns()
+        stage.call.upload = upload
         stage.function(ctypes.byref(stage.call), *call_arguments)
-        wall_ms = (time.perf_counter_ns() - start) / 1e6
-        # stub이 호출마다 0으로 두고 누적한 native 시간. FPGA thread마다 따로 재서 더하므로
-        # 여러 FPGA가 동시에 일하면 합이 wall time보다 클 수 있다(device 시간의 합).
-        timing = (ctypes.c_double * len(stage.timing_names)).in_dll(stage.library, "pim_timing_ms")
-        stage.last_native_ms = dict(zip(stage.timing_names, timing))
-        stage.last_pim_exec = ctypes.c_uint64.in_dll(stage.library, "pim_invoke_count").value
-        phase = "upload" if upload else "run"
-        record = self.breakdown[f"{phase}:{stage.name}"]
-        record["calls"] += 1
-        record["wall_ms"] += wall_ms
-        # native는 FPGA thread 합이므로 job 수로 나눠 thread 평균으로 둔다. wall과 같은 척도다.
-        for name, milliseconds in stage.last_native_ms.items():
-            record[name] += milliseconds / record["jobs"]
-        self.totals[f"{phase}_wall_ms"] += wall_ms
+
+    def _pack_group(self, group):
+        """Host images of one group's weight range, one per FPGA; the range starts at offset 0.
+
+        Pack calls write host memory only, so this may run while other stages compute.
+        Returns ({FPGA: image}, bytes of the range).
+        """
+        layers = self.plans_of_group[group]
+        weight_bytes = sum(self.memory.slot_weight_bytes[:len(layers)])
+        weight_stages = [(plan, stage) for plan in layers for stage in plan.stages if any(stage.weight_mask)]
+        # 0으로 채운 image라 정렬 padding 자리도 0으로 올라간다
+        images = {fpga: ctypes.create_string_buffer(weight_bytes)
+                  for fpga in sorted({fpga for _, stage in weight_stages for fpga in stage.fpgas})}
+        for plan, stage in weight_stages:
+            entry = next(self.memory.entries[(plan.index, stage.name, index)]
+                         for index, kind in enumerate(stage.slot_table_kinds) if kind == WEIGHT)
+            # stub은 weight buffer(VA v)를 host + (v - pack_va)에 쓴다. pack_va를 그 FPGA에서
+            # offset 0이 있을 VA로 두면 image 안의 위치가 table offset과 같아진다.
+            stage.pack_hosts = (ctypes.c_void_p * len(stage.fpgas))(
+                *(ctypes.addressof(images[fpga]) for fpga in stage.fpgas))
+            stage.pack_vas = (ctypes.c_uint64 * len(stage.fpgas))(
+                *(self._address(entry, fpga, "va") - entry.offset for fpga in stage.fpgas))
+            stage.call.pack_hosts = ctypes.cast(stage.pack_hosts, ctypes.POINTER(ctypes.c_void_p))
+            stage.call.pack_vas = ctypes.cast(stage.pack_vas, ctypes.POINTER(ctypes.c_uint64))
+            self._call(stage, stage.preparation_matrices, stage.preparation_output, upload=2)
+        # 이 thread의 host 조립 buffer를 돌려준다. 다른 thread는 계속 stage를 실행하고 있을 수 있다.
+        self.library.aimx_host_cache_clear_thread()
+        return images, weight_bytes
+
+    def _push_group(self, packed):
+        """One transfer per region the group's weight range covers, on every FPGA."""
+        images, weight_bytes = packed
+        items = [(self.regions[(index, fpga)], ctypes.addressof(image) + chunk_start,
+                  min(chunk_start + size, weight_bytes) - chunk_start)
+                 for fpga, image in images.items()
+                 for index, (chunk_start, size) in enumerate(self.chunks) if chunk_start < weight_bytes]
+        if not items:
+            return
+        regions, hosts, sizes = zip(*items)
+        self.library.aimx_model_push(
+            len(items), (ctypes.c_void_p * len(items))(*regions),
+            (ctypes.c_void_p * len(items))(*hosts), (ctypes.c_int64 * len(items))(*sizes))
+        self.totals["weight_bytes"] += sum(sizes)
 
     def enter_layer(self, plan):
-        # group이 이미 올라와 있으면 보내지 않는다. 아니면 group의 모든 layer weight를 먼저 올린다.
-        group = self.memory.group_of_layer[plan.index]
-        if group == self.loaded_group:
-            return
-        for member in self.plans_of_group[group]:
-            for stage in member.stages:
-                if any(stage.weight_mask):
-                    self.invoke(stage, stage.preparation_matrices, stage.preparation_output,
-                                upload=True)
-                    self.totals["weight_uploads"] += 1
-                    self.totals["weight_bytes"] += self._bytes(stage, True) * len(stage.fpgas)
-        self.loaded_group = group
+        # group이 바뀔 때만 그 group의 weight를 한 번 올린다 (pack은 대개 앞 group 실행 중에 끝나 있다).
+        self.loader.enter(self.memory.group_of_layer[plan.index])
 
     def exit_layer(self, plan):
         """Slots stay allocated; the next group overwrites only the weights."""
 
     def run(self, stage, matrices, output):
-        self.invoke(stage, matrices, output, upload=False)
+        start = time.perf_counter_ns()
+        self._call(stage, matrices, output, upload=0)
+        wall_ms = (time.perf_counter_ns() - start) / 1e6
+        # stub이 호출마다 0으로 두고 누적한 native 시간. FPGA thread마다 따로 재서 더하므로
+        # 여러 FPGA가 동시에 일하면 합이 wall time보다 클 수 있다(device 시간의 합).
+        # background pack이 같은 stub을 동시에 부르면 이 칸들은 섞인다 (wall time은 정확하다).
+        timing = (ctypes.c_double * len(stage.timing_names)).in_dll(stage.library, "pim_timing_ms")
+        stage.last_native_ms = dict(zip(stage.timing_names, timing))
+        stage.last_pim_exec = ctypes.c_uint64.in_dll(stage.library, "pim_invoke_count").value
+        record = self.breakdown[f"run:{stage.name}"]
+        record["calls"] += 1
+        record["wall_ms"] += wall_ms
+        # native는 FPGA thread 합이므로 job 수로 나눠 thread 평균으로 둔다. wall과 같은 척도다.
+        for name, milliseconds in stage.last_native_ms.items():
+            record[name] += milliseconds / record["jobs"]
+        self.totals["run_wall_ms"] += wall_ms
         self.totals["invocations"] += 1
 
     def weight_table(self, plans):
@@ -323,6 +392,7 @@ class AiMXModelRuntime:
 
         pa is the planned address (region + table offset); device_pa is the address the
         stub allocated, 0 until the stage first runs. They must be equal once allocated.
+        Input/output rows of different stages share the scratch addresses.
         """
         first = {}
         layers = {}
@@ -334,18 +404,17 @@ class AiMXModelRuntime:
         for slot, plan in first.items():
             for stage in plan.stages:
                 for fpga, context in zip(stage.fpgas, stage.contexts):
-                    region = ctypes.cast(self.regions[(slot, fpga)], ctypes.POINTER(AiMXModelRegion)).contents
                     resident = ctypes.cast(context, ctypes.POINTER(AiMXResidentContext)).contents
-                    for index, offset in enumerate(stage.offsets):
+                    for index in range(len(stage.slot_bytes)):
                         entry = self.memory.entries[(plan.index, stage.name, index)]
                         rows.append({"slot": slot, "layers": layers[slot], "stage": stage.name,
                                      "unit": fpga, "buffer": index, "kind": entry.kind,
-                                     "offset": entry.offset, "pa": region.pa + offset,
+                                     "offset": entry.offset, "pa": self._address(entry, fpga, "pa"),
                                      "bytes": entry.bytes, "device_pa": resident.buffers[index].pa})
         return rows
 
     def stats(self):
-        totals = dict(self.totals)
+        totals = {**self.totals, **self.loader.totals}
         totals["breakdown"] = {key: dict(record) for key, record in self.breakdown.items()}
         totals["live_bytes"] = sum(
             self.library.aimx_model_live_bytes(context)
@@ -353,6 +422,9 @@ class AiMXModelRuntime:
         return totals
 
     def close(self):
+        # background pack이 context를 읽고 있을 수 있으므로 먼저 끝낸다.
+        if self.loader is not None:
+            self.loader.close()
         for stage in self.stages:
             for context in stage.contexts:
                 self.library.aimx_model_destroy(context)
@@ -361,3 +433,5 @@ class AiMXModelRuntime:
         for region in self.regions.values():
             self.library.aimx_model_region_destroy(region)
         self.regions.clear()
+        # stage 호출이 남긴 host 조립 buffer를 돌려준다. 측정 후보마다 새 DSO가 올라와도 쌓이지 않는다.
+        self.library.aimx_host_cache_clear()

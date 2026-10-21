@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 
 static void *model_allocate(size_t bytes) {
     void *memory = calloc(1, bytes);
@@ -43,11 +44,37 @@ struct upmem_model_kernel *upmem_model_create(
         kernel->pointers[binding] = model_allocate(
             (size_t)batch_size * kernel->logical_units * sizeof(void *));
     }
+    // pool은 쓰는 동안에만 잡는다 (upmem_model_pools_acquire).
     kernel->pool_count = pool_count;
     kernel->pools = model_allocate(pool_count * sizeof(void *));
+    kernel->pool_bytes = model_allocate(pool_count * sizeof(uint64_t));
     for (uint32_t pool = 0; pool < pool_count; ++pool)
-        kernel->pools[pool] = model_allocate(batch_size * pool_bytes[pool]);
+        kernel->pool_bytes[pool] = batch_size * pool_bytes[pool];
     return kernel;
+}
+
+void upmem_model_pools_acquire(struct upmem_model_kernel *kernel) {
+    // mmap은 0 page를 주고 건드린 page만 host memory를 쓴다. stage가 쓰지 않는 pool은 비용이 없다.
+    for (uint32_t pool = 0; pool < kernel->pool_count; ++pool) {
+        if (kernel->pools[pool] != NULL || kernel->pool_bytes[pool] == 0)
+            continue;
+        void *memory = mmap(NULL, kernel->pool_bytes[pool], PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (memory == MAP_FAILED) {
+            fprintf(stderr, "UPMEM model pool allocation failed\n");
+            abort();
+        }
+        kernel->pools[pool] = memory;
+    }
+}
+
+void upmem_model_pools_release(struct upmem_model_kernel *kernel) {
+    for (uint32_t pool = 0; pool < kernel->pool_count; ++pool) {
+        if (kernel->pools[pool] == NULL)
+            continue;
+        munmap(kernel->pools[pool], kernel->pool_bytes[pool]);
+        kernel->pools[pool] = NULL;
+    }
 }
 
 void upmem_model_arguments(struct upmem_model_kernel *kernel, void **arguments,
@@ -150,11 +177,11 @@ void upmem_model_mapping(struct upmem_model_kernel *kernel, uint32_t *mapping) {
 }
 
 void upmem_model_close(struct upmem_model_kernel *kernel) {
-    for (uint32_t pool = 0; pool < kernel->pool_count; ++pool)
-        free(kernel->pools[pool]);
+    upmem_model_pools_release(kernel);
     for (uint32_t binding = 0; binding < 3; ++binding)
         free(kernel->pointers[binding]);
     free(kernel->pools);
+    free(kernel->pool_bytes);
     free(kernel->metadata);
     free(kernel->mapping);
     free(kernel->active);
