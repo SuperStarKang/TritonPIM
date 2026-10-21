@@ -139,8 +139,9 @@ struct aimx_model_call {
   const int *weights;               // [arguments], 1 when the argument is a resident weight
   uint32_t instances, batch_size, arguments;
   // 0: run (stage activations, invoke, unstage). 1: stage weights to the device.
-  // 2: pack, stage weights into pack_hosts instead of the device. 1 and 2 build
-  // chains but never invoke or unstage.
+  // 2: pack, assemble weights in pack_hosts instead of the device; touches no device.
+  // 3: chain, build and upload descriptor chains only. 1 and 3 build chains, and
+  // only 0 invokes or unstages.
   int upload;
   uint32_t batch_base;
   // pack only: per job, the host image of the job's weight range and the device
@@ -149,14 +150,21 @@ struct aimx_model_call {
   const uint64_t *pack_vas;         // [batch_size * devices]
 };
 
-// Stage copy of a model stage: the device, or the job's pack image when upload is 2.
+// Where a pack call assembles the buffer at device VA pim_dst: the same offset in the
+// job's pack image.
+static inline void *aimx_model_pack_target(const aimx_model_call *model, uint32_t job,
+                                           void *pim_dst) {
+  return (char *)model->pack_hosts[job] + ((uint64_t)pim_dst - model->pack_vas[job]);
+}
+
+// Stage copy of a model stage from a shared host pool: the device, or the job's pack
+// image when upload is 2.
 static inline int aimx_model_copy_to_pim(const aimx_model_call *model, uint32_t job,
                                          void *pim_dst, const void *host_src, size_t bytes,
                                          int fpga) {
   if (model->upload != 2)
     return aimx_copy_to_pim(pim_dst, host_src, bytes, fpga);
-  memcpy((char *)model->pack_hosts[job] + ((uint64_t)pim_dst - model->pack_vas[job]),
-         host_src, bytes);
+  memcpy(aimx_model_pack_target(model, job, pim_dst), host_src, bytes);
   return 0;
 }
 
@@ -178,8 +186,10 @@ int aimx_model_open();
 aimx_model_region *aimx_model_region_create(int fpga, int64_t bytes, int64_t alignment);
 // Destroy the contexts placed in a region first.
 void aimx_model_region_destroy(aimx_model_region *region);
-// Return the pages of a host shadow range; later writes start from zero pages.
-void aimx_model_host_release(void *host, int64_t bytes);
+// A pack image: an anonymous mapping on huge pages that is not zero-filled up front;
+// pages a pack call never writes read as zero.
+void *aimx_host_image_create(int64_t bytes);
+void aimx_host_image_destroy(void *image, int64_t bytes);
 // Copy hosts[i] to the start of regions[i] (bytes[i]); one thread per FPGA.
 void aimx_model_push(size_t count, aimx_model_region *const *regions, void *const *hosts,
                      const int64_t *bytes);

@@ -286,6 +286,7 @@ struct StubEmitter {
         return emitConstruction(region, depth);
       // model stage 의 pack(2) 호출은 host image 만 채운다. device 에 아무것도 보내지 않아야
       // 다른 stage 가 PIM 연산을 하는 동안 background 에서 돌 수 있다 (연산과 DMA 는 겹칠 수 없다).
+      // chain(3) 호출은 이 construction 만 한다.
       e.indent(depth);
       os() << "if (_model->upload != 2) {\n";
       if (failed(emitConstruction(region, depth + 1)))
@@ -317,14 +318,17 @@ struct StubEmitter {
         return success();
       }
       // weight 는 upload(1)·pack(2) 호출에서만, activation 과 상수는 실행 호출에서만 올린다.
+      // chain(3) 호출은 아무것도 stage 하지 않는다.
       int64_t argument = hostArgument(st.getSrc());
       int slot = buffers.lookup(st.getDst()).slot;
       if (slot < 0)
         return st.emitError("aimx-to-model-stub: a staged buffer must be a resident slot");
       slotInput[slot] = argument;
       e.indent(depth);
+      // weight 인자: upload(1)·pack(2). activation 인자와 상수: 실행(0). chain(3): 둘 다 아님.
       if (argument >= 0)
-        os() << "if (_model->weights[" << argument << "] == (_model->upload != 0)) {\n";
+        os() << "if (_model->weights[" << argument
+             << "] ? (_model->upload == 1 || _model->upload == 2) : !_model->upload) {\n";
       else
         os() << "if (!_model->upload) {\n";
       if (failed(emitStage(st, depth + 1)))
@@ -937,6 +941,12 @@ struct StubEmitter {
       e.indent(depth + 1);
       os() << "std::call_once(" << shared->second.once << "[" << key << "], [&] {\n";
       pd = depth + 1;
+    } else if (model) {
+      // pack(2) 호출이면 host 조립본 대신 job 의 pack image 안 이 buffer 자리에 바로 조립한다.
+      host = e.temp("_dst");
+      e.indent(depth + 1);
+      os() << "char *" << host << " = _model->upload == 2 ? (char*)aimx_model_pack_target(_model, "
+           << "(uint32_t)_job, (void*)" << b.va << ") : (char*)" << b.host << ";\n";
     }
     e.indent(pd + 1);
     os() << "aimx_require(" << rows << " >= 0 && " << cols << " >= 0 && "
@@ -1162,10 +1172,16 @@ struct StubEmitter {
     // 공유 slot 이면 먼저 온 thread 가 조립하는 동안 기다린 시간도 여기 들어간다.
     mark(kLayoutIn, depth + 1);
     e.indent(depth + 1);
-    // model stage 는 pack 호출이면 device 대신 job 의 pack host 영역에 쓴다.
-    if (model)
+    // model stage 의 공유 pool 은 pack 호출이면 device 대신 job 의 pack image 로 옮긴다.
+    // 자기 buffer 는 pack 이면 이미 image 에 조립했으므로 보내지 않는다.
+    if (model && shared != sharedPools.end())
       os() << "aimx_require(aimx_model_copy_to_pim(_model, (uint32_t)_job, (void*)" << b.va
            << ", " << host << ", (size_t)" << padRows << " * (size_t)" << pitch << " * "
+           << bytes << ", _fpga) >= 0, \"input upload failed\");\n";
+    else if (model)
+      os() << "if (_model->upload != 2)\n" << std::string(2 * (depth + 2), ' ')
+           << "aimx_require(aimx_copy_to_pim((void*)" << b.va << ", " << host
+           << ", (size_t)" << padRows << " * (size_t)" << pitch << " * "
            << bytes << ", _fpga) >= 0, \"input upload failed\");\n";
     else
       os() << "aimx_require(aimx_copy_to_pim((void*)" << b.va << ", " << host

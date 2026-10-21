@@ -66,8 +66,13 @@ LayerPlan이 해당 후보에서 Execution Tile, partition, `p_b`, round를 결�
 CPU 컴파일 준비에서 계산한 실제 출력으로 다음 block을 분석하며, tuple 출력은 positional 입력으로 전달한다.
 모든 block의 메모리 요구량을 모은 뒤 adapter가 공통 주소와 native artifact를 확정한다.
 `build_layer_plan()`은 이 과정에서 쓰는 기존 FX 분석 함수로 유지한다.
-Activation/ready table은 만들지 않는다. Weight는 현재 Layer만 device에 상주하며,
-KV API는 우선 CPU 저장소를 제공한다. 정적 shape, UPMEM, 동기 실행을 지원한다.
+device 메모리는 memory table(`../backend/residency.py`)이 unit마다 같은 배치로 정한다:
+모든 slot의 weight, 모든 slot의 state(AiMX descriptor chain, PMM), activation scratch 순서다.
+layer i는 slot i mod slots, group i // slots에 놓이며, group 하나의 weight는 unit 시작부터 연속이다.
+weight는 group에 진입할 때 group 단위로 올라간다(`GroupLoader`): host에서 pack한 group을
+전송하고 바로 해제하며, 그 group이 실행되는 동안 다음 group을 background thread가 pack한다.
+pack은 host 메모리만 쓴다(연산과 DMA는 겹칠 수 없다). group 0의 pack/전송 시간은 따로 보고한다.
+KV API는 우선 CPU 저장소를 제공한다. 정적 shape, UPMEM과 AiMX, 동기 실행을 지원한다.
 UPMEM 모델 stage의 p_k > 1은 host가 K 부분합을 누적하며, 모델 경로에서 정답 검증은 아직 하지 않았다.
 Resident weight GEMM은 단일 instance·단일 M/N/K round로 제한한다.
 
@@ -97,7 +102,8 @@ with compiled.session as session:
 compile time  첫 layer 분석 (GEMM packing → stage class) → class별 제약 tune() (weight 상주 후 E 측정)
               → class별 가장 빠른 config → 모든 layer PIMSession.compile (할당 없음)
               → plan_memory: 모두 들어가면 layer마다 slot, 아니면 layer i는 slot i mod N, group i // N 단위로 함께 업로드
-runtime       open (할당, unit 수 확인, slot 결합) → run_model → close
+runtime       open (할당, unit 수 확인, slot 결합, AiMX는 slot마다 descriptor chain 생성)
+              → run_model (group 진입: pack → 전송 → 해제, 다음 group은 background pack) → close
 ```
 
 모든 layer는 분석한 layer와 stage 구성이 같아야 한다. 실행 예제는
@@ -265,11 +271,13 @@ driver는 네이티브 host의 timing version을 실행 전에 확인하고 버�
 | `model.py` | weight freeze, packing, `LayerPlan`, `build_layer_plan`: FX graph를 CPU/PIM stage partition으로 분할 |
 | `model_policy.py` | 첫 layer의 stage class 분석과 model stage 제약 |
 | `model_compile.py` | 제약 autotuning, stage 측정, class별 가장 빠른 config, `compile_model` |
-| `../backend/residency.py` | 메모리 계획: slot 수, 고정 slot, layer → slot 대응표 |
-| `../backend/runtime.py` | 공통 `RuntimeBackend` 계약과 요청 단위 `PIMSession` |
+| `../backend/residency.py` | 메모리 계획: slot 수, layer → slot/group, weight·state·scratch offset |
+| `../backend/runtime.py` | 공통 `RuntimeBackend` 계약, 요청 단위 `PIMSession`, group 업로드 `GroupLoader` |
 | `../backend/upmem_adapter.py` | UPMEM 모델 경로: stage 배치·program 링크, DPU 할당/해제와 stage 결합 |
 | `../backend/upmem_artifact.py` | UPMEM stage의 MRAM binding 해석과 주소 고정 DPU program 링크 |
+| `../backend/upmem_model.py` | UPMEM stage handle, 쓰는 동안만 잡는 host pool, group PACK/sg 전송 |
 | `../backend/aimx_adapter.py` | AiMX 모델 경로: FPGA 자원, stage 배치와 context 결합 |
+| `../backend/aimx_model.py` | AiMX table region·host shadow, context, chain 생성, group pack/전송 |
 
 예제는 target별로 나뉜다: [examples/upmem](examples/upmem), [examples/aimx](examples/aimx).
 목록은 [examples/README.md](examples/README.md)에 있다.

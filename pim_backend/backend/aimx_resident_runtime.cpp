@@ -306,8 +306,18 @@ extern "C" void aimx_model_region_destroy(aimx_model_region *region) {
   delete region;
 }
 
-extern "C" void aimx_model_host_release(void *host, int64_t bytes) {
-  aimx_require(madvise(host, (size_t)bytes, MADV_DONTNEED) == 0, "host shadow release failed");
+extern "C" void *aimx_host_image_create(int64_t bytes) {
+  aimx_require(bytes > 0, "a pack image needs bytes");
+  void *image = mmap(nullptr, (size_t)bytes, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  aimx_require(image != MAP_FAILED, "pack image allocation failed");
+  // 2 MB page로 받아 GB 단위 image를 채울 때의 page fault를 줄인다.
+  aimx_require(madvise(image, (size_t)bytes, MADV_HUGEPAGE) == 0, "pack image huge page advice failed");
+  return image;
+}
+
+extern "C" void aimx_host_image_destroy(void *image, int64_t bytes) {
+  munmap(image, (size_t)bytes);
 }
 
 extern "C" void aimx_model_push(size_t count, aimx_model_region *const *regions,

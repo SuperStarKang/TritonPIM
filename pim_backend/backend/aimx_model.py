@@ -15,9 +15,11 @@ slot, the state of every slot (descriptor chain, PMM), then the activation
 scratch. The table is cut at slot boundaries into regions of at most one vendor
 allocation, one pim_malloc per region and FPGA. Every region also has a host
 shadow of the same size, and a buffer assembles its host copy at its table
-offset there: the scratch copy is shared like the device scratch, weight copies
-are returned once packed, and descriptor records once uploaded (unless their
-addresses are patched later).
+offset there: the scratch copy is shared like the device scratch, and descriptor
+records are returned once uploaded (unless their addresses are patched later).
+Pack calls assemble weights straight into the group image, never the shadow.
+Descriptor chains, one per slot since they hold physical addresses, are built
+and uploaded at bind, before any request.
 """
 
 import bisect
@@ -183,7 +185,8 @@ class AiMXModelRuntime:
         self.plans_of_group = {}
         # group 업로드 순서와 background pack (runtime.GroupLoader). place가 만든다.
         self.loader = None
-        self.totals = {"weight_bytes": 0, "invocations": 0, "run_wall_ms": 0.0}
+        # chain_build_ms는 bind에서 slot마다 descriptor chain을 만들어 올린 시간이다 (요청 밖).
+        self.totals = {"weight_bytes": 0, "invocations": 0, "run_wall_ms": 0.0, "chain_build_ms": 0.0}
         # "run:mm" 처럼 stage 이름마다 layer를 합친 호출 수, wall time, native 칸별 시간.
         self.breakdown = {}
 
@@ -220,7 +223,7 @@ class AiMXModelRuntime:
                 "scratch_bytes": memory.scratch_bytes,
                 "bytes_per_unit": memory.bytes_per_unit,
             }
-        self.loader = GroupLoader(memory.groups, self._pack_group, self._push_group, lambda packed: None)
+        self.loader = GroupLoader(memory.groups, self._pack_group, self._push_group, self._release_group)
         # slot의 weight, slot의 state, scratch 순서로 이어진 조각을 region 상한까지 묶는다.
         # 조각 하나는 나누지 않으므로 한 slot의 weight는 언제나 한 region 안에 있다.
         start = 0
@@ -241,8 +244,9 @@ class AiMXModelRuntime:
         return getattr(region, field) + entry.offset - self.chunks[index][0]
 
     def bind(self, plans):
-        """Runtime: the regions on every FPGA, then the contexts at the table addresses; the
-        first layer of a slot creates them. Weights move only when a group is entered."""
+        """Runtime: the regions on every FPGA, the contexts at the table addresses (the first
+        layer of a slot creates them), then every slot's descriptor chains built and uploaded.
+        Weights move only when a group is entered."""
         for fpga in range(self.base_fpga, self.base_fpga + self.units):
             for index, (_, size) in enumerate(self.chunks):
                 self.regions[(index, fpga)] = self.library.aimx_model_region_create(
@@ -252,6 +256,12 @@ class AiMXModelRuntime:
             owner = first.setdefault(self.memory.slot_of_layer[plan.index], plan)
             for stage, slot_stage in zip(plan.stages, owner.stages):
                 self._create_stage(plan, stage, slot_stage)
+        # chain에는 buffer의 물리 주소가 들어가므로 slot마다 하나다. 요청 전에 만들어 올린다
+        # (아직 PIM 연산이 없으므로 업로드가 연산과 겹치지 않는다).
+        start = time.perf_counter_ns()
+        for stage in self.stages:
+            self._call(stage, None, None, upload=3)
+        self.totals["chain_build_ms"] += (time.perf_counter_ns() - start) / 1e6
 
     def _create_stage(self, plan, stage, slot_stage):
         jobs = stage.p_b * stage.devices
@@ -293,12 +303,15 @@ class AiMXModelRuntime:
             "calls": 0, "jobs": jobs, "wall_ms": 0.0, **dict.fromkeys(stage.timing_names, 0.0)})
 
     def _call(self, stage, matrices, output, upload):
-        """One stub call; upload 0 runs the stage, 2 packs its weights into stage.pack_hosts."""
+        """One stub call; upload 0 runs the stage, 2 packs its weights into stage.pack_hosts,
+        3 builds and uploads its descriptor chains. A chain call reads no tensor, so it
+        passes no matrices and the stage keeps its previous pointers."""
         arguments = len(stage.scalar_arguments)
-        for instance in range(stage.instance_count):
-            tensors = (*matrices[instance], output[instance])
-            for argument, operand in stage.pointer_operands.items():
-                stage.pointers[instance * arguments + argument] = tensors[operand].data_ptr()
+        if matrices is not None:
+            for instance in range(stage.instance_count):
+                tensors = (*matrices[instance], output[instance])
+                for argument, operand in stage.pointer_operands.items():
+                    stage.pointers[instance * arguments + argument] = tensors[operand].data_ptr()
         # 함수 인자의 포인터는 instance 0이다. stub은 job 안에서 instance별 표를 쓴다.
         call_arguments = [
             ctypes.c_void_p(stage.pointers[index]) if value is None else value
@@ -316,28 +329,20 @@ class AiMXModelRuntime:
         layers = self.plans_of_group[group]
         weight_bytes = sum(self.memory.slot_weight_bytes[:len(layers)])
         weight_stages = [(plan, stage) for plan in layers for stage in plan.stages if any(stage.weight_mask)]
-        # 0으로 채운 image라 정렬 padding 자리도 0으로 올라간다
-        images = {fpga: ctypes.create_string_buffer(weight_bytes)
+        # stage가 image 안 자기 buffer 자리에 바로 조립한다. 아무도 쓰지 않는 정렬 간격은 0으로 읽힌다.
+        images = {fpga: self.library.aimx_host_image_create(weight_bytes)
                   for fpga in sorted({fpga for _, stage in weight_stages for fpga in stage.fpgas})}
         for plan, stage in weight_stages:
             entry = next(self.memory.entries[(plan.index, stage.name, index)]
                          for index, kind in enumerate(stage.slot_table_kinds) if kind == WEIGHT)
             # stub은 weight buffer(VA v)를 host + (v - pack_va)에 쓴다. pack_va를 그 FPGA에서
             # offset 0이 있을 VA로 두면 image 안의 위치가 table offset과 같아진다.
-            stage.pack_hosts = (ctypes.c_void_p * len(stage.fpgas))(
-                *(ctypes.addressof(images[fpga]) for fpga in stage.fpgas))
+            stage.pack_hosts = (ctypes.c_void_p * len(stage.fpgas))(*(images[fpga] for fpga in stage.fpgas))
             stage.pack_vas = (ctypes.c_uint64 * len(stage.fpgas))(
                 *(self._address(entry, fpga, "va") - entry.offset for fpga in stage.fpgas))
             stage.call.pack_hosts = ctypes.cast(stage.pack_hosts, ctypes.POINTER(ctypes.c_void_p))
             stage.call.pack_vas = ctypes.cast(stage.pack_vas, ctypes.POINTER(ctypes.c_uint64))
             self._call(stage, stage.preparation_matrices, stage.preparation_output, upload=2)
-        # weight 조립본(host shadow의 weight 구간)은 image로 옮겼으므로 page를 돌려준다.
-        for fpga in images:
-            for index, (chunk_start, size) in enumerate(self.chunks):
-                if chunk_start < weight_bytes:
-                    region = ctypes.cast(self.regions[(index, fpga)], ctypes.POINTER(AiMXModelRegion)).contents
-                    self.library.aimx_model_host_release(
-                        region.host, min(chunk_start + size, weight_bytes) - chunk_start)
         # 이 thread의 host 조립 buffer를 돌려준다. 다른 thread는 계속 stage를 실행하고 있을 수 있다.
         self.library.aimx_host_cache_clear_thread()
         return images, weight_bytes
@@ -345,7 +350,7 @@ class AiMXModelRuntime:
     def _push_group(self, packed):
         """One transfer per region the group's weight range covers, on every FPGA."""
         images, weight_bytes = packed
-        items = [(self.regions[(index, fpga)], ctypes.addressof(image) + chunk_start,
+        items = [(self.regions[(index, fpga)], image + chunk_start,
                   min(chunk_start + size, weight_bytes) - chunk_start)
                  for fpga, image in images.items()
                  for index, (chunk_start, size) in enumerate(self.chunks) if chunk_start < weight_bytes]
@@ -356,6 +361,11 @@ class AiMXModelRuntime:
             len(items), (ctypes.c_void_p * len(items))(*regions),
             (ctypes.c_void_p * len(items))(*hosts), (ctypes.c_int64 * len(items))(*sizes))
         self.totals["weight_bytes"] += sum(sizes)
+
+    def _release_group(self, packed):
+        images, weight_bytes = packed
+        for image in images.values():
+            self.library.aimx_host_image_destroy(image, weight_bytes)
 
     def enter_layer(self, plan):
         # group이 바뀔 때만 그 group의 weight를 한 번 올린다 (pack은 대개 앞 group 실행 중에 끝나 있다).

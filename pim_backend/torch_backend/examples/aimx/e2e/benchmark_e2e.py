@@ -88,6 +88,9 @@ def main():
 
         calls = []
         with session:
+            # session open이 slot마다 descriptor chain을 만들어 올린다 (요청 밖의 준비 비용).
+            chain_build_ms = session.stats()["chain_build_ms"]
+            print(f"session_open_ms={session.open_ms:.1f} chain_build_ms={chain_build_ms:.1f}", flush=True)
             for phase, count in (("first", 1), ("sample", args.repeat)):
                 for step in range(count):
                     before = session.stats()
@@ -147,6 +150,7 @@ def main():
         "qk_heads": args.qk_heads, "pv_heads": args.pv_heads, "kv": args.kv,
         "reference": {"token": reference_token, "token_text": tokenizer.decode([reference_token])},
         "compile_ms": compile_ms, "session_open_ms": session.open_ms, "session_close_ms": session.close_ms,
+        "chain_build_ms": chain_build_ms,
         "memory": memory_record(memory),
         "config_report": config_report, "memory_table": memory_table, "stages": stages,
         "calls": calls, "summary": summary,
