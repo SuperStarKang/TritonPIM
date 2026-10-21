@@ -22,6 +22,19 @@ from .template import TORCH_GEMM_TEMPLATE_VERSION
 log = logging.getLogger(__name__)
 
 
+def gemm_problem(m, n, k, *, input_dtype, output_dtype):
+    """The PIM problem of one GEMM (M × K)·(K × N).
+
+    A GEMM with one output row or column is a GEMV over the other operand: x·W with
+    one row is Wᵀ·x over N rows, A·x with one column is A·x over M rows. It runs as a
+    matvec (GEMV template); every other GEMM is a matmul.
+    """
+    if m == 1 or n == 1:
+        return PIMProblem.matvec(n if m == 1 else m, k, input_dtype=input_dtype,
+                                 output_dtype=output_dtype)
+    return PIMProblem(m, n, k, input_dtype=input_dtype, output_dtype=output_dtype)
+
+
 @dataclass(frozen=True)
 class PIMExecution:
     """Values needed to compile one Triton template through PIM Common IR."""
@@ -32,13 +45,16 @@ class PIMExecution:
     torch_config: PIMTorchConfig
 
     def template_meta(self):
-        return {
+        meta = {
             "BLOCK_M": self.config.block_m,
-            "BLOCK_N": self.config.block_n,
             "BLOCK_K": self.config.block_k,
             # BF16 출력도 FP32로 누산한다 (Triton은 BF16 누산을 받지 않는다). store가 출력 dtype으로 바꾼다.
             "ACC_TYPE": "tl.int32" if self.problem.output_dtype == "int32" else "tl.float32",
         }
+        # GEMV의 n은 1이라 source에 BLOCK_N이 없다.
+        if self.problem.compute_kind == "matmul":
+            meta["BLOCK_N"] = self.config.block_n
+        return meta
 
     def backend_options(self):
         return validate_pim_options(pim_launch_options(

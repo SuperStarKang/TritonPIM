@@ -25,9 +25,10 @@ from torch import fx
 from torch.fx.operator_schemas import normalize_function
 
 from ._autotuner import (
-    ConstraintEngine, PIMProblem, best_partitions, build_config_space, legal_partitions,
+    ConstraintEngine, best_partitions, build_config_space, legal_partitions,
     make_config, pim_hierarchy, rank_block_groups, target_model, tile_ladder,
 )
+from .execution import gemm_problem
 from .fx_normalization import GemmNormalization
 
 
@@ -255,9 +256,9 @@ def _block_diagonal(graph, gemms, members, spec):
     for count in range(1, len(members) + 1):
         if len(members) % count:
             continue
-        cost = _cost(spec, PIMProblem(m, count * n, count * k,
-                                      input_dtype=str(info.left.dtype).removeprefix("torch."),
-                                      output_dtype=str(info.output_dtype).removeprefix("torch.")))
+        cost = _cost(spec, gemm_problem(m, count * n, count * k,
+                                        input_dtype=str(info.left.dtype).removeprefix("torch."),
+                                        output_dtype=str(info.output_dtype).removeprefix("torch.")))
         if cost is not None:
             # 묶음 하나의 비용 × 묶음 수
             costs[count] = (cost[0] * len(members) // count, cost[1] * len(members) // count)

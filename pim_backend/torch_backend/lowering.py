@@ -1,4 +1,4 @@
-"""CPU FP32/BF16 mm and INT8 _int_mm lowering to a PIM GEMM template."""
+"""CPU FP32/BF16 mm and INT8 _int_mm lowering to a PIM GEMM or GEMV template."""
 
 import logging
 
@@ -11,8 +11,8 @@ from torch._inductor.lowering import _register_lowering, lowerings
 
 from ._autotuner import PIMProblem
 from .config import PIMTorchConfig, UnsupportedPIMGemm
-from .execution import resolve_execution
-from .template import pim_gemm_template
+from .execution import gemm_problem, resolve_execution
+from .template import pim_gemm_template, pim_gemv_template
 
 aten = torch.ops.aten
 log = logging.getLogger(__name__)
@@ -50,10 +50,8 @@ def validate_pim_gemm(
                 f"{name} must be a CPU tensor, got {device}"
             )
 
-    return PIMProblem(
-        M=_static_int(m, "M"),
-        N=_static_int(n, "N"),
-        K=_static_int(k, "K"),
+    return gemm_problem(
+        _static_int(m, "M"), _static_int(n, "N"), _static_int(k, "K"),
         input_dtype=str(input_dtype).removeprefix("torch."),
         output_dtype=str(output_dtype).removeprefix("torch."),
     )
@@ -98,6 +96,36 @@ def generate_pim_gemm_template(mat1, mat2, layout, execution):
     buffer.allow_epilogue_fusion = False
     buffer.allow_prologue_fusion = False
     return node
+
+
+def generate_pim_gemv_template(mat1, mat2, layout, execution, *, row_vector):
+    """GEMV template into a buffer of the output rows, viewed back as the GEMM output."""
+    problem = execution.problem
+    rows = ir.FixedLayout(layout.device, layout.dtype, [sympy.Integer(problem.M)], [sympy.Integer(1)])
+    caller = pim_gemv_template.generate(
+        input_nodes=(mat1, mat2),
+        layout=rows,
+        num_stages=execution.torch_config.num_stages,
+        num_warps=execution.torch_config.num_warps,
+        call_sizes=[sympy.Integer(problem.M)],
+        triton_meta={
+            "compile_backend": "pim",
+            "backend_options": execution.backend_options(),
+        },
+        ROW_VECTOR=row_vector,
+        **execution.template_meta(),
+    )
+    if caller is None:
+        raise UnsupportedPIMGemm(
+            f"PIM GEMV template failed to generate for {problem}"
+        )
+
+    node = caller.output_node()
+    buffer = _unwrap_template_buffer(node)
+    buffer._pim_template = True
+    buffer.allow_epilogue_fusion = False
+    buffer.allow_prologue_fusion = False
+    return lowerings[aten.view.default](node, list(layout.size))
 
 
 def make_pim_gemm_lowering(config: PIMTorchConfig, output_dtypes):
@@ -150,6 +178,12 @@ def make_pim_gemm_lowering(config: PIMTorchConfig, output_dtypes):
         mat1_r = ir.ExternKernel.require_contiguous(mat1_r)
         mat2_r = ir.ExternKernel.require_contiguous(mat2_r)
 
+        if problem.compute_kind == "matvec":
+            # 출력 행이 하나면(M = 1) 행렬이 B 쪽이다.
+            return generate_pim_gemv_template(
+                mat1_r, mat2_r, out_layout, execution,
+                row_vector=_static_int(m, "M") == 1,
+            )
         return generate_pim_gemm_template(
             mat1_r, mat2_r, out_layout, execution,
         )

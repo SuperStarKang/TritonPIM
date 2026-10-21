@@ -9,9 +9,8 @@ from torch.export.graph_signature import InputKind, OutputKind
 from torch.fx.passes.split_module import split_module
 from torch.utils import _pytree
 
-from ._autotuner import PIMProblem
 from .backend import PIMInductorBackend
-from .execution import select_layer_config
+from .execution import gemm_problem, select_layer_config
 from .fx_normalization import normalize_fx_gemms
 from .fx_packing import PackedGemm, gemm_operands, pack_gemms
 
@@ -139,7 +138,7 @@ class _LayerGemm(torch.nn.Module):
         if self.batched_operand and any(self.weight_mask):
             raise ValueError("resident batched weights require expert placement support")
         self.config, self.p_b, self.batch_rounds, self.mnk_rounds = select_layer_config(
-            PIMProblem(*self.shape, input_dtype=str(self.input_dtype).removeprefix("torch."),
+            gemm_problem(*self.shape, input_dtype=str(self.input_dtype).removeprefix("torch."),
                        output_dtype=str(self.output_dtype).removeprefix("torch.")),
             spec, self.torch_config, self.instance_count, has_weights=any(self.weight_mask),
         )

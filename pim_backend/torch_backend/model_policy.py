@@ -8,7 +8,8 @@ from dataclasses import dataclass
 
 import torch
 
-from ._autotuner import PIMProblem, build_config_space, pim_hierarchy
+from ._autotuner import build_config_space, pim_hierarchy
+from .execution import gemm_problem
 from .config import PIMTorchConfig
 from .fx_analysis import analyze_fx_gemms
 from .model import build_layer_plan
@@ -27,7 +28,7 @@ class StageKey:
 
     @property
     def problem(self):
-        return PIMProblem(*self.mnk, input_dtype=self.input_dtype, output_dtype=self.output_dtype)
+        return gemm_problem(*self.mnk, input_dtype=self.input_dtype, output_dtype=self.output_dtype)
 
     @property
     def has_weights(self):
