@@ -6,6 +6,10 @@ one FPGA. Weights are staged only by upload calls; run calls stage activations.
 Layers that share a memory slot share these contexts: buffers and descriptor
 chains are built once. Entering the first layer of a layer group uploads the
 weights of every layer in the group, which then run without further uploads.
+
+Buffer addresses come from the memory table: every slot is one region (one
+pim_malloc) per FPGA, and every buffer of a context, the PMM included, sits at
+its table offset from the start of the slot.
 """
 
 import ctypes
@@ -14,6 +18,21 @@ import time
 from .compiler import _run_translate
 from .residency import STATE, WEIGHT, OperandRequirement, StageRequirement
 from .runtime import current_invocation
+
+# operand 시작 주소 정렬. data buffer는 16 KB 정렬이 필요하고(8 KB면 결과가 틀린다, batch 8 실측),
+# PMM은 256 KB 정렬이 필요하다(AiMXDialect kPMMAlign). 모든 operand를 이 배수로 보고하므로
+# table의 offset은 모두 두 조건을 함께 만족한다.
+OPERAND_ALIGNMENT = 256 * 1024
+
+
+class AiMXModelRegion(ctypes.Structure):
+    # aimx_runtime.h의 aimx_model_region과 같은 배치
+    _fields_ = [
+        ("fpga", ctypes.c_int),
+        ("va", ctypes.c_uint64),
+        ("pa", ctypes.c_uint64),
+        ("bytes", ctypes.c_int64),
+    ]
 
 
 class AiMXModelCall(ctypes.Structure):
@@ -135,6 +154,8 @@ class AiMXModelRuntime:
         # context를 가진 stage. slot을 공유하는 다른 layer의 stage는 여기 없다.
         self.stages = []
         self.memory = None
+        # (memory slot, FPGA) -> aimx_model_region. bind가 만들고 close가 context 다음에 해제한다.
+        self.regions = {}
         # group index -> 그 group의 layer plan들 (실행 순서). place가 만들고 enter_layer가 올린다.
         self.plans_of_group = {}
         self.loaded_group = None
@@ -154,10 +175,11 @@ class AiMXModelRuntime:
 
     def requirements(self, plans):
         # stage마다 자기 activation buffer를 가지므로 공용 scratch는 없고 state에 들어간다.
-        # 실제 주소는 vendor 할당이 정하므로 memory table의 offset은 쓰지 않는다.
+        # PMM(buffer 0)도 state다. bytes를 OPERAND_ALIGNMENT 배수로 올려 모든 offset을 정렬한다.
         return [
             StageRequirement(plan.index, stage.name, tuple(
-                OperandRequirement(index, WEIGHT if weight else STATE, size)
+                OperandRequirement(index, WEIGHT if weight else STATE,
+                                   (size + OPERAND_ALIGNMENT - 1) // OPERAND_ALIGNMENT * OPERAND_ALIGNMENT)
                 for index, (size, weight) in enumerate(zip(stage.slot_bytes, stage.slot_weights))))
             for plan in plans for stage in plan.stages
         ]
@@ -165,6 +187,12 @@ class AiMXModelRuntime:
     def place(self, plans, memory):
         self.memory = memory
         for plan in plans:
+            slot = memory.slot_of_layer[plan.index]
+            slot_start = sum(memory.slot_bytes[:slot])
+            for stage in plan.stages:
+                # slot 시작부터의 offset. FPGA마다 slot 하나가 region 하나다.
+                stage.offsets = tuple(memory.entries[(plan.index, stage.name, index)].offset - slot_start
+                                      for index in range(len(stage.slot_bytes)))
             self.plans_of_group.setdefault(memory.group_of_layer[plan.index], []).append(plan)
             plan.weight_bytes_per_unit = sum(self._bytes(stage, True) for stage in plan.stages)
             plan.backend_plan = {
@@ -175,27 +203,36 @@ class AiMXModelRuntime:
             }
 
     def bind(self, plans):
-        """Runtime: create the FPGA contexts of every slot; the first layer of a slot creates them."""
+        """Runtime: one region per memory slot on every FPGA, then the contexts of every slot
+        at the table offsets; the first layer of a slot creates them."""
+        for slot, slot_bytes in enumerate(self.memory.slot_bytes):
+            for fpga in range(self.base_fpga, self.base_fpga + self.units):
+                self.regions[(slot, fpga)] = self.library.aimx_model_region_create(
+                    fpga, slot_bytes, OPERAND_ALIGNMENT)
         first = {}
         for plan in plans:
-            owner = first.setdefault(self.memory.slot_of_layer[plan.index], plan)
+            slot = self.memory.slot_of_layer[plan.index]
+            owner = first.setdefault(slot, plan)
             for stage, slot_stage in zip(plan.stages, owner.stages):
-                self._create_stage(stage, slot_stage)
+                self._create_stage(stage, slot_stage, slot)
 
-    def _create_stage(self, stage, slot_stage):
+    def _create_stage(self, stage, slot_stage, slot):
         jobs = stage.p_b * stage.devices
         if jobs > self.units:
             raise ValueError(f"{stage.name}: {jobs} jobs exceed {self.units} FPGAs")
         arguments = len(stage.scalar_arguments)
         if slot_stage is stage:
             stage.fpgas = (ctypes.c_int * jobs)(*(self.base_fpga + job for job in range(jobs)))
+            offsets = (ctypes.c_int64 * len(stage.offsets))(*stage.offsets)
             stage.contexts = (ctypes.c_void_p * jobs)(*(
-                self.library.aimx_model_create(fpga, len(stage.slot_bytes)) for fpga in stage.fpgas))
+                self.library.aimx_model_create(self.regions[(slot, fpga)], len(stage.offsets), offsets)
+                for fpga in stage.fpgas))
             self.stages.append(stage)
         else:
             # 같은 slot의 context(device buffer, descriptor chain)를 쓰므로 slot 표가 같아야 한다.
-            if (stage.slot_bytes, stage.slot_weights, jobs) != (
-                    slot_stage.slot_bytes, slot_stage.slot_weights, slot_stage.p_b * slot_stage.devices):
+            if (stage.slot_bytes, stage.slot_weights, stage.offsets, jobs) != (
+                    slot_stage.slot_bytes, slot_stage.slot_weights, slot_stage.offsets,
+                    slot_stage.p_b * slot_stage.devices):
                 raise ValueError(f"{stage.name}: slot layout differs from {slot_stage.name} "
                                  "of the shared memory slot")
             stage.fpgas = slot_stage.fpgas
@@ -282,7 +319,11 @@ class AiMXModelRuntime:
         return table
 
     def memory_table(self, plans):
-        """One row per allocated buffer of every slot; buffers are allocated on first use."""
+        """One row per table entry on every FPGA of its stage.
+
+        pa is the planned address (region + table offset); device_pa is the address the
+        stub allocated, 0 until the stage first runs. They must be equal once allocated.
+        """
         first = {}
         layers = {}
         for plan in plans:
@@ -293,21 +334,14 @@ class AiMXModelRuntime:
         for slot, plan in first.items():
             for stage in plan.stages:
                 for fpga, context in zip(stage.fpgas, stage.contexts):
+                    region = ctypes.cast(self.regions[(slot, fpga)], ctypes.POINTER(AiMXModelRegion)).contents
                     resident = ctypes.cast(context, ctypes.POINTER(AiMXResidentContext)).contents
-                    for index in range(resident.count):
-                        buffer = resident.buffers[index]
-                        if not buffer.va:
-                            continue
-                        # kind 1은 descriptor chain, 2는 PMM이다. 나머지는 operand buffer다.
-                        if stage.slot_weights[index]:
-                            column = "weight"
-                        elif buffer.kind in (1, 2):
-                            column = "state"
-                        else:
-                            column = "activation"
+                    for index, offset in enumerate(stage.offsets):
+                        entry = self.memory.entries[(plan.index, stage.name, index)]
                         rows.append({"slot": slot, "layers": layers[slot], "stage": stage.name,
-                                     "unit": fpga, "buffer": index, "column": column,
-                                     "pa": buffer.pa, "bytes": buffer.bytes})
+                                     "unit": fpga, "buffer": index, "kind": entry.kind,
+                                     "offset": entry.offset, "pa": region.pa + offset,
+                                     "bytes": entry.bytes, "device_pa": resident.buffers[index].pa})
         return rows
 
     def stats(self):
@@ -323,3 +357,7 @@ class AiMXModelRuntime:
             for context in stage.contexts:
                 self.library.aimx_model_destroy(context)
         self.stages.clear()
+        # context가 region 안의 buffer를 가리키므로 context를 먼저 해제한다.
+        for region in self.regions.values():
+            self.library.aimx_model_region_destroy(region)
+        self.regions.clear()

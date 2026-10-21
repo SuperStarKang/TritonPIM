@@ -18,7 +18,10 @@ class AiMXAdapter:
         self.library = ctypes.CDLL(self.path)
         signatures = {
             "aimx_model_open": ([], ctypes.c_int),
-            "aimx_model_create": ([ctypes.c_int, ctypes.c_size_t], ctypes.c_void_p),
+            "aimx_model_region_create": ([ctypes.c_int, ctypes.c_int64, ctypes.c_int64], ctypes.c_void_p),
+            "aimx_model_region_destroy": ([ctypes.c_void_p], None),
+            "aimx_model_create": ([ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_int64)],
+                                  ctypes.c_void_p),
             "aimx_model_destroy": ([ctypes.c_void_p], None),
             "aimx_model_live_bytes": ([ctypes.c_void_p], ctypes.c_int64),
         }

@@ -9,12 +9,18 @@
 #include <vector>
 
 namespace {
+// vendor multi_mmap_drv(int size)가 2 GiB에서 overflow하므로 pim_malloc 하나의 상한이다.
+constexpr int64_t kMaxAllocationBytes = 1023ll * 2 * 1024 * 1024;
+
 struct DeviceState {
   std::mutex mutex;
   int fpga = -1;
   std::string plan;
   std::vector<aimx_resident_buffer> buffers;
   aimx_resident_context context{};
+  // model context만 쓴다. buffer i는 region 시작에서 offsets[i]에 놓인다 (memory table).
+  aimx_model_region *region = nullptr;
+  std::vector<int64_t> offsets;
 };
 struct Registry {
   std::mutex mutex;
@@ -38,7 +44,8 @@ void checkProcess(Registry &r) {
 }
 void clear(DeviceState &state) {
   for (auto it = state.buffers.rbegin(); it != state.buffers.rend(); ++it) {
-    if (it->va)
+    // region 안의 buffer는 따로 할당하지 않았으므로 region을 해제할 때 함께 사라진다.
+    if (it->va && !state.region)
       pim_free((void *)it->va, state.fpga);
     if (it->host)
       munmap(it->host, (size_t)it->bytes);
@@ -100,7 +107,7 @@ extern "C" aimx_resident_buffer *aimx_resident_alloc(
     aimx_resident_context *context, size_t slot, int64_t bytes,
     int64_t alignment, int kind) {
   aimx_require(context && slot < context->count && bytes > 0 &&
-                   bytes <= 1023ll * 2 * 1024 * 1024 && alignment > 0 &&
+                   bytes <= kMaxAllocationBytes && alignment > 0 &&
                    (alignment & (alignment - 1)) == 0 && kind >= 0 && kind <= 2,
                "invalid resident allocation");
   auto &state = *static_cast<DeviceState *>(context->owner);
@@ -114,10 +121,17 @@ extern "C" aimx_resident_buffer *aimx_resident_alloc(
   buffer.bytes = bytes;
   buffer.alignment = alignment;
   buffer.kind = kind;
-  // Own PMM explicitly. Vendor private_pool.c keys its cached PMM by thread ID,
-  // which is not a stable ownership key for a persistent physical-device plan.
-  buffer.va = (uint64_t)pim_malloc(bytes, state.fpga, kind == 2 ? 7 : 0);
-  aimx_require(buffer.va != 0, "resident PIM allocation failed");
+  if (state.region) {
+    // memory table이 정한 자리. PMM을 포함한 모든 buffer가 slot region 안에 놓인다.
+    aimx_require(state.offsets[slot] >= 0 && state.offsets[slot] + bytes <= state.region->bytes,
+                 "resident buffer exceeds its memory-table region");
+    buffer.va = state.region->va + (uint64_t)state.offsets[slot];
+  } else {
+    // Own PMM explicitly. Vendor private_pool.c keys its cached PMM by thread ID,
+    // which is not a stable ownership key for a persistent physical-device plan.
+    buffer.va = (uint64_t)pim_malloc(bytes, state.fpga, kind == 2 ? 7 : 0);
+    aimx_require(buffer.va != 0, "resident PIM allocation failed");
+  }
   buffer.pa = VA2PA(buffer.va, state.fpga);
   aimx_require(buffer.pa % (uint64_t)alignment == 0 &&
                    buffer.pa < (1ull << 33) && (uint64_t)bytes <= (1ull << 33) - buffer.pa,
@@ -184,17 +198,42 @@ extern "C" int aimx_model_open() {
   return available;
 }
 
-extern "C" aimx_resident_context *aimx_model_create(int fpga, size_t slots) {
+extern "C" aimx_model_region *aimx_model_region_create(int fpga, int64_t bytes,
+                                                       int64_t alignment) {
   Registry &r = registry();
   checkProcess(r);
   {
     std::lock_guard<std::mutex> lock(r.mutex);
-    aimx_require(r.devices.count(fpga) == 1, "model context on an unopened FPGA");
+    aimx_require(r.devices.count(fpga) == 1, "memory-table region on an unopened FPGA");
   }
-  aimx_require(slots > 0, "a model context needs at least one slot");
+  aimx_require(bytes > 0 && bytes <= kMaxAllocationBytes,
+               "a memory-table region must fit one vendor allocation (1023 x 2 MB)");
+  aimx_require(alignment >= 4096 && alignment <= (4096 << 9) && (alignment & (alignment - 1)) == 0,
+               "memory-table region alignment must be a power of two from 4 KB to 2 MB");
+  auto *region = new aimx_model_region;
+  region->fpga = fpga;
+  region->bytes = bytes;
+  // page_align_idx k는 2^k page(4 KB) 정렬이다. 2 MB를 넘는 할당은 hugepage 경계에서 시작한다.
+  region->va = (uint64_t)pim_malloc(bytes, fpga, __builtin_ctzll(alignment) - 12);
+  aimx_require(region->va != 0, "memory-table region allocation failed");
+  region->pa = VA2PA(region->va, fpga);
+  aimx_require(region->pa % (uint64_t)alignment == 0, "memory-table region is misaligned");
+  return region;
+}
+
+extern "C" void aimx_model_region_destroy(aimx_model_region *region) {
+  pim_free((void *)region->va, region->fpga);
+  delete region;
+}
+
+extern "C" aimx_resident_context *aimx_model_create(aimx_model_region *region, size_t slots,
+                                                    const int64_t *offsets) {
+  aimx_require(region && slots > 0 && offsets, "a model context needs a region and buffer offsets");
   auto *state = new DeviceState;
-  state->fpga = fpga;
+  state->fpga = region->fpga;
   state->plan = "model";
+  state->region = region;
+  state->offsets.assign(offsets, offsets + slots);
   state->buffers.resize(slots);
   state->context = {state->buffers.data(), slots, false, state};
   return &state->context;

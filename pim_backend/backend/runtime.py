@@ -222,7 +222,7 @@ class PIMSession:
             raise RuntimeError("PIMSession must be used by its owning thread and context")
 
     def memory_table(self):
-        """Memory table rows with device addresses: UPMEM the planned MRAM offsets, AiMX its allocated buffers."""
+        """Memory table rows with device addresses: UPMEM MRAM base + offset, AiMX slot region + offset per FPGA."""
         self._check_owner()
         return self.backend.memory_table(self.layers)
 

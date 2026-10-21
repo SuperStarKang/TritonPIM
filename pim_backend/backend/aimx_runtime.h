@@ -141,13 +141,26 @@ struct aimx_model_call {
   int upload;                       // 1: stage weights and build chains, no invoke/unstage
   uint32_t batch_base;
 };
+// One memory-table weight slot on one FPGA: a single physically linear pim_malloc.
+struct aimx_model_region {
+  int fpga;
+  uint64_t va, pa;
+  int64_t bytes;
+};
 extern "C" {
 // Opens every physical FPGA once and returns how many exist.
 int aimx_model_open();
+// The region of one memory-table slot; alignment is its start alignment in bytes.
+aimx_model_region *aimx_model_region_create(int fpga, int64_t bytes, int64_t alignment);
+// Destroy the contexts placed in a region first.
+void aimx_model_region_destroy(aimx_model_region *region);
 // Session-owned contexts. Never replaced implicitly; slots are allocated by the
 // stage stub on first use and stay until destroy. Layers that share a residency
 // slot share the context, so its buffers and descriptor chain are built once.
-aimx_resident_context *aimx_model_create(int fpga, size_t slots);
+// Buffer i (the PMM included) is placed at region->va + offsets[i], the memory
+// table offset from the start of the slot.
+aimx_resident_context *aimx_model_create(aimx_model_region *region, size_t slots,
+                                         const int64_t *offsets);
 void aimx_model_destroy(aimx_resident_context *context);
 int64_t aimx_model_live_bytes(aimx_resident_context *context);
 }
