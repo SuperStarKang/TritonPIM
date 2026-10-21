@@ -20,6 +20,7 @@ import time
 
 import torch
 
+from triton.backends.pim.residency import kv_parts
 from triton.backends.pim.runtime import PIMSession
 
 from ._autotuner import (
@@ -98,7 +99,7 @@ def measure_stage(key, weights, session, config, *, warmup, repeat):
     # 후보마다 새로 컴파일한다. dynamo가 앞 후보의 컴파일 결과를 돌려주지 않게 한다.
     torch._dynamo.reset()
     with torch.no_grad():
-        plan, = session.prepare([module], inputs, configure=configure)
+        plan, = session.prepare({"stage": ([module], inputs, configure)})["stage"]
         stage, = plan.stages
         # packing이 측정할 stage의 shape를 바꾸지 않았는지 확인한다.
         if (tuple(stage.shape), stage.instance_count) != (key.mnk, key.instances):
@@ -109,11 +110,11 @@ def measure_stage(key, weights, session, config, *, warmup, repeat):
         session.backend.model.enter_layer(plan)
         upload_ms = (time.perf_counter_ns() - start) / 1e6
         for _ in range(warmup):
-            session.run_model(*inputs)
+            session.run_model("stage", *inputs)
         samples = []
         for _ in range(repeat):
             start = time.perf_counter_ns()
-            session.run_model(*inputs)
+            session.run_model("stage", *inputs)
             samples.append((time.perf_counter_ns() - start) / 1e6)
     session.release()
     return PIMBenchmarkResult(
@@ -363,28 +364,18 @@ class CompiledModel:
     report: dict
 
 
-def compile_model(layers, example_inputs, *, target, units, runtime_options=None,
-                  cache_path=DEFAULT_CACHE_PATH, max_benchmarks=20, max_generations=10,
-                  warmup=1, repeat=3, seed=0):
-    """Compile time of a model whose layers share one structure; the session runs it at runtime.
+def choose_phase(phase, layer, example_inputs, spec, capacity_bytes, *, cache_path,
+                 search_budget, warmup, repeat, seed):
+    """Stage classes, packing and one config per class for the first layer of one phase.
 
-    1. analyze the first layer into stage classes
-    2. tune every class with its weights resident; a packed class also tunes its members
-    3. for every pack/separate choice of the packed classes, select_configs picks one
-       candidate per class; the choice with the smallest E + U of one layer wins
-    4. compile every layer with those configs; plan_memory places them in slots
+    capacity_bytes is what one unit has for the phase area (after the key/value cache).
     """
-    layers = tuple(layers)
-    spec = target_spec(target, num_units=units, **(runtime_options or {}))
-
     start = time.perf_counter_ns()
-    classes, assignment = analyze_layer(layers[0], example_inputs, spec)
+    classes, assignment = analyze_layer(layer, example_inputs, spec)
     analysis_ms = (time.perf_counter_ns() - start) / 1e6
-    print(f"[model compile] target={target} units={units} layers={len(layers)} "
-          f"stage_classes={len(classes)}", flush=True)
+    print(f"[model compile] {phase}: stage_classes={len(classes)}", flush=True)
 
     start = time.perf_counter_ns()
-    search_budget = SearchBudget(max_generations=max_generations, max_benchmarks=max_benchmarks)
     candidates = {}
 
     def tune_once(stage_class):
@@ -402,7 +393,6 @@ def compile_model(layers, example_inputs, *, target, units, runtime_options=None
                 tune_once(member)
         tune_once(stage_class)
 
-    capacity_bytes = spec.common_profile.banks_per_unit * spec.common_profile.bank_capacity_limit_bytes
     packed_classes = [stage_class for stage_class in classes if stage_class.origin is not None]
     best = None
     packing = []
@@ -421,14 +411,14 @@ def compile_model(layers, example_inputs, *, target, units, runtime_options=None
                         "layer_ms": None if selection is None else selection[0],
                         "slot_bytes": None if selection is None else selection[1],
                         "scratch_bytes": None if selection is None else selection[2]})
-        print(f"[model compile] separate={[key.label() for key in separated]} -> "
+        print(f"[model compile] {phase}: separate={[key.label() for key in separated]} -> "
               + ("no layer fits one unit" if selection is None else
                  f"E+U {selection[0]:.1f} ms/layer, slot {selection[1]} B, scratch {selection[2]} B"),
               flush=True)
         if selection is not None and (best is None or selection[0] < best[0][0]):
             best = (selection, separated, parts)
     if best is None:
-        raise ValueError(f"no choice of measured configs fits one layer in {capacity_bytes} bytes")
+        raise ValueError(f"{phase}: no choice of measured configs fits one layer in {capacity_bytes} bytes")
     (_, _, _, selected), separated_keys, parts = best
     separate = set()
     for key in separated_keys:
@@ -439,60 +429,115 @@ def compile_model(layers, example_inputs, *, target, units, runtime_options=None
                           [sources for part in group for sources in part.stage_sources])
                for key, group in parts.items()]
     tuning_ms = (time.perf_counter_ns() - start) / 1e6
+    return {"selected": selected, "assignment": assignment, "separate": separate,
+            "classes": classes, "candidates": candidates, "packing": packing,
+            "analysis_ms": analysis_ms, "tuning_ms": tuning_ms}
+
+
+def compile_model(phases, *, target, units, kv=None, runtime_options=None,
+                  cache_path=DEFAULT_CACHE_PATH, max_benchmarks=20, max_generations=10,
+                  warmup=1, repeat=3, seed=0):
+    """Compile time of a model whose layers share one structure in every phase; the session runs it.
+
+    phases maps each phase name, in execution order, to (layers, example_inputs); kv is the
+    model's KVRequirement, or None when the key/value cache stays on the host. Every phase
+    overlays one area after the key/value cache, so its configs are chosen for what is left:
+    1. analyze the first layer of the phase into stage classes
+    2. tune every class with its weights resident; a packed class also tunes its members
+    3. for every pack/separate choice of the packed classes, select_configs picks one
+       candidate per class; the choice with the smallest E + U of one layer wins
+    4. compile every layer of every phase with those configs; plan_memory places them
+    """
+    spec = target_spec(target, num_units=units, **(runtime_options or {}))
+    kv_bytes = 0 if kv is None else 2 * kv.layers * kv_parts(kv, units)[2]
+    capacity_bytes = (spec.common_profile.banks_per_unit * spec.common_profile.bank_capacity_limit_bytes
+                      - kv_bytes)
+    print(f"[model compile] target={target} units={units} phases={list(phases)} "
+          f"kv_bytes={kv_bytes}", flush=True)
+    search_budget = SearchBudget(max_generations=max_generations, max_benchmarks=max_benchmarks)
+    choices = {phase: choose_phase(phase, tuple(layers)[0], example_inputs, spec, capacity_bytes,
+                                   cache_path=cache_path, search_budget=search_budget,
+                                   warmup=warmup, repeat=repeat, seed=seed)
+               for phase, (layers, example_inputs) in phases.items()}
+
+    def configure_with(choice):
+        # 모든 layer의 GEMM 이름이 분석한 layer와 같다. 없는 이름은 KeyError로 드러난다.
+        def configure(gemms, spec):
+            return {gemm.node: PIMTorchConfig(spec=spec,
+                                              config=choice["selected"][choice["assignment"][gemm.node]].config,
+                                              pack=gemm.node not in choice["separate"])
+                    for gemm in gemms}
+        return configure
 
     start = time.perf_counter_ns()
     session = PIMSession(spec)
-
-    # 모든 layer의 GEMM 이름이 분석한 layer와 같다. 없는 이름은 KeyError로 드러난다.
-    def configure(gemms, spec):
-        return {gemm.node: PIMTorchConfig(spec=spec, config=selected[assignment[gemm.node]].config,
-                                          pack=gemm.node not in separate)
-                for gemm in gemms}
-
     torch._dynamo.reset()
-    session.compile(layers, example_inputs, configure=configure)
-    # packing 판단을 반영한 layer가 측정한 class와 같은 stage들로 나뉘었는지 확인한다.
-    compiled = Counter(stage_key(stage) for stage in session.layers[0].stages)
-    expected = Counter({stage_class.key: stage_class.count for stage_class in classes})
-    if compiled != expected:
-        raise ValueError(f"layer 0 compiled into stages {dict(compiled)}; the tuned classes are {expected}")
-    analyzed = [(tuple(stage.shape), stage.instance_count, tuple(stage.weight_mask))
-                for stage in session.layers[0].stages]
-    for plan in session.layers[1:]:
-        stages = [(tuple(stage.shape), stage.instance_count, tuple(stage.weight_mask))
-                  for stage in plan.stages]
-        if stages != analyzed:
-            raise ValueError(f"layer {plan.index} has stages {stages}; the analyzed layer has {analyzed}")
+    session.compile({phase: (layers, example_inputs, configure_with(choices[phase]))
+                     for phase, (layers, example_inputs) in phases.items()}, kv=kv)
+    for phase, plans in session.plans.items():
+        classes = choices[phase]["classes"]
+        # packing 판단을 반영한 layer가 측정한 class와 같은 stage들로 나뉘었는지 확인한다.
+        compiled = Counter(stage_key(stage) for stage in plans[0].stages)
+        expected = Counter({stage_class.key: stage_class.count for stage_class in classes})
+        if compiled != expected:
+            raise ValueError(f"{phase}: layer 0 compiled into stages {dict(compiled)}; "
+                             f"the tuned classes are {expected}")
+        analyzed = [(tuple(stage.shape), stage.instance_count, tuple(stage.weight_mask))
+                    for stage in plans[0].stages]
+        for plan in plans[1:]:
+            stages = [(tuple(stage.shape), stage.instance_count, tuple(stage.weight_mask))
+                      for stage in plan.stages]
+            if stages != analyzed:
+                raise ValueError(f"{phase}: layer {plan.index} has stages {stages}; "
+                                 f"the analyzed layer has {analyzed}")
     compile_ms = (time.perf_counter_ns() - start) / 1e6
     memory = session.memory
-    print(f"[model compile] slots={memory.slots} groups={memory.groups} "
-          f"bytes_per_unit={memory.bytes_per_unit} capacity={memory.capacity_bytes} "
-          f"analysis_ms={analysis_ms:.1f} tuning_ms={tuning_ms:.1f} compile_ms={compile_ms:.1f}", flush=True)
+    for phase, layout in memory.phases.items():
+        print(f"[model compile] {phase}: slots={layout.slots} groups={layout.groups} bytes={layout.bytes} "
+              f"analysis_ms={choices[phase]['analysis_ms']:.1f} tuning_ms={choices[phase]['tuning_ms']:.1f}",
+              flush=True)
+    print(f"[model compile] kv_bytes={memory.kv_bytes} bytes_per_unit={memory.bytes_per_unit} "
+          f"capacity={memory.capacity_bytes} compile_ms={compile_ms:.1f}", flush=True)
+
+    def phase_report(phase, layers):
+        choice = choices[phase]
+        selected = choice["selected"]
+        return {
+            "layers": len(layers),
+            # weight 상주 실행 시간만 더한 값. weight 업로드와 CPU 시간은 들어가지 않는다.
+            "estimated_execution_ms": len(layers) * sum(
+                stage_class.count * selected[stage_class.key].execution_ms
+                for stage_class in choice["classes"]),
+            "analysis_ms": choice["analysis_ms"], "tuning_ms": choice["tuning_ms"],
+            "packing": choice["packing"],
+            "stage_classes": [{
+                "label": stage_class.key.label(),
+                "mnk": list(stage_class.key.mnk), "op": stage_class.key.op,
+                "weight_mask": list(stage_class.key.weight_mask),
+                "instances": stage_class.key.instances,
+                "stages_per_layer": stage_class.count,
+                "measured": len(choice["candidates"][stage_class.key]),
+                "selected": {"config": asdict(selected[stage_class.key].config),
+                             "execution_ms": selected[stage_class.key].execution_ms,
+                             # 격리 측정의 첫 업로드. group 진입 때 pack과 전송이 함께 일어나므로 둘 다 들어간다.
+                             "first_upload_ms": selected[stage_class.key].upload_ms,
+                             "footprint": asdict(selected[stage_class.key].footprint)},
+            } for stage_class in choice["classes"]],
+        }
 
     report = {
-        "target": target, "units": units, "spec": asdict(spec), "layers": len(layers),
-        "memory": {"slots": memory.slots, "groups": memory.groups,
-                   "slot_of_layer": memory.slot_of_layer, "group_of_layer": memory.group_of_layer,
-                   "slot_bytes": list(memory.slot_bytes),
-                   "scratch_bytes": memory.scratch_bytes, "bytes_per_unit": memory.bytes_per_unit,
-                   "capacity_bytes": memory.capacity_bytes},
-        # weight 상주 실행 시간만 더한 값. weight 업로드와 CPU 시간은 들어가지 않는다.
-        "estimated_execution_ms": len(layers) * sum(
-            stage_class.count * selected[stage_class.key].execution_ms for stage_class in classes),
-        "analysis_ms": analysis_ms, "tuning_ms": tuning_ms, "compile_ms": compile_ms,
-        "packing": packing,
-        "stage_classes": [{
-            "label": stage_class.key.label(),
-            "mnk": list(stage_class.key.mnk), "op": stage_class.key.op,
-            "weight_mask": list(stage_class.key.weight_mask),
-            "instances": stage_class.key.instances,
-            "stages_per_layer": stage_class.count,
-            "measured": len(candidates[stage_class.key]),
-            "selected": {"config": asdict(selected[stage_class.key].config),
-                         "execution_ms": selected[stage_class.key].execution_ms,
-                         # 격리 측정의 첫 업로드. group 진입 때 pack과 전송이 함께 일어나므로 둘 다 들어간다.
-                         "first_upload_ms": selected[stage_class.key].upload_ms,
-                         "footprint": asdict(selected[stage_class.key].footprint)},
-        } for stage_class in classes],
+        "target": target, "units": units, "spec": asdict(spec),
+        "kv": None if kv is None else asdict(kv),
+        "memory": {"kv_split": memory.kv_split, "kv_tokens_per_unit": memory.kv_tokens_per_unit,
+                   "kv_bytes": memory.kv_bytes, "bytes_per_unit": memory.bytes_per_unit,
+                   "capacity_bytes": memory.capacity_bytes,
+                   "phases": {phase: {"slots": layout.slots, "groups": layout.groups,
+                                      "slot_of_layer": layout.slot_of_layer,
+                                      "group_of_layer": layout.group_of_layer,
+                                      "slot_bytes": list(layout.slot_bytes),
+                                      "scratch_bytes": layout.scratch_bytes, "bytes": layout.bytes}
+                              for phase, layout in memory.phases.items()}},
+        "compile_ms": compile_ms,
+        "phases": {phase: phase_report(phase, layers) for phase, (layers, _) in phases.items()},
     }
     return CompiledModel(session, report)

@@ -12,7 +12,7 @@ from .compiler import _run_translate
 from .residency import INPUT as INPUT_KIND, OUTPUT as OUTPUT_KIND, WEIGHT as WEIGHT_KIND
 from .residency import OperandRequirement, StageRequirement
 from .upmem_artifact import INPUT, MRAM_BASE, OUTPUT, WEIGHT, TransferStats, _artifact_bindings, _build_program
-from .runtime import GroupLoader, current_invocation
+from .runtime import GroupLoader, current_invocation, group_order
 
 
 # binding role -> memory table 종류
@@ -95,7 +95,7 @@ class UPMEMModelRuntime:
         self.stages = []
         self.loaded_program = None
         self.memory = None
-        # group index -> 그 group의 layer plan들 (실행 순서). place가 만들고 group 업로드가 쓴다.
+        # (phase, group) -> 그 group의 layer plan들 (실행 순서). place가 만들고 group 업로드가 쓴다.
         self.plans_of_group = {}
         # group 업로드 순서와 background pack (runtime.GroupLoader). place가 만든다.
         self.loader = None
@@ -143,31 +143,36 @@ class UPMEMModelRuntime:
     def place(self, plans, memory):
         """Link every stage program at the MRAM offsets of the memory table.
 
-        The slots are contiguous, so one layer group fills the weight regions with
-        one transfer. Layers in the same slot get the same weight addresses, so a
-        group change overwrites only the weights.
+        The slots of a phase are contiguous, so one layer group fills the weight regions
+        with one transfer. Layers in the same slot get the same weight addresses, so a
+        group change overwrites only the weights; the phases share one area, so the first
+        group of the next phase overwrites the previous phase.
         """
         self.memory = memory
-        self.loader = GroupLoader(memory.groups, self._pack_group, self._push_group, self._release_group)
+        self.loader = GroupLoader(group_order(memory), self._pack_group, self._push_group,
+                                  self._release_group)
         for plan in plans:
-            self.plans_of_group.setdefault(memory.group_of_layer[plan.index], []).append(plan)
+            layout = memory.phases[plan.phase]
+            self.plans_of_group.setdefault((plan.phase, layout.group_of_layer[plan.index]), []).append(plan)
             for stage in plan.stages:
                 stage.addresses = {
-                    binding.symbol: MRAM_BASE + memory.entries[(plan.index, stage.name, index)].offset
+                    binding.symbol:
+                        MRAM_BASE + memory.entries[(plan.phase, plan.index, stage.name, index)].offset
                     for index, binding in enumerate(stage.bindings)}
                 stage.program = _build_program(stage.bundle, stage.addresses, stats=self.totals)
             plan.weight_bytes_per_unit = sum(binding.size for stage in plan.stages
                                              for binding in stage.bindings if binding.role == WEIGHT)
             plan.backend_plan = {
-                "slot": memory.slot_of_layer[plan.index],
-                "group": memory.group_of_layer[plan.index],
+                "phase": plan.phase,
+                "slot": layout.slot_of_layer[plan.index],
+                "group": layout.group_of_layer[plan.index],
                 "weight_bytes": plan.weight_bytes_per_unit,
                 "bytes_per_unit": memory.bytes_per_unit,
             }
 
     def memory_table(self, plans):
         """The memory table rows with MRAM addresses; every DPU has this layout."""
-        return [{"kind": entry.kind, "layer": entry.layer, "stage": entry.stage,
+        return [{"kind": entry.kind, "phase": entry.phase, "layer": entry.layer, "stage": entry.stage,
                  "operand": entry.operand, "slot": entry.slot, "group": entry.group,
                  "pa": MRAM_BASE + entry.offset, "bytes": entry.bytes}
                 for entry in self.memory.entries.values()]
@@ -179,13 +184,13 @@ class UPMEMModelRuntime:
             for stage in plan.stages:
                 self._create_stage(stage, units)
 
-    def _pack_group(self, group):
+    def _pack_group(self, key):
         """Lay the group's weights out in the stage pools and build its block table.
 
         PACK calls only fill host pools (no DPU access), so this may run while DPUs compute.
         The table covers the group's weights, which are contiguous in MRAM.
         """
-        plans = self.plans_of_group[group]
+        plans = self.plans_of_group[key]
         stages = [stage for plan in plans for stage in plan.stages if any(stage.weight_mask)]
         if not stages:
             return None
@@ -254,7 +259,7 @@ class UPMEMModelRuntime:
 
     def enter_layer(self, plan):
         # group이 바뀔 때만 그 group 전체 weight를 한 번에 보낸다 (pack은 대개 앞 group 실행 중에 끝나 있다).
-        self.loader.enter(self.memory.group_of_layer[plan.index])
+        self.loader.enter((plan.phase, self.memory.phases[plan.phase].group_of_layer[plan.index]))
 
     def exit_layer(self, plan):
         """다음 group이 같은 weight 영역을 덮어쓴다. 이번 요청에서 다시 돌지 않는 layer의 host pool을 놓는다."""
@@ -267,7 +272,7 @@ class UPMEMModelRuntime:
             for stage in plan.stages:
                 for binding in stage.bindings:
                     if binding.role == WEIGHT:
-                        table[(plan.index, stage.name, binding.operand)] = {
+                        table[(plan.phase, plan.index, stage.name, binding.operand)] = {
                             "tensor": stage.weights[binding.operand],
                             "address": stage.addresses[binding.symbol],
                             "bytes_per_unit": binding.size,
@@ -290,7 +295,9 @@ class UPMEMModelRuntime:
         for name in totals:
             totals[name] += self.group_stats[name]
         totals.update(self.totals)
-        totals.update(self.loader.totals)
+        # place 전에 준비가 실패해도 정리 경로가 통계를 읽는다. 그때는 group 업로드가 없다.
+        if self.loader is not None:
+            totals.update(self.loader.totals)
         return totals
 
     def close(self):

@@ -28,7 +28,7 @@ import time
 
 from .compiler import _run_translate
 from .residency import INPUT, OUTPUT, STATE, WEIGHT, OperandRequirement, StageRequirement
-from .runtime import GroupLoader, current_invocation
+from .runtime import GroupLoader, current_invocation, group_order
 
 # operand 시작 주소 정렬. data buffer는 16 KB 정렬이 필요하고(8 KB면 결과가 틀린다, batch 8 실측),
 # PMM은 256 KB 정렬이 필요하다(AiMXDialect kPMMAlign). 모든 operand를 이 배수로 보고하므로
@@ -211,23 +211,34 @@ class AiMXModelRuntime:
         ]
 
     def place(self, plans, memory):
+        # phase overlay, key/value cache 영역, 그리고 phase가 바뀔 때 descriptor chain을 다시
+        # 만드는 일은 아직 UPMEM만 한다. AiMX는 phase 하나를 offset 0부터 배치한다.
+        if len(memory.phases) != 1 or memory.kv_bytes:
+            raise NotImplementedError(
+                f"AiMX places one phase and no device key/value cache; got phases "
+                f"{list(memory.phases)} and {memory.kv_bytes} key/value bytes")
         self.memory = memory
+        (self.phase, self.layout), = memory.phases.items()
         for plan in plans:
-            self.plans_of_group.setdefault(memory.group_of_layer[plan.index], []).append(plan)
+            self.plans_of_group.setdefault((plan.phase, self.layout.group_of_layer[plan.index]),
+                                           []).append(plan)
             plan.weight_bytes_per_unit = sum(self._bytes(stage, WEIGHT) for stage in plan.stages)
             plan.backend_plan = {
-                "slot": memory.slot_of_layer[plan.index],
-                "group": memory.group_of_layer[plan.index],
+                "phase": plan.phase,
+                "slot": self.layout.slot_of_layer[plan.index],
+                "group": self.layout.group_of_layer[plan.index],
                 "weight_bytes": plan.weight_bytes_per_unit,
                 "state_bytes": sum(self._bytes(stage, STATE) for stage in plan.stages),
-                "scratch_bytes": memory.scratch_bytes,
+                "scratch_bytes": self.layout.scratch_bytes,
                 "bytes_per_unit": memory.bytes_per_unit,
             }
-        self.loader = GroupLoader(memory.groups, self._pack_group, self._push_group, self._release_group)
+        self.loader = GroupLoader(group_order(memory), self._pack_group, self._push_group,
+                                  self._release_group)
         # slot의 weight, slot의 state, scratch 순서로 이어진 조각을 region 상한까지 묶는다.
         # 조각 하나는 나누지 않으므로 한 slot의 weight는 언제나 한 region 안에 있다.
         start = 0
-        for size in (*memory.slot_weight_bytes, *memory.slot_state_bytes, memory.scratch_bytes):
+        for size in (*self.layout.slot_weight_bytes, *self.layout.slot_state_bytes,
+                     self.layout.scratch_bytes):
             if size > MAX_REGION_BYTES:
                 raise ValueError(f"a memory-table piece of {size} bytes exceeds one AiMX region "
                                  f"({MAX_REGION_BYTES} bytes)")
@@ -253,7 +264,7 @@ class AiMXModelRuntime:
                     fpga, size, OPERAND_ALIGNMENT)
         first = {}
         for plan in plans:
-            owner = first.setdefault(self.memory.slot_of_layer[plan.index], plan)
+            owner = first.setdefault(self.layout.slot_of_layer[plan.index], plan)
             for stage, slot_stage in zip(plan.stages, owner.stages):
                 self._create_stage(plan, stage, slot_stage)
         # chain에는 buffer의 물리 주소가 들어가므로 slot마다 하나다. 요청 전에 만들어 올린다
@@ -268,7 +279,7 @@ class AiMXModelRuntime:
         if jobs > self.units:
             raise ValueError(f"{stage.name}: {jobs} jobs exceed {self.units} FPGAs")
         arguments = len(stage.scalar_arguments)
-        entries = [self.memory.entries[(plan.index, stage.name, index)]
+        entries = [self.memory.entries[(plan.phase, plan.index, stage.name, index)]
                    for index in range(len(stage.slot_bytes))]
         stage.offsets = tuple(entry.offset for entry in entries)
         if slot_stage is stage:
@@ -320,20 +331,20 @@ class AiMXModelRuntime:
         stage.call.upload = upload
         stage.function(ctypes.byref(stage.call), *call_arguments)
 
-    def _pack_group(self, group):
+    def _pack_group(self, key):
         """Host images of one group's weight range, one per FPGA; the range starts at offset 0.
 
         Pack calls write host memory only, so this may run while other stages compute.
         Returns ({FPGA: image}, bytes of the range).
         """
-        layers = self.plans_of_group[group]
-        weight_bytes = sum(self.memory.slot_weight_bytes[:len(layers)])
+        layers = self.plans_of_group[key]
+        weight_bytes = sum(self.layout.slot_weight_bytes[:len(layers)])
         weight_stages = [(plan, stage) for plan in layers for stage in plan.stages if any(stage.weight_mask)]
         # stage가 image 안 자기 buffer 자리에 바로 조립한다. 아무도 쓰지 않는 정렬 간격은 0으로 읽힌다.
         images = {fpga: self.library.aimx_host_image_create(weight_bytes)
                   for fpga in sorted({fpga for _, stage in weight_stages for fpga in stage.fpgas})}
         for plan, stage in weight_stages:
-            entry = next(self.memory.entries[(plan.index, stage.name, index)]
+            entry = next(self.memory.entries[(plan.phase, plan.index, stage.name, index)]
                          for index, kind in enumerate(stage.slot_table_kinds) if kind == WEIGHT)
             # stub은 weight buffer(VA v)를 host + (v - pack_va)에 쓴다. pack_va를 그 FPGA에서
             # offset 0이 있을 VA로 두면 image 안의 위치가 table offset과 같아진다.
@@ -369,7 +380,7 @@ class AiMXModelRuntime:
 
     def enter_layer(self, plan):
         # group이 바뀔 때만 그 group의 weight를 한 번 올린다 (pack은 대개 앞 group 실행 중에 끝나 있다).
-        self.loader.enter(self.memory.group_of_layer[plan.index])
+        self.loader.enter((plan.phase, self.layout.group_of_layer[plan.index]))
 
     def exit_layer(self, plan):
         """Slots stay allocated; the next group overwrites only the weights."""
@@ -400,7 +411,7 @@ class AiMXModelRuntime:
                 for operand, weight in enumerate(stage.weights):
                     if weight is None:
                         continue
-                    table[(plan.index, stage.name, operand)] = {
+                    table[(plan.phase, plan.index, stage.name, operand)] = {
                         "tensor": weight,
                         "bytes_per_unit": sum(
                             size for size, slot_operand, slot_weight in zip(
@@ -420,7 +431,7 @@ class AiMXModelRuntime:
         first = {}
         layers = {}
         for plan in plans:
-            slot = self.memory.slot_of_layer[plan.index]
+            slot = self.layout.slot_of_layer[plan.index]
             first.setdefault(slot, plan)
             layers.setdefault(slot, []).append(plan.index)
         rows = []
@@ -429,7 +440,7 @@ class AiMXModelRuntime:
                 for fpga, context in zip(stage.fpgas, stage.contexts):
                     resident = ctypes.cast(context, ctypes.POINTER(AiMXResidentContext)).contents
                     for index in range(len(stage.slot_bytes)):
-                        entry = self.memory.entries[(plan.index, stage.name, index)]
+                        entry = self.memory.entries[(plan.phase, plan.index, stage.name, index)]
                         rows.append({"slot": slot, "layers": layers[slot], "stage": stage.name,
                                      "unit": fpga, "buffer": index, "kind": entry.kind,
                                      "offset": entry.offset, "pa": self._address(entry, fpga, "pa"),
@@ -437,7 +448,10 @@ class AiMXModelRuntime:
         return rows
 
     def stats(self):
-        totals = {**self.totals, **self.loader.totals}
+        totals = dict(self.totals)
+        # place 전에 준비가 실패해도 정리 경로가 통계를 읽는다. 그때는 group 업로드가 없다.
+        if self.loader is not None:
+            totals.update(self.loader.totals)
         totals["breakdown"] = {key: dict(record) for key, record in self.breakdown.items()}
         totals["live_bytes"] = sum(
             self.library.aimx_model_live_bytes(context)

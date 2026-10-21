@@ -93,6 +93,8 @@ class LayerPlan:
     example_inputs: tuple
     exported_graph: fx.GraphModule
     spec: object = None
+    # 이 layer가 속한 요청 단계 (prefill, decode). PIMSession이 정한다.
+    phase: str = None
     backend_plan: object = None
     weight_bytes_per_unit: int = 0
 

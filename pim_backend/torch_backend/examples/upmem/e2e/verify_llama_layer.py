@@ -91,7 +91,7 @@ def main():
 
         start = time.perf_counter_ns()
         compiled = compile_model(
-            [block], (torch.zeros_like(hidden), ()), target="upmem", units=2048,
+            {"prefill": ([block], (torch.zeros_like(hidden), ()))}, target="upmem", units=2048,
             runtime_options={"nr_tasklets": 16,
                              "local_capacity_limit_bytes": args.local_capacity_limit_bytes},
             cache_path=args.cache,
@@ -99,9 +99,10 @@ def main():
         )
         compile_ms = (time.perf_counter_ns() - start) / 1e6
         session = compiled.session
-        plan, = session.layers
+        plan, = session.plans["prefill"]
         print(f"compile_ms={compile_ms:.1f} stages={len(plan.stages)} "
-              f"slots={session.memory.slots} bytes_per_unit={session.memory.bytes_per_unit}", flush=True)
+              f"slots={session.memory.phases['prefill'].slots} "
+              f"bytes_per_unit={session.memory.bytes_per_unit}", flush=True)
         for stage in plan.stages:
             print(f"  stage={stage.name} mnk={stage.shape} instances={stage.instance_count} "
                   f"batch_rounds={stage.batch_rounds} dtype={stage.input_dtype}", flush=True)
@@ -111,7 +112,7 @@ def main():
             # 첫 호출은 layer 진입 시 weight upload를 포함한다.
             for phase in ("first", "second"):
                 start = time.perf_counter_ns()
-                output, _ = session.run_model(hidden, ())
+                output, _ = session.run_model("prefill", hidden, ())
                 outputs.append(output)
                 calls.append({"phase": phase, "wall_ms": (time.perf_counter_ns() - start) / 1e6})
 

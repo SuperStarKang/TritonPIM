@@ -41,7 +41,7 @@ def analytical_config(problem, spec, space):
 def compile_session(layers, example_inputs, args):
     """compile_model on the experiment's FPGAs: the unopened session and its config report."""
     compiled = compile_model(
-        layers, example_inputs, target="aimx", units=args.fpgas,
+        {"prefill": (layers, example_inputs)}, target="aimx", units=args.fpgas,
         runtime_options={"base_fpga": args.base_fpga},
         cache_path=args.cache, max_benchmarks=args.max_benchmarks,
     )
@@ -49,8 +49,9 @@ def compile_session(layers, example_inputs, args):
 
 
 def memory_record(memory):
-    """The session's memory plan for a report: slots, layers kept in their own slot, bytes."""
-    return {"slots": memory.slots, "groups": memory.groups, "slot_of_layer": memory.slot_of_layer,
+    """The session's memory plan for a report: slots and groups of the prefill phase, bytes."""
+    prefill = memory.phases["prefill"]
+    return {"slots": prefill.slots, "groups": prefill.groups, "slot_of_layer": prefill.slot_of_layer,
             "bytes_per_fpga": memory.bytes_per_unit, "capacity_bytes": memory.capacity_bytes}
 
 

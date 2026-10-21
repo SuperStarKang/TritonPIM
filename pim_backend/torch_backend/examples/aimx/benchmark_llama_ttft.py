@@ -68,10 +68,11 @@ def main():
         session, config_report = compile_session(
             blocks, (torch.zeros(1, SEQUENCE, model.config.hidden_size),), args)
         compile_ms = (time.perf_counter_ns() - start) / 1e6
-        plans = session.layers
+        plans = session.plans["prefill"]
         memory = session.memory
+        prefill = memory.phases["prefill"]
         print(f"compile_ms={compile_ms:.1f} layers={len(plans)} stages/layer={len(plans[0].stages)} "
-              f"slots={memory.slots} groups={memory.groups} bytes_per_fpga={memory.bytes_per_unit} "
+              f"slots={prefill.slots} groups={prefill.groups} bytes_per_fpga={memory.bytes_per_unit} "
               f"capacity={memory.capacity_bytes}", flush=True)
 
         with session:
@@ -82,7 +83,7 @@ def main():
                     start = time.perf_counter_ns()
                     embedded = model.model.embed_tokens(prompt_ids(tokenizer, prompt)).float()
                     tokenized_at = time.perf_counter_ns()
-                    hidden = session.run_model(embedded)
+                    hidden = session.run_model("prefill", embedded)
                     layers_at = time.perf_counter_ns()
                     logits = lm_head(norm(hidden[:, -1, :]))
                     token = logits.argmax(dim=-1).item()

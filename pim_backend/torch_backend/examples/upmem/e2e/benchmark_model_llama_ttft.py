@@ -3,7 +3,10 @@
 Run 1024 tokens, every layer, 2048 DPUs and 16 tasklets. --kv share|repeat as
 e2e/llama_workloads.py. compile_model tunes every
 stage class of the first layer, compiles all layers and plans the MRAM slots
-before the DPUs are opened. Two identical requests follow: cold TTFT includes
+before the DPUs are opened. The memory table reserves the key/value cache for
+1024 + --max-new-tokens token positions at the bottom of every DPU (the prefill
+phase starts after it; the cache itself still stays on the CPU here). Two
+identical requests follow: cold TTFT includes
 one weight push per layer group; warm TTFT pushes again only when there is more
 than one group. Compile and resource open/close are excluded. CPU
 FP32 KV tensors are retained through the first token. No calibration or
@@ -26,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
 import triton
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from triton.backends.pim.residency import KVRequirement
 
 from torch_backend import compile_model
 from torch_backend._autotuner import DEFAULT_CACHE_PATH
@@ -54,6 +58,8 @@ def main():
     parser.add_argument("--report-dir", type=Path, required=True)
     parser.add_argument("--kv", choices=KV_MODES, default="share", help="how a query head reads its KV head")
     parser.add_argument("--cache", default=DEFAULT_CACHE_PATH)
+    parser.add_argument("--max-new-tokens", type=int, default=128,
+                        help="tokens one request generates; the key/value cache holds 1024 + this many positions")
     parser.add_argument("--max-benchmarks", type=int, default=20, help="per stage class")
     parser.add_argument("--max-generations", type=int, default=10)
     parser.add_argument("--local-capacity-limit-bytes", type=int, required=True,
@@ -89,8 +95,11 @@ def main():
 
         print(f"Compiling {layers} INT8 layers (kv={args.kv}): tuning -> compile -> memory plan ...",
               flush=True)
+        # decode가 읽을 INT8 key/value cache: layer마다 key/value head의 token 위치 1024 + 생성 token 수
+        kv = KVRequirement(layers, config.num_key_value_heads, config.head_dim,
+                           1024 + args.max_new_tokens, 1)
         compiled = compile_model(
-            blocks, (example, ()), target="upmem", units=2048,
+            {"prefill": (blocks, (example, ()))}, kv=kv, target="upmem", units=2048,
             runtime_options={"nr_tasklets": 16,
                              "local_capacity_limit_bytes": args.local_capacity_limit_bytes},
             cache_path=args.cache,
@@ -98,11 +107,12 @@ def main():
         )
         compile_report = compiled.report
         memory = compiled.session.memory
-        print(f"slots={memory.slots} groups={memory.groups} "
+        prefill = memory.phases["prefill"]
+        print(f"slots={prefill.slots} groups={prefill.groups} kv_bytes={memory.kv_bytes} "
               f"bytes_per_unit={memory.bytes_per_unit} capacity={memory.capacity_bytes} "
-              f"tuning_ms={compile_report['tuning_ms']:.1f} "
+              f"tuning_ms={compile_report['phases']['prefill']['tuning_ms']:.1f} "
               f"compile_ms={compile_report['compile_ms']:.1f}", flush=True)
-        for stage_class in compile_report["stage_classes"]:
+        for stage_class in compile_report["phases"]["prefill"]["stage_classes"]:
             selected = stage_class["selected"]
             print(f"  {stage_class['label']}: measured={stage_class['measured']} "
                   f"E_ms={selected['execution_ms']:.3f} U_ms={selected['first_upload_ms']:.3f} "
@@ -110,7 +120,7 @@ def main():
 
         with compiled.session as session:
             preparation_ms = (time.perf_counter_ns() - setup_start) / 1e6
-            plans = session.layers
+            plans = session.plans["prefill"]
             layer_plans = []
             for plan in plans:
                 stages = [{
@@ -133,7 +143,7 @@ def main():
                     "memory": plan.backend_plan,
                 })
             expected_launches = sum(layer["expected_launches"] for layer in layer_plans)
-            print(f"slots={memory.slots} groups={memory.groups} open_ms={session.open_ms:.3f} "
+            print(f"slots={prefill.slots} groups={prefill.groups} open_ms={session.open_ms:.3f} "
                   f"expected_launches={expected_launches}", flush=True)
 
             preparation_transfers = session.stats()
@@ -152,7 +162,7 @@ def main():
                         raise ValueError("the prompt must contain at least 1024 tokens including special tokens")
                     tokenized_at = time.perf_counter_ns()
 
-                    hidden, cache = session.run_model(model.model.embed_tokens(input_ids), ())
+                    hidden, cache = session.run_model("prefill", model.model.embed_tokens(input_ids), ())
                     for layer_id, (key, value) in enumerate(cache):
                         session.kv_table[layer_id] = {
                             "key": key, "value": value,
@@ -181,12 +191,12 @@ def main():
 
         weight_bytes = sum(layer["upload_bytes"] for layer in layer_plans)
         # group이 하나면 두 번째 요청에서 weight가 이미 올라와 있다. 아니면 매 요청 모든 group을 올린다.
-        warm_pushes = memory.groups if memory.groups > 1 else 0
-        warm_weight_bytes = weight_bytes if memory.groups > 1 else 0
+        warm_pushes = prefill.groups if prefill.groups > 1 else 0
+        warm_weight_bytes = weight_bytes if prefill.groups > 1 else 0
         cold, warm = requests
         assert cold["transfers"]["weight_bytes"] == weight_bytes
         assert warm["transfers"]["weight_bytes"] == warm_weight_bytes
-        assert cold["transfers"]["weight_pushes"] == memory.groups
+        assert cold["transfers"]["weight_pushes"] == prefill.groups
         assert warm["transfers"]["weight_pushes"] == warm_pushes
         for request in requests:
             assert request["transfers"]["launches"] == expected_launches
@@ -213,7 +223,8 @@ def main():
                 "activation_scale": ACTIVATION_SCALE,
                 "probability": "per-row max/127", "calibration": "none",
             },
-            "groups": memory.groups, "group_of_layer": memory.group_of_layer,
+            "groups": prefill.groups, "group_of_layer": prefill.group_of_layer,
+            "max_new_tokens": args.max_new_tokens, "device_kv_bytes_reserved": memory.kv_bytes,
             "activation_transfer_policy": "always",
             "kv_cache_location": "cpu", "kv_cache_dtype": "float32", "kv_cache_bytes": expected_kv_bytes,
             "cpu_threads": torch.get_num_threads(),
@@ -234,7 +245,7 @@ def main():
         for plan in plans:
             write_fx_graph(plan.exported_graph, args.report_dir / f"layer_{plan.index}_export", {})
             write_fx_graph(plan.graph, args.report_dir / f"layer_{plan.index}_partitions", {})
-        print(f"slots={memory.slots} groups={memory.groups} cold_TTFT_ms={cold['ttft_ms']:.3f} "
+        print(f"slots={prefill.slots} groups={prefill.groups} cold_TTFT_ms={cold['ttft_ms']:.3f} "
               f"warm_TTFT_ms={warm['ttft_ms']:.3f} cold_weight_bytes={cold['transfers']['weight_bytes']} "
               f"warm_weight_bytes={warm['transfers']['weight_bytes']} resources=1/1", flush=True)
         print(f"Execution report saved to {args.report_dir.resolve() / 'report.json'}", flush=True)

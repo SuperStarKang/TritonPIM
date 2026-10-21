@@ -68,9 +68,9 @@ def main():
         session, config_report = compile_session(
             [block], (torch.zeros(1, SEQUENCE, model.config.hidden_size),), args)
         compile_ms = (time.perf_counter_ns() - start) / 1e6
-        plan, = session.layers
+        plan, = session.plans["prefill"]
         print(f"compile_ms={compile_ms:.1f} stages={len(plan.stages)} "
-              f"slots={session.memory.slots} bytes_per_fpga={session.memory.bytes_per_unit}",
+              f"slots={session.memory.phases['prefill'].slots} bytes_per_fpga={session.memory.bytes_per_unit}",
               flush=True)
         for stage in plan.stages:
             print(f"  stage={stage.name} mnk={stage.shape} instances={stage.instance_count} "
@@ -81,7 +81,7 @@ def main():
             # 첫 호출은 layer 진입 시 weight upload를 포함한다.
             for phase in ("first", "second"):
                 start = time.perf_counter_ns()
-                outputs.append(session.run_model(hidden))
+                outputs.append(session.run_model("prefill", hidden))
                 calls.append({"phase": phase, "wall_ms": (time.perf_counter_ns() - start) / 1e6})
 
     results = {
