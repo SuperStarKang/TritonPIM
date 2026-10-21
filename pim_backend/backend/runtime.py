@@ -69,12 +69,16 @@ class GroupLoader:
     (waiting for the background pack, or packing now), pushes and releases them, then
     starts packing the next key of order; the last group of a phase is followed by the
     first group of the next phase, whose push then overwrites the previous phase. The
-    first key has nothing to hide behind, so its pack and push are also accumulated
-    apart (group0_*), to be subtracted from a request time.
+    last phase runs again and again (one decode step per generated token), so its last
+    group is followed by its own first group. The first key has nothing to hide behind,
+    so its pack and push are also accumulated apart (group0_*), to be subtracted from a
+    request time.
     """
 
     def __init__(self, order, pack, push, release):
         self.order = order
+        # 마지막 phase의 첫 group. 마지막 phase의 마지막 group 다음에 다시 들어간다.
+        self.repeat_from = next(key for key in order if key[0] == order[-1][0])
         self.pack = pack
         self.push = push
         self.release = release
@@ -122,7 +126,7 @@ class GroupLoader:
         start = time.perf_counter_ns()
         self.push(packed)
         upload_ms = (time.perf_counter_ns() - start) / 1e6
-        # 보낸 weight는 이번 요청에서 다시 쓰지 않는다.
+        # host 사본은 해제한다. 같은 group에 다시 들어가면 다시 pack한다.
         self.release(packed)
         self.totals["pack_wall_ms"] += pack_ms
         self.totals["upload_wall_ms"] += upload_ms
@@ -135,6 +139,8 @@ class GroupLoader:
         position = self.order.index(key)
         if position + 1 < len(self.order):
             self._start_prefetch(self.order[position + 1])
+        elif key != self.repeat_from:
+            self._start_prefetch(self.repeat_from)
 
     def close(self):
         """Finish a background pack and free what it packed; call before freeing its stages."""

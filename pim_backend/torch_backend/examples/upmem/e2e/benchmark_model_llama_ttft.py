@@ -33,18 +33,11 @@ from triton.backends.pim.residency import KVRequirement
 
 from torch_backend import compile_model
 from torch_backend._autotuner import DEFAULT_CACHE_PATH
-from attention.int8_workloads import ACTIVATION_SCALE
 from e2e.llama_workloads import KV_MODES, LlamaPrefillLayer
 from fx_utils import write_fx_graph
-from transformer.benchmark_model_transformer_block import PaddedFFNProjection
 
 
 class ModelPrefillLayer(LlamaPrefillLayer):
-    def __init__(self, layer, config, cosine, sine, causal_mask, kv):
-        super().__init__(layer, config, cosine, sine, causal_mask, kv)
-        self.gate_proj = PaddedFFNProjection(self.gate_proj)
-        self.up_proj = PaddedFFNProjection(self.up_proj)
-
     def forward(self, hidden, cache):
         hidden, key, value = super().forward(hidden)
         # Session forwards tuple outputs as the next layer's positional inputs.
@@ -219,9 +212,10 @@ def main():
             "lm_head_dtype": "float32", "lm_head_scope": "last_token_only",
             "accuracy_checked": False,
             "quantization": {
-                "weight": "per-tensor absmax/128, round, clip [-127, 127]",
-                "activation_scale": ACTIVATION_SCALE,
-                "probability": "per-row max/127", "calibration": "none",
+                "weight": "per-output-channel absmax/127, round, clip [-127, 127]",
+                "activation": "per-token absmax/127 at run time",
+                "query_key_value": "per-(head, token) absmax/127",
+                "probability": "times the value scale, then per-row absmax/127", "calibration": "none",
             },
             "groups": prefill.groups, "group_of_layer": prefill.group_of_layer,
             "max_new_tokens": args.max_new_tokens, "device_kv_bytes_reserved": memory.kv_bytes,

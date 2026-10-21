@@ -196,38 +196,49 @@ def cache_version(key):
     return f"{TORCH_GEMM_TEMPLATE_VERSION}|model|{key.op}|w{mask}|x{key.instances}"
 
 
-def select_configs(classes, candidates, capacity_bytes):
-    """One measured candidate per class with the smallest E + U of one layer that fits one unit.
+def select_configs(classes, candidates, capacity_bytes, *, layers, repeats):
+    """One measured candidate per class with the smallest time of one layer in one request.
 
-    classes maps a stage class key to its stage count in the layer. A cold request
-    runs every layer once and uploads its weights once, so the slot/group plan does
-    not change the time; a layer only has to fit one unit with the scratch. The slot
-    bytes add up over the stages, the scratch is the largest input plus the largest
-    output, so the search keeps every partial choice that no other choice beats in
-    slot bytes, input, output and time together (multiple-choice knapsack).
+    classes maps a stage class key to its stage count in the layer; one request runs
+    the phase repeats times (prefill once, decode once per generated token after the
+    first). Two memory plans give two times per layer:
+      reloaded  layer groups take turns in the slots, so every run uploads the weights
+                again: repeats * (E + U); one layer has to fit one unit with the scratch
+      resident  every layer keeps its own slot, so the weights are uploaded once:
+                repeats * E + U; all layers have to fit one unit with the scratch
+    With one run both times are E + U, and the reloaded plan, which fits more choices,
+    is kept. The slot bytes add up over the stages, the scratch is the largest input
+    plus the largest output, so the search keeps every partial choice that no other
+    choice beats in slot bytes, input, output and time together (multiple-choice knapsack).
     Returns (time_ms, slot_bytes, scratch_bytes, {key: candidate}) or None.
     """
-    # (slot bytes, 최대 input, 최대 output, 시간, 고른 후보)
-    frontier = [(0, 0, 0, 0.0, {})]
-    for key, count in classes.items():
-        extended = [(slot + count * (candidate.footprint.weight + candidate.footprint.state),
-                     max(largest_input, candidate.footprint.input),
-                     max(largest_output, candidate.footprint.output),
-                     elapsed + count * (candidate.execution_ms + candidate.upload_ms),
-                     {**chosen, key: candidate})
-                    for slot, largest_input, largest_output, elapsed, chosen in frontier
-                    for candidate in candidates[key]]
-        extended.sort(key=lambda option: (option[3], option[0]))
-        frontier = []
-        for option in extended:
-            # 시간이 더 짧은 선택이 bytes도 모두 같거나 작으면 이 선택은 쓸 일이 없다.
-            if not any(all(kept[axis] <= option[axis] for axis in range(3)) for kept in frontier):
-                frontier.append(option)
-    feasible = [option for option in frontier
-                if option[0] + option[1] + option[2] <= capacity_bytes]
-    if not feasible:
+    best = None
+    # (unit 하나에 함께 놓이는 layer 수, upload 횟수): reloaded, resident 순서
+    for resident_layers, uploads in ((1, repeats), (layers, 1)):
+        # (slot bytes, 최대 input, 최대 output, 시간, 고른 후보)
+        frontier = [(0, 0, 0, 0.0, {})]
+        for key, count in classes.items():
+            extended = [(slot + count * (candidate.footprint.weight + candidate.footprint.state),
+                         max(largest_input, candidate.footprint.input),
+                         max(largest_output, candidate.footprint.output),
+                         elapsed + count * (repeats * candidate.execution_ms
+                                            + uploads * candidate.upload_ms),
+                         {**chosen, key: candidate})
+                        for slot, largest_input, largest_output, elapsed, chosen in frontier
+                        for candidate in candidates[key]]
+            extended.sort(key=lambda option: (option[3], option[0]))
+            frontier = []
+            for option in extended:
+                # 시간이 더 짧은 선택이 bytes도 모두 같거나 작으면 이 선택은 쓸 일이 없다.
+                if not any(all(kept[axis] <= option[axis] for axis in range(3)) for kept in frontier):
+                    frontier.append(option)
+        feasible = [option for option in frontier
+                    if resident_layers * option[0] + option[1] + option[2] <= capacity_bytes]
+        if feasible and (best is None or feasible[0][3] < best[3]):
+            best = feasible[0]
+    if best is None:
         return None
-    slot, largest_input, largest_output, elapsed, chosen = feasible[0]
+    slot, largest_input, largest_output, elapsed, chosen = best
     return elapsed, slot, largest_input + largest_output, chosen
 
 
@@ -364,14 +375,15 @@ class CompiledModel:
     report: dict
 
 
-def choose_phase(phase, layer, example_inputs, spec, capacity_bytes, *, cache_path,
+def choose_phase(phase, layers, example_inputs, spec, capacity_bytes, *, repeats, cache_path,
                  search_budget, warmup, repeat, seed):
     """Stage classes, packing and one config per class for the first layer of one phase.
 
-    capacity_bytes is what one unit has for the phase area (after the key/value cache).
+    capacity_bytes is what one unit has for the phase area (after the key/value cache);
+    one request runs the phase repeats times.
     """
     start = time.perf_counter_ns()
-    classes, assignment = analyze_layer(layer, example_inputs, spec)
+    classes, assignment = analyze_layer(layers[0], example_inputs, spec)
     analysis_ms = (time.perf_counter_ns() - start) / 1e6
     print(f"[model compile] {phase}: stage_classes={len(classes)}", flush=True)
 
@@ -406,14 +418,16 @@ def choose_phase(phase, layer, example_inputs, spec, capacity_bytes, *, cache_pa
                          else [stage_class]):
                 parts.setdefault(part.key, []).append(part)
         counts = {key: sum(part.count for part in group) for key, group in parts.items()}
-        selection = select_configs(counts, candidates, capacity_bytes)
+        selection = select_configs(counts, candidates, capacity_bytes,
+                                   layers=len(layers), repeats=repeats)
         packing.append({"separated": [key.label() for key in separated],
                         "layer_ms": None if selection is None else selection[0],
                         "slot_bytes": None if selection is None else selection[1],
                         "scratch_bytes": None if selection is None else selection[2]})
         print(f"[model compile] {phase}: separate={[key.label() for key in separated]} -> "
               + ("no layer fits one unit" if selection is None else
-                 f"E+U {selection[0]:.1f} ms/layer, slot {selection[1]} B, scratch {selection[2]} B"),
+                 f"{repeats} runs {selection[0]:.1f} ms/layer, slot {selection[1]} B, "
+                 f"scratch {selection[2]} B"),
               flush=True)
         if selection is not None and (best is None or selection[0] < best[0][0]):
             best = (selection, separated, parts)
@@ -430,22 +444,25 @@ def choose_phase(phase, layer, example_inputs, spec, capacity_bytes, *, cache_pa
                for key, group in parts.items()]
     tuning_ms = (time.perf_counter_ns() - start) / 1e6
     return {"selected": selected, "assignment": assignment, "separate": separate,
-            "classes": classes, "candidates": candidates, "packing": packing,
+            "classes": classes, "candidates": candidates, "packing": packing, "repeats": repeats,
             "analysis_ms": analysis_ms, "tuning_ms": tuning_ms}
 
 
-def compile_model(phases, *, target, units, kv=None, runtime_options=None,
+def compile_model(phases, *, target, units, kv=None, repeats=None, runtime_options=None,
                   cache_path=DEFAULT_CACHE_PATH, max_benchmarks=20, max_generations=10,
                   warmup=1, repeat=3, seed=0):
     """Compile time of a model whose layers share one structure in every phase; the session runs it.
 
     phases maps each phase name, in execution order, to (layers, example_inputs); kv is the
-    model's KVRequirement, or None when the key/value cache stays on the host. Every phase
-    overlays one area after the key/value cache, so its configs are chosen for what is left:
+    model's KVRequirement, or None when the key/value cache stays on the host. repeats maps
+    every phase to the times one request runs it (decode: generated tokens - 1); None runs
+    every phase once. Every phase overlays one area after the key/value cache, so its
+    configs are chosen for what is left:
     1. analyze the first layer of the phase into stage classes
     2. tune every class with its weights resident; a packed class also tunes its members
     3. for every pack/separate choice of the packed classes, select_configs picks one
-       candidate per class; the choice with the smallest E + U of one layer wins
+       candidate per class; the choice with the smallest time of one layer in one
+       request wins (E and U weighed by the repeats)
     4. compile every layer of every phase with those configs; plan_memory places them
     """
     spec = target_spec(target, num_units=units, **(runtime_options or {}))
@@ -455,7 +472,8 @@ def compile_model(phases, *, target, units, kv=None, runtime_options=None,
     print(f"[model compile] target={target} units={units} phases={list(phases)} "
           f"kv_bytes={kv_bytes}", flush=True)
     search_budget = SearchBudget(max_generations=max_generations, max_benchmarks=max_benchmarks)
-    choices = {phase: choose_phase(phase, tuple(layers)[0], example_inputs, spec, capacity_bytes,
+    choices = {phase: choose_phase(phase, tuple(layers), example_inputs, spec, capacity_bytes,
+                                   repeats=1 if repeats is None else repeats[phase],
                                    cache_path=cache_path, search_budget=search_budget,
                                    warmup=warmup, repeat=repeat, seed=seed)
                for phase, (layers, example_inputs) in phases.items()}
@@ -503,8 +521,8 @@ def compile_model(phases, *, target, units, kv=None, runtime_options=None,
         choice = choices[phase]
         selected = choice["selected"]
         return {
-            "layers": len(layers),
-            # weight 상주 실행 시간만 더한 값. weight 업로드와 CPU 시간은 들어가지 않는다.
+            "layers": len(layers), "repeats": choice["repeats"],
+            # 한 번 실행할 때 weight 상주 실행 시간만 더한 값. weight 업로드와 CPU 시간은 들어가지 않는다.
             "estimated_execution_ms": len(layers) * sum(
                 stage_class.count * selected[stage_class.key].execution_ms
                 for stage_class in choice["classes"]),
