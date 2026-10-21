@@ -33,7 +33,8 @@ def gemv_kernel(
             a_ptr + rows[:, None] * stride_am + columns[None, :] * stride_ak,
             mask=(rows[:, None] < M) & (columns[None, :] < K), other=0)
         vector = tl.load(x_ptr + columns * stride_x, mask=columns < K, other=0)
-        accumulator += tl.sum(matrix * vector[None, :], axis=1)
+        # 곱하기 전에 INT32로 넓힌다. INT8 입력은 lowering이 INT8 matvec로 만든다.
+        accumulator += tl.sum(matrix.to(tl.int32) * vector.to(tl.int32)[None, :], axis=1)
     tl.store(y_ptr + rows * stride_y, accumulator, mask=rows < M)
 
 
@@ -42,8 +43,8 @@ def run_gemv(a, x, target, config):
         raise ValueError("the GEMV autotuning kernel currently supports UPMEM only")
     if a.ndim != 2 or x.ndim != 1:
         raise ValueError("GEMV requires a matrix and a vector")
-    if a.dtype != torch.int32 or x.dtype != torch.int32:
-        raise ValueError("UPMEM GEMV requires INT32 inputs")
+    if a.dtype != x.dtype or a.dtype not in (torch.int8, torch.int32):
+        raise ValueError("UPMEM GEMV requires INT8 or INT32 inputs of one dtype")
     m, k = a.shape
     if x.shape[0] != k:
         raise ValueError("GEMV inputs must have matching reduction sizes")
