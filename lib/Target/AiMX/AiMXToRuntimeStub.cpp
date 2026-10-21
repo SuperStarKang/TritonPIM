@@ -766,6 +766,16 @@ struct StubEmitter {
            << ", sizeof(pim_isa_32_t) * (size_t)" << chain.idx
            << ", _fpga) >= 0, \"descriptor upload failed\");\n";
     }
+    // 그대로 재사용하는 chain 은 올린 뒤 host record 를 다시 읽지 않으므로 page 를 돌려준다.
+    // 다시 만들 때는 0 page 에 처음부터 쓴다. 주소만 고치는 chain 은 record 를 고쳐 다시 올린다.
+    if (persistentBody && reuse == DescriptorReuse::Unchanged) {
+      for (Value value : chains) {
+        const Buffer &chain = buffers[value];
+        e.indent(depth);
+        os() << "aimx_require(madvise(" << chain.host << ", " << chain.bytes
+             << "ull, MADV_DONTNEED) == 0, \"descriptor host release failed\");\n";
+      }
+    }
     if (persistentBody) {
       e.indent(depth);
       os() << "_resident->ready = " << fullTile << ";\n";

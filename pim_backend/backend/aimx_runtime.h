@@ -160,12 +160,16 @@ static inline int aimx_model_copy_to_pim(const aimx_model_call *model, uint32_t 
   return 0;
 }
 
-// One memory-table region on one FPGA (a weight slot or the scratch): a single
-// physically linear pim_malloc.
+// One memory-table region on one FPGA: a single physically linear pim_malloc and a
+// host shadow of the same size. A buffer's host assembly copy sits in the shadow at
+// the buffer's table offset, so host copies follow the table: buffers that share
+// device memory (the scratch, a shared slot) share their host copy too. The shadow
+// is an anonymous mapping, so only pages a stage writes use host memory.
 struct aimx_model_region {
   int fpga;
   uint64_t va, pa;
   int64_t bytes;
+  void *host;
 };
 extern "C" {
 // Opens every physical FPGA once and returns how many exist.
@@ -174,6 +178,8 @@ int aimx_model_open();
 aimx_model_region *aimx_model_region_create(int fpga, int64_t bytes, int64_t alignment);
 // Destroy the contexts placed in a region first.
 void aimx_model_region_destroy(aimx_model_region *region);
+// Return the pages of a host shadow range; later writes start from zero pages.
+void aimx_model_host_release(void *host, int64_t bytes);
 // Copy hosts[i] to the start of regions[i] (bytes[i]); one thread per FPGA.
 void aimx_model_push(size_t count, aimx_model_region *const *regions, void *const *hosts,
                      const int64_t *bytes);
@@ -181,9 +187,10 @@ void aimx_model_push(size_t count, aimx_model_region *const *regions, void *cons
 // stage stub on first use and stay until destroy. Layers that share a residency
 // slot share the context, so its buffers and descriptor chain are built once.
 // Buffer i (the PMM included) is placed at va[i], its memory-table address in a
-// region of this FPGA, and may use at most capacity[i] bytes.
+// region of this FPGA, may use at most capacity[i] bytes, and assembles in host[i],
+// the same offset in the region's host shadow.
 aimx_resident_context *aimx_model_create(int fpga, size_t slots, const uint64_t *va,
-                                         const int64_t *capacity);
+                                         const int64_t *capacity, void *const *host);
 void aimx_model_destroy(aimx_resident_context *context);
 int64_t aimx_model_live_bytes(aimx_resident_context *context);
 }

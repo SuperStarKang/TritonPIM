@@ -13,7 +13,11 @@ same FPGA cannot overlap.
 Buffer addresses come from the memory table, laid out as the weights of every
 slot, the state of every slot (descriptor chain, PMM), then the activation
 scratch. The table is cut at slot boundaries into regions of at most one vendor
-allocation, one pim_malloc per region and FPGA.
+allocation, one pim_malloc per region and FPGA. Every region also has a host
+shadow of the same size, and a buffer assembles its host copy at its table
+offset there: the scratch copy is shared like the device scratch, weight copies
+are returned once packed, and descriptor records once uploaded (unless their
+addresses are patched later).
 """
 
 import bisect
@@ -39,6 +43,7 @@ class AiMXModelRegion(ctypes.Structure):
         ("va", ctypes.c_uint64),
         ("pa", ctypes.c_uint64),
         ("bytes", ctypes.c_int64),
+        ("host", ctypes.c_void_p),
     ]
 
 
@@ -230,7 +235,7 @@ class AiMXModelRuntime:
             start += size
 
     def _address(self, entry, fpga, field):
-        """va or pa of a table entry on one FPGA: the region holding its offset."""
+        """va, pa or host (shadow) address of a table entry on one FPGA: the region holding its offset."""
         index = bisect.bisect_right([chunk_start for chunk_start, _ in self.chunks], entry.offset) - 1
         region = ctypes.cast(self.regions[(index, fpga)], ctypes.POINTER(AiMXModelRegion)).contents
         return getattr(region, field) + entry.offset - self.chunks[index][0]
@@ -262,7 +267,8 @@ class AiMXModelRuntime:
                 self.library.aimx_model_create(
                     fpga, len(entries),
                     (ctypes.c_uint64 * len(entries))(*(self._address(entry, fpga, "va") for entry in entries)),
-                    (ctypes.c_int64 * len(entries))(*(entry.bytes for entry in entries)))
+                    (ctypes.c_int64 * len(entries))(*(entry.bytes for entry in entries)),
+                    (ctypes.c_void_p * len(entries))(*(self._address(entry, fpga, "host") for entry in entries)))
                 for fpga in stage.fpgas))
             self.stages.append(stage)
         else:
@@ -325,6 +331,13 @@ class AiMXModelRuntime:
             stage.call.pack_hosts = ctypes.cast(stage.pack_hosts, ctypes.POINTER(ctypes.c_void_p))
             stage.call.pack_vas = ctypes.cast(stage.pack_vas, ctypes.POINTER(ctypes.c_uint64))
             self._call(stage, stage.preparation_matrices, stage.preparation_output, upload=2)
+        # weight 조립본(host shadow의 weight 구간)은 image로 옮겼으므로 page를 돌려준다.
+        for fpga in images:
+            for index, (chunk_start, size) in enumerate(self.chunks):
+                if chunk_start < weight_bytes:
+                    region = ctypes.cast(self.regions[(index, fpga)], ctypes.POINTER(AiMXModelRegion)).contents
+                    self.library.aimx_model_host_release(
+                        region.host, min(chunk_start + size, weight_bytes) - chunk_start)
         # 이 thread의 host 조립 buffer를 돌려준다. 다른 thread는 계속 stage를 실행하고 있을 수 있다.
         self.library.aimx_host_cache_clear_thread()
         return images, weight_bytes

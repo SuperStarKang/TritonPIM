@@ -120,19 +120,26 @@ def main():
             # slot buffer는 첫 실행에서 할당되므로 요청이 끝난 뒤 읽는다.
             memory_table = session.memory_table()
 
+    summary = {}
+    # --repeat 0이면 단일 요청만 잰다
     samples = [call for call in calls if call["phase"] == "sample"]
-    summary = {name: statistics.median(call[name] for call in samples)
-               for name in ("ttft_ms", "layers_ms", "per_layer_ms")}
-    summary["kinds"] = {name: statistics.median(call["kinds"][name] for call in samples)
-                        for name in samples[0]["kinds"]}
-    print(f"summary ttft_ms={summary['ttft_ms']:.1f} per_layer_ms={summary['per_layer_ms']:.1f} "
-          f"slots={memory.slots} groups={memory.groups}", flush=True)
+    if samples:
+        summary = {name: statistics.median(call[name] for call in samples)
+                   for name in ("ttft_ms", "layers_ms", "per_layer_ms")}
+        summary["kinds"] = {name: statistics.median(call["kinds"][name] for call in samples)
+                            for name in samples[0]["kinds"]}
+        print(f"summary ttft_ms={summary['ttft_ms']:.1f} per_layer_ms={summary['per_layer_ms']:.1f} "
+              f"slots={memory.slots} groups={memory.groups}", flush=True)
     # 단일 요청: 첫 요청이 group 0을 포함한 모든 weight 업로드를 한다
     first = next(call for call in calls if call["phase"] == "first")
     summary["first"] = {name: first[name] for name in
-                        ("ttft_ms", "group0_load_ms", "ttft_without_group0_load_ms", "layers_ms")}
+                        ("ttft_ms", "group0_load_ms", "ttft_without_group0_load_ms", "layers_ms",
+                         "pack_wall_ms", "background_pack_ms", "upload_wall_ms", "weight_uploads")}
     print(f"first ttft_ms={first['ttft_ms']:.1f} group0_load_ms={first['group0_load_ms']:.1f} "
-          f"ttft_without_group0_load_ms={first['ttft_without_group0_load_ms']:.1f}", flush=True)
+          f"ttft_without_group0_load_ms={first['ttft_without_group0_load_ms']:.1f} "
+          f"pack_wall_ms={first['pack_wall_ms']:.1f} background_pack_ms={first['background_pack_ms']:.1f} "
+          f"upload_wall_ms={first['upload_wall_ms']:.1f} weight_uploads={first['weight_uploads']} "
+          f"slots={memory.slots} groups={memory.groups}", flush=True)
 
     report = {
         "checkpoint": str(args.checkpoint), "layers": args.layers, "fpgas": args.fpgas,

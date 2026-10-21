@@ -19,9 +19,11 @@ struct DeviceState {
   std::string plan;
   std::vector<aimx_resident_buffer> buffers;
   aimx_resident_context context{};
-  // model context만 쓴다. buffer i는 memory table 주소 va[i]에 놓이고 capacity[i]까지 쓴다.
+  // model context만 쓴다. buffer i는 memory table 주소 va[i]에 놓이고 capacity[i]까지 쓰며,
+  // host 조립본은 region host shadow의 같은 offset(host[i])이다.
   std::vector<uint64_t> placed_va;
   std::vector<int64_t> placed_capacity;
+  std::vector<void *> placed_host;
 };
 struct Registry {
   std::mutex mutex;
@@ -48,7 +50,8 @@ void clear(DeviceState &state) {
     // region 안의 buffer는 따로 할당하지 않았으므로 region을 해제할 때 함께 사라진다.
     if (it->va && state.placed_va.empty())
       pim_free((void *)it->va, state.fpga);
-    if (it->host)
+    // region host shadow의 일부는 region과 함께 해제된다.
+    if (it->host && state.placed_va.empty())
       munmap(it->host, (size_t)it->bytes);
   }
   state.buffers.clear();
@@ -223,7 +226,9 @@ extern "C" aimx_resident_buffer *aimx_resident_alloc(
     aimx_require(buffer.pa + bytes <= existing.pa || existing.pa + existing.bytes <= buffer.pa,
                  "resident physical allocations overlap");
   }
-  if (kind != 2) {
+  if (kind != 2 && !state.placed_va.empty()) {
+    buffer.host = state.placed_host[slot];
+  } else if (kind != 2) {
     buffer.host = mmap(nullptr, (size_t)bytes, PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     aimx_require(buffer.host != MAP_FAILED, "resident host allocation failed");
@@ -288,12 +293,21 @@ extern "C" aimx_model_region *aimx_model_region_create(int fpga, int64_t bytes,
   aimx_require(region->va != 0, "memory-table region allocation failed");
   region->pa = VA2PA(region->va, fpga);
   aimx_require(region->pa % (uint64_t)alignment == 0, "memory-table region is misaligned");
+  // 쓰지 않은 page는 host memory를 쓰지 않는다.
+  region->host = mmap(nullptr, (size_t)bytes, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  aimx_require(region->host != MAP_FAILED, "memory-table host shadow allocation failed");
   return region;
 }
 
 extern "C" void aimx_model_region_destroy(aimx_model_region *region) {
+  munmap(region->host, (size_t)region->bytes);
   pim_free((void *)region->va, region->fpga);
   delete region;
+}
+
+extern "C" void aimx_model_host_release(void *host, int64_t bytes) {
+  aimx_require(madvise(host, (size_t)bytes, MADV_DONTNEED) == 0, "host shadow release failed");
 }
 
 extern "C" void aimx_model_push(size_t count, aimx_model_region *const *regions,
@@ -319,19 +333,20 @@ extern "C" void aimx_model_push(size_t count, aimx_model_region *const *regions,
 }
 
 extern "C" aimx_resident_context *aimx_model_create(int fpga, size_t slots, const uint64_t *va,
-                                                    const int64_t *capacity) {
+                                                    const int64_t *capacity, void *const *host) {
   Registry &r = registry();
   checkProcess(r);
   {
     std::lock_guard<std::mutex> lock(r.mutex);
     aimx_require(r.devices.count(fpga) == 1, "model context on an unopened FPGA");
   }
-  aimx_require(slots > 0 && va && capacity, "a model context needs buffer addresses");
+  aimx_require(slots > 0 && va && capacity && host, "a model context needs buffer addresses");
   auto *state = new DeviceState;
   state->fpga = fpga;
   state->plan = "model";
   state->placed_va.assign(va, va + slots);
   state->placed_capacity.assign(capacity, capacity + slots);
+  state->placed_host.assign(host, host + slots);
   state->buffers.resize(slots);
   state->context = {state->buffers.data(), slots, false, state};
   return &state->context;
