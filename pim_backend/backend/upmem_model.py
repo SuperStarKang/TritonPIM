@@ -5,6 +5,7 @@ import hashlib
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 
 from triton.runtime.cache import get_cache_manager
 
@@ -101,7 +102,12 @@ class UPMEMModelRuntime:
         self.loader = None
         # 해제한 group 표들의 전송 통계
         self.group_stats = {name: 0 for name, _ in TransferStats._fields_}
-        self.totals = {"program_loads": 0, "device_compiles": 0, "weight_pushes": 0}
+        # program_load_ms는 stage 실행 전 IRAM program 적재 시간, invoke_ms는 host pool 준비부터
+        # 입력 전송·실행·출력 회수까지 native 호출 시간이다.
+        self.totals = {"program_loads": 0, "device_compiles": 0, "weight_pushes": 0,
+                       "program_load_ms": 0.0, "invoke_ms": 0.0}
+        # (stage 이름, (M, N, K)) -> {"calls", "program_load_ms", "invoke_ms"}. 모든 layer의 같은 stage가 합쳐진다.
+        self.stage_times = {}
         pointer = ctypes.c_void_p
         uint = ctypes.c_uint32
         uints = ctypes.POINTER(uint)
@@ -281,9 +287,22 @@ class UPMEMModelRuntime:
         return table
 
     def run(self, stage, matrices, output):
+        start = time.perf_counter_ns()
         self.library.upmem_model_pools_acquire(stage.handle)
+        acquired = time.perf_counter_ns()
         self.load_program(stage)
+        loaded = time.perf_counter_ns()
         self.invoke(stage, matrices, output)
+        end = time.perf_counter_ns()
+        load_ms = (loaded - acquired) / 1e6
+        invoke_ms = (end - loaded + acquired - start) / 1e6
+        self.totals["program_load_ms"] += load_ms
+        self.totals["invoke_ms"] += invoke_ms
+        times = self.stage_times.setdefault((stage.name, tuple(stage.shape)),
+                                            {"calls": 0, "program_load_ms": 0.0, "invoke_ms": 0.0})
+        times["calls"] += 1
+        times["program_load_ms"] += load_ms
+        times["invoke_ms"] += invoke_ms
 
     def stats(self):
         totals = {name: 0 for name, _ in TransferStats._fields_}
