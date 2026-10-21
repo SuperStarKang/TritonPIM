@@ -62,6 +62,8 @@ def main():
         reference = model.model.embed_tokens(prompt_ids(tokenizer, prompt)).float()
         for layer in layers:
             reference = reference_layer(layer, reference, cosine, sine)
+        # slice와 loop 변수가 HF layer를 붙잡지 않게 한다. 아래에서 Identity로 바꾸면 바로 해제된다.
+        del layers, layer
         reference_logits = lm_head(norm(reference[:, -1, :]))
         reference_token = reference_logits.argmax(dim=-1).item()
         print(f"reference layers={args.layers} token={reference_token} "
@@ -78,6 +80,8 @@ def main():
         session, config_report = compile_session(
             blocks, (torch.zeros(1, SEQUENCE, model.config.hidden_size),), args)
         compile_ms = (time.perf_counter_ns() - start) / 1e6
+        # plan이 필요한 weight를 직접 참조한다. packing으로 대체된 원본(q/k/v, gate/up)을 해제한다.
+        del blocks
         stages = stage_records(session.layers[0])
         weight_stages = {stage["name"] for stage in stages if stage["kind"] == "weight"}
         memory = session.memory
