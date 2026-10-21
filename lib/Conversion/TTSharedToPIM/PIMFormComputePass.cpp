@@ -120,6 +120,29 @@ static Value matchBroadcastedVector(Value value, RankedTensorType matrixType) {
   return expand.getSrc();
 }
 
+// INT8 GEMV는 곱하기 전에 행렬과 vector를 INT32로 넓힌다. 그 sign extension
+// (elementwise generic 또는 tensor arith.extsi) 앞의 좁은 값을 돌려준다.
+// linalg.matvec는 입력을 출력 type으로 sign extension해 곱하므로(cast_signed)
+// 넓히기 전 값을 바로 입력으로 써도 의미가 같다. extension이 아니면 그대로 둔다.
+static Value stripSignExtension(Value value) {
+  if (auto ext = value.getDefiningOp<arith::ExtSIOp>())
+    return ext.getIn();
+  auto gen = value.getDefiningOp<linalg::GenericOp>();
+  if (!gen || gen.getInputs().size() != 1 || gen.getOutputs().size() != 1)
+    return value;
+  for (AffineMap m : gen.getIndexingMapsArray())
+    if (!m.isIdentity())
+      return value;
+  for (utils::IteratorType t : gen.getIteratorTypesArray())
+    if (t != utils::IteratorType::parallel)
+      return value;
+  auto yield = cast<linalg::YieldOp>(gen.getBody()->getTerminator());
+  auto ext = yield->getOperand(0).getDefiningOp<arith::ExtSIOp>();
+  if (!ext || ext.getIn() != gen.getBody()->getArgument(0))
+    return value;
+  return gen.getInputs()[0];
+}
+
 static bool allResultsUnused(Operation *op) {
   return llvm::all_of(op->getResults(), [](Value v) { return v.use_empty(); });
 }
@@ -311,8 +334,15 @@ struct PIMFormComputePass
     Value matrix, vector;
     for (unsigned broadcastOperand = 0; broadcastOperand < 2;
          ++broadcastOperand) {
-      Value candidate = matchBroadcastedVector(
-          mul.getInputs()[broadcastOperand], productType);
+      Value input = mul.getInputs()[broadcastOperand];
+      Value candidate = matchBroadcastedVector(input, productType);
+      // INT8 vector를 먼저 broadcast하고 넓힌 경우: extension 앞의 broadcast를 본다.
+      if (!candidate) {
+        Value narrow = stripSignExtension(input);
+        if (narrow != input)
+          candidate = matchBroadcastedVector(
+              narrow, cast<RankedTensorType>(narrow.getType()));
+      }
       if (!candidate)
         continue;
       Value other = mul.getInputs()[1 - broadcastOperand];
@@ -324,6 +354,11 @@ struct PIMFormComputePass
     }
     if (!matrix || !vector)
       return;
+    // 넓히기 전 INT8 행렬과 vector를 matvec 입력으로 쓴다. WRAM에 INT32 사본을
+    // 만들지 않고, device 곱셈도 좁은 값으로 한다.
+    matrix = stripSignExtension(matrix);
+    vector = stripSignExtension(vector);
+    SmallVector<Value> mulInputs(mul.getInputs().begin(), mul.getInputs().end());
 
     OpBuilder b(reduce);
     auto matvec =
@@ -332,16 +367,20 @@ struct PIMFormComputePass
     reduce.getResult(0).replaceAllUsesWith(matvec.getResult(0));
 
     // 다른 사용자가 있으면 원래 계산을 보존한다. GEMV 전용 연쇄인
-    // 경우에만 소비자에서 생산자 순으로 지워 중간 tile을 없앤다.
+    // 경우에만 소비자에서 생산자 순으로 지워 중간 tile을 없앤다. mul 입력에서
+    // matvec가 쓰는 값까지 거슬러 오르는 broadcast, expand_shape, extension이 대상이다.
     Operation *transposeOp = transpose ? transpose.getOperation() : nullptr;
-    auto broadcast =
-        (mul.getInputs()[0] == matrix ? mul.getInputs()[1] : mul.getInputs()[0])
-            .getDefiningOp<linalg::GenericOp>();
-    auto expand =
-        broadcast.getInputs()[0].getDefiningOp<tensor::ExpandShapeOp>();
-    SmallVector<Operation *> deadCandidates{
-        reduce, transposeOp, mul.getOperation(), broadcast.getOperation(),
-        expand.getOperation()};
+    SmallVector<Operation *> deadCandidates{reduce, transposeOp, mul.getOperation()};
+    for (Value input : mulInputs) {
+      Value value = input;
+      while (value != matrix && value != vector) {
+        Operation *def = value.getDefiningOp();
+        if (!def || !isa<linalg::GenericOp, tensor::ExpandShapeOp, arith::ExtSIOp>(def))
+          break;
+        deadCandidates.push_back(def);
+        value = def->getOperand(0);
+      }
+    }
     for (Operation *op : deadCandidates)
       if (op && allResultsUnused(op))
         op->erase();

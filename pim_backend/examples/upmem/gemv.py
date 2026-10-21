@@ -48,7 +48,8 @@ def gemv_kernel(
             mask=k < K,
             other=0.0,
         )
-        acc += tl.sum(a * x[None, :], axis=1)
+        # 곱하기 전에 INT32로 넓힌다. INT8끼리 곱하면 곱이 INT8에서 넘친다.
+        acc += tl.sum(a.to(tl.int32) * x.to(tl.int32)[None, :], axis=1)
 
     tl.store(y_ptr + offs_m * stride_y, acc, mask=offs_m < M)
 
@@ -88,9 +89,10 @@ if __name__ == "__main__":
     torch.manual_seed(0)
 
     M, K = 128, 256
-    a = torch.randn((M, K)).to(torch.int32)
-    x = torch.randn((K,)).to(torch.int32)
+    a = torch.randn((M, K)).to(torch.int8)
+    x = torch.randn((K,)).to(torch.int8)
 
     out = gemv(a, x)
-    ref = torch.mv(a, x)
+    # torch.mv는 INT8 입력에 INT8 결과를 낸다. INT32로 넓혀 기준값을 만든다.
+    ref = torch.mv(a.to(torch.int32), x.to(torch.int32))
     print((out - ref).abs().max())
