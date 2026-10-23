@@ -42,6 +42,10 @@ SHAPES = {
     "pv_head": (1024, 128, 1024),
     "qk_2head": (1024, 2048, 256),
     "pv_4head": (1024, 512, 4096),
+    # Llama-3-8B: q/o는 q_proj와 같고, k/v는 GQA로 KV head 8개, FFN은 14336이다.
+    "llama3_kv_proj": (1024, 1024, 4096),
+    "llama3_gate_proj": (1024, 14336, 4096),
+    "llama3_down_proj": (1024, 4096, 14336),
 }
 
 
@@ -91,9 +95,16 @@ def main():
         problem = PIMProblem(M=m, N=n, K=k, input_dtype="bfloat16", output_dtype="bfloat16")
         a = torch.randn((m, k), generator=generator).bfloat16()
         b = torch.randn((k, n), generator=generator).bfloat16()
+        # 수렴 곡선: 실제로 측정한 후보를 측정 순서대로 기록한다. cache에 있던 후보는 측정하지 않으므로 빠진다.
+        tuning = []
         if args.config_source == "autotune":
+            tune_start = time.perf_counter_ns()
+
             def benchmark_fn(problem, target, config):
                 wall_ms, slots = measure(target, config, a, b, warmup=0, repeat=args.tune_repeat)
+                best_ms = min([wall_ms, *(trial["wall_ms"] for trial in tuning)])
+                tuning.append({"index": len(tuning), "elapsed_s": (time.perf_counter_ns() - tune_start) / 1e9,
+                               "config": asdict(config), "wall_ms": wall_ms, "best_ms": best_ms})
                 return PIMBenchmarkResult(total_ms=wall_ms, correctness=None, timings=tuple(slots.items()))
 
             config = tune(problem, spec, benchmark_fn, space=build_config_space(problem, spec),
@@ -115,6 +126,7 @@ def main():
             "operations": 2 * m * n * k, "wall_ms": wall_ms, "native_sum_ms": native,
             "slots_ms": slots, "groups_ms": groups,
             "groups_percent": {group: 100 * value / wall_ms for group, value in groups.items()},
+            "tuning": tuning,
         }
         rows.append(row)
         print(f"{name} mnk=({m},{n},{k}) config={config.key()} wall_ms={wall_ms:.2f} "

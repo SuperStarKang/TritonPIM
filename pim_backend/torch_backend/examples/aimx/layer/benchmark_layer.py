@@ -109,7 +109,7 @@ def main():
                           for name in samples[0]["phases"][kind]}
                    for kind in samples[0]["phases"]},
         # QK^T와 PV의 유효 연산 수는 묶음과 무관하다. executed_operations와 비교하면 0 블록 계산량이 나온다.
-        "useful_activation_operations": 2 * (2 * SEQUENCE * SEQUENCE * block.head_dim * block.heads),
+        "useful_activation_operations": 2 * (2 * SEQUENCE * SEQUENCE * block.self_attn.head_dim * block.self_attn.heads),
         "executed_activation_operations": sum(stage["executed_operations"] for stage in stages
                                               if stage["kind"] == "activation"),
     }

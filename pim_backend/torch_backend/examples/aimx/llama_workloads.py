@@ -109,11 +109,12 @@ class CheckpointRMSNorm(torch.nn.Module):
         return self.weight * (activation * torch.rsqrt(activation.square().mean(dim=-1, keepdim=True) + self.eps))
 
 
-class LlamaAimxLayer(torch.nn.Module):
+class LlamaAimxAttention(torch.nn.Module):
+    """QKV projections, RoPE, QK^T, softmax (CPU) and PV of one layer: the context before o_proj."""
+
     def __init__(self, layer, cosine, sine, qk_heads=QK_HEADS, pv_heads=PV_HEADS, kv="share"):
         super().__init__()
         config = layer.self_attn.config
-        self.hidden = config.hidden_size
         self.heads = config.num_attention_heads
         self.kv_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
@@ -124,23 +125,15 @@ class LlamaAimxLayer(torch.nn.Module):
         self.qk_heads = qk_heads
         self.pv_heads = pv_heads
         self.kv = kv
-        self.input_layernorm = CheckpointRMSNorm(layer.input_layernorm)
-        self.post_attention_layernorm = CheckpointRMSNorm(layer.post_attention_layernorm)
         self.q_proj = CheckpointLinear(layer.self_attn.q_proj)
         self.k_proj = CheckpointLinear(layer.self_attn.k_proj)
         self.v_proj = CheckpointLinear(layer.self_attn.v_proj)
-        self.o_proj = CheckpointLinear(layer.self_attn.o_proj)
-        # Gate/Up는 N을 512 단위로 올려 계산하고 앞 열만 쓴다 (Llama-2 11008 → 11264, Llama-3 14336 그대로).
-        padded = -(-config.intermediate_size // 512) * 512
-        self.gate_proj = CheckpointLinear(layer.mlp.gate_proj, padded)
-        self.up_proj = CheckpointLinear(layer.mlp.up_proj, padded)
-        self.down_proj = CheckpointLinear(layer.mlp.down_proj)
         self.scaling = layer.self_attn.scaling
         self.register_buffer("cosine", cosine[0].float().contiguous())
         self.register_buffer("sine", sine[0].float().contiguous())
         self.register_buffer("mask", torch.ones(SEQUENCE, SEQUENCE, dtype=torch.bool).triu(1))
 
-    def attention(self, normalized):
+    def forward(self, normalized):
         group = self.heads // self.kv_heads
         query = self.q_proj(normalized).reshape(SEQUENCE, self.heads, self.head_dim).transpose(0, 1)
         key = self.k_proj(normalized).reshape(SEQUENCE, self.kv_heads, self.head_dim).transpose(0, 1)
@@ -169,11 +162,25 @@ class LlamaAimxLayer(torch.nn.Module):
             right = block_diagonal([value[head // group] for head in heads])
             outputs.append(torch.mm(left, right))
         # [O_h | O_h+1 ...]의 열 순서가 곧 hidden 열 순서 head * head_dim + d다.
-        context = torch.cat(outputs, dim=1).float().reshape(1, SEQUENCE, self.heads * self.head_dim)
-        return self.o_proj(context)
+        return torch.cat(outputs, dim=1).float().reshape(1, SEQUENCE, self.heads * self.head_dim)
+
+
+class LlamaAimxLayer(torch.nn.Module):
+    def __init__(self, layer, cosine, sine, qk_heads=QK_HEADS, pv_heads=PV_HEADS, kv="share"):
+        super().__init__()
+        config = layer.self_attn.config
+        self.input_layernorm = CheckpointRMSNorm(layer.input_layernorm)
+        self.post_attention_layernorm = CheckpointRMSNorm(layer.post_attention_layernorm)
+        self.self_attn = LlamaAimxAttention(layer, cosine, sine, qk_heads, pv_heads, kv)
+        self.o_proj = CheckpointLinear(layer.self_attn.o_proj)
+        # Gate/Up는 N을 512 단위로 올려 계산하고 앞 열만 쓴다 (Llama-2 11008 → 11264, Llama-3 14336 그대로).
+        padded = -(-config.intermediate_size // 512) * 512
+        self.gate_proj = CheckpointLinear(layer.mlp.gate_proj, padded)
+        self.up_proj = CheckpointLinear(layer.mlp.up_proj, padded)
+        self.down_proj = CheckpointLinear(layer.mlp.down_proj)
 
     def forward(self, hidden):
-        hidden = hidden + self.attention(self.input_layernorm(hidden))
+        hidden = hidden + self.o_proj(self.self_attn(self.input_layernorm(hidden)))
         normalized = self.post_attention_layernorm(hidden)
         gated = torch.nn.functional.silu(self.gate_proj(normalized)) * self.up_proj(normalized)
         return hidden + self.down_proj(gated)

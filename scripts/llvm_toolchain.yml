@@ -1,0 +1,9 @@
+# triton-san/script/build_llvm.sh가 요구하는 clang/clang++과, LLVM이 링크할 zstd 개발 파일.
+# LLVM 빌드에만 쓰고, triton은 시스템 gcc로 빌드한다.
+name: llvm_toolchain
+channels:
+  - conda-forge
+dependencies:
+  - clang
+  - clangxx
+  - zstd
