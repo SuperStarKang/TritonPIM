@@ -1,0 +1,163 @@
+Loading weights:   0%|          | 0/291 [00:00<?, ?it/s]Loading weights:   1%|          | 2/291 [00:00<00:24, 11.93it/s]Loading weights:   8%|▊         | 24/291 [00:00<00:02, 105.23it/s]Loading weights:  14%|█▎        | 40/291 [00:00<00:02, 115.68it/s]Loading weights:  19%|█▉        | 55/291 [00:00<00:01, 125.34it/s]Loading weights:  24%|██▎       | 69/291 [00:00<00:01, 124.98it/s]Loading weights:  29%|██▊       | 83/291 [00:00<00:01, 108.85it/s]Loading weights:  33%|███▎      | 95/291 [00:00<00:01, 108.34it/s]Loading weights:  37%|███▋      | 109/291 [00:00<00:01, 115.74it/s]Loading weights:  42%|████▏     | 121/291 [00:01<00:01, 116.45it/s]Loading weights:  47%|████▋     | 136/291 [00:01<00:01, 116.55it/s]Loading weights:  51%|█████     | 148/291 [00:01<00:01, 115.82it/s]Loading weights:  56%|█████▌    | 163/291 [00:01<00:01, 124.59it/s]Loading weights:  60%|██████    | 176/291 [00:01<00:00, 121.07it/s]Loading weights:  66%|██████▋   | 193/291 [00:01<00:00, 123.00it/s]Loading weights:  73%|███████▎  | 211/291 [00:01<00:00, 104.05it/s]Loading weights:  78%|███████▊  | 226/291 [00:02<00:00, 110.63it/s]Loading weights:  82%|████████▏ | 239/291 [00:02<00:00, 113.00it/s]Loading weights:  87%|████████▋ | 253/291 [00:02<00:00, 115.46it/s]Loading weights:  91%|█████████▏| 266/291 [00:02<00:00, 117.52it/s]Loading weights:  97%|█████████▋| 281/291 [00:02<00:00, 125.93it/s]Loading weights: 100%|██████████| 291/291 [00:02<00:00, 116.61it/s]
+preparation_ms=40272.055 compile_and_warmup_ms=16278.445
+Executing TTFT request 0: tokenize -> 32 layers -> first token
+layer=0 layer_ms=151.141
+layer=1 layer_ms=925.418
+layer=2 layer_ms=931.711
+layer=3 layer_ms=925.249
+layer=4 layer_ms=941.676
+layer=5 layer_ms=898.195
+layer=6 layer_ms=879.867
+layer=7 layer_ms=894.814
+layer=8 layer_ms=940.670
+layer=9 layer_ms=906.277
+layer=10 layer_ms=908.692
+layer=11 layer_ms=815.454
+layer=12 layer_ms=704.676
+layer=13 layer_ms=699.412
+layer=14 layer_ms=677.599
+layer=15 layer_ms=683.911
+layer=16 layer_ms=727.545
+layer=17 layer_ms=694.055
+layer=18 layer_ms=765.191
+layer=19 layer_ms=707.556
+layer=20 layer_ms=687.616
+layer=21 layer_ms=686.606
+layer=22 layer_ms=694.185
+layer=23 layer_ms=682.763
+layer=24 layer_ms=687.550
+layer=25 layer_ms=693.533
+layer=26 layer_ms=737.247
+layer=27 layer_ms=718.183
+layer=28 layer_ms=708.741
+layer=29 layer_ms=793.421
+layer=30 layer_ms=708.331
+layer=31 layer_ms=673.341
+request=0 TTFT_ms=24326.608 first_token_id=19697 text='intermediate'
+Executing TTFT request 1: tokenize -> 32 layers -> first token
+layer=0 layer_ms=745.169
+layer=1 layer_ms=724.519
+layer=2 layer_ms=716.613
+layer=3 layer_ms=717.004
+layer=4 layer_ms=693.486
+layer=5 layer_ms=680.352
+layer=6 layer_ms=710.512
+layer=7 layer_ms=746.409
+layer=8 layer_ms=749.763
+layer=9 layer_ms=743.372
+layer=10 layer_ms=699.189
+layer=11 layer_ms=707.588
+layer=12 layer_ms=735.995
+layer=13 layer_ms=739.112
+layer=14 layer_ms=724.524
+layer=15 layer_ms=734.902
+layer=16 layer_ms=726.664
+layer=17 layer_ms=726.994
+layer=18 layer_ms=736.561
+layer=19 layer_ms=724.591
+layer=20 layer_ms=737.033
+layer=21 layer_ms=733.732
+layer=22 layer_ms=734.282
+layer=23 layer_ms=730.274
+layer=24 layer_ms=715.599
+layer=25 layer_ms=720.310
+layer=26 layer_ms=695.179
+layer=27 layer_ms=731.855
+layer=28 layer_ms=730.730
+layer=29 layer_ms=792.077
+layer=30 layer_ms=726.495
+layer=31 layer_ms=734.896
+request=1 TTFT_ms=23389.706 first_token_id=19697 text='intermediate'
+Executing TTFT request 2: tokenize -> 32 layers -> first token
+layer=0 layer_ms=791.883
+layer=1 layer_ms=741.891
+layer=2 layer_ms=718.934
+layer=3 layer_ms=729.272
+layer=4 layer_ms=731.092
+layer=5 layer_ms=711.558
+layer=6 layer_ms=728.752
+layer=7 layer_ms=708.447
+layer=8 layer_ms=719.054
+layer=9 layer_ms=696.774
+layer=10 layer_ms=736.699
+layer=11 layer_ms=776.724
+layer=12 layer_ms=790.484
+layer=13 layer_ms=774.378
+layer=14 layer_ms=777.011
+layer=15 layer_ms=768.171
+layer=16 layer_ms=793.065
+layer=17 layer_ms=753.551
+layer=18 layer_ms=770.268
+layer=19 layer_ms=780.246
+layer=20 layer_ms=785.654
+layer=21 layer_ms=804.016
+layer=22 layer_ms=784.840
+layer=23 layer_ms=769.614
+layer=24 layer_ms=766.826
+layer=25 layer_ms=783.951
+layer=26 layer_ms=776.810
+layer=27 layer_ms=789.928
+layer=28 layer_ms=812.688
+layer=29 layer_ms=782.689
+layer=30 layer_ms=782.248
+layer=31 layer_ms=784.345
+request=2 TTFT_ms=24475.826 first_token_id=19697 text='intermediate'
+Executing profiled request for the kernel breakdown
+/home/dlrkdals/miniconda3/envs/pim_triton/lib/python3.12/site-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+USDT:2026-10-23 13:05:18 1149097:1149097 ActivityProfilerController.cpp:415] profiler_start
+layer=0 layer_ms=708.507
+layer=1 layer_ms=764.977
+layer=2 layer_ms=728.856
+layer=3 layer_ms=735.110
+layer=4 layer_ms=765.720
+layer=5 layer_ms=759.936
+layer=6 layer_ms=743.783
+layer=7 layer_ms=731.302
+layer=8 layer_ms=706.411
+layer=9 layer_ms=715.662
+layer=10 layer_ms=696.133
+layer=11 layer_ms=706.446
+layer=12 layer_ms=720.873
+layer=13 layer_ms=725.667
+layer=14 layer_ms=695.607
+layer=15 layer_ms=721.333
+layer=16 layer_ms=707.614
+layer=17 layer_ms=713.411
+layer=18 layer_ms=709.817
+layer=19 layer_ms=733.737
+layer=20 layer_ms=704.120
+layer=21 layer_ms=720.496
+layer=22 layer_ms=709.154
+layer=23 layer_ms=746.888
+layer=24 layer_ms=712.930
+layer=25 layer_ms=733.874
+layer=26 layer_ms=711.281
+layer=27 layer_ms=709.238
+layer=28 layer_ms=715.101
+layer=29 layer_ms=421.805
+layer=30 layer_ms=419.957
+layer=31 layer_ms=411.247
+USDT:2026-10-23 13:05:40 1149097:1149097 ActivityProfilerController.cpp:455] profiler_stop
+ERROR:2026-10-23 13:05:40 1149097:1149097 DeviceProperties.cpp:50] gpuGetDeviceCount failed with code 35
+profiled model_to_token_ms=22255.872 gemm_ms=20766.180 other_kernel_ms=1245.947 outside_kernels_ms=243.744
+  stage=outside_regions calls=8 total_ms=0.038
+  stage=embedding calls=1 total_ms=6.579
+  stage=before_q_proj calls=32 total_ms=19.831
+  stage=q_proj calls=32 total_ms=2495.355
+  stage=k_proj calls=32 total_ms=2470.602
+  stage=v_proj calls=32 total_ms=2457.714
+  stage=after_v_proj calls=32 total_ms=371.732
+  stage=attention_qk calls=1024 total_ms=154.366
+  stage=after_attention_qk calls=192 total_ms=498.818
+  stage=attention_pv calls=1024 total_ms=160.556
+  stage=after_attention_pv calls=192 total_ms=63.728
+  stage=o_proj calls=32 total_ms=2479.276
+  stage=after_o_proj calls=32 total_ms=39.912
+  stage=gate_proj calls=32 total_ms=2327.940
+  stage=up_proj calls=32 total_ms=2186.603
+  stage=after_up_proj calls=32 total_ms=132.157
+  stage=down_proj calls=32 total_ms=6033.768
+  stage=after_down_proj calls=32 total_ms=73.622
+  stage=head calls=12 total_ms=39.531
+Execution report saved to /home/dlrkdals/TritonPIM/triton_shared/pim_backend/torch_backend/examples/cpu/llama2_ttft_cpp_t96_nobind/report.json

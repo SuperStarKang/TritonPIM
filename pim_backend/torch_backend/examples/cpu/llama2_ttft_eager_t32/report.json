@@ -1,0 +1,445 @@
+{
+  "scope": "single prefill request to the first greedy token ID; no decode steps",
+  "measurement_scope": "tokenize, embedding, 32 layers, KV kept on CPU, last-token norm/lm_head/argmax; excludes checkpoint load, quantization and compilation",
+  "checkpoint": "/home/dlrkdals/.cache/huggingface/hub/models--meta-llama--Llama-2-7b-hf/snapshots/01c7f73d771dfac7d292323805ebc428287df4f9",
+  "prompt_file": "/home/dlrkdals/TritonPIM/triton_shared/pim_backend/torch_backend/examples/upmem/e2e/prompt.txt",
+  "batch_size": 1,
+  "sequence_length": 1024,
+  "layers": 32,
+  "gemm_dtype": "int8 x int8 -> int32",
+  "cpu_dtype": "float32",
+  "mode": "eager",
+  "inductor_overrides": null,
+  "triton_shared_num_threads": "",
+  "omp_num_threads": "32",
+  "torch_threads": 32,
+  "versions": {
+    "torch": "2.12.0+cu130"
+  },
+  "preparation_ms": 32339.108846,
+  "compile": {
+    "compile_and_warmup_ms": 312.374834,
+    "phases_s": {}
+  },
+  "ttft_ms": {
+    "mean": 8250.353759333333,
+    "min": 7891.784596,
+    "max": 8722.783602
+  },
+  "requests": [
+    {
+      "tokenization_ms": 6.45659,
+      "embedding_ms": 1.479604,
+      "layer_ms": [
+        252.59685,
+        287.286933,
+        282.789324,
+        276.817149,
+        276.121087,
+        267.883357,
+        278.799985,
+        266.771422,
+        268.392617,
+        290.945391,
+        242.986313,
+        260.733408,
+        285.10876,
+        253.893816,
+        261.147086,
+        268.159843,
+        277.794595,
+        266.462585,
+        265.285144,
+        281.233623,
+        277.537524,
+        265.514383,
+        271.274671,
+        264.245025,
+        280.688331,
+        270.079452,
+        267.09065,
+        282.200532,
+        284.391976,
+        263.881593,
+        281.79411,
+        270.373516
+      ],
+      "head_ms": 22.979284,
+      "model_to_token_ms": 8716.327012,
+      "ttft_ms": 8722.783602,
+      "token_id": 19697,
+      "token_text": "intermediate",
+      "kv_cache_bytes": 1073741824
+    },
+    {
+      "tokenization_ms": 4.91987,
+      "embedding_ms": 0.983435,
+      "layer_ms": [
+        251.380961,
+        242.051445,
+        243.919714,
+        235.999674,
+        250.426366,
+        231.909657,
+        237.899635,
+        235.997331,
+        238.264949,
+        231.921461,
+        250.229669,
+        250.45392,
+        248.487623,
+        240.292897,
+        243.435553,
+        255.590297,
+        240.959487,
+        248.288321,
+        230.590792,
+        245.264661,
+        238.960529,
+        243.934429,
+        237.157005,
+        241.686083,
+        246.410828,
+        248.170395,
+        247.754783,
+        255.399772,
+        263.587338,
+        243.894092,
+        277.96218,
+        263.366584
+      ],
+      "head_ms": 22.637896,
+      "model_to_token_ms": 7886.864726,
+      "ttft_ms": 7891.784596,
+      "token_id": 19697,
+      "token_text": "intermediate",
+      "kv_cache_bytes": 1073741824
+    },
+    {
+      "tokenization_ms": 4.923022,
+      "embedding_ms": 0.975225,
+      "layer_ms": [
+        238.76789,
+        255.587732,
+        259.058545,
+        240.211286,
+        235.83483,
+        241.810305,
+        244.557552,
+        245.767242,
+        244.801565,
+        231.771982,
+        236.020633,
+        239.034144,
+        245.353596,
+        243.90921,
+        249.752291,
+        244.656679,
+        252.474058,
+        239.444875,
+        244.739602,
+        239.800446,
+        245.620348,
+        233.678643,
+        252.81849,
+        262.771454,
+        267.66247,
+        261.193484,
+        280.045835,
+        288.712995,
+        296.914758,
+        282.79036,
+        274.090743,
+        286.423235
+      ],
+      "head_ms": 22.885189,
+      "model_to_token_ms": 8131.570058,
+      "ttft_ms": 8136.49308,
+      "token_id": 19697,
+      "token_text": "intermediate",
+      "kv_cache_bytes": 1073741824
+    }
+  ],
+  "profiled_request": {
+    "tokenization_ms": 5.069213,
+    "embedding_ms": 1.04249,
+    "layer_ms": [
+      240.606056,
+      244.790549,
+      238.161345,
+      245.437539,
+      232.88245,
+      225.200813,
+      236.278639,
+      239.448933,
+      236.073644,
+      234.120636,
+      227.598402,
+      228.643556,
+      230.814719,
+      219.149641,
+      220.769609,
+      210.615708,
+      222.425093,
+      244.241261,
+      222.657187,
+      234.326107,
+      240.520076,
+      231.443326,
+      221.686582,
+      235.281397,
+      226.61541,
+      258.407306,
+      253.108969,
+      267.135581,
+      250.119674,
+      273.777294,
+      260.270295,
+      248.97268
+    ],
+    "head_ms": 22.674275,
+    "model_to_token_ms": 7626.900835,
+    "ttft_ms": 7631.970048,
+    "token_id": 19697,
+    "token_text": "intermediate",
+    "kv_cache_bytes": 1073741824
+  },
+  "breakdown": {
+    "model_to_token_ms": 7626.900835,
+    "gemm_ms": 2473.701840999976,
+    "other_kernel_ms": 4791.04364900003,
+    "outside_kernels_ms": 362.15534499999467,
+    "stages": {
+      "outside_regions": {
+        "calls": 8,
+        "total_ms": 0.020077999999999523
+      },
+      "embedding": {
+        "calls": 1,
+        "total_ms": 0.9080870000000004
+      },
+      "before_q_proj": {
+        "calls": 544,
+        "total_ms": 192.51755299999604
+      },
+      "q_proj": {
+        "calls": 32,
+        "total_ms": 156.4542050000031
+      },
+      "after_q_proj": {
+        "calls": 288,
+        "total_ms": 85.8813250000092
+      },
+      "k_proj": {
+        "calls": 32,
+        "total_ms": 153.9390790000015
+      },
+      "after_k_proj": {
+        "calls": 288,
+        "total_ms": 89.97865600000169
+      },
+      "v_proj": {
+        "calls": 32,
+        "total_ms": 156.60971899999527
+      },
+      "after_v_proj": {
+        "calls": 1696,
+        "total_ms": 1112.9625410000228
+      },
+      "attention_qk": {
+        "calls": 1024,
+        "total_ms": 105.15462799998647
+      },
+      "after_attention_qk": {
+        "calls": 22528,
+        "total_ms": 714.2119680000274
+      },
+      "attention_pv": {
+        "calls": 1024,
+        "total_ms": 125.30335699999301
+      },
+      "after_attention_pv": {
+        "calls": 7392,
+        "total_ms": 560.3255009999929
+      },
+      "o_proj": {
+        "calls": 32,
+        "total_ms": 165.32935299999855
+      },
+      "after_o_proj": {
+        "calls": 768,
+        "total_ms": 277.46500500000053
+      },
+      "gate_proj": {
+        "calls": 32,
+        "total_ms": 577.4071330000029
+      },
+      "after_gate_proj": {
+        "calls": 256,
+        "total_ms": 527.7180959999979
+      },
+      "up_proj": {
+        "calls": 32,
+        "total_ms": 598.6975919999962
+      },
+      "after_up_proj": {
+        "calls": 512,
+        "total_ms": 1064.786739999985
+      },
+      "down_proj": {
+        "calls": 32,
+        "total_ms": 434.80677500000223
+      },
+      "after_down_proj": {
+        "calls": 224,
+        "total_ms": 141.88170499999745
+      },
+      "head": {
+        "calls": 12,
+        "total_ms": 22.38639400000125
+      }
+    },
+    "kernels": {
+      "aten::_int_mm": {
+        "calls": 2272,
+        "total_ms": 2473.701840999976
+      },
+      "aten::mul": {
+        "calls": 4834,
+        "total_ms": 1463.4286849999983
+      },
+      "aten::to": {
+        "calls": 3652,
+        "total_ms": 704.7090439999952
+      },
+      "aten::abs": {
+        "calls": 1248,
+        "total_ms": 367.66115799999585
+      },
+      "aten::contiguous": {
+        "calls": 3136,
+        "total_ms": 331.0470820000035
+      },
+      "aten::clamp": {
+        "calls": 1248,
+        "total_ms": 294.91280300000346
+      },
+      "aten::round": {
+        "calls": 1248,
+        "total_ms": 275.3138369999966
+      },
+      "aten::div": {
+        "calls": 3520,
+        "total_ms": 238.76418600000574
+      },
+      "aten::add": {
+        "calls": 193,
+        "total_ms": 221.4091689999975
+      },
+      "aten::amax": {
+        "calls": 1248,
+        "total_ms": 183.3031820000071
+      },
+      "aten::cat": {
+        "calls": 64,
+        "total_ms": 117.15674500000114
+      },
+      "aten::silu": {
+        "calls": 32,
+        "total_ms": 113.29021199999985
+      },
+      "aten::masked_fill": {
+        "calls": 1024,
+        "total_ms": 86.48287800000261
+      },
+      "aten::stack": {
+        "calls": 32,
+        "total_ms": 83.83509099999732
+      },
+      "aten::reshape": {
+        "calls": 2848,
+        "total_ms": 72.34757700000617
+      },
+      "aten::softmax": {
+        "calls": 1024,
+        "total_ms": 52.43336800000822
+      },
+      "aten::neg": {
+        "calls": 64,
+        "total_ms": 50.36875000000555
+      },
+      "aten::pow": {
+        "calls": 65,
+        "total_ms": 47.31706800000024
+      },
+      "aten::select": {
+        "calls": 6145,
+        "total_ms": 30.00992099998529
+      },
+      "aten::linear": {
+        "calls": 1,
+        "total_ms": 22.07731799999997
+      },
+      "aten::clamp_min": {
+        "calls": 1248,
+        "total_ms": 11.29797600001554
+      },
+      "aten::mean": {
+        "calls": 65,
+        "total_ms": 9.195825000002321
+      },
+      "aten::t": {
+        "calls": 1024,
+        "total_ms": 5.662267999999303
+      },
+      "aten::chunk": {
+        "calls": 64,
+        "total_ms": 1.978347999999125
+      },
+      "aten::slice": {
+        "calls": 64,
+        "total_ms": 1.8158869999974265
+      },
+      "aten::alias": {
+        "calls": 160,
+        "total_ms": 1.6986450000028748
+      },
+      "aten::transpose": {
+        "calls": 128,
+        "total_ms": 1.3743680000004461
+      },
+      "aten::embedding": {
+        "calls": 1,
+        "total_ms": 0.9080870000000004
+      },
+      "aten::unsqueeze": {
+        "calls": 64,
+        "total_ms": 0.5781320000037086
+      },
+      "aten::rsqrt": {
+        "calls": 65,
+        "total_ms": 0.5477449999989076
+      },
+      "aten::argmax": {
+        "calls": 1,
+        "total_ms": 0.08922300000023096
+      },
+      "aten::empty": {
+        "calls": 2,
+        "total_ms": 0.010566000000000712
+      },
+      "aten::item": {
+        "calls": 1,
+        "total_ms": 0.009845000000670552
+      },
+      "aten::detach_": {
+        "calls": 2,
+        "total_ms": 0.007245999999999185
+      },
+      "aten::lift_fresh": {
+        "calls": 2,
+        "total_ms": 0.0014139999999997599
+      }
+    }
+  }
+}

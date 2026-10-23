@@ -1,0 +1,167 @@
+Loading weights:   0%|          | 0/291 [00:00<?, ?it/s]Loading weights:   2%|▏         | 6/291 [00:00<00:08, 33.74it/s]Loading weights:  11%|█         | 31/291 [00:00<00:02, 105.06it/s]Loading weights:  16%|█▌        | 46/291 [00:00<00:02, 120.28it/s]Loading weights:  20%|██        | 59/291 [00:00<00:02, 106.96it/s]Loading weights:  26%|██▌       | 76/291 [00:00<00:01, 108.10it/s]Loading weights:  30%|███       | 88/291 [00:00<00:01, 108.97it/s]Loading weights:  35%|███▌      | 103/291 [00:00<00:01, 107.66it/s]Loading weights:  41%|████      | 118/291 [00:01<00:01, 113.86it/s]Loading weights:  45%|████▍     | 130/291 [00:01<00:01, 109.21it/s]Loading weights:  51%|█████     | 147/291 [00:01<00:01, 119.52it/s]Loading weights:  55%|█████▍    | 160/291 [00:01<00:01, 115.17it/s]Loading weights:  60%|██████    | 175/291 [00:01<00:01, 107.86it/s]Loading weights:  65%|██████▌   | 190/291 [00:01<00:00, 108.96it/s]Loading weights:  69%|██████▉   | 202/291 [00:01<00:00, 109.49it/s]Loading weights:  75%|███████▍  | 217/291 [00:01<00:00, 117.50it/s]Loading weights:  79%|███████▊  | 229/291 [00:02<00:00, 104.18it/s]Loading weights:  85%|████████▍ | 247/291 [00:02<00:00, 104.37it/s]Loading weights:  91%|█████████ | 265/291 [00:02<00:00, 113.27it/s]Loading weights:  95%|█████████▌| 277/291 [00:02<00:00, 113.95it/s]Loading weights: 100%|██████████| 291/291 [00:02<00:00, 111.58it/s]
+preparation_ms=50772.184 compile_and_warmup_ms=1110.144
+Executing TTFT request 0: tokenize -> 32 layers -> first token
+layer=0 layer_ms=438.697
+layer=1 layer_ms=1002.430
+layer=2 layer_ms=1018.375
+layer=3 layer_ms=1027.602
+layer=4 layer_ms=1013.731
+layer=5 layer_ms=1074.815
+layer=6 layer_ms=1032.430
+layer=7 layer_ms=1017.496
+layer=8 layer_ms=1072.795
+layer=9 layer_ms=1087.651
+layer=10 layer_ms=1029.676
+layer=11 layer_ms=1041.717
+layer=12 layer_ms=870.621
+layer=13 layer_ms=876.614
+layer=14 layer_ms=895.630
+layer=15 layer_ms=979.097
+layer=16 layer_ms=978.322
+layer=17 layer_ms=902.145
+layer=18 layer_ms=912.159
+layer=19 layer_ms=868.075
+layer=20 layer_ms=847.058
+layer=21 layer_ms=904.166
+layer=22 layer_ms=967.918
+layer=23 layer_ms=936.350
+layer=24 layer_ms=920.264
+layer=25 layer_ms=837.408
+layer=26 layer_ms=875.411
+layer=27 layer_ms=958.050
+layer=28 layer_ms=1015.797
+layer=29 layer_ms=1036.451
+layer=30 layer_ms=1057.211
+layer=31 layer_ms=993.242
+[transformers] Ignoring clean_up_tokenization_spaces=True for BPE tokenizer TokenizersBackend. The clean_up_tokenization post-processing step is designed for WordPiece tokenizers and is destructive for BPE (it strips spaces before punctuation). Set clean_up_tokenization_spaces=False to suppress this warning, or set clean_up_tokenization_spaces_for_bpe_even_though_it_will_corrupt_output=True to force cleanup anyway.
+request=0 TTFT_ms=30768.050 first_token_id=47544 text=' multiplication'
+Executing TTFT request 1: tokenize -> 32 layers -> first token
+layer=0 layer_ms=933.995
+layer=1 layer_ms=895.932
+layer=2 layer_ms=884.677
+layer=3 layer_ms=864.646
+layer=4 layer_ms=853.613
+layer=5 layer_ms=875.179
+layer=6 layer_ms=858.215
+layer=7 layer_ms=862.364
+layer=8 layer_ms=852.059
+layer=9 layer_ms=868.365
+layer=10 layer_ms=850.142
+layer=11 layer_ms=836.151
+layer=12 layer_ms=953.921
+layer=13 layer_ms=973.601
+layer=14 layer_ms=953.654
+layer=15 layer_ms=967.402
+layer=16 layer_ms=985.568
+layer=17 layer_ms=1010.758
+layer=18 layer_ms=1009.474
+layer=19 layer_ms=1017.606
+layer=20 layer_ms=978.773
+layer=21 layer_ms=916.140
+layer=22 layer_ms=949.052
+layer=23 layer_ms=935.796
+layer=24 layer_ms=937.143
+layer=25 layer_ms=957.178
+layer=26 layer_ms=914.699
+layer=27 layer_ms=852.615
+layer=28 layer_ms=861.753
+layer=29 layer_ms=850.930
+layer=30 layer_ms=842.235
+layer=31 layer_ms=869.656
+request=1 TTFT_ms=29496.564 first_token_id=47544 text=' multiplication'
+Executing TTFT request 2: tokenize -> 32 layers -> first token
+layer=0 layer_ms=919.303
+layer=1 layer_ms=915.657
+layer=2 layer_ms=969.676
+layer=3 layer_ms=963.530
+layer=4 layer_ms=960.298
+layer=5 layer_ms=960.288
+layer=6 layer_ms=960.256
+layer=7 layer_ms=891.183
+layer=8 layer_ms=965.728
+layer=9 layer_ms=993.490
+layer=10 layer_ms=916.393
+layer=11 layer_ms=935.089
+layer=12 layer_ms=906.909
+layer=13 layer_ms=893.571
+layer=14 layer_ms=914.897
+layer=15 layer_ms=907.553
+layer=16 layer_ms=918.775
+layer=17 layer_ms=903.213
+layer=18 layer_ms=914.956
+layer=19 layer_ms=916.448
+layer=20 layer_ms=919.219
+layer=21 layer_ms=891.514
+layer=22 layer_ms=882.433
+layer=23 layer_ms=884.542
+layer=24 layer_ms=876.430
+layer=25 layer_ms=895.946
+layer=26 layer_ms=902.640
+layer=27 layer_ms=925.880
+layer=28 layer_ms=928.552
+layer=29 layer_ms=879.291
+layer=30 layer_ms=899.897
+layer=31 layer_ms=911.222
+request=2 TTFT_ms=29637.865 first_token_id=47544 text=' multiplication'
+Executing profiled request for the kernel breakdown
+/home/dlrkdals/miniconda3/envs/pim_triton/lib/python3.12/site-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+USDT:2026-10-23 12:56:59 1147670:1147670 ActivityProfilerController.cpp:415] profiler_start
+layer=0 layer_ms=898.772
+layer=1 layer_ms=877.408
+layer=2 layer_ms=881.646
+layer=3 layer_ms=910.758
+layer=4 layer_ms=991.528
+layer=5 layer_ms=926.676
+layer=6 layer_ms=913.112
+layer=7 layer_ms=902.986
+layer=8 layer_ms=967.727
+layer=9 layer_ms=870.014
+layer=10 layer_ms=909.922
+layer=11 layer_ms=914.820
+layer=12 layer_ms=902.231
+layer=13 layer_ms=943.542
+layer=14 layer_ms=931.578
+layer=15 layer_ms=911.197
+layer=16 layer_ms=598.010
+layer=17 layer_ms=521.683
+layer=18 layer_ms=527.850
+layer=19 layer_ms=529.024
+layer=20 layer_ms=537.507
+layer=21 layer_ms=914.439
+layer=22 layer_ms=943.925
+layer=23 layer_ms=969.647
+layer=24 layer_ms=948.312
+layer=25 layer_ms=933.984
+layer=26 layer_ms=943.413
+layer=27 layer_ms=921.484
+layer=28 layer_ms=900.340
+layer=29 layer_ms=897.752
+layer=30 layer_ms=900.413
+layer=31 layer_ms=883.411
+USDT:2026-10-23 12:57:27 1147670:1147670 ActivityProfilerController.cpp:455] profiler_stop
+ERROR:2026-10-23 12:57:27 1147670:1147670 DeviceProperties.cpp:50] gpuGetDeviceCount failed with code 35
+profiled model_to_token_ms=27688.406 gemm_ms=19905.000 other_kernel_ms=6392.711 outside_kernels_ms=1390.694
+  stage=outside_regions calls=8 total_ms=0.030
+  stage=embedding calls=1 total_ms=1.513
+  stage=before_q_proj calls=544 total_ms=199.430
+  stage=q_proj calls=32 total_ms=2580.408
+  stage=after_q_proj calls=288 total_ms=80.460
+  stage=k_proj calls=32 total_ms=635.948
+  stage=after_k_proj calls=288 total_ms=32.212
+  stage=v_proj calls=32 total_ms=635.613
+  stage=after_v_proj calls=1696 total_ms=545.380
+  stage=attention_qk calls=1024 total_ms=144.042
+  stage=after_attention_qk calls=22528 total_ms=2094.313
+  stage=attention_pv calls=1024 total_ms=185.925
+  stage=after_attention_pv calls=7392 total_ms=526.210
+  stage=o_proj calls=32 total_ms=2571.233
+  stage=after_o_proj calls=768 total_ms=352.817
+  stage=gate_proj calls=32 total_ms=2813.250
+  stage=after_gate_proj calls=256 total_ms=715.357
+  stage=up_proj calls=32 total_ms=2739.784
+  stage=after_up_proj calls=512 total_ms=1528.668
+  stage=down_proj calls=32 total_ms=7598.798
+  stage=after_down_proj calls=224 total_ms=157.252
+  stage=head calls=12 total_ms=159.069
+Execution report saved to /home/dlrkdals/TritonPIM/triton_shared/pim_backend/torch_backend/examples/cpu/llama3_ttft_eager_t48_nobind/report.json

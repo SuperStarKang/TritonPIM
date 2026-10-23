@@ -1,0 +1,429 @@
+{
+  "scope": "single prefill request to the first greedy token ID; no decode steps",
+  "measurement_scope": "tokenize, embedding, 32 layers, KV kept on CPU, last-token norm/lm_head/argmax; excludes checkpoint load, quantization and compilation",
+  "checkpoint": "/home/dlrkdals/.cache/huggingface/hub/models--meta-llama--Llama-2-7b-hf/snapshots/01c7f73d771dfac7d292323805ebc428287df4f9",
+  "prompt_file": "/home/dlrkdals/TritonPIM/triton_shared/pim_backend/torch_backend/examples/upmem/e2e/prompt.txt",
+  "batch_size": 1,
+  "sequence_length": 1024,
+  "layers": 32,
+  "gemm_dtype": "int8 x int8 -> int32",
+  "cpu_dtype": "float32",
+  "mode": "eager",
+  "inductor_overrides": null,
+  "triton_shared_num_threads": "",
+  "omp_num_threads": "48",
+  "torch_threads": 48,
+  "versions": {
+    "torch": "2.12.0+cu130"
+  },
+  "preparation_ms": 34616.304387,
+  "compile": {
+    "compile_and_warmup_ms": 305.382779,
+    "phases_s": {}
+  },
+  "ttft_ms": {
+    "mean": 7987.620999666667,
+    "min": 7138.7552,
+    "max": 9365.203578
+  },
+  "requests": [
+    {
+      "tokenization_ms": 6.546185,
+      "embedding_ms": 1.421254,
+      "layer_ms": [
+        275.40708,
+        310.720311,
+        301.566599,
+        292.956622,
+        302.752522,
+        314.595231,
+        297.763272,
+        295.548262,
+        288.006924,
+        291.6074,
+        292.56732,
+        284.178731,
+        310.271648,
+        264.746877,
+        303.155582,
+        305.389582,
+        298.974121,
+        290.484308,
+        296.492545,
+        272.010189,
+        304.169082,
+        319.083084,
+        294.029622,
+        283.501953,
+        290.039987,
+        280.710965,
+        274.099551,
+        265.935218,
+        283.57813,
+        276.561323,
+        303.221112,
+        272.277593
+      ],
+      "head_ms": 19.19193,
+      "model_to_token_ms": 9358.657393,
+      "ttft_ms": 9365.203578,
+      "token_id": 29949,
+      "token_text": "O",
+      "kv_cache_bytes": 1073741824
+    },
+    {
+      "tokenization_ms": 4.993391,
+      "embedding_ms": 1.058202,
+      "layer_ms": [
+        216.920512,
+        222.040286,
+        227.645596,
+        219.74176,
+        229.988205,
+        218.425505,
+        245.588093,
+        234.114391,
+        224.304468,
+        222.387743,
+        223.318953,
+        229.167449,
+        219.199771,
+        219.403645,
+        224.880861,
+        215.383679,
+        223.666835,
+        211.072457,
+        226.074701,
+        233.856091,
+        229.991971,
+        219.278572,
+        218.807551,
+        218.041222,
+        223.909197,
+        218.741316,
+        231.092239,
+        234.326866,
+        274.30026,
+        296.497654,
+        288.801138,
+        289.046619
+      ],
+      "head_ms": 21.128028,
+      "model_to_token_ms": 7453.91083,
+      "ttft_ms": 7458.904221,
+      "token_id": 29949,
+      "token_text": "O",
+      "kv_cache_bytes": 1073741824
+    },
+    {
+      "tokenization_ms": 5.052547,
+      "embedding_ms": 1.008169,
+      "layer_ms": [
+        216.482717,
+        209.313836,
+        221.383062,
+        226.251152,
+        219.628822,
+        228.967474,
+        222.250173,
+        219.128224,
+        223.036129,
+        227.998317,
+        215.696384,
+        217.855075,
+        216.735685,
+        219.382683,
+        227.505855,
+        222.48047,
+        216.134878,
+        226.946458,
+        232.502299,
+        220.550392,
+        213.528168,
+        213.430903,
+        228.030018,
+        217.608773,
+        214.25012,
+        223.178056,
+        223.088893,
+        218.69224,
+        215.429252,
+        229.198542,
+        253.626948,
+        232.014248
+      ],
+      "head_ms": 18.566531,
+      "model_to_token_ms": 7133.702653,
+      "ttft_ms": 7138.7552,
+      "token_id": 29949,
+      "token_text": "O",
+      "kv_cache_bytes": 1073741824
+    }
+  ],
+  "profiled_request": {
+    "tokenization_ms": 5.045687,
+    "embedding_ms": 1.117408,
+    "layer_ms": [
+      227.456722,
+      224.080254,
+      225.639768,
+      210.246589,
+      216.640472,
+      209.677257,
+      205.167309,
+      205.094541,
+      200.262519,
+      213.854789,
+      209.291252,
+      218.600779,
+      209.656482,
+      226.942763,
+      220.973583,
+      233.64595,
+      219.267886,
+      226.217563,
+      268.346324,
+      288.46782,
+      267.653391,
+      287.933312,
+      293.828367,
+      287.652965,
+      280.336556,
+      289.013548,
+      274.380063,
+      283.818019,
+      289.52093,
+      287.760483,
+      292.41443,
+      284.556912
+    ],
+    "head_ms": 18.919316,
+    "model_to_token_ms": 7900.193579,
+    "ttft_ms": 7905.239266,
+    "token_id": 29949,
+    "token_text": "O",
+    "kv_cache_bytes": 1073741824
+  },
+  "breakdown": {
+    "model_to_token_ms": 7900.193579,
+    "gemm_ms": 3083.3487239999813,
+    "other_kernel_ms": 4320.384486999938,
+    "outside_kernels_ms": 496.46036800008005,
+    "stages": {
+      "outside_regions": {
+        "calls": 8,
+        "total_ms": 0.019995000000000797
+      },
+      "embedding": {
+        "calls": 1,
+        "total_ms": 0.9708649999999998
+      },
+      "before_q_proj": {
+        "calls": 416,
+        "total_ms": 141.762428999992
+      },
+      "q_proj": {
+        "calls": 32,
+        "total_ms": 176.93137100000047
+      },
+      "after_q_proj": {
+        "calls": 192,
+        "total_ms": 49.2496719999976
+      },
+      "k_proj": {
+        "calls": 32,
+        "total_ms": 163.2040459999993
+      },
+      "after_k_proj": {
+        "calls": 192,
+        "total_ms": 49.12689800000492
+      },
+      "v_proj": {
+        "calls": 32,
+        "total_ms": 158.0737570000006
+      },
+      "after_v_proj": {
+        "calls": 1280,
+        "total_ms": 769.733227
+      },
+      "attention_qk": {
+        "calls": 1024,
+        "total_ms": 130.6905650000018
+      },
+      "after_attention_qk": {
+        "calls": 11264,
+        "total_ms": 1302.1925689999825
+      },
+      "attention_pv": {
+        "calls": 1024,
+        "total_ms": 192.50266399998063
+      },
+      "after_attention_pv": {
+        "calls": 7296,
+        "total_ms": 581.4699949999707
+      },
+      "o_proj": {
+        "calls": 32,
+        "total_ms": 191.61732400000074
+      },
+      "after_o_proj": {
+        "calls": 544,
+        "total_ms": 212.76711799999288
+      },
+      "gate_proj": {
+        "calls": 32,
+        "total_ms": 782.7475170000007
+      },
+      "after_gate_proj": {
+        "calls": 160,
+        "total_ms": 353.4844369999979
+      },
+      "up_proj": {
+        "calls": 32,
+        "total_ms": 852.2100509999976
+      },
+      "after_up_proj": {
+        "calls": 288,
+        "total_ms": 754.858720999998
+      },
+      "down_proj": {
+        "calls": 32,
+        "total_ms": 435.37142899999924
+      },
+      "after_down_proj": {
+        "calls": 128,
+        "total_ms": 86.1575970000029
+      },
+      "head": {
+        "calls": 12,
+        "total_ms": 18.590963999999687
+      }
+    },
+    "kernels": {
+      "aten::_int_mm": {
+        "calls": 2272,
+        "total_ms": 3083.3487239999813
+      },
+      "aten::mul": {
+        "calls": 3586,
+        "total_ms": 927.540338999953
+      },
+      "aten::to": {
+        "calls": 3652,
+        "total_ms": 789.4670139999874
+      },
+      "aten::div": {
+        "calls": 2272,
+        "total_ms": 463.96236600000475
+      },
+      "aten::round": {
+        "calls": 1248,
+        "total_ms": 409.5387619999776
+      },
+      "aten::clamp": {
+        "calls": 1248,
+        "total_ms": 406.3422799999881
+      },
+      "aten::contiguous": {
+        "calls": 1184,
+        "total_ms": 339.6791630000145
+      },
+      "aten::softmax": {
+        "calls": 1024,
+        "total_ms": 180.32980100000347
+      },
+      "aten::add": {
+        "calls": 193,
+        "total_ms": 155.42397699999984
+      },
+      "aten::masked_fill": {
+        "calls": 1024,
+        "total_ms": 111.24109500001146
+      },
+      "aten::silu": {
+        "calls": 32,
+        "total_ms": 103.84236500000044
+      },
+      "aten::cat": {
+        "calls": 64,
+        "total_ms": 100.0686079999995
+      },
+      "aten::stack": {
+        "calls": 32,
+        "total_ms": 88.25575900000109
+      },
+      "aten::reshape": {
+        "calls": 576,
+        "total_ms": 46.34624399999684
+      },
+      "aten::amax": {
+        "calls": 1024,
+        "total_ms": 44.88995300001585
+      },
+      "aten::pow": {
+        "calls": 65,
+        "total_ms": 40.786915
+      },
+      "aten::neg": {
+        "calls": 64,
+        "total_ms": 33.501273999999086
+      },
+      "aten::mean": {
+        "calls": 65,
+        "total_ms": 31.82973599999557
+      },
+      "aten::linear": {
+        "calls": 1,
+        "total_ms": 18.274650999999604
+      },
+      "aten::select": {
+        "calls": 3073,
+        "total_ms": 17.458937999981565
+      },
+      "aten::t": {
+        "calls": 1024,
+        "total_ms": 5.813171000005314
+      },
+      "aten::chunk": {
+        "calls": 64,
+        "total_ms": 2.01119299999958
+      },
+      "aten::transpose": {
+        "calls": 128,
+        "total_ms": 1.4707770000008282
+      },
+      "aten::embedding": {
+        "calls": 1,
+        "total_ms": 0.9708649999999998
+      },
+      "aten::rsqrt": {
+        "calls": 65,
+        "total_ms": 0.6258780000016694
+      },
+      "aten::unsqueeze": {
+        "calls": 64,
+        "total_ms": 0.5748050000015064
+      },
+      "aten::argmax": {
+        "calls": 1,
+        "total_ms": 0.11135499999951572
+      },
+      "aten::empty": {
+        "calls": 2,
+        "total_ms": 0.010193000000000212
+      },
+      "aten::item": {
+        "calls": 1,
+        "total_ms": 0.008348000000230968
+      },
+      "aten::detach_": {
+        "calls": 2,
+        "total_ms": 0.0073150000000005095
+      },
+      "aten::lift_fresh": {
+        "calls": 2,
+        "total_ms": 0.0013469999999997527
+      }
+    }
+  }
+}

@@ -1,0 +1,487 @@
+{
+  "scope": "single prefill request to the first greedy token ID; no decode steps",
+  "measurement_scope": "tokenize, embedding, 32 layers, KV kept on CPU, last-token norm/lm_head/argmax; excludes checkpoint load, quantization and compilation",
+  "checkpoint": "/home/dlrkdals/models/Meta-Llama-3-8B",
+  "prompt_file": "/home/dlrkdals/TritonPIM/triton_shared/pim_backend/torch_backend/examples/upmem/e2e/prompt.txt",
+  "batch_size": 1,
+  "sequence_length": 1024,
+  "layers": 32,
+  "gemm_dtype": "int8 x int8 -> int32",
+  "cpu_dtype": "float32",
+  "mode": "inductor-cpp",
+  "inductor_overrides": {
+    "cpu_backend": "cpp",
+    "max_autotune": false,
+    "max_autotune_gemm": false,
+    "cpp_wrapper": false,
+    "cpp.enable_kernel_profile": true
+  },
+  "triton_shared_num_threads": "",
+  "omp_num_threads": "48",
+  "torch_threads": 48,
+  "versions": {
+    "torch": "2.12.0+cu130"
+  },
+  "preparation_ms": 39055.794344,
+  "compile": {
+    "compile_and_warmup_ms": 52231.634745,
+    "phases_s": {
+      "_compile.compile_inner": 51.850378,
+      "compile_attempt_0": 51.802051,
+      "bytecode_tracing": 1.089982,
+      "get_fake_value": 0.592644,
+      "create_proxy": 0.126251,
+      "wrap_to_fake_tensor_and_record": 0.011925,
+      "variable_builder_call": 0.086617,
+      "insert_deferred_runtime_asserts": 0.035428,
+      "OutputGraph.call_user_compiler": 50.660585,
+      "inductor_codecache_torch_key": 0.202914,
+      "_recursive_pre_grad_passes": 0.012804,
+      "pass.pre_grad_passes.group_batch_fusion_passes": 5.2e-05,
+      "pass.pre_grad_passes.efficient_conv_bn_eval_pass": 0.001797,
+      "pass.pre_grad_passes.apply_gumbel_max_trick_pass": 3.6e-05,
+      "create_aot_dispatcher_function": 44.664834,
+      "aot_collect_metadata": 0.537109,
+      "compile_fx.<locals>.fw_compiler_base": 42.861427,
+      "_recursive_joint_graph_passes": 0.38233,
+      "pass.joint_graph_passes.remove_noop_ops": 0.012025,
+      "pass.joint_graph_passes.constant_fold_uniform_value": 0.037409,
+      "pass.joint_graph_passes.pass_pattern_0": 0.10161,
+      "pass.joint_graph_passes.pass_pattern_1": 0.003884,
+      "compile_fx_inner": 42.477808,
+      "fx_codegen_and_compile": 42.466468,
+      "additional_fake_tensor_prop": 0.386333,
+      "_recursive_post_grad_passes": 0.624621,
+      "pass.post_grad_passes.reorder_for_locality": 0.00744,
+      "pass.post_grad_passes.remove_profiler_ops": 0.000383,
+      "pass.post_grad_passes.post_grad_custom_pre_pass": 5.5e-05,
+      "pass.post_grad_passes.remove_noop_ops": 0.010793,
+      "pass.post_grad_passes.remove_assert_ops": 3.1e-05,
+      "pass.post_grad_passes.pass_pattern_0": 1.5e-05,
+      "pass.post_grad_passes.pass_pattern_1": 0.287816,
+      "pass.post_grad_passes.pass_pattern_2": 0.008086,
+      "pass.post_grad_passes.stable_sort": 0.002014,
+      "pass.post_grad_passes.move_constructors_to_cuda": 0.002139,
+      "pass.post_grad_passes.reinplace_inplaceable_ops": 0.014714,
+      "pass.post_grad_passes.decompose_triton_kernel_wrapper_functional": 8e-05,
+      "pass.post_grad_passes.decompose_auto_functionalized": 0.002092,
+      "pass.post_grad_passes.decompose_scan_to_while_loop": 5.9e-05,
+      "pass.post_grad_passes.decompose_map_to_while_loop": 4.5e-05,
+      "GraphLowering.run": 1.77097,
+      "GraphLowering.compile_to_fn": 39.433784,
+      "GraphLowering.compile_to_module": 39.433727,
+      "GraphLowering.codegen": 22.16482,
+      "Scheduler.__init__": 4.810483,
+      "Scheduler.fused_nodes": 3.949242,
+      "Scheduler.codegen": 17.253465,
+      "PythonWrapperCodegen.generate": 0.097597,
+      "PyCodeCache.load_by_key_path": 17.26471,
+      "compile_file": 33.429051,
+      "async_compile.wait": 16.963899,
+      "TritonBundler.collect": 9.4e-05,
+      "build_guards": 0.034116,
+      "gc": 0.000682
+    }
+  },
+  "ttft_ms": {
+    "mean": 4248.5728229999995,
+    "min": 4157.385515,
+    "max": 4389.198008
+  },
+  "requests": [
+    {
+      "tokenization_ms": 8.872579,
+      "embedding_ms": 1.40456,
+      "layer_ms": [
+        125.121097,
+        351.887386,
+        130.124094,
+        129.349048,
+        130.071228,
+        126.710039,
+        127.805507,
+        127.221327,
+        128.729638,
+        129.724086,
+        125.598311,
+        124.26122,
+        125.60451,
+        124.854985,
+        126.629874,
+        126.117517,
+        124.895341,
+        129.682062,
+        126.754598,
+        124.961804,
+        131.976117,
+        127.095942,
+        129.158253,
+        129.639104,
+        126.250718,
+        126.175819,
+        129.193322,
+        127.220167,
+        127.951364,
+        127.348259,
+        127.381053,
+        129.814172
+      ],
+      "head_ms": 71.860322,
+      "model_to_token_ms": 4380.325429,
+      "ttft_ms": 4389.198008,
+      "token_id": 47544,
+      "token_text": " multiplication",
+      "kv_cache_bytes": 268435456
+    },
+    {
+      "tokenization_ms": 6.700441,
+      "embedding_ms": 1.067155,
+      "layer_ms": [
+        128.408518,
+        129.842246,
+        128.944413,
+        128.400796,
+        130.393652,
+        136.779848,
+        128.510182,
+        130.742131,
+        125.471828,
+        124.585491,
+        128.239738,
+        123.52593,
+        126.511651,
+        128.901935,
+        128.957587,
+        128.509188,
+        125.727524,
+        127.5843,
+        129.912784,
+        128.963467,
+        128.492174,
+        125.642353,
+        130.597449,
+        128.516329,
+        124.496569,
+        126.348335,
+        128.445267,
+        132.585242,
+        133.109595,
+        131.04404,
+        130.598599,
+        129.102693
+      ],
+      "head_ms": 71.792462,
+      "model_to_token_ms": 4192.434505,
+      "ttft_ms": 4199.134946,
+      "token_id": 47544,
+      "token_text": " multiplication",
+      "kv_cache_bytes": 268435456
+    },
+    {
+      "tokenization_ms": 6.973161,
+      "embedding_ms": 1.049433,
+      "layer_ms": [
+        128.626405,
+        126.943981,
+        126.448224,
+        133.290638,
+        124.993102,
+        131.891415,
+        126.207686,
+        127.330831,
+        127.477382,
+        129.258813,
+        124.753449,
+        132.940587,
+        125.937423,
+        125.045691,
+        126.021309,
+        125.591127,
+        125.071056,
+        126.475451,
+        129.596452,
+        132.479181,
+        125.682984,
+        129.313789,
+        130.21368,
+        128.645341,
+        124.125339,
+        125.593283,
+        123.748171,
+        129.646295,
+        123.477323,
+        127.60859,
+        127.53511,
+        123.953483
+      ],
+      "head_ms": 71.703672,
+      "model_to_token_ms": 4150.412354,
+      "ttft_ms": 4157.385515,
+      "token_id": 47544,
+      "token_text": " multiplication",
+      "kv_cache_bytes": 268435456
+    }
+  ],
+  "profiled_request": {
+    "tokenization_ms": 6.70712,
+    "embedding_ms": 1.094373,
+    "layer_ms": [
+      127.047397,
+      128.164893,
+      132.472356,
+      129.404465,
+      131.632908,
+      133.091809,
+      127.730952,
+      130.110081,
+      130.043047,
+      135.088211,
+      126.089312,
+      130.727905,
+      130.042724,
+      125.625692,
+      128.935232,
+      127.95021,
+      126.40574,
+      130.322674,
+      128.535039,
+      130.156115,
+      128.502745,
+      133.278461,
+      130.058501,
+      131.279018,
+      128.080527,
+      130.214667,
+      130.763375,
+      131.201535,
+      130.420207,
+      132.340515,
+      130.708725,
+      132.520254
+    ],
+    "head_ms": 71.838156,
+    "model_to_token_ms": 4233.587137,
+    "ttft_ms": 4240.294257,
+    "token_id": 47544,
+    "token_text": " multiplication",
+    "kv_cache_bytes": 268435456
+  },
+  "breakdown": {
+    "model_to_token_ms": 4233.587137,
+    "gemm_ms": 3065.617916000005,
+    "other_kernel_ms": 862.1524100000029,
+    "outside_kernels_ms": 305.8168109999924,
+    "stages": {
+      "outside_regions": {
+        "calls": 8,
+        "total_ms": 0.02866299999999956
+      },
+      "embedding": {
+        "calls": 1,
+        "total_ms": 0.9299160000000002
+      },
+      "before_q_proj": {
+        "calls": 32,
+        "total_ms": 16.323828000000407
+      },
+      "q_proj": {
+        "calls": 32,
+        "total_ms": 69.75397299999969
+      },
+      "after_q_proj": {
+        "calls": 32,
+        "total_ms": 44.93968999999988
+      },
+      "k_proj": {
+        "calls": 32,
+        "total_ms": 47.83222000000102
+      },
+      "after_k_proj": {
+        "calls": 32,
+        "total_ms": 20.47501600000053
+      },
+      "v_proj": {
+        "calls": 32,
+        "total_ms": 163.03018999999935
+      },
+      "after_v_proj": {
+        "calls": 32,
+        "total_ms": 145.1986980000001
+      },
+      "attention_qk": {
+        "calls": 1024,
+        "total_ms": 118.22529100000371
+      },
+      "attention_pv": {
+        "calls": 1024,
+        "total_ms": 100.06115699999826
+      },
+      "after_attention_pv": {
+        "calls": 512,
+        "total_ms": 286.93509200000364
+      },
+      "o_proj": {
+        "calls": 32,
+        "total_ms": 167.1233509999996
+      },
+      "after_o_proj": {
+        "calls": 32,
+        "total_ms": 31.37792399999808
+      },
+      "gate_proj": {
+        "calls": 32,
+        "total_ms": 974.1574140000014
+      },
+      "up_proj": {
+        "calls": 32,
+        "total_ms": 915.8024010000008
+      },
+      "after_up_proj": {
+        "calls": 32,
+        "total_ms": 175.49387400000072
+      },
+      "down_proj": {
+        "calls": 32,
+        "total_ms": 509.63191900000015
+      },
+      "after_down_proj": {
+        "calls": 32,
+        "total_ms": 69.03206399999999
+      },
+      "head": {
+        "calls": 12,
+        "total_ms": 71.41764499999957
+      }
+    },
+    "kernels": {
+      "aten::_int_mm": {
+        "calls": 2272,
+        "total_ms": 3065.617916000005
+      },
+      "graph_0_cpp_fused__to_copy_abs_amax_clamp_clamp_min_div_mul_round_silu_view_15": {
+        "calls": 32,
+        "total_ms": 175.49387400000072
+      },
+      "graph_0_cpp_fused__to_copy_abs_add_amax_cat_clamp_clamp_min_clone_div_mul_neg_round_select_split_transpose_view_3": {
+        "calls": 32,
+        "total_ms": 145.1986980000001
+      },
+      "aten::linear": {
+        "calls": 1,
+        "total_ms": 70.85729799999996
+      },
+      "graph_0_cpp_fused__to_copy_add_clamp_min_div_mul_view_16": {
+        "calls": 32,
+        "total_ms": 69.03206399999999
+      },
+      "graph_0_cpp_fused__softmax__to_copy_abs_amax_clamp_clamp_min_div_masked_fill_mul_round_select_view_4": {
+        "calls": 32,
+        "total_ms": 62.80291699999969
+      },
+      "graph_0_cpp_fused__to_copy_abs_add_amax_cat_clamp_clamp_min_clone_div_mul_neg_round_select_split_t_transpose_unsqueeze_view_1": {
+        "calls": 32,
+        "total_ms": 44.93968999999988
+      },
+      "graph_0_cpp_fused__to_copy_clamp_min_div_mul_5": {
+        "calls": 224,
+        "total_ms": 39.00701599999911
+      },
+      "graph_0_cpp_fused__to_copy_abs_add_amax_clamp_clamp_min_div_mean_mul_pow_round_rsqrt_view_14": {
+        "calls": 32,
+        "total_ms": 31.37792399999808
+      },
+      "graph_0_cpp_fused__softmax__to_copy_abs_amax_clamp_clamp_min_div_masked_fill_mul_round_select_view_6": {
+        "calls": 32,
+        "total_ms": 29.234063000000106
+      },
+      "graph_0_cpp_fused__to_copy__unsafe_view_abs_amax_clamp_clamp_min_clone_div_mul_round_stack_transpose_13": {
+        "calls": 32,
+        "total_ms": 23.994459999999513
+      },
+      "graph_0_cpp_fused__softmax__to_copy_abs_amax_clamp_clamp_min_div_masked_fill_mul_round_select_view_7": {
+        "calls": 32,
+        "total_ms": 22.453069000000852
+      },
+      "graph_0_cpp_fused__softmax__to_copy_abs_amax_clamp_clamp_min_div_masked_fill_mul_round_select_view_12": {
+        "calls": 32,
+        "total_ms": 22.227738000001175
+      },
+      "graph_0_cpp_fused__softmax__to_copy_abs_amax_clamp_clamp_min_div_masked_fill_mul_round_select_view_8": {
+        "calls": 32,
+        "total_ms": 21.937813000000137
+      },
+      "graph_0_cpp_fused__softmax__to_copy_abs_amax_clamp_clamp_min_div_masked_fill_mul_round_select_view_11": {
+        "calls": 32,
+        "total_ms": 21.92639300000132
+      },
+      "graph_0_cpp_fused__softmax__to_copy_abs_amax_clamp_clamp_min_div_masked_fill_mul_round_select_view_10": {
+        "calls": 32,
+        "total_ms": 21.789008000000827
+      },
+      "graph_0_cpp_fused__softmax__to_copy_abs_amax_clamp_clamp_min_div_masked_fill_mul_round_select_view_9": {
+        "calls": 32,
+        "total_ms": 21.562615000000907
+      },
+      "graph_0_cpp_fused__to_copy_abs_amax_clamp_clamp_min_clone_div_mul_round_select_transpose_unsqueeze_view_2": {
+        "calls": 32,
+        "total_ms": 20.47501600000053
+      },
+      "graph_0_cpp_fused__to_copy_abs_add_amax_clamp_clamp_min_div_mean_mul_pow_round_rsqrt_0": {
+        "calls": 32,
+        "total_ms": 16.323828000000407
+      },
+      "aten::embedding": {
+        "calls": 1,
+        "total_ms": 0.9299160000000002
+      },
+      "aten::argmax": {
+        "calls": 1,
+        "total_ms": 0.30339099999982866
+      },
+      "aten::mean": {
+        "calls": 1,
+        "total_ms": 0.10495699999993667
+      },
+      "aten::pow": {
+        "calls": 1,
+        "total_ms": 0.05990099999960512
+      },
+      "aten::select": {
+        "calls": 1,
+        "total_ms": 0.02868099999986589
+      },
+      "aten::mul": {
+        "calls": 2,
+        "total_ms": 0.022719000000040977
+      },
+      "aten::add": {
+        "calls": 1,
+        "total_ms": 0.01993500000005588
+      },
+      "aten::empty": {
+        "calls": 2,
+        "total_ms": 0.016751000000000203
+      },
+      "aten::detach_": {
+        "calls": 2,
+        "total_ms": 0.009123999999998886
+      },
+      "aten::rsqrt": {
+        "calls": 1,
+        "total_ms": 0.008679000000003725
+      },
+      "aten::item": {
+        "calls": 1,
+        "total_ms": 0.007792000000365078
+      },
+      "aten::to": {
+        "calls": 4,
+        "total_ms": 0.006166999999899418
+      },
+      "aten::lift_fresh": {
+        "calls": 2,
+        "total_ms": 0.0009130000000004656
+      }
+    }
+  }
+}
