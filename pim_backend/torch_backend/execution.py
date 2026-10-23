@@ -126,8 +126,13 @@ def resolve_execution(torch_config, problem):
         torch_config=torch_config)
 
 
-def select_layer_config(problem, target, torch_config, instance_count, *, has_weights):
-    """Choose an existing configuration after the session has acquired its units."""
+def select_layer_config(problem, target, torch_config, instance_count, *, has_weights, resident_kv):
+    """Choose an existing configuration after the session has acquired its units.
+
+    A stage that reads the key/value cache in place (resident_kv) needs every unit's
+    part of the cache in memory at once: one M/N/K round and every instance in one
+    batch round.
+    """
     if torch_config.config is not None:
         candidates = ((torch_config.config, 0.0),)
     elif torch_config.autotune_cache_path is not None:
@@ -158,6 +163,11 @@ def select_layer_config(problem, target, torch_config, instance_count, *, has_we
         units = config.p_m * config.p_n * config.p_k
         p_b = min(instance_count, target.common_profile.num_units // units)
         rounds = (instance_count + p_b - 1) // p_b
+        if resident_kv and (hierarchy.scheduling_rounds != 1 or rounds != 1):
+            rejected.append((config.key(), (
+                f"a resident key/value cache operand requires one M/N/K round and one batch round; "
+                f"got rounds {hierarchy.rounds} and {rounds} batch rounds")))
+            continue
         choices.append((rounds * cost, config, p_b, rounds, hierarchy.rounds))
     if not choices:
         raise ValueError(

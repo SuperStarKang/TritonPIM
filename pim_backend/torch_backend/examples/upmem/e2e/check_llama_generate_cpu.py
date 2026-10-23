@@ -2,8 +2,8 @@
 
 The prefill and decode layers of e2e/llama_generation.py run eagerly on the CPU
 (torch._int_mm for every GEMM) through the same loop as
-benchmark_model_llama_generate.py, with the report's checkpoint, prompt, kv mode and
-token count. The INT32 GEMM results are the same on both sides; the FP32 parts on the
+benchmark_model_llama_generate.py, with the report's checkpoint, prompt, kv mode,
+token count and cache row order (kv_rows). The INT32 GEMM results are the same on both sides; the FP32 parts on the
 PIM side are compiled by Inductor, so a token whose top two logits are almost equal can
 still differ. Prints the first position that differs, if any.
 
@@ -39,9 +39,12 @@ def main():
         prefill_layers, decode_layers = generation_layers(model, report["kv"])
         input_ids = tokenizer(Path(report["prompt_file"]).read_text(encoding="utf-8"), return_tensors="pt",
                               truncation=True, max_length=PROMPT_TOKENS)["input_ids"]
-        result = generate(model, input_ids, report["max_new_tokens"],
-                          lambda *inputs: run_layers(prefill_layers, *inputs),
-                          lambda *inputs: run_layers(decode_layers, *inputs))
+        # CPU layer는 host cache를 그대로 읽으므로 store할 곳이 없다. cache 행 순서는 report와 같다.
+        result = generate(model, input_ids, report["max_new_tokens"], torch.tensor(report["kv_rows"]),
+                          lambda hidden, cache, after_layer: run_layers(
+                              prefill_layers, hidden, cache, after_layer=after_layer),
+                          lambda *inputs: run_layers(decode_layers, *inputs),
+                          lambda layer, cache, start, stop: None)
 
     pim = report["token_ids"]
     cpu = result["tokens"]

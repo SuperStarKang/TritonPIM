@@ -1,9 +1,10 @@
 """Model compile time: tiling configs of one layer, then every layer compiled with them.
 
 compile_model analyzes the first layer into stage classes (after GEMM packing),
-measures each class with its weights already resident, chooses the packing and one
-measured config per class together (select_configs), and compiles every layer with
-those configs without allocating the device. plan_memory then fits as many layer slots as one unit holds: every layer
+measures each class with its weights (or the key/value cache it reads) already
+resident, chooses the packing and one measured config per class together
+(select_configs), and compiles every layer with those configs without allocating
+the device. plan_memory then fits as many layer slots as one unit holds: every layer
 keeps its own slot if all fit; otherwise layer i takes slot i mod slots and the
 layers of one group are uploaded together, overwriting only the weights. The
 returned session allocates, binds and runs at runtime.
@@ -20,7 +21,7 @@ import time
 
 import torch
 
-from triton.backends.pim.residency import kv_parts
+from triton.backends.pim.residency import KEY
 from triton.backends.pim.runtime import PIMSession
 
 from ._autotuner import (
@@ -36,7 +37,11 @@ from .template import TORCH_GEMM_TEMPLATE_VERSION
 
 
 class StageModule(torch.nn.Module):
-    """One stage class alone: a weight GEMM, or its independent activation GEMM instances."""
+    """One stage class alone: a weight GEMM, or its independent activation GEMM instances.
+
+    A key/value cache class takes the cache first, [instances, ...], and instance i
+    reads cache[i] as its cache operand.
+    """
 
     def __init__(self, key, weights):
         super().__init__()
@@ -60,6 +65,11 @@ class StageModule(torch.nn.Module):
             return self._gemm(left, right)
         if self.key.op == "aten.bmm.default":
             return self._gemm(*inputs)
+        if self.key.has_kv:
+            cache, *others = inputs
+            if self.key.kv_mask[0]:
+                return tuple(self._gemm(cache[instance], other) for instance, other in enumerate(others))
+            return tuple(self._gemm(other, cache[instance]) for instance, other in enumerate(others))
         return tuple(self._gemm(inputs[index], inputs[index + 1])
                      for index in range(0, len(inputs), 2))
 
@@ -82,13 +92,18 @@ def stage_inputs(key):
         return (tensor(m, k) if key.weight_mask[1] else tensor(k, n),)
     if key.op == "aten.bmm.default":
         return (tensor(key.instances, m, k), tensor(key.instances, k, n))
+    if key.has_kv:
+        cache, other = ((m, k), (k, n)) if key.kv_mask[0] else ((k, n), (m, k))
+        return (tensor(key.instances, *cache),) + tuple(tensor(*other) for _ in range(key.instances))
     return tuple(operand for _ in range(key.instances) for operand in (tensor(m, k), tensor(k, n)))
 
 
 def measure_stage(key, weights, session, config, *, warmup, repeat):
-    """E with the weights already resident, U of one upload, and measured footprint.
+    """E with the weights (or the key/value cache) already resident, U of one weight upload,
+    and measured footprint.
 
     session is open; the prepared stage is released afterwards and the units stay allocated.
+    The cache is not written: E does not depend on its values.
     """
     module = StageModule(key, weights).eval()
     inputs = stage_inputs(key)
@@ -99,7 +114,10 @@ def measure_stage(key, weights, session, config, *, warmup, repeat):
     # 후보마다 새로 컴파일한다. dynamo가 앞 후보의 컴파일 결과를 돌려주지 않게 한다.
     torch._dynamo.reset()
     with torch.no_grad():
-        plan, = session.prepare({"stage": ([module], inputs, configure)})["stage"]
+        plan, = session.prepare(
+            {"stage": ([module], inputs, configure)},
+            kv_inputs={"stage": lambda index, inputs: {KEY: inputs[0]}} if key.has_kv else None,
+        )["stage"]
         stage, = plan.stages
         # packing이 측정할 stage의 shape를 바꾸지 않았는지 확인한다.
         if (tuple(stage.shape), stage.instance_count) != (key.mnk, key.instances):
@@ -121,8 +139,10 @@ def measure_stage(key, weights, session, config, *, warmup, repeat):
         total_ms=statistics.median(samples),
         correctness=None,
         timings=(("weight_upload", upload_ms),),
+        # cache class는 cache 영역 bytes를 다섯째로 더한다 (Footprint.kv).
         physical_allocations=((requirement.weight_bytes, requirement.state_bytes,
-                               requirement.input_bytes, requirement.output_bytes),),
+                               requirement.input_bytes, requirement.output_bytes)
+                              + ((requirement.kv_bytes,) if key.has_kv else ()),),
     )
 
 
@@ -193,7 +213,11 @@ class Candidate:
 def cache_version(key):
     # E, U, footprint는 배치와 무관하다. stage class가 다르면 같은 (M,N,K)여도 측정 대상이 다르다.
     mask = "".join(str(int(flag)) for flag in key.weight_mask)
-    return f"{TORCH_GEMM_TEMPLATE_VERSION}|model|{key.op}|w{mask}|x{key.instances}"
+    version = f"{TORCH_GEMM_TEMPLATE_VERSION}|model|{key.op}|w{mask}|x{key.instances}"
+    # cache를 읽는 class는 같은 (M,N,K)의 activation class와 다른 것을 잰다 (cache 전송 없음).
+    if key.has_kv:
+        version += "|kv" + "".join(str(int(flag)) for flag in key.kv_mask)
+    return version
 
 
 def select_configs(classes, candidates, capacity_bytes, *, layers, repeats):
@@ -323,7 +347,7 @@ def stage_config_space(key, spec):
     # instance가 unit보다 많으면(AiMX 2 FPGA의 head stage) instance 하나는 unit 하나를 쓴다.
     overrides = {"partition_axes": (True, True, split_k),
                  "instance_units": max(1, spec.common_profile.num_units // key.instances)}
-    if key.has_weights:
+    if key.has_weights or key.has_kv:
         overrides["initial_round_patterns"] = ((1, 1, 1),)
     return build_config_space(problem, spec, **overrides)
 
@@ -332,7 +356,7 @@ def tune_stage_class(stage_class, spec, *, cache_path, search_budget, warmup, re
     """Measured candidates of one class that satisfy the model-stage constraints."""
     key = stage_class.key
     problem = key.problem
-    constraint = stage_constraint(key, max_stage_rounds(problem, spec))
+    constraint = stage_constraint(key, max_stage_rounds(problem, spec), spec.common_profile.num_units)
     cache = PIMConfigCache(cache_path, template_version=cache_version(key))
     # packing member의 config를 넓힌 후보, 같은 context의 비슷한 shape config를 이 shape에 맞춘 후보
     initial = tuple({config.key(): config for config in (
@@ -362,8 +386,9 @@ def tune_stage_class(stage_class, spec, *, cache_path, search_budget, warmup, re
         if record["correctness"] is False or not engine.valid(config):
             continue
         timings = dict(record["timings"])
+        allocations = record["physical_allocations"][0]
         candidates.append(Candidate(config, record["total_ms"], timings["weight_upload"],
-                                    Footprint(*record["physical_allocations"][0])))
+                                    Footprint(*allocations) if key.has_kv else Footprint(*allocations, kv=0)))
     if not candidates:
         raise ValueError(f"{key.label()}: no measured config satisfies the model-stage constraints")
     return candidates
@@ -375,15 +400,14 @@ class CompiledModel:
     report: dict
 
 
-def choose_phase(phase, layers, example_inputs, spec, capacity_bytes, *, repeats, cache_path,
-                 search_budget, warmup, repeat, seed):
-    """Stage classes, packing and one config per class for the first layer of one phase.
+def tune_phase(phase, layers, example_inputs, spec, kv, *, cache_path, search_budget, warmup, repeat,
+               seed):
+    """Stage classes of the first layer of one phase and the measured candidates of every class.
 
-    capacity_bytes is what one unit has for the phase area (after the key/value cache);
-    one request runs the phase repeats times.
+    kv is the first layer's {KEY/VALUE: cache input} or None (build_layer_plan).
     """
     start = time.perf_counter_ns()
-    classes, assignment = analyze_layer(layers[0], example_inputs, spec)
+    classes, assignment = analyze_layer(layers[0], example_inputs, spec, kv)
     analysis_ms = (time.perf_counter_ns() - start) / 1e6
     print(f"[model compile] {phase}: stage_classes={len(classes)}", flush=True)
 
@@ -404,7 +428,33 @@ def choose_phase(phase, layers, example_inputs, spec, capacity_bytes, *, repeats
             for member in members[stage_class.key][0]:
                 tune_once(member)
         tune_once(stage_class)
+    return {"classes": classes, "assignment": assignment, "members": members, "candidates": candidates,
+            "analysis_ms": analysis_ms, "tuning_ms": (time.perf_counter_ns() - start) / 1e6}
 
+
+def kv_bytes_bound(tuned, layers):
+    """Per-unit cache bytes of the phase's layers under its largest measured cache candidates.
+
+    The cache sits below every phase area, so the configs are chosen for what is left
+    after this bound; the memory table then places the bytes the chosen configs need.
+    """
+    return layers * sum(
+        stage_class.count * max(candidate.footprint.kv for candidate in tuned["candidates"][stage_class.key])
+        for stage_class in tuned["classes"] if stage_class.key.has_kv)
+
+
+def select_phase(phase, tuned, capacity_bytes, *, layers, repeats):
+    """Packing and one config per class for the layers of one phase.
+
+    capacity_bytes is what one unit has for the phase area (below the key/value cache
+    once a phase reads it);
+    one request runs the phase repeats times.
+    """
+    start = time.perf_counter_ns()
+    classes = tuned["classes"]
+    members = tuned["members"]
+    candidates = tuned["candidates"]
+    assignment = dict(tuned["assignment"])
     packed_classes = [stage_class for stage_class in classes if stage_class.origin is not None]
     best = None
     packing = []
@@ -419,7 +469,7 @@ def choose_phase(phase, layers, example_inputs, spec, capacity_bytes, *, repeats
                 parts.setdefault(part.key, []).append(part)
         counts = {key: sum(part.count for part in group) for key, group in parts.items()}
         selection = select_configs(counts, candidates, capacity_bytes,
-                                   layers=len(layers), repeats=repeats)
+                                   layers=layers, repeats=repeats)
         packing.append({"separated": [key.label() for key in separated],
                         "layer_ms": None if selection is None else selection[0],
                         "slot_bytes": None if selection is None else selection[1],
@@ -442,41 +492,56 @@ def choose_phase(phase, layers, example_inputs, spec, capacity_bytes, *, repeats
     classes = [StageClass(key, sum(part.count for part in group), group[0].weights, group[0].origin,
                           [sources for part in group for sources in part.stage_sources])
                for key, group in parts.items()]
-    tuning_ms = (time.perf_counter_ns() - start) / 1e6
     return {"selected": selected, "assignment": assignment, "separate": separate,
             "classes": classes, "candidates": candidates, "packing": packing, "repeats": repeats,
-            "analysis_ms": analysis_ms, "tuning_ms": tuning_ms}
+            "analysis_ms": tuned["analysis_ms"], "tuning_ms": tuned["tuning_ms"],
+            "selection_ms": (time.perf_counter_ns() - start) / 1e6}
 
 
-def compile_model(phases, *, target, units, kv=None, repeats=None, runtime_options=None,
+def compile_model(phases, *, target, units, kv_inputs=None, repeats=None, runtime_options=None,
                   cache_path=DEFAULT_CACHE_PATH, max_benchmarks=20, max_generations=10,
                   warmup=1, repeat=3, seed=0):
     """Compile time of a model whose layers share one structure in every phase; the session runs it.
 
-    phases maps each phase name, in execution order, to (layers, example_inputs); kv is the
-    model's KVRequirement, or None when the key/value cache stays on the host. repeats maps
-    every phase to the times one request runs it (decode: generated tokens - 1); None runs
-    every phase once. Every phase overlays one area after the key/value cache, so its
-    configs are chosen for what is left:
-    1. analyze the first layer of the phase into stage classes
-    2. tune every class with its weights resident; a packed class also tunes its members
-    3. for every pack/separate choice of the packed classes, select_configs picks one
+    phases maps each phase name, in execution order, to (layers, example_inputs). kv_inputs
+    maps a phase to kv(index, inputs) -> {KEY/VALUE: tensor}, the host key/value cache
+    among the inputs of layer index; the GEMMs reading one head of it read the device
+    cache in place (PIMSession.compile, write_kv). Without kv_inputs the cache stays on
+    the host. repeats maps every phase to the times one request runs it (decode:
+    generated tokens - 1); None runs every phase once. Every phase overlays one area
+    from offset 0 and the cache sits at the top of the unit; the phases before the
+    first one that reads the cache run before it is written and are chosen for the
+    whole unit, the others for what the cache leaves:
+    1. analyze the first layer of every phase into stage classes
+    2. tune every class with its weights (or cache) resident; a packed class also tunes
+       its members
+    3. reserve the cache under the largest measured cache candidates (kv_bytes_bound)
+    4. for every pack/separate choice of the packed classes, select_configs picks one
        candidate per class; the choice with the smallest time of one layer in one
        request wins (E and U weighed by the repeats)
-    4. compile every layer of every phase with those configs; plan_memory places them
+    5. compile every layer of every phase with those configs; plan_memory places them
     """
     spec = target_spec(target, num_units=units, **(runtime_options or {}))
-    kv_bytes = 0 if kv is None else 2 * kv.layers * kv_parts(kv, units)[2]
-    capacity_bytes = (spec.common_profile.banks_per_unit * spec.common_profile.bank_capacity_limit_bytes
-                      - kv_bytes)
-    print(f"[model compile] target={target} units={units} phases={list(phases)} "
-          f"kv_bytes={kv_bytes}", flush=True)
+    print(f"[model compile] target={target} units={units} phases={list(phases)}", flush=True)
     search_budget = SearchBudget(max_generations=max_generations, max_benchmarks=max_benchmarks)
-    choices = {phase: choose_phase(phase, tuple(layers), example_inputs, spec, capacity_bytes,
-                                   repeats=1 if repeats is None else repeats[phase],
-                                   cache_path=cache_path, search_budget=search_budget,
-                                   warmup=warmup, repeat=repeat, seed=seed)
-               for phase, (layers, example_inputs) in phases.items()}
+    tuned = {phase: tune_phase(phase, tuple(layers), example_inputs, spec,
+                               None if kv_inputs is None or phase not in kv_inputs
+                               else kv_inputs[phase](0, example_inputs),
+                               cache_path=cache_path, search_budget=search_budget,
+                               warmup=warmup, repeat=repeat, seed=seed)
+             for phase, (layers, example_inputs) in phases.items()}
+    kv_bounds = {phase: kv_bytes_bound(tuned[phase], len(tuple(layers))) for phase, (layers, _) in phases.items()}
+    kv_bytes = max(kv_bounds.values())
+    unit_bytes = spec.common_profile.banks_per_unit * spec.common_profile.bank_capacity_limit_bytes
+    # plan_memory와 같은 규칙: cache를 처음 읽는 phase부터 cache 아래 영역만 쓴다.
+    first_reader = next((index for index, phase in enumerate(phases) if kv_bounds[phase]), len(phases))
+    capacity_bytes = {phase: unit_bytes - (kv_bytes if index >= first_reader else 0)
+                      for index, phase in enumerate(phases)}
+    print(f"[model compile] key/value cache bound {kv_bytes} bytes per unit; phase areas "
+          f"{capacity_bytes}", flush=True)
+    choices = {phase: select_phase(phase, tuned[phase], capacity_bytes[phase], layers=len(tuple(layers)),
+                                   repeats=1 if repeats is None else repeats[phase])
+               for phase, (layers, _) in phases.items()}
 
     def configure_with(choice):
         # 모든 layer의 GEMM 이름이 분석한 layer와 같다. 없는 이름은 KeyError로 드러난다.
@@ -491,7 +556,7 @@ def compile_model(phases, *, target, units, kv=None, repeats=None, runtime_optio
     session = PIMSession(spec)
     torch._dynamo.reset()
     session.compile({phase: (layers, example_inputs, configure_with(choices[phase]))
-                     for phase, (layers, example_inputs) in phases.items()}, kv=kv)
+                     for phase, (layers, example_inputs) in phases.items()}, kv_inputs=kv_inputs)
     for phase, plans in session.plans.items():
         classes = choices[phase]["classes"]
         # packing 판단을 반영한 layer가 측정한 class와 같은 stage들로 나뉘었는지 확인한다.
@@ -514,7 +579,7 @@ def compile_model(phases, *, target, units, kv=None, repeats=None, runtime_optio
         print(f"[model compile] {phase}: slots={layout.slots} groups={layout.groups} bytes={layout.bytes} "
               f"analysis_ms={choices[phase]['analysis_ms']:.1f} tuning_ms={choices[phase]['tuning_ms']:.1f}",
               flush=True)
-    print(f"[model compile] kv_bytes={memory.kv_bytes} bytes_per_unit={memory.bytes_per_unit} "
+    print(f"[model compile] kv_bytes={memory.kv_bytes} kv_base={memory.kv_base} bytes_per_unit={memory.bytes_per_unit} "
           f"capacity={memory.capacity_bytes} compile_ms={compile_ms:.1f}", flush=True)
 
     def phase_report(phase, layers):
@@ -527,6 +592,7 @@ def compile_model(phases, *, target, units, kv=None, repeats=None, runtime_optio
                 stage_class.count * selected[stage_class.key].execution_ms
                 for stage_class in choice["classes"]),
             "analysis_ms": choice["analysis_ms"], "tuning_ms": choice["tuning_ms"],
+            "selection_ms": choice["selection_ms"],
             "packing": choice["packing"],
             "stage_classes": [{
                 "label": stage_class.key.label(),
@@ -545,9 +611,12 @@ def compile_model(phases, *, target, units, kv=None, repeats=None, runtime_optio
 
     report = {
         "target": target, "units": units, "spec": asdict(spec),
-        "kv": None if kv is None else asdict(kv),
-        "memory": {"kv_split": memory.kv_split, "kv_tokens_per_unit": memory.kv_tokens_per_unit,
-                   "kv_bytes": memory.kv_bytes, "bytes_per_unit": memory.bytes_per_unit,
+        "memory": {"kv_bytes": memory.kv_bytes, "kv_base": memory.kv_base, "kv_bytes_bound": kv_bytes,
+                   "phase_capacity_bytes": capacity_bytes,
+                   "kv_regions": [{"layer": entry.layer, "kind": entry.kind, "offset": entry.offset,
+                                   "bytes": entry.bytes}
+                                  for key, entry in memory.entries.items() if key[0] == "kv"],
+                   "bytes_per_unit": memory.bytes_per_unit,
                    "capacity_bytes": memory.capacity_bytes,
                    "phases": {phase: {"slots": layout.slots, "groups": layout.groups,
                                       "slot_of_layer": layout.slot_of_layer,

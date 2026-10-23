@@ -115,7 +115,7 @@ class LayerPlan:
 
 
 class _LayerGemm(torch.nn.Module):
-    def __init__(self, name, gemms, weights, torch_config, sources, origin):
+    def __init__(self, name, gemms, weights, torch_config, sources, origin, kv, kv_heads):
         super().__init__()
         self.name = name
         # 이 stage가 계산하는 원래 GEMM 이름 (packing으로 여러 개일 수 있다)
@@ -125,6 +125,10 @@ class _LayerGemm(torch.nn.Module):
         self.gemms = tuple(gemms)
         self.weights = tuple(weights)
         self.weight_mask = tuple(weight is not None for weight in weights)
+        # (operand, KEY/VALUE): 이 operand는 매 호출 보내지 않고 장치의 key/value cache 영역을
+        # 그대로 읽는다. kv_heads[instance]는 그 instance가 읽는 cache head다. 아니면 None.
+        self.kv = kv
+        self.kv_heads = kv_heads
         self.torch_config = torch_config
         self.batched_operand = gemms[0].op == "aten.bmm.default"
         self.instance_count = gemms[0].instance_count if self.batched_operand else len(gemms)
@@ -141,6 +145,7 @@ class _LayerGemm(torch.nn.Module):
             gemm_problem(*self.shape, input_dtype=str(self.input_dtype).removeprefix("torch."),
                        output_dtype=str(self.output_dtype).removeprefix("torch.")),
             spec, self.torch_config, self.instance_count, has_weights=any(self.weight_mask),
+            resident_kv=self.kv is not None,
         )
         self.weights = tuple(weight.contiguous() if weight is not None else None
                              for weight in self.weights)
@@ -163,7 +168,8 @@ class _LayerGemm(torch.nn.Module):
         self.preparation_matrices = (tuple(
             weight if weight is not None else torch.empty((1, 1), dtype=self.input_dtype)
             for weight in self.weights),)
-        self.preparation_output = torch.empty((1, 1), dtype=self.output_dtype)
+        # weight 업로드와 key/value cache 쓰기는 출력을 쓰지 않는다. instance마다 하나씩 둔다.
+        self.preparation_output = torch.empty((self.instance_count, 1, 1), dtype=self.output_dtype)
 
     def reference(self, *inputs):
         if self.batched_operand:
@@ -209,7 +215,7 @@ class CompileModelCPU(fx.Interpreter):
         return compiled(*args, **kwargs)
 
 
-def build_layer_plan(exported_program, example_inputs, *, configs, index, spec):
+def build_layer_plan(exported_program, example_inputs, *, configs, index, spec, kv=None):
     """Analyze one exported block without compiling it or acquiring hardware.
 
     configs maps original GEMM names to PIMTorchConfig. GEMMs are first packed on
@@ -217,13 +223,28 @@ def build_layer_plan(exported_program, example_inputs, *, configs, index, spec):
     config sets pack=False; GEMMs packed together must share one config. Independent activation GEMMs of the same
     shape/config are then grouped; weight GEMMs remain stationary single-instance
     stages. aten.bmm uses its explicit operand batch dimension.
+    kv maps KEY/VALUE to the tensors of example_inputs that are this block's host
+    key/value cache, [heads, positions, ...]; a GEMM operand cache[head] then reads
+    the device cache region (stage.kv, stage.kv_heads).
     """
-    _, specification = _pytree.tree_flatten((example_inputs, {}))
+    leaves, specification = _pytree.tree_flatten((example_inputs, {}))
     if specification != exported_program.call_spec.in_spec:
         raise ValueError("example_inputs must match the exported positional inputs")
     normalized, mappings = normalize_fx_gemms(exported_program, allow_bmm=True)
     if set(configs) != {mapping.original.node for mapping in mappings}:
         raise ValueError("configs must contain every original GEMM exactly once")
+    # placeholder 이름 -> KEY/VALUE
+    kv_inputs = {}
+    if kv is not None:
+        user_inputs = [input_spec.arg.name for input_spec in normalized.graph_signature.input_specs
+                       if input_spec.kind == InputKind.USER_INPUT]
+        if len(user_inputs) != len(leaves):
+            raise ValueError(f"{len(leaves)} example input leaves export to {len(user_inputs)} user inputs")
+        for kind, tensor in kv.items():
+            matches = [name for name, leaf in zip(user_inputs, leaves) if leaf is tensor]
+            if len(matches) != 1:
+                raise ValueError(f"the {kind} cache must be exactly one example input leaf; found {len(matches)}")
+            kv_inputs[matches[0]] = kind
     frozen_graph, frozen = _freeze_graph(normalized)
     gemms = pack_gemms(frozen_graph, frozen, {
         mapping.normalized.node: PackedGemm(mapping, (mapping.original.node,), None) for mapping in mappings
@@ -231,6 +252,15 @@ def build_layer_plan(exported_program, example_inputs, *, configs, index, spec):
     for entry in gemms.values():
         if len({configs[source] for source in entry.sources}) != 1:
             raise ValueError(f"packed GEMMs {entry.sources} must share one config")
+
+    def kv_source(operand):
+        """(KEY/VALUE, head) if the operand is one head of a cache input, else None."""
+        if (operand.op == "call_function" and operand.target == torch.ops.aten.select.int
+                and operand.args[0].op == "placeholder" and operand.args[0].name in kv_inputs):
+            if operand.args[1] != 0:
+                raise ValueError(f"{operand.name}: a cache operand must select a head on axis 0")
+            return kv_inputs[operand.args[0].name], operand.args[2]
+        return None
     depths = {}
     groups = {}
     group_for_node = {}
@@ -263,6 +293,14 @@ def build_layer_plan(exported_program, example_inputs, *, configs, index, spec):
             arguments = tuple(emit(operand) for member in nodes for operand in gemm_operands(member))
             mapping = gemms[nodes[0].name].mapping
             operands = gemm_operands(nodes[0])
+            # operand마다 instance별 (KEY/VALUE, head) 또는 None
+            cache_sources = [[kv_source(gemm_operands(member)[operand]) for member in nodes] for operand in range(2)]
+            kv_operands = [operand for operand in range(2) if any(cache_sources[operand])]
+            if len(kv_operands) > 1 or any(None in cache_sources[operand] for operand in kv_operands) \
+                    or any(len({kind for kind, _ in cache_sources[operand]}) != 1 for operand in kv_operands):
+                raise ValueError(f"{nodes[0].name}: every instance must read one cache kind with the same operand")
+            if kv_operands and gemms[nodes[0].name].origin is not None:
+                raise ValueError(f"{nodes[0].name}: a packed GEMM cannot read the key/value cache")
             stage = _LayerGemm(
                 mapping.original.node,
                 tuple(gemms[member.name].mapping.normalized for member in nodes),
@@ -270,6 +308,8 @@ def build_layer_plan(exported_program, example_inputs, *, configs, index, spec):
                 configs[mapping.original.node],
                 tuple(source for member in nodes for source in gemms[member.name].sources),
                 gemms[nodes[0].name].origin,
+                (kv_operands[0], cache_sources[kv_operands[0]][0][0]) if kv_operands else None,
+                tuple(head for _, head in cache_sources[kv_operands[0]]) if kv_operands else None,
             )
             name = "pim_stage_" + str(len(stages))
             frozen_graph.add_module(name, stage)

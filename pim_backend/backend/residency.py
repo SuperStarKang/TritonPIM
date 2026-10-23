@@ -4,11 +4,18 @@ Adapters report only numbers: their actual units, the capacity of one unit and
 the per-unit bytes of every stage operand. The planner never sees vendor handles.
 
 Every unit has the same layout, so one table of offsets from the unit's memory
-base serves all units. The key/value cache comes first from offset 0: layer by
-layer, the key then the value of the token positions this unit holds. Every
-phase of a request (prefill, decode) then lays its own area out from the end of
-the cache, and the phases overlay one another: only the phase that runs holds
-the area, so its weights overwrite those of the previous phase.
+base serves all units. Phase areas grow up from offset 0 and the key/value cache
+grows down from the capacity: layer by layer, the key then the value region, each
+below the previous one. A stage operand of kind KEY or VALUE reads that region in
+place; its per-unit bytes, and which token positions a unit holds there, come
+from the stage that reads it (its config and the adapter's operand layout), so
+every stage reading one region must need the same bytes. Every phase of a
+request (prefill, decode) lays its own area out from offset 0, and the phases
+overlay one another: only the phase that runs holds the area, so its weights
+overwrite those of the previous phase. The cache is written to the device only
+right before the first phase that reads it, so the phases that run before that
+one may use the whole unit, the cache's range included; the later phases end
+below the cache.
 
 One slot holds the weights and state of one layer's stages; layer i takes slot
 i mod slots and belongs to group i // slots. If every layer fits there is one
@@ -22,7 +29,6 @@ large as its largest stage.
 """
 
 from dataclasses import dataclass
-import math
 
 
 WEIGHT = "weight"
@@ -30,7 +36,7 @@ WEIGHT = "weight"
 STATE = "state"
 INPUT = "input"
 OUTPUT = "output"
-# key/value cache 항목
+# key/value cache 항목, 그리고 그 영역을 그대로 읽는 stage operand
 KEY = "key"
 VALUE = "value"
 
@@ -75,20 +81,9 @@ class StageRequirement:
     def output_bytes(self):
         return self._bytes(OUTPUT)
 
-
-@dataclass(frozen=True)
-class KVRequirement:
-    """The key/value cache of a model, sized for the most token positions one request stores.
-
-    Each layer has kv_heads heads; the token positions of one head are split into
-    contiguous ranges over units / kv_heads units, so every unit holds the same bytes.
-    """
-
-    layers: int
-    kv_heads: int
-    head_dim: int
-    max_tokens: int
-    element_bytes: int
+    @property
+    def kv_bytes(self):
+        return self._bytes(KEY) + self._bytes(VALUE)
 
 
 @dataclass(frozen=True)
@@ -96,7 +91,8 @@ class MemoryEntry:
     """One region; offset is from the memory base of every unit.
 
     Stage operands belong to a phase. Key/value cache entries have no phase, stage
-    or operand: they stay at the same offset through every phase.
+    or operand: they stay at the same offset through every phase. A KEY/VALUE stage
+    operand entry has the offset of the cache entry it reads.
     """
 
     kind: str
@@ -113,7 +109,7 @@ class MemoryEntry:
 
 @dataclass(frozen=True)
 class PhaseLayout:
-    """The area of one phase, from the end of the key/value cache."""
+    """The area of one phase, from offset 0."""
 
     # slot 수와 layer group 수. layer i는 slot i mod slots, group i // slots에 놓인다.
     slots: int
@@ -136,12 +132,10 @@ class PhaseLayout:
 class MemoryTable:
     units: int
     capacity_bytes: int
-    # key/value head 하나의 token 위치를 나눠 담는 unit 수와 unit 하나가 담는 위치 수
-    kv_split: int
-    kv_tokens_per_unit: int
-    # offset 0부터의 key/value cache bytes. phase 영역은 여기서 시작한다.
+    # key/value cache bytes와 그 시작 offset. cache는 [kv_base, capacity_bytes)를 차지한다.
     kv_bytes: int
-    # key/value cache + 가장 큰 phase 영역
+    kv_base: int
+    # 한 시점에 unit이 담는 최대 bytes: cache 전 phase 영역, 또는 cache + 그 뒤 phase 영역
     bytes_per_unit: int
     # phase -> PhaseLayout (실행 순서)
     phases: dict
@@ -179,7 +173,7 @@ def _plan_phase(phase, requirements, base, capacity_bytes, entries):
         if slots < 1:
             raise ValueError(
                 f"{phase}: one layer does not fit one unit: it needs {layer_bytes} bytes "
-                f"and scratch {scratch}, {capacity_bytes} are left after the key/value cache")
+                f"and scratch {scratch}, the phase area has {capacity_bytes}")
         slot_weight_bytes = (layer_weight[layers[0]],) * slots
         slot_state_bytes = (layer_state[layers[0]],) * slots
     slot_bytes = tuple(weight + state for weight, state in zip(slot_weight_bytes, slot_state_bytes))
@@ -199,6 +193,12 @@ def _plan_phase(phase, requirements, base, capacity_bytes, entries):
             offsets[INPUT] = state_end
             offsets[OUTPUT] = state_end + input_bytes
             for operand in requirement.operands:
+                if operand.kind in (KEY, VALUE):
+                    # phase 영역을 쓰지 않고 key/value cache 영역을 그대로 읽는다.
+                    entries[(phase, layer, requirement.stage, operand.operand)] = MemoryEntry(
+                        operand.kind, phase, layer, requirement.stage, operand.operand, None, None,
+                        entries[("kv", layer, operand.kind)].offset, operand.bytes)
+                    continue
                 resident = operand.kind in (WEIGHT, STATE)
                 entries[(phase, layer, requirement.stage, operand.operand)] = MemoryEntry(
                     operand.kind, phase, layer, requirement.stage, operand.operand,
@@ -210,42 +210,48 @@ def _plan_phase(phase, requirements, base, capacity_bytes, entries):
                        state_end + scratch - base)
 
 
-def kv_parts(kv, units):
-    """Units sharing one key/value head, token positions per unit, and the bytes of one
-    layer's key (or value) per unit."""
-    if units % kv.kv_heads:
-        raise ValueError(f"{units} units cannot split {kv.kv_heads} key/value heads evenly")
-    split = units // kv.kv_heads
-    tokens = math.ceil(kv.max_tokens / split)
-    return split, tokens, tokens * kv.head_dim * kv.element_bytes
-
-
-def plan_memory(resources, requirements, kv=None):
+def plan_memory(resources, requirements):
     """The memory table that fits one unit.
 
-    requirements maps each phase, in execution order, to its stage requirements;
-    kv is the model's KVRequirement, or None when the key/value cache stays on the host.
-    Every stage is assumed to occupy the first unit, so stage sums bound the most
-    loaded unit.
+    requirements maps each phase, in execution order, to its stage requirements.
+    The key/value cache regions are those the KEY/VALUE stage operands read; a
+    model without them has no cache on the device. The phases before the first one
+    that reads the cache may use the whole unit. Every stage is assumed to occupy
+    the first unit, so stage sums bound the most loaded unit.
     """
+    # (layer, KEY/VALUE) -> unit당 bytes. 같은 영역을 읽는 stage는 모두 같은 bytes여야 한다.
+    regions = {}
+    # cache를 처음 읽는 phase의 순서. 읽는 phase가 없으면 모든 phase가 그 앞이다.
+    first_reader = len(requirements)
+    for index, (phase, phase_requirements) in enumerate(requirements.items()):
+        for requirement in phase_requirements:
+            for operand in requirement.operands:
+                if operand.kind not in (KEY, VALUE):
+                    continue
+                first_reader = min(first_reader, index)
+                region = (requirement.layer, operand.kind)
+                if regions.setdefault(region, operand.bytes) != operand.bytes:
+                    raise ValueError(
+                        f"{phase} layer {requirement.layer} {requirement.stage} reads the {operand.kind} "
+                        f"cache with {operand.bytes} bytes per unit; another stage reads it with "
+                        f"{regions[region]}")
     entries = {}
-    kv_split = kv_tokens_per_unit = kv_bytes = 0
-    if kv is not None:
-        kv_split, kv_tokens_per_unit, part = kv_parts(kv, resources.units)
-        # layer마다 key, value 순서로, unit이 담는 token 위치들의 head_dim 원소
-        for layer in range(kv.layers):
-            entries[("kv", layer, KEY)] = MemoryEntry(
-                KEY, None, layer, None, None, None, None, 2 * layer * part, part)
-            entries[("kv", layer, VALUE)] = MemoryEntry(
-                VALUE, None, layer, None, None, None, None, (2 * layer + 1) * part, part)
-        kv_bytes = 2 * kv.layers * part
-    if kv_bytes > resources.capacity_bytes:
+    kv_base = resources.capacity_bytes
+    # capacity에서 아래로 layer마다 key, value 순서로 놓는다.
+    for layer, kind in sorted(regions, key=lambda region: (region[0], region[1] != KEY)):
+        kv_base -= regions[layer, kind]
+        entries[("kv", layer, kind)] = MemoryEntry(
+            kind, None, layer, None, None, None, None, kv_base, regions[layer, kind])
+    kv_bytes = resources.capacity_bytes - kv_base
+    if kv_base < 0:
         raise ValueError(f"the key/value cache needs {kv_bytes} bytes per unit; "
                          f"capacity is {resources.capacity_bytes}")
-    # 모든 phase가 key/value cache 끝에서 시작하는 같은 영역을 번갈아 쓴다.
-    phases = {phase: _plan_phase(phase, phase_requirements, kv_bytes,
-                                 resources.capacity_bytes - kv_bytes, entries)
-              for phase, phase_requirements in requirements.items()}
-    return MemoryTable(resources.units, resources.capacity_bytes, kv_split, kv_tokens_per_unit,
-                       kv_bytes, kv_bytes + max(layout.bytes for layout in phases.values()),
-                       phases, entries)
+    # 모든 phase가 offset 0부터 같은 영역을 번갈아 쓴다. cache를 처음 읽는 phase부터는 cache 아래에서 끝난다.
+    phases = {phase: _plan_phase(phase, phase_requirements, 0,
+                                 kv_base if index >= first_reader else resources.capacity_bytes, entries)
+              for index, (phase, phase_requirements) in enumerate(requirements.items())}
+    # cache 전 phase는 자기 영역만, 그 뒤 phase는 cache와 함께 담긴다.
+    held = [layout.bytes + (kv_bytes if index >= first_reader else 0)
+            for index, layout in enumerate(phases.values())]
+    return MemoryTable(resources.units, resources.capacity_bytes, kv_bytes, kv_base,
+                       max(held), phases, entries)

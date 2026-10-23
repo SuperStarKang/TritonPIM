@@ -168,6 +168,8 @@ class PIMSession:
     compile() prepares the Torch blocks of every phase before open; entering the
     session then allocates and binds them. prepare() does both inside an open
     session. run_model(phase, ...) executes the layers of one phase in order.
+    write_kv() copies token positions of a host key/value cache into the device
+    regions that the stages of a layer read in place.
     """
 
     def __init__(self, spec):
@@ -216,34 +218,38 @@ class PIMSession:
         self.open_ms = (time.perf_counter_ns() - start) / 1e6
         return self
 
-    def compile(self, phases, *, kv=None):
+    def compile(self, phases, *, kv_inputs=None):
         """Compile time: prepare the Torch blocks of every phase without allocating device resources.
 
         phases maps each phase name, in execution order, to (layers, example_inputs,
-        configure); kv is the model's KVRequirement or None. The session keeps the
+        configure). kv_inputs maps a phase to kv(index, inputs) -> {KEY/VALUE: tensor}:
+        the inputs of layer index that are its host key/value cache; a GEMM operand
+        that selects one head of such an input reads the device cache region in place
+        instead of being sent (write_kv fills the region). The session keeps the
         compiled plans; entering it allocates the units, checks their count against
         the spec and binds the compiled stages.
         """
         if self.phase != "new" or self.backend is not None:
             raise RuntimeError("compile a PIMSession once, before opening it")
         self.backend = create_runtime(self.spec)
-        self._build(phases, kv)
+        self._build(phases, kv_inputs)
         self.phase = "compiled"
         return self.plans
 
-    def prepare(self, phases, *, kv=None):
+    def prepare(self, phases, *, kv_inputs=None):
         """Export and prepare the Torch blocks of every phase on the session's allocated resources.
 
         configure(gemms, spec) maps original FX GEMM names to PIMTorchConfig.
         CPU preparation outputs supply the next block's positional inputs.
+        kv_inputs is as in compile().
         """
         self._check_owner()
-        self._build(phases, kv)
+        self._build(phases, kv_inputs)
         self.backend.bind_model(self._all_plans())
         self.weight_table = self.backend.weight_table(self._all_plans())
         return self.plans
 
-    def _build(self, phases, kv):
+    def _build(self, phases, kv_inputs):
         """Export, configure, compile and place the layers of every phase; no device access."""
         import torch
 
@@ -264,6 +270,8 @@ class PIMSession:
                         exported, example_inputs,
                         configs=configure(analyze_fx_gemms(exported, allow_bmm=True), self.spec),
                         index=index, spec=self.spec,
+                        kv=(None if kv_inputs is None or phase not in kv_inputs
+                            else kv_inputs[phase](index, example_inputs)),
                     )
                     plan.phase = phase
                     plan.plan_model(self.spec, self.backend.model)
@@ -274,11 +282,14 @@ class PIMSession:
 
         self.memory = plan_memory(
             self.backend.resources(),
-            {phase: self.backend.requirements(plans) for phase, plans in self.plans.items()}, kv)
+            {phase: self.backend.requirements(plans) for phase, plans in self.plans.items()})
         self.backend.prepare_model(self._all_plans(), self.memory)
 
-    def run_model(self, phase, *inputs):
-        """Chain the prepared blocks of one phase; tuple outputs become the next block's inputs."""
+    def run_model(self, phase, *inputs, after_layer=None):
+        """Chain the prepared blocks of one phase; tuple outputs become the next block's inputs.
+
+        after_layer(index, outputs), if given, runs after every layer, before the next.
+        """
         self._check_owner()
         if phase not in self.plans:
             raise RuntimeError(f"phase {phase!r} is not prepared; prepared: {list(self.plans)}")
@@ -287,8 +298,54 @@ class PIMSession:
             self.loaded_layer = (phase, plan.index)
             outputs = plan.run_model(*inputs)
             self.backend.model.exit_layer(plan)
+            if after_layer is not None:
+                after_layer(plan.index, outputs)
             inputs = outputs if isinstance(outputs, tuple) else (outputs,)
         return outputs
+
+    def write_kv(self, layer, kind, cache, start, stop):
+        """Copy positions [start, stop) of a host cache into the device region of (layer, kind).
+
+        cache is the whole host cache of that layer and kind, [heads, positions, ...], as
+        the kv_inputs of compile() return it. The adapter may send the positions later,
+        but before the next run of a stage that reads the region; cache must keep them
+        until then.
+        """
+        self._check_owner()
+        stages = [stage for plans in self.plans.values() for plan in plans if plan.index == layer
+                  for stage in plan.stages if stage.kv is not None and stage.kv[1] == kind]
+        if not stages:
+            raise ValueError(f"no stage of layer {layer} reads the {kind} cache")
+        for stage in stages:
+            self.backend.model.write_kv(stage, cache, start, stop)
+
+    def kv_rows(self, phase):
+        """The host cache row of every token position, for the stages of phase that read the cache.
+
+        A reading stage splits the cache rows over P units that hold S rows each, unit c
+        holding rows [c·S, (c+1)·S). Position p goes to unit p mod P at its local row p // P,
+        so the positions written so far fill every unit evenly; attention does not depend on
+        the order, as long as the key, the value, their scales and the mask share it. Every
+        reading stage must split the rows the same way; the result has P·S rows.
+        """
+        import torch
+
+        self._check_owner()
+        splits = {}
+        for plan in self.plans[phase]:
+            for stage in plan.stages:
+                if stage.kv is None:
+                    continue
+                config = stage.config
+                # 왼쪽 operand는 행(M)이, 오른쪽 operand는 K가 위치 축이다.
+                splits[stage.name] = ((config.p_m, config.execution_extent[0]) if stage.kv[0] == 0
+                                      else (config.p_k, config.execution_extent[2]))
+        if len(set(splits.values())) != 1:
+            raise ValueError(f"{phase}: the cache stages split the positions as {splits} "
+                             f"(units, rows per unit); they must agree")
+        (units, rows), = set(splits.values())
+        positions = torch.arange(units * rows)
+        return positions % units * rows + positions // units
 
     def release(self):
         """Release the prepared layers and keep the units allocated; prepare() can follow."""

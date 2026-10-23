@@ -2,6 +2,8 @@
 
 import ctypes
 import hashlib
+from itertools import product
+import math
 from pathlib import Path
 import subprocess
 import tempfile
@@ -12,7 +14,9 @@ from triton.runtime.cache import get_cache_manager
 from .compiler import _run_translate
 from .residency import INPUT as INPUT_KIND, OUTPUT as OUTPUT_KIND, WEIGHT as WEIGHT_KIND
 from .residency import OperandRequirement, StageRequirement
-from .upmem_artifact import INPUT, MRAM_BASE, OUTPUT, WEIGHT, TransferStats, _artifact_bindings, _build_program
+from .upmem_artifact import (
+    INPUT, KV, MRAM_BASE, OUTPUT, WEIGHT, TransferStats, _artifact_bindings, _build_program, _staging_layout,
+)
 from .runtime import GroupLoader, current_invocation, group_order
 
 
@@ -21,6 +25,8 @@ ROLE_KINDS = {WEIGHT: WEIGHT_KIND, INPUT: INPUT_KIND, OUTPUT: OUTPUT_KIND}
 
 # upmem_model.h UPMEM_MODEL_PACK: weight를 pool에 배치만 하고 보내지 않는다.
 PACK = 2
+# upmem_model.h UPMEM_MODEL_KV_PACK: 고른 job의 key/value cache operand만 pool에 배치한다.
+KV_PACK = 3
 
 
 def _build_model_host(bundle, runtime_path):
@@ -67,8 +73,13 @@ class ModelCompileInvocation:
         stage.bindings = _artifact_bindings(
             bundle["target_ir"], host_arguments, self.physical_inputs,
             stage.weight_mask, config.p_m * config.p_n * config.p_k,
+            None if stage.kv is None else stage.kv[0],
         )
         stage.bundle = bundle
+        if stage.kv is not None:
+            symbol, = [binding.symbol for binding in stage.bindings if binding.role == KV]
+            # (tile, unit buffer shape): 생성 host 코드가 cache operand를 unit마다 배치하는 단위
+            stage.kv_staging = _staging_layout(bundle["target_ir"], symbol)
         stage.library = ctypes.CDLL(_build_model_host(bundle, self.runtime.path))
         stage.function = getattr(stage.library, entry)
         stage.function.argtypes = [ctypes.c_void_p] + [
@@ -104,9 +115,19 @@ class UPMEMModelRuntime:
         self.group_stats = {name: 0 for name, _ in TransferStats._fields_}
         # program_load_ms는 stage 실행 전 IRAM program 적재 시간, invoke_ms는 host pool 준비부터
         # 입력 전송·실행·출력 회수까지 native 호출 시간이다.
+        # kv_push_ms는 대기 중인 key/value cache 위치를 host image에 반영하고 바뀐 부분을 한 번 보낸
+        # 시간(prefill 위치는 cache 영역 전체, decode 위치는 scatter program 적재·전송·실행)이고,
+        # kv_layout_check_ms는 host 배치식을 생성 pack과 한 번 대조한 시간이다.
         self.totals = {"program_loads": 0, "device_compiles": 0, "weight_pushes": 0,
-                       "program_load_ms": 0.0, "invoke_ms": 0.0}
-        # (stage 이름, (M, N, K)) -> {"calls", "program_load_ms", "invoke_ms"}. 모든 layer의 같은 stage가 합쳐진다.
+                       "program_load_ms": 0.0, "invoke_ms": 0.0, "kv_push_ms": 0.0, "kv_layout_check_ms": 0.0}
+        # stage -> [(host cache, start, stop)]: cache를 읽는 다음 실행 전에 보낼 위치
+        self.kv_pending = {}
+        # [DPU, kv_bytes] int8: DPU마다 MRAM [kv_base, capacity)에 있어야 할 bytes. 처음 보낼 때 만든다.
+        self.kv_image = None
+        # (upmem_kv_scatter program 경로, 단위 수 상한): cache stage가 있으면 bind가 만든다.
+        self.kv_scatter = None
+        # (stage 이름, (M, N, K)) -> {"calls", "program_load_ms", "invoke_ms", "kv_push_ms"}.
+        # 모든 layer의 같은 stage가 합쳐진다.
         self.stage_times = {}
         pointer = ctypes.c_void_p
         uint = ctypes.c_uint32
@@ -125,6 +146,10 @@ class UPMEMModelRuntime:
             "group_push": ([pointer], None),
             "group_stats": ([pointer, ctypes.POINTER(TransferStats)], None),
             "group_close": ([pointer], None),
+            "kv_select": ([pointer, uints, uint], None),
+            "kv_gather": ([pointer, uint, pointer], None),
+            "kv_push_region": ([pointer, uint, pointer, uint], None),
+            "kv_scatter": ([pointer, uint, uint, pointer, pointer], None),
         }
         for name, (arguments, returns) in signatures.items():
             function = getattr(self.library, "upmem_model_" + name)
@@ -138,10 +163,11 @@ class UPMEMModelRuntime:
 
     def requirements(self, plans):
         # 프로그램은 IRAM에 적재되므로 MRAM state는 없다. 입력·출력 scratch는 모든
-        # stage가 같은 영역을 처음부터 쓴다.
+        # stage가 같은 영역을 처음부터 쓴다. cache operand는 그 layer의 KEY/VALUE 영역을 읽는다.
         return [
             StageRequirement(plan.index, stage.name, tuple(
-                OperandRequirement(index, ROLE_KINDS[binding.role], binding.size)
+                OperandRequirement(index, stage.kv[1] if binding.role == KV else ROLE_KINDS[binding.role],
+                                   binding.size)
                 for index, binding in enumerate(stage.bindings)))
             for plan in plans for stage in plan.stages
         ]
@@ -186,9 +212,30 @@ class UPMEMModelRuntime:
     def bind(self, plans, units):
         """Runtime: create the native handle of every placed stage on the open DPU set.
         Weights move only when a group is entered."""
+        import torch
+
         for plan in plans:
             for stage in plan.stages:
                 self._create_stage(stage, units)
+        cache_stages = [stage for plan in plans for stage in plan.stages if stage.kv is not None]
+        if not cache_stages:
+            return
+        # 위치 하나를 쓸 때 바뀌는 8 byte 단위 수의 상한(모든 cache stage의 합)으로 scatter program을 만든다.
+        # cache stage의 slot은 서로 겹치지 않고 8 byte 경계에서 시작하므로 stage마다 센 수를 더한다.
+        # 같은 config와 배치의 stage(layer마다 같은 stage)는 한 번만 센다.
+        counts = {}
+        for stage in cache_stages:
+            key = (stage.kv[0], stage.kv_staging, stage.config)
+            if key not in counts:
+                extent = stage.kv_staging[1][0 if stage.kv[0] == 0 else 1]
+                counts[key] = max(torch.unique(self._kv_bytes(stage, local, local + 1) // 8).numel()
+                                  for local in range(extent))
+        count = sum(counts[(stage.kv[0], stage.kv_staging, stage.config)] for stage in cache_stages)
+        capacity = count + count % 2
+        source = (Path(__file__).resolve().parent / "upmem_kv_scatter.c").read_text()
+        program = _build_program({"device": f"#define KV_CHUNKS {capacity}\n" + source,
+                                  "nr_tasklets": cache_stages[0].bundle["nr_tasklets"]}, {}, stats=self.totals)
+        self.kv_scatter = (program, capacity)
 
     def _pack_group(self, key):
         """Lay the group's weights out in the stage pools and build its block table.
@@ -231,6 +278,8 @@ class UPMEMModelRuntime:
             self.library.upmem_model_pools_release(stage.handle)
 
     def _create_stage(self, stage, units):
+        import torch
+
         uint = ctypes.c_uint32
         pool_count = uint.in_dll(stage.library, "pim_model_pool_count").value
         pool_bytes = (ctypes.c_uint64 * pool_count).in_dll(stage.library, "pim_model_pool_bytes")
@@ -249,6 +298,11 @@ class UPMEMModelRuntime:
         stage.arguments = (ctypes.c_void_p * (stage.instance_count * len(stage.scalar_arguments)))()
         stage.physical_mapping = (uint * units)()
         self.library.upmem_model_mapping(stage.handle, stage.physical_mapping)
+        # cache operand의 unit 안 배치와 DPU마다 맡은 job (image 행 -> job image 행).
+        # 생성 pack과의 대조는 처음 보낼 때 한다.
+        stage.kv_layout = None if stage.kv is None else self._kv_layout(stage)
+        stage.kv_jobs = None if stage.kv is None else torch.tensor(list(stage.physical_mapping), dtype=torch.long)
+        stage.kv_checked = False
 
     def load_program(self, stage):
         self.totals["program_loads"] += self.library.upmem_runtime_load(stage.program.encode())
@@ -262,6 +316,153 @@ class UPMEMModelRuntime:
                 stage.arguments[instance * argument_count + argument] = tensors[operand].data_ptr()
         self.library.upmem_model_arguments(stage.handle, stage.arguments, int(upload_weights))
         stage.function(stage.handle, *stage.scalar_arguments)
+
+    def write_kv(self, stage, cache, start, stop):
+        """Queue positions [start, stop) of cache for the next run of any stage reading the cache.
+
+        Right before that run every queued position goes into the host image of the cache and
+        the whole cache range goes out in one transfer. cache is [heads, positions, ...] and
+        must keep those positions until then; instance i reads cache[stage.kv_heads[i]].
+        """
+        operand, _ = stage.kv
+        m, n, k = stage.shape
+        if tuple(cache.shape[1:]) != ((m, k) if operand == 0 else (k, n)):
+            raise ValueError(f"{stage.name}: cache {tuple(cache.shape)} does not match operand {operand} "
+                             f"of (M, N, K) = {stage.shape}")
+        if not 0 <= start < stop <= cache.shape[1]:
+            raise ValueError(f"positions [{start}, {stop}) are outside the cache of {cache.shape[1]}")
+        self.kv_pending.setdefault(stage, []).append((cache, start, stop))
+
+    def _kv_layout(self, stage):
+        """Where every element of one unit's cache slot comes from.
+
+        Returns (rows, cols): for each byte of the slot, its row and column in the unit's
+        execution tile (UPMEMToHost tileIndex). With one M/N/K round, the unit at coordinates
+        (c_m, c_k) holds rows c_m * R + rows and columns c_k * C + cols of the stage matrix.
+        """
+        import torch
+
+        (tile_rows, tile_cols), (rows, cols) = stage.kv_staging
+        config = stage.config
+        extent = config.execution_extent
+        if (rows, cols) != (extent[0], extent[2]) or rows % tile_rows or cols % tile_cols or config.p_n != 1:
+            raise ValueError(f"{stage.name}: cache slot {rows}x{cols} tile {tile_rows}x{tile_cols} does not "
+                             f"follow execution extent {extent} with p_n = 1")
+        binding, = [binding for binding in stage.bindings if binding.role == KV]
+        if binding.size != rows * cols:
+            raise ValueError(f"{stage.name}: an INT8 cache slot of {rows}x{cols} needs {rows * cols} bytes, "
+                             f"the binding has {binding.size}")
+        row = torch.arange(rows).reshape(rows, 1).expand(rows, cols)
+        col = torch.arange(cols).reshape(1, cols).expand(rows, cols)
+        index = (((row // tile_rows) * (cols // tile_cols) + col // tile_cols) * (tile_rows * tile_cols)
+                 + (row % tile_rows) * tile_cols + col % tile_cols).flatten()
+        slot_rows = torch.empty(rows * cols, dtype=torch.long)
+        slot_cols = torch.empty(rows * cols, dtype=torch.long)
+        slot_rows[index] = row.flatten()
+        slot_cols[index] = col.flatten()
+        return slot_rows, slot_cols
+
+    def _kv_images(self, stage, cache, slot_bytes):
+        """The slot_bytes of every job's cache slot from the host cache, [jobs, len(slot_bytes)] int8."""
+        import torch
+
+        operand, _ = stage.kv
+        slot_rows, slot_cols = stage.kv_layout
+        config = stage.config
+        rows, cols = stage.kv_staging[1]
+        # (p_m, 길이), (p_k, 길이): stage 행렬 안의 행과 열
+        matrix_rows = (torch.arange(config.p_m) * rows).reshape(-1, 1) + slot_rows[slot_bytes]
+        matrix_cols = (torch.arange(config.p_k) * cols).reshape(-1, 1) + slot_cols[slot_bytes]
+        # 왼쪽 operand는 행이 위치, 오른쪽 operand(행렬이 Bᵀ)는 열이 위치다.
+        positions, features = ((matrix_rows[:, None], matrix_cols[None]) if operand == 0
+                               else (matrix_cols[None], matrix_rows[:, None]))
+        positions, features = torch.broadcast_tensors(positions, features)
+        # unit이 cache 끝을 넘어 맡는 자리는 생성 pack처럼 0이다.
+        inside = (positions < cache.shape[1]) & (features < cache.shape[2])
+        heads = torch.tensor(stage.kv_heads).reshape(-1, 1, 1, 1)
+        values = cache[heads, positions.clamp(max=cache.shape[1] - 1), features.clamp(max=cache.shape[2] - 1)]
+        return torch.where(inside, values, torch.zeros((), dtype=cache.dtype)).reshape(-1, len(slot_bytes)).contiguous()
+
+    def _kv_bytes(self, stage, start, stop):
+        """Bytes of a slot that hold positions [start, stop) in every unit; the whole slot if they span units."""
+        import torch
+
+        operand, _ = stage.kv
+        slot_rows, slot_cols = stage.kv_layout
+        extent = stage.kv_staging[1][0 if operand == 0 else 1]
+        if stop - start >= extent or start // extent != (stop - 1) // extent:
+            return torch.arange(slot_rows.numel())
+        # 모든 unit이 같은 배치이므로 unit 안 위치 번호가 같은 자리를 함께 쓴다. 그 위치를 맡지 않은
+        # unit의 그 자리는 host cache의 현재 값을 다시 쓴다.
+        local = slot_rows if operand == 0 else slot_cols
+        return torch.nonzero((local >= start % extent) & (local <= (stop - 1) % extent)).flatten()
+
+    def _check_kv_layout(self, stage, cache):
+        """Compare the host layout with the generated pack of every job; a mismatch raises."""
+        import torch
+
+        start = time.perf_counter_ns()
+        jobs = stage.p_b * stage.config.p_m * stage.config.p_n * stage.config.p_k
+        binding = next(index for index, binding in enumerate(stage.bindings) if binding.role == KV)
+        size = stage.bindings[binding].size
+        self.library.upmem_model_kv_select(stage.handle, (ctypes.c_uint32 * jobs)(*range(jobs)), jobs)
+        heads = [cache[head].contiguous() for head in stage.kv_heads]
+        self.library.upmem_model_pools_acquire(stage.handle)
+        # 다른 operand는 KV_PACK에서 읽지 않는다. 같은 head를 넘긴다.
+        self.invoke(stage, tuple((head, head) for head in heads), stage.preparation_output,
+                    upload_weights=KV_PACK)
+        packed = torch.empty(jobs * size, dtype=torch.int8)
+        self.library.upmem_model_kv_gather(stage.handle, binding, packed.data_ptr())
+        self.library.upmem_model_pools_release(stage.handle)
+        if not torch.equal(packed, self._kv_images(stage, cache, torch.arange(size)).flatten()):
+            raise ValueError(f"{stage.name}: the host cache layout differs from the generated pack")
+        self.totals["kv_layout_check_ms"] += (time.perf_counter_ns() - start) / 1e6
+
+    def _push_kv(self, stage):
+        """Write every queued position into the host image, then send what changed once.
+
+        A write that covers whole slots (the prefill positions) sends the cache range
+        [kv_base, capacity), contiguous and at the same offset on every DPU. Otherwise the
+        changed 8 byte chunks of every layer, at the same offsets on every DPU, go to the
+        upmem_kv_scatter program in one transfer and one launch, and it writes them in place.
+        stage is the one about to run; any stage reaches every DPU.
+        """
+        import torch
+
+        memory = self.memory
+        if self.kv_image is None:
+            self.kv_image = torch.zeros((len(stage.physical_mapping), memory.kv_bytes), dtype=torch.int8)
+        whole = False
+        # image 안에서 바뀐 byte (모든 DPU 공통)
+        changed = []
+        for pending, writes in self.kv_pending.items():
+            binding, = [binding for binding in pending.bindings if binding.role == KV]
+            # 이 stage의 cache slot이 image 안에서 시작하는 byte
+            base = pending.addresses[binding.symbol] - MRAM_BASE - memory.kv_base
+            for cache, start, stop in writes:
+                if not pending.kv_checked:
+                    self._check_kv_layout(pending, cache)
+                    pending.kv_checked = True
+                slot_bytes = self._kv_bytes(pending, start, stop)
+                self.kv_image[:, base + slot_bytes] = self._kv_images(pending, cache, slot_bytes)[pending.kv_jobs]
+                whole = whole or slot_bytes.numel() == binding.size
+                changed.append(base + slot_bytes)
+        self.kv_pending.clear()
+        if whole:
+            self.library.upmem_model_kv_push_region(stage.handle, MRAM_BASE + memory.kv_base,
+                                                    self.kv_image.data_ptr(), memory.kv_bytes)
+            return
+        chunks = torch.unique(torch.cat(changed) // 8)
+        count = chunks.numel()
+        program, capacity = self.kv_scatter
+        if count > capacity:
+            raise ValueError(f"{count} changed cache chunks exceed the {capacity} of the scatter program")
+        addresses = torch.zeros(capacity, dtype=torch.int32)
+        addresses[:count] = MRAM_BASE + memory.kv_base + chunks * 8
+        data = torch.zeros((self.kv_image.shape[0], capacity), dtype=torch.int64)
+        data[:, :count] = self.kv_image.view(torch.int64)[:, chunks]
+        self.totals["program_loads"] += self.library.upmem_runtime_load(program.encode())
+        self.library.upmem_model_kv_scatter(stage.handle, count, capacity, addresses.data_ptr(), data.data_ptr())
 
     def enter_layer(self, plan):
         # group이 바뀔 때만 그 group 전체 weight를 한 번에 보낸다 (pack은 대개 앞 group 실행 중에 끝나 있다).
@@ -287,6 +488,16 @@ class UPMEMModelRuntime:
         return table
 
     def run(self, stage, matrices, output):
+        times = self.stage_times.setdefault((stage.name, tuple(stage.shape)),
+                                            {"calls": 0, "program_load_ms": 0.0, "invoke_ms": 0.0,
+                                             "kv_push_ms": 0.0})
+        if stage.kv is not None and self.kv_pending:
+            # cache를 읽는 stage가 처음 돌기 전에, 모든 layer의 대기 위치를 cache 영역 전송 한 번으로 보낸다.
+            start = time.perf_counter_ns()
+            self._push_kv(stage)
+            push_ms = (time.perf_counter_ns() - start) / 1e6
+            self.totals["kv_push_ms"] += push_ms
+            times["kv_push_ms"] += push_ms
         start = time.perf_counter_ns()
         self.library.upmem_model_pools_acquire(stage.handle)
         acquired = time.perf_counter_ns()
@@ -298,8 +509,6 @@ class UPMEMModelRuntime:
         invoke_ms = (end - loaded + acquired - start) / 1e6
         self.totals["program_load_ms"] += load_ms
         self.totals["invoke_ms"] += invoke_ms
-        times = self.stage_times.setdefault((stage.name, tuple(stage.shape)),
-                                            {"calls": 0, "program_load_ms": 0.0, "invoke_ms": 0.0})
         times["calls"] += 1
         times["program_load_ms"] += load_ms
         times["invoke_ms"] += invoke_ms

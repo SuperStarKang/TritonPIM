@@ -17,6 +17,8 @@ MRAM_BASE = 0x08000000
 WEIGHT = 1
 INPUT = 2
 OUTPUT = 3
+# upmem_resident.h UPMEM_RESIDENT_KV: MRAM의 key/value cache 영역을 그대로 읽는 입력
+KV = 4
 
 
 @dataclass(frozen=True)
@@ -30,10 +32,12 @@ class Binding:
 class TransferStats(ctypes.Structure):
     _fields_ = [(name, ctypes.c_uint64) for name in (
         "weight_bytes", "activation_bytes", "output_bytes", "metadata_bytes",
-        "launches", "program_loads", "activation_hits")]
+        "launches", "program_loads", "activation_hits", "kv_bytes")]
 
 
-def _artifact_bindings(target_ir, arguments, physical_inputs, weight_mask, units):
+def _artifact_bindings(target_ir, arguments, physical_inputs, weight_mask, units, kv_operand):
+    """MRAM bindings of one model stage; kv_operand is the operand that reads the
+    key/value cache in place, or None."""
     acquire = re.findall(r"upmem\.acquire\s+(\d+)\s*,", target_ir)
     if acquire != [str(units)]:
         raise ValueError(f"resident artifact must acquire exactly {units} DPUs: {acquire}")
@@ -70,13 +74,31 @@ def _artifact_bindings(target_ir, arguments, physical_inputs, weight_mask, units
             roles = {weight_mask[index] for index in operands}
             if len(roles) != 1:
                 raise ValueError(f"cannot associate {symbol} with the FX operand provenance")
-            role = WEIGHT if roles.pop() else INPUT
             operand = operands[0]
+            role = WEIGHT if roles.pop() else KV if operand == kv_operand else INPUT
         size = int(count) * {"i8": 1, "i32": 4, "f32": 4}[dtype]
         if size % 8:
             raise ValueError(f"{symbol}: MRAM transfer size {size} is not aligned to 8 bytes")
         bindings.append(Binding(symbol, size, role, operand))
     return tuple(bindings)
+
+
+def _staging_layout(target_ir, symbol):
+    """(tile, buffer shape) of the upmem.stage that fills one unit's slot of an MRAM binding.
+
+    The host code lays the slot out tile by tile (UPMEMToHost tileIndex): tiles in
+    row-major order over the buffer, elements row-major inside a tile.
+    """
+    staged = re.findall(rf"upmem\.to_mram\s+%[\w.$]+\s*,\s*(%[\w.$]+)\s*,\s*@{re.escape(symbol)}\b",
+                        target_ir)
+    if len(staged) != 1:
+        raise ValueError(f"{symbol}: expected one staged transfer, found {len(staged)}")
+    stage = re.search(rf"{re.escape(staged[0])}\s*=\s*upmem\.stage\b[^\n]*?\btile\s*\[([\d,\s]+)\]"
+                      rf"[^\n]*?->\s*memref<([\dx]+)x(?:i8|i32|f32)\b", target_ir)
+    if stage is None:
+        raise ValueError(f"{symbol}: the upmem.stage of {staged[0]} has no tile or buffer type")
+    return (tuple(int(size) for size in stage.group(1).split(",")),
+            tuple(int(size) for size in stage.group(2).split("x")))
 
 
 def _check_device_elf(data, addresses):

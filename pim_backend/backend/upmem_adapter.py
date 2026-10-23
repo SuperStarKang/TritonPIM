@@ -31,7 +31,7 @@ class UPMEMAdapter:
         self.totals.update(resource_opens=0, resource_closes=0)
         self.totals["device_compiles"] = 0
         self.totals["weight_pushes"] = 0
-        self.totals.update(program_load_ms=0.0, invoke_ms=0.0)
+        self.totals.update(program_load_ms=0.0, invoke_ms=0.0, kv_push_ms=0.0, kv_layout_check_ms=0.0)
         self.totals.update(dict.fromkeys(GROUP_LOAD_STATS, 0))
         self.cleanup = None
 

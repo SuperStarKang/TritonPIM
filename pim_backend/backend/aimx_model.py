@@ -202,6 +202,10 @@ class AiMXModelRuntime:
         # weight와 state(descriptor chain, PMM)는 layer의 slot에, activation(input/output)은 모든
         # stage가 처음부터 함께 쓰는 scratch에 놓인다. bytes를 OPERAND_ALIGNMENT 배수로 올려
         # 모든 offset을 정렬한다.
+        reading = [stage.name for plan in plans for stage in plan.stages if stage.kv is not None]
+        if reading:
+            raise NotImplementedError(
+                f"AiMX does not read a device key/value cache yet; stages {reading} read one")
         return [
             StageRequirement(plan.index, stage.name, tuple(
                 OperandRequirement(index, kind,

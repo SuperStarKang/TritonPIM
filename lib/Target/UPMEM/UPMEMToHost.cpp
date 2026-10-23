@@ -618,7 +618,9 @@ struct HostEmitter {
       if (!to)
         return st.emitError("model stage must feed an MRAM transfer");
       e.indent(depth);
-      os() << "if (upmem_model_wants(_model, " << bindingIndices.find(to.getDst())->second << ")) {\n";
+      // job마다 묻는다. key/value cache 쓰기는 그 위치를 담는 job만 pack한다.
+      os() << "if (upmem_model_wants(_model, " << bindingIndices.find(to.getDst())->second
+           << ", _job)) {\n";
       ++depth;
     }
     // 같은 slot은 공유 축 좌표가 모두 0인 대표 device에서 한 번만 채운다.
