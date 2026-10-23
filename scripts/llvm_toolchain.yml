@@ -1,12 +1,12 @@
 # triton-san/script/build_llvm.sh가 요구하는 clang/clang++과, LLVM이 링크할 zstd 개발 파일.
 # LLVM 빌드에만 쓰고, triton은 시스템 gcc로 빌드한다.
-# 이전에 LLVM 빌드가 성공한 clang/lld 버전으로 고정한다. clang 23은 third-party/benchmark의
-# -pedantic-errors에서 __COUNTER__를 C2y 확장 에러로 낸다.
+# clang 22부터 third-party/benchmark의 -pedantic-errors에서 __COUNTER__를 C2y 확장 에러로 낸다.
+# triton이 지정한 LLVM 소스(2025-08)에 이 진단이 아직 없으므로 그 이전 릴리스인 21로 고정한다.
 name: llvm_toolchain
 channels:
   - conda-forge
 dependencies:
-  - clang=22.1.5
-  - clangxx=22.1.5
-  - lld=22.1.5
+  - clang=21.1.8
+  - clangxx=21.1.8
+  - lld=21.1.8
   - zstd
