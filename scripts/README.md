@@ -37,7 +37,7 @@ git clone -b experiment https://github.com/SuperStarKang/TritonPIM.git triton_sh
 
 ## 실험
 
-모델은 Llama-3-8B, prefill 토큰 수 1024. FPGA 개수는 스크립트 인자로 준다 (예: `4 8`, 시험용 `1 2`). 결과는 `results/<실험>/f<N>/{report.json,log.txt}`.
+prefill 토큰 수는 1024. 첫 인자로 모델(`llama2` = Llama-2-7b-hf, `llama3` = Meta-Llama-3-8B), 그 뒤에 FPGA 개수들을 준다 (예: `llama3 4 8`, 시험용 `llama3 1 2`). 결과는 `results/<실험>/<model>/f<N>/{report.json,log.txt}`.
 
 | # | 실험 | 스크립트 | 주요 결과 |
 |---|---|---|---|
@@ -49,9 +49,11 @@ git clone -b experiment https://github.com/SuperStarKang/TritonPIM.git triton_sh
 | 5 | e2e decode | (decode 구현 후) | |
 
 ```bash
-./triton_shared/scripts/experiments/run_gemm.sh 4 8
-./triton_shared/scripts/experiments/run_attention.sh 4 8
-./triton_shared/scripts/experiments/run_e2e_prefill.sh 4 8
+for model in llama2 llama3; do
+  ./triton_shared/scripts/experiments/run_gemm.sh $model 4 8
+  ./triton_shared/scripts/experiments/run_attention.sh $model 4 8
+  ./triton_shared/scripts/experiments/run_e2e_prefill.sh $model 4 8
+done
 ```
 
 autotune cache가 결과 폴더에 저장되므로, 같은 폴더로 다시 돌리면 탐색 없이 측정만 한다. 수렴 곡선을 다시 얻으려면 폴더를 지우고 실행한다.
