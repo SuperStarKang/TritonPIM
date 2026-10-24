@@ -183,7 +183,8 @@ workspace/Experiment/Autotuner/upmem_gemm/
 `autotuner/gemv.py`의 INT32 GEMV 커널을 profiling과 autotuning에서 함께 사용한다.
 `profile_gemv(target, output_dir=...)`는 target 정보로 측정 대상을 구성하고,
 일반 실행은 `ensure_gemv_profile` callback으로 자료가 없을 때 먼저 측정한다.
-완료된 tuning cache가 있으면 profiling을 생략한다. 현재 GEMV의 이 경로는 UPMEM만 지원한다.
+완료된 tuning cache가 있으면 profiling을 생략한다. AiMX GEMV는 같은 커널을 FP32 누산으로
+쓰며 `examples/silent_pim/autotune_gemv.py`가 진입점이다([Silent-PIM 설계](../../design/Silent-PIM_Design.md) §9).
 
 `UPMEMModel.gemv_profile_spec`은 활성 tasklet마다 출력 한 행을 주는 행 눈금과
 기존 GEMV 커널의 누산 크기 64를 출발점으로 삼는다. 행 크기 1·2·4배와 누산 크기

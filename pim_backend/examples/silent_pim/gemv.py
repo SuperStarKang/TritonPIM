@@ -23,7 +23,8 @@ def gemv_kernel(
 
     각 Triton program은 BLOCK_M개의 출력 행을 맡고, 내부 loop는 K를
     BLOCK_K씩 순회한다. Common lowering은 이 multiply/reduce 형태를
-    linalg.matvec와 pim.combine으로 정규화하고 AiMX는 N=1 MAC으로 실행한다.
+    linalg.matvec와 pim.combine으로 정규화하고 AiMX는 yᵀ = xᵀ·Wᵀ (batch 1,
+    출력 lane = M 방향)으로 실행한다.
 
     현재 실행 가능한 AiMX GEMV template은 M % BLOCK_M == 0 및
     K % BLOCK_K == 0인 full-block 형태다. rank-1 masked x/y의 dynamic valid를
@@ -47,7 +48,8 @@ def gemv_kernel(
     for k_block in range(0, tl.cdiv(K, BLOCK_K)):
         a = tl.load(a_ptrs)
         x = tl.load(x_ptrs)
-        acc += tl.sum(a * x[None, :], axis=1)
+        # 곱하기 전에 누산 type으로 넓힌다. bf16 입력은 PIM DRAM에 변환 없이 올라간다.
+        acc += tl.sum(a.to(tl.float32) * x.to(tl.float32)[None, :], axis=1)
         a_ptrs += BLOCK_K * stride_ak
         x_ptrs += BLOCK_K * stride_x
 
@@ -99,14 +101,20 @@ if __name__ == "__main__":
     k_start = 96
     scale = 0.5
 
-    a = torch.ones((M, K), dtype=torch.float32)
-    x = torch.zeros((K,), dtype=torch.float32)
+    a = torch.ones((M, K), dtype=torch.bfloat16)
+    x = torch.zeros((K,), dtype=torch.bfloat16)
     x[k_start:k_start + 32] = scale
 
-    out = gemv(a, x)
+    # 같은 W를 두 메모리 배치로 넘긴다. 커널과 Common IR은 같고 stride만 다르다.
+    #   [M][K] : stride (K, 1). AiMX stage가 W를 [K][M] panel로 block 전치한다.
+    #   [K][M] : W를 K-major로 저장하고 (M, K) view로 넘긴다. stride (1, M)이라 전치 없이 연속 복사한다.
+    w_kmajor = a.t().contiguous()
+    layouts = {"[M][K]": a, "[K][M]": w_kmajor.t()}
 
     print(f"K[{k_start}:{k_start + 32}] scale={scale}")
     print("expected:", 32.0 * scale)
-    print("out, 8 rows per line:")
-    print(out.reshape(M // 8, 8))
-    print("max_abs_error:", (out - 32.0 * scale).abs().max().item())
+    for name, matrix in layouts.items():
+        out = gemv(matrix, x)
+        print(f"W {name} stride={matrix.stride()}, out, 8 rows per line:")
+        print(out.reshape(M // 8, 8))
+        print("max_abs_error:", (out - 32.0 * scale).abs().max().item())

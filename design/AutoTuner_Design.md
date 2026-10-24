@@ -140,7 +140,7 @@ seed, constraint, feature는 [model.py](../pim_backend/autotuner/model.py)의 `T
   Block m이 8이어도 Group m이 2 이상이면 16 tasklet 조건을 만족한다.
 - AiMX Block Group 상한은 저장 padding 없이 device 하나가 계산하는 단위다. 그보다 큰 범위는
   Execution Tile이 bank에 상주시킨다.
-- AiMX 할당은 GEMM 상주량의 하한 추정이다. scratch, 상수, fusion 할당은 lowering이 최종
+- AiMX 할당은 GEMM/GEMV 상주량의 하한 추정이다. scratch, 상수, fusion 할당은 lowering이 최종
   검사한다. constraint를 통과해도 lowering이 용량 초과를 진단할 수 있고, 그 경우 다른
   config로 대체하지 않는다.
 - access 할당은 전송량 feature와 compute/byte에, overhead 할당은 용량 검사에만 쓴다.
@@ -149,11 +149,11 @@ seed, constraint, feature는 [model.py](../pim_backend/autotuner/model.py)의 `T
 
 | 질의 | 쓰는 곳 | UPMEM | AiMX |
 |---|---|---|---|
-| `problem_reason` | 제약 | 없음 | matmul만, bf16/fp16/fp32 |
-| `group_reason(extent)` | Block Group | `extent_m % lanes ≠ 0`이면 거부 | extent > `(batch, 4096, max(256, matmul_k_alignment 또는 4096/batch))`이면 거부 |
+| `problem_reason` | 제약 | 없음 | matmul·matvec, bf16/fp16/fp32 |
+| `group_reason(extent)` | Block Group | `extent_m % lanes ≠ 0`이면 거부 | matmul: extent > `(batch, 4096, max(256, matmul_k_alignment 또는 4096/batch))`, matvec: extent > `(4096, 1, 256)`이면 거부 |
 | `local_capacity` | Block Group | `local_capacity_limit_bytes`(기본 46,680 B) | 0(검사 생략) |
-| `scheduled_compute` | 순위, feature | 논리 compute | m→batch, n→4096/batch, k→256 올림 |
-| `access_allocations` | 순위, 제약, feature | 논리 footprint | A/B/C(물리 padding 포함) |
+| `scheduled_compute` | 순위, feature | 논리 compute | matmul: m→batch, n→4096/batch, k→256 올림. matvec: m→4096, k→256 올림 |
+| `access_allocations` | 순위, 제약, feature | 논리 footprint | A/B/C(물리 padding 포함). matvec은 W→B, x→A, y→C |
 | `overhead_allocations` | 제약, feature | 없음 | PMM, Arel, descriptor chain |
 | `allocation_reason` | 제약 | 없음 | 단일 할당 ≤ 1023×2 MiB, bank interleave footprint ≤ bank 용량 |
 | `unit_capacity` | 제약 | `banks_per_unit × bank_capacity`(기본 60 MiB) | 같음 |
@@ -162,7 +162,7 @@ seed, constraint, feature는 [model.py](../pim_backend/autotuner/model.py)의 `T
 | `launch_timing_name` | 단일 unit 측정 | `kernel` | `invoke` |
 | `shared_activation_scratch` | 모델 runtime | True | False |
 | `gemm_profile_spec` | 단일 unit 측정 | Block (8,16,16), int8→int32, Group (lanes/8, 2, 1) | Block (8,16,16), fp16→fp32, Group = 연산 단위 / Block |
-| `gemv_profile_spec` | 단일 unit 측정 | Block (2^a,1,64), int32→int32, Group (lanes/2^a,1,1) | 없음 |
+| `gemv_profile_spec` | 단일 unit 측정 | Block (2^a,1,64), int32→int32, Group (lanes/2^a,1,1) | Block (8,1,16), fp16→fp32, Group (512,1,16) |
 
 ## 6. Stage A: seed
 
@@ -562,7 +562,7 @@ session 실행
 
 **내용**
 
-`autotuner/gemm.py`(`profile_gemm`), `autotuner/gemv.py`(`profile_gemv`, UPMEM만),
+`autotuner/gemm.py`(`profile_gemm`), `autotuner/gemv.py`(`profile_gemv`, UPMEM·AiMX),
 `performance.py`(`calibrate_performance`, `profile_single_unit`)는 device 1개에서 Group과
 Tile을 키우며 throughput 포화점을 측정하는 독립 도구다. seed 생성과 `tune`에는 쓰지 않는다.
 
@@ -577,7 +577,9 @@ Tile을 키우며 throughput 포화점을 측정하는 독립 도구다. seed �
   `tile_growth`를 따라 측정한다.
 - 결과는 `single_unit.csv`(측정마다 즉시 기록)와 `performance.json`(schema
   `pim-single-unit-saturation-v2`)이다. 저장 경로는 프로젝트 안이어야 한다(`project_path`).
-- GEMV profiling은 INT32 입출력만 받는다(`profile_gemv`).
+- GEMV profiling의 dtype은 target의 `gemv_profile_spec`을 따른다(UPMEM int32→int32, AiMX
+  fp16→fp32). AiMX의 정확도 검사는 `x[::256] = 1`, 기대값 `ceil(K/256)`이다
+  ([Silent-PIM 설계](Silent-PIM_Design.md) §9).
 
 **예시**
 

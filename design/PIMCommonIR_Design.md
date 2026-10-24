@@ -2,7 +2,7 @@
 
 이 문서는 TTShared IR을 PIM Common IR로 바꾸는 pass들과, Target이 소비하는 Common
 계약을 설명한다. Target별 lowering은 [UPMEM Target 설계](UPMEMTarget_Implementation.md)와
-[AiMX Target 설계](AiMXTarget_Design.md)가 다룬다. 아래 `text` 예시는 타입·상수·access
+[Silent-PIM (AiMX) Target 설계](Silent-PIM_Design.md)가 다룬다. 아래 `text` 예시는 타입·상수·access
 선언을 생략한 의사 코드이며 그대로 파싱되는 MLIR이 아니다.
 
 ## 1. Common이 결정하는 것
@@ -246,15 +246,17 @@ loop를 `pim.reduction="add"`로 표시하고, 누산기 초기화 chain을 loop
 
 **내용**
 
-TTShared가 내는 두 GEMV 배치를 `linalg.matvec(A, x, init)`로 바꾼다. 곱셈 앞의 sign
-extension(INT8 → INT32)은 벗겨 내고 좁은 원래 값을 matvec 입력으로 쓴다.
+TTShared가 내는 두 GEMV 배치를 `linalg.matvec(A, x, init)`로 바꾼다. 곱셈 앞의
+extension(INT8 → INT32 `extsi`, BF16/F16 → F32 `extf`)은 벗겨 내고 좁은 원래 값을
+matvec 입력으로 쓴다.
 
 **근거**
 
 - `formMatvec`: reduce는 input + accumulator의 sum, 곱셈은 두 직접 입력의 identity/
   all-parallel 곱, broadcast map은 정확히 `(m,k)->(0,k)`여야 한다.
-- `stripSignExtension`: `arith.extsi`이거나 body가 `extsi` 하나인 identity generic만
-  벗긴다. `linalg.matvec`는 입력을 출력 타입으로 sign extension해 곱하므로 의미가 같다.
+- `stripExtension`: `arith.extsi`/`arith.extf`이거나 body가 그 하나인 identity generic만
+  벗긴다. `linalg.matvec`는 입력을 출력 타입으로 넓혀 곱하므로 의미가 같다. 넓힌 사본
+  tile이 남지 않으므로 Block Group 형성 때 shape를 정할 수 없는 tile root도 생기지 않는다.
 - 곱셈 tensor와 reduce 결과의 원소 타입이 같아야 한다. 곱셈 **후** 확장(INT8 곱 →
   INT32)은 곱셈 결과 타입이 달라 이 패턴에 해당하지 않는다.
 - 다른 사용자가 없는 broadcast/expand_shape/extension/mul/transpose/reduce만 지운다.
@@ -271,7 +273,8 @@ A_i8[M,K] ───────────────────────�
 Triton 소스에서는 곱하기 전에 넓혀야 이 형태가 된다.
 
 ```python
-acc += tl.sum(a.to(tl.int32) * x.to(tl.int32)[None, :], axis=1)
+acc += tl.sum(a.to(tl.int32) * x.to(tl.int32)[None, :], axis=1)      # INT8 입력
+acc += tl.sum(a.to(tl.float32) * x.to(tl.float32)[None, :], axis=1)  # BF16/F16 입력
 ```
 
 ### 5.3 출력 float 변환 흡수 (`convert-ttshared-to-pim`)

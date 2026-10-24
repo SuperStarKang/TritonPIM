@@ -39,13 +39,33 @@ def access_footprint_bytes(problem, extents):
 
 
 def aimx_runtime_allocations(problem, target, config):
-    """Precompile lower bound for GEMM residency and its MAC chain.
+    """Precompile lower bound for GEMM/GEMV residency and its MAC chain.
 
     Scratch, constants, copies and fused operations come from the compiled
     Common IR. The target's allocation report and capacity check are final.
     """
     runtime = target.runtime_config
     assert isinstance(runtime, AiMXRuntimeConfig)
+    if problem.compute_kind == "matvec":
+        # yᵀ = xᵀ·Wᵀ (batch 1): x는 A 한 행, Wᵀ는 B [K × M], y는 C 한 행이다.
+        # 출력 lane 4096개가 M 방향이고 vecA 한 번이 K 256개다.
+        useful_m, _, useful_k = group_extent(config)
+        physical_m = _round_up(useful_m, 4096)
+        physical_k = _round_up(useful_k, 256)
+        steps = ceil_div(useful_k, 256)
+        descriptor_groups = config.tile_m * (
+            config.tile_k * 2 * (physical_k // 256)
+            + (physical_m // 4096) * (2 * config.tile_k * steps + 1)
+        )
+        return {
+            "PMM": AIMX_PMM_BYTES,
+            # x의 K-group 행은 b=1의 A pitch 조건으로 4096 배수다.
+            "A": config.tile_k * _round_up(useful_k, 4096) * 2,
+            "Arel": config.tile_k * physical_k * 2 * 16,
+            "B": config.tile_m * config.tile_k * physical_k * physical_m * 2,
+            "C": config.tile_m * physical_m * 2,
+            "descriptor chain": descriptor_groups * 512,
+        }
     batch = runtime.batch
     useful_m, useful_n, useful_k = group_extent(config)
     physical_m = _round_up(useful_m, batch)
@@ -201,13 +221,16 @@ class UPMEMModel(TargetModel):
 class AiMXModel(TargetModel):
     launch_timing_name = "invoke"
 
-    def _compute_unit(self):
+    def _compute_unit(self, compute_kind):
         """Block Group extent one device computes without storage padding.
 
-        B/C panels store n 4096 wide, Arel/B store k in 256 and A in matmul_k_alignment.
+        GEMM: B/C panels store n 4096 wide, Arel/B store k in 256 and A in
+        matmul_k_alignment. GEMV: Wᵀ stores m 4096 wide and k in 256 (batch 1).
         """
         runtime = self.target.runtime_config
         assert isinstance(runtime, AiMXRuntimeConfig)
+        if compute_kind == "matvec":
+            return (4096, 1, 256)
         if runtime.batch not in (1, 2, 4, 8):
             raise ValueError("AiMX batch must be 1, 2, 4, or 8")
         return (runtime.batch, 4096,
@@ -215,13 +238,21 @@ class AiMXModel(TargetModel):
 
     @property
     def gemm_profile_spec(self):
-        unit = self._compute_unit()
+        unit = self._compute_unit("matmul")
         return PIMGemmProfileSpec(
             TRITON_BLOCK, "float16", "float32",
             tuple(size // block for size, block in zip(unit, TRITON_BLOCK)))
 
+    @property
+    def gemv_profile_spec(self):
+        unit = self._compute_unit("matvec")
+        block = (TRITON_BLOCK[0], 1, TRITON_BLOCK[2])
+        return PIMGemvProfileSpec(
+            block, "float16", "float32",
+            tuple(size // axis for size, axis in zip(unit, block)))
+
     def group_reason(self, problem, extent):
-        unit = self._compute_unit()
+        unit = self._compute_unit(problem.compute_kind)
         # Block Group은 연산 단위까지만 키운다. 그보다 큰 범위는 Execution Tile이 bank에 상주시킨다.
         if any(size > bound for size, bound in zip(extent, unit)):
             return (
@@ -230,8 +261,8 @@ class AiMXModel(TargetModel):
         return None
 
     def problem_reason(self, problem):
-        if problem.compute_kind != "matmul":
-            return "현재 AiMX lowering은 matmul만 지원한다"
+        if problem.compute_kind not in ("matmul", "matvec"):
+            return "현재 AiMX lowering은 matmul과 matvec만 지원한다"
         if any(access.dtype not in ("bfloat16", "float16", "float32")
                for access in problem.accesses):
             return "AiMX host buffer는 bfloat16/float16/float32여야 한다"
@@ -259,6 +290,9 @@ class AiMXModel(TargetModel):
     def access_allocations(self, problem, config):
         allocations = aimx_runtime_allocations(problem, self.target, config)
         names = {("m", "k"): "A", ("k", "n"): "B", ("m", "n"): "C"}
+        if problem.compute_kind == "matvec":
+            # matvec은 행렬 W(m,k)가 B, 벡터 x(k)가 A, 출력 y(m)가 C다.
+            names = {("m", "k"): "B", ("k",): "A", ("m",): "C"}
         return tuple(allocations[names[access.axes]] for access in problem.accesses)
 
     def overhead_allocations(self, problem, config):
@@ -269,8 +303,12 @@ class AiMXModel(TargetModel):
         }
 
     def scheduled_compute(self, problem, config):
-        batch = self.target.runtime_config.batch
         gm, gn, gk = group_extent(config)
+        if problem.compute_kind == "matvec":
+            # 출력 microtile은 M 4096개, MAC step은 K 256개 단위다 (batch 1).
+            return (config.tile_m * ceil_div(gm, 4096) * 4096
+                    * config.tile_k * ceil_div(gk, 256) * 256)
+        batch = self.target.runtime_config.batch
         mac_k = ceil_div(gk, 256 // batch) * (256 // batch)
         return config.tile_m * config.tile_n * (
             ceil_div(gm, batch) * batch

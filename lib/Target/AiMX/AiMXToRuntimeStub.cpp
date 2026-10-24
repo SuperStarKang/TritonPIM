@@ -889,8 +889,9 @@ struct StubEmitter {
       return op->emitError("aimx-to-runtime-stub: stage writes a buffer that "
                            "was not allocated here");
     const Buffer &b = it->second;
-    if (op.getTranspose())
-      return op->emitError("aimx-to-runtime-stub: transpose is not emitted yet");
+    if (op.getTranspose() && !op.getGroupLayoutAttr())
+      return op->emitError("aimx-to-runtime-stub: transpose is emitted only for "
+                           "contiguous group layouts");
     int64_t bytes = CEmitter::elementBytes(op.getElementType());
     if (bytes != aimx::kTypeSize)
       return op->emitError("aimx-to-runtime-stub: PIM DRAM holds bfloat16, so "
@@ -969,9 +970,15 @@ struct StubEmitter {
       std::string gr = e.temp("_gr"), gc = e.temp("_gc");
       std::string validRows = e.temp("_vr"), validCols = e.temp("_vc");
       std::string panel = e.temp("_panel");
+      // group_layout은 물리 순서다. 전치 stage에서는 host 열이 물리 행, host 행이 물리 열이다.
+      bool transpose = op.getTranspose();
+      std::string physRows = transpose ? cols : rows;
+      std::string physCols = transpose ? rows : cols;
+      std::string rowStride = e.name(op.getStrides()[rank - 2]);
+      std::string colStride = e.name(op.getStrides()[rank - 1]);
       e.indent(pd + 1);
-      os() << "aimx_require(" << rows << " <= " << ur * rowGroups << "ll && "
-           << cols << " <= " << uc * colGroups << "ll && " << padRows << " == "
+      os() << "aimx_require(" << physRows << " <= " << ur * rowGroups << "ll && "
+           << physCols << " <= " << uc * colGroups << "ll && " << padRows << " == "
            << pr * rowGroups << "ll && " << pitch << " == " << pc * colGroups
            << "ll, \"stage does not match the contiguous group layout\");\n";
       e.indent(pd + 1);
@@ -980,7 +987,7 @@ struct StubEmitter {
       os() << "for (int64_t " << gr << " = 0; " << gr << " < " << rowGroups
            << "ll; ++" << gr << ") {\n";
       e.indent(pd + 2);
-      os() << "int64_t " << validRows << " = " << rows << " - " << gr << " * " << ur << "ll;\n";
+      os() << "int64_t " << validRows << " = " << physRows << " - " << gr << " * " << ur << "ll;\n";
       e.indent(pd + 2);
       os() << "if (" << validRows << " < 0) " << validRows << " = 0;\n";
       e.indent(pd + 2);
@@ -989,7 +996,7 @@ struct StubEmitter {
       os() << "for (int64_t " << gc << " = 0; " << gc << " < " << colGroups
            << "ll; ++" << gc << ") {\n";
       e.indent(pd + 3);
-      os() << "int64_t " << validCols << " = " << cols << " - " << gc << " * " << uc << "ll;\n";
+      os() << "int64_t " << validCols << " = " << physCols << " - " << gc << " * " << uc << "ll;\n";
       e.indent(pd + 3);
       os() << "if (" << validCols << " < 0) " << validCols << " = 0;\n";
       e.indent(pd + 3);
@@ -997,25 +1004,54 @@ struct StubEmitter {
       e.indent(pd + 3);
       os() << "uint16_t *" << panel << " = " << base << " + (" << gr << " * "
            << colGroups << "ll + " << gc << ") * " << pr * pc << "ll;\n";
-      e.indent(pd + 3);
-      os() << "for (int64_t " << i << " = 0; " << i << " < " << validRows
-           << "; ++" << i << ") {\n";
-      e.indent(pd + 4);
-      os() << "const " << srcTy << " *" << sr << " = " << e.name(op.getSrc()) << " + "
-           << hostRow(op.getOrigin(), op.getStrides(),
-                      "(" + gr + " * " + std::to_string(ur) + "ll + " + i + ")") << ";\n";
-      e.indent(pd + 4);
-      os() << "uint16_t *" << dr << " = " << panel << " + " << i << " * " << pc << "ll;\n";
-      e.indent(pd + 4);
-      os() << "for (int64_t " << j << " = 0; " << j << " < " << validCols << "; ++" << j << ")\n";
-      e.indent(pd + 5);
-      os() << dr << "[" << j << "] = " << toBF16(srcElem, sr + "[(" + gc + " * " +
-          std::to_string(uc) + "ll + " + j + ") * " + e.name(op.getStrides()[rank - 1]) + "]") << ";\n";
-      e.indent(pd + 4);
-      os() << "memset(" << dr << " + " << validCols << ", 0, (size_t)(" << pc
-           << "ll - " << validCols << ") * " << bytes << "u);\n";
-      e.indent(pd + 3);
-      os() << "}\n";
+      if (!transpose) {
+        e.indent(pd + 3);
+        os() << "for (int64_t " << i << " = 0; " << i << " < " << validRows
+             << "; ++" << i << ") {\n";
+        e.indent(pd + 4);
+        os() << "const " << srcTy << " *" << sr << " = " << e.name(op.getSrc()) << " + "
+             << hostRow(op.getOrigin(), op.getStrides(),
+                        "(" + gr + " * " + std::to_string(ur) + "ll + " + i + ")") << ";\n";
+        e.indent(pd + 4);
+        os() << "uint16_t *" << dr << " = " << panel << " + " << i << " * " << pc << "ll;\n";
+        e.indent(pd + 4);
+        os() << "for (int64_t " << j << " = 0; " << j << " < " << validCols << "; ++" << j << ")\n";
+        e.indent(pd + 5);
+        os() << dr << "[" << j << "] = " << toBF16(srcElem, sr + "[(" + gc + " * " +
+            std::to_string(uc) + "ll + " + j + ") * " + e.name(op.getStrides()[rank - 1]) + "]") << ";\n";
+        e.indent(pd + 4);
+        os() << "memset(" << dr << " + " << validCols << ", 0, (size_t)(" << pc
+             << "ll - " << validCols << ") * " << bytes << "u);\n";
+        e.indent(pd + 3);
+        os() << "}\n";
+      } else {
+        // panel (k, m)에 host (m, k)를 쓴다. 어느 순서로 채워도 결과는 같으므로 host stride로
+        // 순회 순서만 고른다. host 행 stride가 1이면 host가 이미 물리 순서라 연속 복사다.
+        // 아니면 panel loop 뒤의 block 전치가 채운다. 여기서는 padding만 지운다.
+        e.indent(pd + 3);
+        os() << "for (int64_t " << i << " = 0; " << i << " < " << validRows << "; ++" << i << ")\n";
+        e.indent(pd + 4);
+        os() << "memset(" << panel << " + " << i << " * " << pc << "ll + " << validCols
+             << ", 0, (size_t)(" << pc << "ll - " << validCols << ") * " << bytes << "u);\n";
+        e.indent(pd + 3);
+        os() << "if (" << rowStride << " == 1) {\n";
+        e.indent(pd + 4);
+        os() << "for (int64_t " << i << " = 0; " << i << " < " << validRows << "; ++" << i << ") {\n";
+        e.indent(pd + 5);
+        os() << "const " << srcTy << " *" << sr << " = " << e.name(op.getSrc()) << " + "
+             << hostRow(op.getOrigin(), op.getStrides(), "(" + gc + " * " + std::to_string(uc) + "ll)")
+             << " + (" << gr << " * " << ur << "ll + " << i << ") * " << colStride << ";\n";
+        e.indent(pd + 5);
+        os() << "uint16_t *" << dr << " = " << panel << " + " << i << " * " << pc << "ll;\n";
+        e.indent(pd + 5);
+        os() << "for (int64_t " << j << " = 0; " << j << " < " << validCols << "; ++" << j << ")\n";
+        e.indent(pd + 6);
+        os() << dr << "[" << j << "] = " << toBF16(srcElem, sr + "[" + j + "]") << ";\n";
+        e.indent(pd + 4);
+        os() << "}\n";
+        e.indent(pd + 3);
+        os() << "}\n";
+      }
       e.indent(pd + 3);
       os() << "memset(" << panel << " + " << validRows << " * " << pc
            << "ll, 0, (size_t)(" << pr << "ll - " << validRows << ") * "
@@ -1024,6 +1060,79 @@ struct StubEmitter {
       os() << "}\n";
       e.indent(pd + 1);
       os() << "}\n";
+      if (transpose) {
+        // host 행 stride가 1이 아니면 32×32 block으로 전치한다. host 32행을 바깥에 두고
+        // K-Group과 K를 안쪽에서 끝까지 돌아, 행마다 순차로 읽게 한다(prefetch, TLB).
+        // panel에는 block 행마다 64 B(한 cache line)씩 쓴다.
+        std::string k0 = e.temp("_k0"), m0 = e.temp("_m0"), kn = e.temp("_kn"),
+                    mn = e.temp("_mn"), block = e.temp("_blk");
+        e.indent(pd + 1);
+        os() << "if (" << rowStride << " != 1) {\n";
+        e.indent(pd + 2);
+        os() << "for (int64_t " << gc << " = 0; " << gc << " < " << colGroups
+             << "ll; ++" << gc << ") {\n";
+        e.indent(pd + 3);
+        os() << "int64_t " << validCols << " = " << physCols << " - " << gc << " * " << uc << "ll;\n";
+        e.indent(pd + 3);
+        os() << "if (" << validCols << " < 0) " << validCols << " = 0;\n";
+        e.indent(pd + 3);
+        os() << "if (" << validCols << " > " << uc << "ll) " << validCols << " = " << uc << "ll;\n";
+        e.indent(pd + 3);
+        os() << "for (int64_t " << m0 << " = 0; " << m0 << " < " << validCols << "; " << m0
+             << " += 32) {\n";
+        e.indent(pd + 4);
+        os() << "int64_t " << mn << " = " << validCols << " - " << m0 << " < 32 ? " << validCols
+             << " - " << m0 << " : 32;\n";
+        e.indent(pd + 4);
+        os() << "for (int64_t " << gr << " = 0; " << gr << " < " << rowGroups
+             << "ll; ++" << gr << ") {\n";
+        e.indent(pd + 5);
+        os() << "int64_t " << validRows << " = " << physRows << " - " << gr << " * " << ur << "ll;\n";
+        e.indent(pd + 5);
+        os() << "if (" << validRows << " < 0) " << validRows << " = 0;\n";
+        e.indent(pd + 5);
+        os() << "if (" << validRows << " > " << ur << "ll) " << validRows << " = " << ur << "ll;\n";
+        e.indent(pd + 5);
+        os() << "uint16_t *" << panel << " = " << base << " + (" << gr << " * "
+             << colGroups << "ll + " << gc << ") * " << pr * pc << "ll;\n";
+        e.indent(pd + 5);
+        os() << "for (int64_t " << k0 << " = 0; " << k0 << " < " << validRows << "; " << k0
+             << " += 32) {\n";
+        e.indent(pd + 6);
+        os() << "int64_t " << kn << " = " << validRows << " - " << k0 << " < 32 ? " << validRows
+             << " - " << k0 << " : 32;\n";
+        e.indent(pd + 6);
+        os() << "uint16_t " << block << "[32][32];\n";
+        e.indent(pd + 6);
+        os() << "for (int64_t " << j << " = 0; " << j << " < " << mn << "; ++" << j << ") {\n";
+        e.indent(pd + 7);
+        os() << "const " << srcTy << " *" << sr << " = " << e.name(op.getSrc()) << " + "
+             << hostRow(op.getOrigin(), op.getStrides(),
+                        "(" + gc + " * " + std::to_string(uc) + "ll + " + m0 + " + " + j + ")")
+             << " + (" << gr << " * " << ur << "ll + " << k0 << ") * " << colStride << ";\n";
+        e.indent(pd + 7);
+        os() << "for (int64_t " << i << " = 0; " << i << " < " << kn << "; ++" << i << ")\n";
+        e.indent(pd + 8);
+        os() << block << "[" << i << "][" << j << "] = "
+             << toBF16(srcElem, sr + "[" + i + " * " + colStride + "]") << ";\n";
+        e.indent(pd + 6);
+        os() << "}\n";
+        e.indent(pd + 6);
+        os() << "for (int64_t " << i << " = 0; " << i << " < " << kn << "; ++" << i << ")\n";
+        e.indent(pd + 7);
+        os() << "memcpy(" << panel << " + (" << k0 << " + " << i << ") * " << pc << "ll + " << m0
+             << ", " << block << "[" << i << "], (size_t)" << mn << " * " << bytes << "u);\n";
+        e.indent(pd + 5);
+        os() << "}\n";
+        e.indent(pd + 4);
+        os() << "}\n";
+        e.indent(pd + 3);
+        os() << "}\n";
+        e.indent(pd + 2);
+        os() << "}\n";
+        e.indent(pd + 1);
+        os() << "}\n";
+      }
     } else if (!gRows && !gCols) {
       // 아래 두 memset 의 길이가 여기서 음수가 아님을 확정한다. size_t 로 계산하므로
       // 어긋나면 조용히 buffer 밖을 지운다.
@@ -1198,8 +1307,9 @@ struct StubEmitter {
       return op->emitError("aimx-to-runtime-stub: unstage reads a buffer that "
                            "was not allocated here");
     const Buffer &b = it->second;
-    if (op.getTranspose())
-      return op->emitError("aimx-to-runtime-stub: transpose is not emitted yet");
+    if (op.getTranspose() && !op.getGroupLayoutAttr())
+      return op->emitError("aimx-to-runtime-stub: transpose is emitted only for "
+                           "contiguous group layouts");
     int64_t bytes = CEmitter::elementBytes(op.getElementType());
     if (bytes != aimx::kTypeSize)
       return op->emitError("aimx-to-runtime-stub: PIM DRAM holds bfloat16, so "
@@ -1222,11 +1332,15 @@ struct StubEmitter {
       int64_t rowGroups = shape[4], colGroups = shape[5];
       int64_t panelElements = pr * pc;
       std::string j0 = e.temp("_g"), width = e.temp("_w");
+      // group_layout은 물리 순서다. 전치 unstage에서는 host 행이 물리 열, host 열이 물리 행이다.
+      bool transpose = op.getTranspose();
+      std::string physRows = transpose ? cols : rows;
+      std::string physCols = transpose ? rows : cols;
       e.indent(depth);
       os() << "{  // aimx.unstage contiguous groups\n";
       e.indent(depth + 1);
       os() << "aimx_require(" << rows << " >= 0 && " << cols << " >= 0 && "
-           << rows << " <= " << ur * rowGroups << "ll && " << cols << " <= "
+           << physRows << " <= " << ur * rowGroups << "ll && " << physCols << " <= "
            << uc * colGroups << "ll && " << pitch << " == " << pc * colGroups
            << "ll && " << panelElements * rowGroups * colGroups * bytes << "ull <= "
            << b.bytes << "ull, \"unstage does not match the contiguous group layout\");\n";
@@ -1264,12 +1378,35 @@ struct StubEmitter {
         e.indent(d);
         os() << "}\n";
       };
+      // host (i, j)는 물리 (j, i)다. 출력은 한 물리 행(y)이라 host 쪽 j는 보통 1회다.
+      auto scatterTransposed = [&](unsigned d, bool accumulate) {
+        e.indent(d);
+        os() << "for (int64_t " << i << " = 0; " << i << " < " << rows << "; ++" << i << ") {\n";
+        e.indent(d + 1);
+        os() << dstTy << " *" << dr << " = " << e.name(op.getDst()) << " + "
+             << hostRow(op.getOrigin(), op.getStrides(), i) << ";\n";
+        std::string lhs = dr + "[" + j + " * " + e.name(op.getStrides()[rank - 1]) + "]";
+        std::string word = "((const uint16_t*)" + b.host + ")[((" + j + " / " +
+                           std::to_string(ur) + "ll) * " + std::to_string(colGroups) + "ll + " +
+                           i + " / " + std::to_string(uc) + "ll) * " +
+                           std::to_string(panelElements) + "ll + (" + j + " % " +
+                           std::to_string(ur) + "ll) * " + std::to_string(pc) + "ll + " + i +
+                           " % " + std::to_string(uc) + "ll]";
+        e.indent(d + 1);
+        os() << "for (int64_t " << j << " = 0; " << j << " < " << cols << "; ++" << j << ")\n";
+        e.indent(d + 2);
+        os() << lhs << " = " << (accumulate ? addBF16(dstElem, lhs, word) : fromBF16(dstElem, word)) << ";\n";
+        e.indent(d);
+        os() << "}\n";
+      };
       e.indent(depth + 1);
       os() << "if (" << e.name(op.getAccumulate()) << ") {\n";
-      scatter(depth + 2, true);
+      if (transpose) scatterTransposed(depth + 2, true);
+      else scatter(depth + 2, true);
       e.indent(depth + 1);
       os() << "} else {\n";
-      scatter(depth + 2, false);
+      if (transpose) scatterTransposed(depth + 2, false);
+      else scatter(depth + 2, false);
       e.indent(depth + 1);
       os() << "}\n";
       e.indent(depth);

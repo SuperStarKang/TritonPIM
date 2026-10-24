@@ -1,21 +1,25 @@
 // Match gemv.py: four M Tiles, each with four K groups of 32x64.
+// AiMX runs y = W·x as yᵀ = xᵀ·Wᵀ with batch 1: x is one A row, W is staged
+// transposed as B [K x M], y is one C row, and output lanes follow M.
 // RUN: triton-shared-opt --pim-verify --pim-form-host-plan --convert-pim-to-aimx %s | FileCheck %s --check-prefix=IR --implicit-check-not=elementwise_
 // RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx --cse --canonicalize --mlir-print-op-generic %s | triton-shared-translate --aimx-to-descriptors | FileCheck %s --check-prefix=DESC
-// The complete K=256 stream needs no final zero MACs.
+// A 256-element MAC step covers each 64-element K group; no final zero MACs.
 // RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx --cse --canonicalize %s | FileCheck %s --check-prefix=FULL
-// Preserve both diagnostic controls while the default uses wide rows and one N microtile.
-// RUN: triton-shared-opt --pim-form-host-plan "--convert-pim-to-aimx=matvec-row-alignment=4096 matvec-first-n-only=false" --cse --canonicalize %s | FileCheck %s --check-prefix=WIDE
-// RUN: triton-shared-opt --pim-form-host-plan "--convert-pim-to-aimx=matvec-row-alignment=512" --cse --canonicalize %s | FileCheck %s --check-prefix=NARROW
-// The default row pitch must remain independent of the MAC/drain column traversal.
-// RUN: triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx --cse %s | FileCheck %s --check-prefix=FIRST
-// RUN: not triton-shared-opt --pim-form-host-plan "--convert-pim-to-aimx=matvec-row-alignment=513" %s 2>&1 | FileCheck %s --check-prefix=BAD-ALIGN
+// The transposed stages and unstage reach the runtime stub.
+// RUN: triton-shared-opt --mlir-print-op-generic --pim-form-host-plan --convert-pim-to-aimx %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=STUB
 // An empty reduction must not drain stale vACC.
 // RUN: sed 's/to %k4 step %k1/to %k0 step %k1/' %s | triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx --cse --canonicalize | FileCheck %s --check-prefix=EMPTY
 // Multiple contributions to the same rank-one output must retain ADDs.
 // RUN: sed '/^        pim.combine /p' %s | triton-shared-opt --pim-form-host-plan --convert-pim-to-aimx | FileCheck %s --check-prefix=COMBINE
+// IR-DAG: aimx.descriptor_program @mv_groups_device0_matmul_relayout_{{[0-9]+}} batch 1
+// IR-DAG: aimx.descriptor_program @mv_groups_device0_matmul_accumulate_{{[0-9]+}} batch 1
+// IR-DAG: aimx.descriptor_program @mv_groups_device0_matmul_drain_{{[0-9]+}} batch 1
 // IR-LABEL: func.func @mv_groups
-// Arel holds all four groups: 4 * 32 * 256 * 2 * 16 bytes.
-// IR: aimx.alloc {{.*}} bytes 1048576 align 8192 kind data
+// Placements: W is 4 K panels of 256 x 4096, x is 4 panels of 1 x 4096.
+// Arel holds the x row of all four groups: 4 * 1 * 256 * 2 * 16 bytes.
+// IR-DAG: aimx.alloc {{.*}} bytes 8388608 align 8192 kind data
+// IR-DAG: aimx.alloc {{.*}} bytes 32768 align 8192 kind data
+// IR-DAG: aimx.alloc {{.*}} bytes 32768 align 8192 kind data
 // IR: scf.execute_region no_inline
 // IR: aimx.build_descriptors @mv_groups_device0_matmul_relayout_
 // IR: aimx.matmul_phase = "relayout"
@@ -28,46 +32,25 @@
 // IR: aimx.matmul_phase = "accumulate"
 // IR: aimx.build_descriptors @mv_groups_device0_matmul_drain_
 // IR-NOT: aimx.build_descriptors {{.*}}matmul_
-// IR: aimx.stage {{.*}}group_layout = array<i64: 64, 1, 256, 4096, 4, 1>
+// IR-DAG: aimx.stage {{.*}}transpose into {{.*}}group_layout = array<i64: 1, 64, 1, 4096, 1, 4>
+// IR-DAG: aimx.stage {{.*}}transpose into {{.*}}group_layout = array<i64: 64, 32, 256, 4096, 4, 1>
 // IR: aimx.invoke
 // IR-NOT: aimx.invoke
-// IR: aimx.unstage {{.*}}group_layout = array<i64: 32, 1, 32, 4096, 1, 1>
+// IR: aimx.unstage {{.*}}transpose {{.*}}group_layout = array<i64: 1, 32, 1, 4096, 1, 1>
+// Batch 1: A reads 8192 bytes of Arel, B reads one full 4096-lane row of Wᵀ.
 // DESC-LABEL: static uint32_t aimx_prog_mv_groups_device0_matmul_accumulate_
-// DESC-DAG: = 64;
-// DESC-DAG: = 32;
-// DESC: 8192u, 0x19012u, fpga_id, code);
-// DESC: 1024u, 0x59014u, fpga_id, code);
-// DESC-NOT: 0x58018u
+// DESC: 8192u, 0x1012u, fpga_id, code);
+// DESC: 8192u, 0x41014u, fpga_id, code);
+// DESC-NOT: 0x40018u
 // DESC: return idx;
 // FULL-LABEL: func.func @mv_groups
 // FULL: aimx.build_descriptors @mv_groups_device0_matmul_accumulate_
 // FULL-NOT: aimx.build_descriptors @mv_groups_device0_matmul_padding_
 // FULL: aimx.matmul_phase = "accumulate"
 // FULL: aimx.build_descriptors @mv_groups_device0_matmul_drain_
-// WIDE-LABEL: func.func @mv_groups
-// WIDE: aimx.build_descriptors @mv_groups_device0_matmul_accumulate_
-// WIDE: aimx.build_descriptors @mv_groups_device0_matmul_drain_
-// WIDE: aimx.stage {{.*}}group_layout = array<i64: 64, 1, 256, 4096, 4, 1>
-// WIDE: aimx.stage {{.*}}group_layout = array<i64: 32, 64, 32, 4096, 1, 4>
-// WIDE: aimx.unstage {{.*}}group_layout = array<i64: 32, 1, 32, 4096, 1, 1>
-// NARROW-LABEL: func.func @mv_groups
-// NARROW: aimx.stage {{.*}}group_layout = array<i64: 64, 1, 256, 512, 4, 1>
-// NARROW: aimx.unstage {{.*}}group_layout = array<i64: 32, 1, 32, 512, 1, 1>
-// FIRST-LABEL: func.func @mv_groups
-// FIRST: aimx.build_descriptors @mv_groups_device0_matmul_relayout_
-// FIRST: aimx.matmul_phase = "relayout"
-// FIRST: scf.for %[[ROW:.*]] =
-// FIRST: %[[WIDTH:.*]] = arith.constant 512 : index
-// FIRST: scf.for %[[COL:.*]] = {{.*}} to %[[WIDTH]] step %[[WIDTH]] {
-// FIRST: scf.for %[[K:.*]] = {{.*}} : i32 {
-// FIRST: aimx.build_descriptors @mv_groups_device0_matmul_accumulate_
-// FIRST-NOT: matmul_drain_
-// FIRST: aimx.matmul_phase = "accumulate"
-// FIRST: aimx.build_descriptors @mv_groups_device0_matmul_drain_
-// FIRST: aimx.stage {{.*}}group_layout = array<i64: 64, 1, 256, 4096, 4, 1>
-// FIRST: aimx.stage {{.*}}group_layout = array<i64: 32, 64, 32, 4096, 1, 4>
-// FIRST: aimx.unstage {{.*}}group_layout = array<i64: 32, 1, 32, 4096, 1, 1>
-// BAD-ALIGN: AiMX matvec row alignment must be zero or a positive multiple of 4096/batch
+// STUB: // aimx.stage
+// STUB: aimx_copy_to_pim
+// STUB: aimx.unstage contiguous groups
 // EMPTY-LABEL: func.func @mv_groups
 // EMPTY-NOT: aimx.build_descriptors @mv_groups_device0_matmul_
 // EMPTY: aimx.invoke

@@ -1,22 +1,26 @@
 // Rank-one x/y stay rank-one in Common; each Tile keeps two K groups in vACC.
+// AiMX runs y = W·x as yᵀ = xᵀ·Wᵀ with batch 1: x is one A row, W is staged
+// transposed as B [K x M], and y is one C row.
 // RUN: triton-shared-opt --pim-verify --pim-form-host-plan --convert-pim-to-aimx %s | FileCheck %s --check-prefix=IR --implicit-check-not=aimx.compute_template --implicit-check-not=linalg. --implicit-check-not=elementwise_
 // RUN: triton-shared-opt --mlir-print-op-generic --pim-form-host-plan --convert-pim-to-aimx %s | triton-shared-translate --aimx-to-runtime-stub | FileCheck %s --check-prefix=STUB
-// IR-DAG: aimx.descriptor_program @mv_device0_matmul_relayout_{{[0-9]+}} batch 8
-// IR-DAG: aimx.descriptor_program @mv_device0_matmul_accumulate_{{[0-9]+}} batch 8
-// IR-DAG: aimx.descriptor_program @mv_device0_matmul_drain_{{[0-9]+}} batch 8
+// IR-DAG: aimx.descriptor_program @mv_device0_matmul_relayout_{{[0-9]+}} batch 1
+// IR-DAG: aimx.descriptor_program @mv_device0_matmul_accumulate_{{[0-9]+}} batch 1
+// IR-DAG: aimx.descriptor_program @mv_device0_matmul_drain_{{[0-9]+}} batch 1
 // IR-LABEL: func.func @mv
 // IR: aimx.foreach_device {{.*}} counts [2, 1, 1]
 // IR: scf.execute_region no_inline
 // IR: aimx.build_descriptors @mv_device0_matmul_relayout_
 // IR: aimx.matmul_phase = "relayout"
 // IR: aimx.build_descriptors @mv_device0_matmul_accumulate_
-// IR: aimx.build_descriptors @mv_device0_matmul_padding_
+// One 256-element MAC step covers each 96-element K group; no final zero MACs.
+// IR-NOT: matmul_padding_
 // IR-NOT: matmul_drain_
 // IR: aimx.matmul_phase = "accumulate"
 // IR: aimx.build_descriptors @mv_device0_matmul_drain_
-// IR: aimx.stage {{.*}}group_layout = array<i64: 96, 1, 256, 4096, 2, 1>
+// IR-DAG: aimx.stage {{.*}}transpose into {{.*}}group_layout = array<i64: 1, 96, 1, 4096, 1, 2>
+// IR-DAG: aimx.stage {{.*}}transpose into {{.*}}group_layout = array<i64: 96, 8, 256, 4096, 2, 1>
 // IR: aimx.invoke
-// IR: aimx.unstage {{.*}}group_layout = array<i64: 8, 1, 8, 4096, 1, 1>
+// IR: aimx.unstage {{.*}}transpose {{.*}}group_layout = array<i64: 1, 8, 1, 4096, 1, 1>
 // STUB: aimx_runtime_init(AIMX_BASE_FPGA, 2)
 // STUB: aimx_resident_acquire(AIMX_KERNEL_KEY ":site0", _fpga,
 // STUB: if (!_resident->ready) {
