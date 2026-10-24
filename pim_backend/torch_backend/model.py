@@ -6,6 +6,7 @@ import operator
 import torch
 from torch import fx
 from torch.export.graph_signature import InputKind, OutputKind
+from torch.fx.operator_schemas import normalize_function
 from torch.fx.passes.split_module import split_module
 from torch.utils import _pytree
 
@@ -115,7 +116,7 @@ class LayerPlan:
 
 
 class _LayerGemm(torch.nn.Module):
-    def __init__(self, name, gemms, weights, torch_config, sources, origin, kv, kv_heads):
+    def __init__(self, name, gemms, weights, torch_config, sources, origin, kv, kv_windows):
         super().__init__()
         self.name = name
         # 이 stage가 계산하는 원래 GEMM 이름 (packing으로 여러 개일 수 있다)
@@ -125,10 +126,11 @@ class _LayerGemm(torch.nn.Module):
         self.gemms = tuple(gemms)
         self.weights = tuple(weights)
         self.weight_mask = tuple(weight is not None for weight in weights)
-        # (operand, KEY/VALUE): 이 operand는 매 호출 보내지 않고 장치의 key/value cache 영역을
-        # 그대로 읽는다. kv_heads[instance]는 그 instance가 읽는 cache head다. 아니면 None.
+        # (operand, KEY/VALUE, transposed): 이 operand는 매 호출 보내지 않고 장치의 key/value cache
+        # 영역을 그대로 읽는다. transposed면 operand가 cache window의 전치다. kv_windows[instance]는
+        # 그 instance가 읽는 cache 열 범위 (start, stop)다. 아니면 None.
         self.kv = kv
-        self.kv_heads = kv_heads
+        self.kv_windows = kv_windows
         self.torch_config = torch_config
         self.batched_operand = gemms[0].op == "aten.bmm.default"
         self.instance_count = gemms[0].instance_count if self.batched_operand else len(gemms)
@@ -174,7 +176,8 @@ class _LayerGemm(torch.nn.Module):
     def reference(self, *inputs):
         if self.batched_operand:
             return torch.bmm(*inputs)
-        outputs = tuple(self.operation(inputs[index], inputs[index + 1])
+        # cache operand는 열 window view라 연속이 아니다.
+        outputs = tuple(self.operation(inputs[index].contiguous(), inputs[index + 1].contiguous())
                         for index in range(0, len(inputs), 2))
         return outputs[0] if len(outputs) == 1 else outputs
 
@@ -183,7 +186,10 @@ class _LayerGemm(torch.nn.Module):
             matrices = tuple((inputs[0][instance].contiguous(), inputs[1][instance].contiguous())
                              for instance in range(self.instance_count))
         else:
+            # cache operand는 장치 영역을 읽으므로 host에서 연속 복사하지 않는다.
             matrices = tuple(tuple(self.weights[operand] if self.weight_mask[operand]
+                                   else inputs[2 * instance + operand]
+                                   if self.kv is not None and self.kv[0] == operand
                                    else inputs[2 * instance + operand].contiguous()
                                    for operand in range(2))
                              for instance in range(self.instance_count))
@@ -224,8 +230,9 @@ def build_layer_plan(exported_program, example_inputs, *, configs, index, spec, 
     shape/config are then grouped; weight GEMMs remain stationary single-instance
     stages. aten.bmm uses its explicit operand batch dimension.
     kv maps KEY/VALUE to the tensors of example_inputs that are this block's host
-    key/value cache, [heads, positions, ...]; a GEMM operand cache[head] then reads
-    the device cache region (stage.kv, stage.kv_heads).
+    key/value cache, [positions, heads * head_dim]; a GEMM operand that is the cache or a
+    column window of it, cache[:, start:stop] (consecutive heads), or the transpose of one,
+    then reads the device cache region (stage.kv, stage.kv_windows).
     """
     leaves, specification = _pytree.tree_flatten((example_inputs, {}))
     if specification != exported_program.call_spec.in_spec:
@@ -254,12 +261,25 @@ def build_layer_plan(exported_program, example_inputs, *, configs, index, spec, 
             raise ValueError(f"packed GEMMs {entry.sources} must share one config")
 
     def kv_source(operand):
-        """(KEY/VALUE, head) if the operand is one head of a cache input, else None."""
-        if (operand.op == "call_function" and operand.target == torch.ops.aten.select.int
+        """(KEY/VALUE, transposed, (start, stop)) if the operand is a column window of a cache
+        input or its transpose, else None."""
+        # 정규화(run_decompositions)는 2차원 전치를 permute [1, 0]으로 바꾼다.
+        transposed = (operand.op == "call_function"
+                      and (operand.target == torch.ops.aten.t.default
+                           or (operand.target == torch.ops.aten.permute.default and list(operand.args[1]) == [1, 0])))
+        if transposed:
+            operand = operand.args[0]
+        if operand.op == "placeholder" and operand.name in kv_inputs:
+            return kv_inputs[operand.name], transposed, (0, operand.meta["val"].shape[1])
+        if (operand.op == "call_function" and operand.target == torch.ops.aten.slice.Tensor
                 and operand.args[0].op == "placeholder" and operand.args[0].name in kv_inputs):
-            if operand.args[1] != 0:
-                raise ValueError(f"{operand.name}: a cache operand must select a head on axis 0")
-            return kv_inputs[operand.args[0].name], operand.args[2]
+            window = normalize_function(operand.target, operand.args, dict(operand.kwargs),
+                                        normalize_to_only_use_kwargs=True).kwargs
+            if window["dim"] != 1 or window["step"] != 1:
+                raise ValueError(f"{operand.name}: a cache operand must be a column window cache[:, start:stop]")
+            # export는 끝까지 자르는 slice의 end를 int64 최댓값으로 둔다.
+            width = operand.args[0].meta["val"].shape[1]
+            return kv_inputs[operand.args[0].name], transposed, (window["start"], min(window["end"], width))
         return None
     depths = {}
     groups = {}
@@ -274,7 +294,11 @@ def build_layer_plan(exported_program, example_inputs, *, configs, index, spec, 
             if any(operand in frozen for operand in operands) or gemm.op == "aten.bmm.default":
                 key = (node.name,)
             else:
-                key = (depth, gemm.op, gemm.mnk, gemm.left.dtype, configs[mapping.original.node])
+                # 같은 cache(KEY/VALUE, 전치 여부)를 같은 operand로 읽는 GEMM끼리만 한 stage가 된다.
+                # 모양이 같은 QK와 PV(MHA)가 한 stage로 묶이지 않게 한다.
+                sources = [kv_source(operand) for operand in operands]
+                key = (depth, gemm.op, gemm.mnk, gemm.left.dtype, configs[mapping.original.node],
+                       tuple(None if source is None else source[:2] for source in sources))
             if key not in groups:
                 groups[key] = []
             groups[key].append(node)
@@ -293,12 +317,13 @@ def build_layer_plan(exported_program, example_inputs, *, configs, index, spec, 
             arguments = tuple(emit(operand) for member in nodes for operand in gemm_operands(member))
             mapping = gemms[nodes[0].name].mapping
             operands = gemm_operands(nodes[0])
-            # operand마다 instance별 (KEY/VALUE, head) 또는 None
+            # operand마다 instance별 (KEY/VALUE, transposed, (start, stop)) 또는 None
             cache_sources = [[kv_source(gemm_operands(member)[operand]) for member in nodes] for operand in range(2)]
             kv_operands = [operand for operand in range(2) if any(cache_sources[operand])]
             if len(kv_operands) > 1 or any(None in cache_sources[operand] for operand in kv_operands) \
-                    or any(len({kind for kind, _ in cache_sources[operand]}) != 1 for operand in kv_operands):
-                raise ValueError(f"{nodes[0].name}: every instance must read one cache kind with the same operand")
+                    or any(len({source[:2] for source in cache_sources[operand]}) != 1 for operand in kv_operands):
+                raise ValueError(f"{nodes[0].name}: every instance must read one cache kind, transposed or not, "
+                                 f"with the same operand")
             if kv_operands and gemms[nodes[0].name].origin is not None:
                 raise ValueError(f"{nodes[0].name}: a packed GEMM cannot read the key/value cache")
             stage = _LayerGemm(
@@ -308,8 +333,8 @@ def build_layer_plan(exported_program, example_inputs, *, configs, index, spec, 
                 configs[mapping.original.node],
                 tuple(source for member in nodes for source in gemms[member.name].sources),
                 gemms[nodes[0].name].origin,
-                (kv_operands[0], cache_sources[kv_operands[0]][0][0]) if kv_operands else None,
-                tuple(head for _, head in cache_sources[kv_operands[0]]) if kv_operands else None,
+                (kv_operands[0], *cache_sources[kv_operands[0]][0][:2]) if kv_operands else None,
+                tuple(window for _, _, window in cache_sources[kv_operands[0]]) if kv_operands else None,
             )
             name = "pim_stage_" + str(len(stages))
             frozen_graph.add_module(name, stage)

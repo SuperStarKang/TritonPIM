@@ -19,7 +19,7 @@ import time
 import torch
 from triton.backends.pim.residency import KEY, VALUE
 
-from e2e.llama_workloads import LlamaDecodeLayer, LlamaPrefillLayer, quantize_rows
+from e2e.llama_workloads import LlamaDecodeLayer, LlamaPrefillLayer, quantize_rows, token_rows
 
 
 PROMPT_TOKENS = 1024
@@ -28,8 +28,10 @@ PROMPT_TOKENS = 1024
 class GenerationPrefillLayer(LlamaPrefillLayer):
     def forward(self, hidden, cache):
         hidden, key, value = super().forward(hidden)
-        # decode가 읽는 cache: prefill attention이 쓴 양자화 값과 scale이다. [kv_heads, 1024, head_dim], [kv_heads, 1024, 1]
-        return hidden, cache + ((*quantize_rows(key[0]), *quantize_rows(value[0])),)
+        # decode가 읽는 cache: prefill attention이 쓴 양자화 값과 scale을 토큰 행으로 둔다.
+        # [1024, kv_heads·head_dim], [1024, kv_heads]
+        return hidden, cache + (tuple(token_rows(part) for part in (*quantize_rows(key[0]),
+                                                                     *quantize_rows(value[0]))),)
 
 
 def generation_layers(model, kv):
@@ -47,9 +49,9 @@ def generation_layers(model, kv):
 
 
 def empty_caches(config, capacity):
-    """Per layer: INT8 key, its scale, INT8 value, its scale."""
-    shape = (config.num_key_value_heads, capacity, config.head_dim)
-    scale_shape = (config.num_key_value_heads, capacity, 1)
+    """Per layer: INT8 key, its scale, INT8 value, its scale; one row per position."""
+    shape = (capacity, config.num_key_value_heads * config.head_dim)
+    scale_shape = (capacity, config.num_key_value_heads)
     return tuple((torch.zeros(shape, dtype=torch.int8), torch.zeros(scale_shape, dtype=torch.float32),
                   torch.zeros(shape, dtype=torch.int8), torch.zeros(scale_shape, dtype=torch.float32))
                  for _ in range(config.num_hidden_layers))
@@ -61,7 +63,7 @@ def decode_inputs(model, hidden, position, caches, rows):
     rows[p] is the cache row of position p, so the rows of the earlier positions are valid.
     """
     cosine, sine = model.model.rotary_emb(hidden, position_ids=torch.tensor([[position]]))
-    capacity = caches[0][0].shape[1]
+    capacity = caches[0][0].shape[0]
     valid = torch.zeros(capacity, dtype=torch.bool)
     valid[rows[:position]] = True
     return hidden, cosine, sine, valid.unsqueeze(0), caches, ()
@@ -110,7 +112,7 @@ def generate(model, input_ids, new_tokens, rows, run_prefill, run_decode, store)
         # layer index가 막 쓴 cache는 출력 cache tuple의 마지막 항목이다.
         _, prefill_cache = outputs
         for part, written in zip(caches[index], prefill_cache[index], strict=True):
-            part[:, rows[:PROMPT_TOKENS]] = written
+            part[rows[:PROMPT_TOKENS]] = written
         # prefill 위치의 행은 연속이 아닐 수 있으므로 cache 전체를 알린다.
         store(index, caches[index], 0, capacity)
 
@@ -127,7 +129,7 @@ def generate(model, input_ids, new_tokens, rows, run_prefill, run_decode, store)
         row = rows[position].item()
         for layer, (cache, new_parts) in enumerate(zip(caches, new, strict=True)):
             for part, written in zip(cache, new_parts, strict=True):
-                part[:, row:row + 1].copy_(written)
+                part[row:row + 1].copy_(written)
             store(layer, cache, row, row + 1)
         token = model.lm_head(model.model.norm(hidden[:, -1, :])).argmax(dim=-1)
         tokens.append(token.item())

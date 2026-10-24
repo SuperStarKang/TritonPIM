@@ -64,8 +64,6 @@ public:
 
   LogicalResult run() {
     auto partitions = device.getMapping().getPartitions().asArrayRef();
-    if (partitions[2] != 1)
-      return device.emitError("AiMX cross-device pim.combine is not implemented");
     if (failed(collectLayouts())) return failure();
     int64_t count;
     if (!aimx::checkedProduct({partitions[0], partitions[1], partitions[2]}, count) ||
@@ -803,14 +801,23 @@ private:
           break;
         }
       }
+    // p_k device의 partial: k 좌표 0만 대입하고 나머지는 stub이 k 순서로 누산한다.
+    bool deviceReduction =
+        placement.combine && device.getMapping().getPartitions().asArrayRef()[2] > 1;
+    if (deviceReduction) {
+      Value later = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne,
+                                           mapped(device.getBody().front().getArgument(2)), c(b, 0));
+      accumulate = b.create<arith::SelectOp>(loc, later, c(b, 1), accumulate);
+    }
     auto place = placement.source;
-    b.create<aimx::UnstageOp>(
+    auto unstaged = b.create<aimx::UnstageOp>(
         loc, placement.view.buffer, mapped(place.getBuffer()),
         hostValues(b, place.getStart(), 0), hostValues(b, placement.sizes, 1),
         hostValues(b, place.getStrides(), 0), c(b, placement.cols), accumulate,
         TypeAttr::get(b.getBF16Type()),
         placement.view.layout.transposed ? b.getUnitAttr() : UnitAttr(),
         DenseI64ArrayAttr(), DenseI64ArrayAttr(), groupLayout(b, placement));
+    if (deviceReduction) unstaged->setAttr("aimx.device_reduction", b.getUnitAttr());
   }
   FailureOr<View> accessView(pim::AccessOp access) {
     auto found = placements.find(access.getId());

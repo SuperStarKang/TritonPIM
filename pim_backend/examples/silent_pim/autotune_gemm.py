@@ -1,4 +1,4 @@
-# @pim_autotune 데코레이터 사용 예시 — AiMX float16 GEMM.
+# @pim_autotune 데코레이터 사용 예시 — AiMX bfloat16 GEMM (FP32 출력).
 #
 # 실행:
 #   python autotune_gemm.py --m 1024 --n 8192 --k 28672 --max-benchmarks 30
@@ -31,7 +31,7 @@ from autotuner.targets import target_spec  # noqa: E402
 
 def main():
     parser = argparse.ArgumentParser(
-        description="PIM AutoTuner 데코레이터 예시 — AiMX float16 GEMM")
+        description="PIM AutoTuner 데코레이터 예시 — AiMX bfloat16 GEMM")
     parser.add_argument("--m", type=int, default=1024)
     parser.add_argument("--n", type=int, default=8192)
     parser.add_argument("--k", type=int, default=28672)
@@ -55,10 +55,8 @@ def main():
     parser.add_argument("--check-correctness",
                         action=argparse.BooleanOptionalAction, default=False,
                         help="정확성 검사 ON/OFF (기본 OFF)")
-    parser.add_argument("--rtol", type=float, default=5e-2,
-                        help="BF16 correctness 상대 허용 오차")
-    parser.add_argument("--atol", type=float, default=5e-2,
-                        help="BF16 correctness 절대 허용 오차")
+    parser.add_argument("--rel-l2", type=float, default=0.02,
+                        help="correctness 판정: 표본의 ‖PIM − bf16 matmul‖ / ‖bf16 matmul‖ 상한")
     args = parser.parse_args()
     if args.reps < 1:
         parser.error("--reps must be positive")
@@ -86,15 +84,16 @@ def main():
 
     @pim_autotune(spec=hardware, cache_path=str(cache_path), budget=budget,
                   reps=args.reps, seed=args.seed,
-                  rtol=args.rtol, atol=args.atol,
+                  rel_l2=args.rel_l2,
                   check_correctness=args.check_correctness,
                   retune=args.retune, template_version=GEMM_KERNEL_VERSION)
     def gemm(a, b, *, config):
         return run_gemm(a, b, hardware, config, output_dtype=gemm_spec.output_dtype)
 
     torch.manual_seed(0)
-    a = torch.randn((args.m, args.k)).to(getattr(torch, gemm_spec.input_dtype))
-    b = torch.randn((args.k, args.n)).to(getattr(torch, gemm_spec.input_dtype))
+    # PIM DRAM이 bf16이므로 입력을 bf16으로 넘겨 host 변환과 입력 반올림 차이를 없앤다.
+    a = torch.randn((args.m, args.k)).to(torch.bfloat16)
+    b = torch.randn((args.k, args.n)).to(torch.bfloat16)
 
     start_ns = time.perf_counter_ns()
     out = gemm(a, b)
@@ -102,8 +101,12 @@ def main():
 
     print(f"\nwall  : {wall_ms:.2f} ms (탐색이 돌았다면 그 시간을 포함한다)")
     if args.check_correctness:
-        ref = torch.matmul(a.to(torch.float32), b.to(torch.float32))
-        print(f"오차  : {(ref - out).abs().max().item()}")
+        # bf16 matmul 결과와 PIM 결과(bf16 drain 값)를 bf16 값끼리 비교한다.
+        # 오차 계산만 float로 해서 지표에 반올림이 더해지지 않게 한다.
+        ref = (a @ b).float()
+        got = out.to(torch.bfloat16).float()
+        print(f"오차  : max_abs={(got - ref).abs().max().item():.6g} "
+              f"rel_l2={((got - ref).norm() / ref.norm()).item():.4%}")
 
 
 if __name__ == "__main__":

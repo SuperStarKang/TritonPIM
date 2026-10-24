@@ -28,7 +28,8 @@ def ConvertPIMToAiMX : Pass<"convert-pim-to-aimx", "mlir::ModuleOp"> {
     Fixed per-device allocations persist across calls when requested. A complete
     chain is reused when its addresses and control operands are invariant,
     including full-tile equality conditions on dynamic scheduling bounds.
-    Common cross-device K reduction is not implemented. AiMX uses BF16 physical
+    Cross-device K partials (p_k > 1) are unstaged in device order: the k = 0
+    device assigns, later devices add on the host. AiMX uses BF16 physical
     storage and native arithmetic; this pass does not promise IEEE-equivalent
     source floating-point results.
 

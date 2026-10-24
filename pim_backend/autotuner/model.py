@@ -4,10 +4,11 @@ Seed generation, constraints and features call only ``TargetModel``. Every
 target-specific rule lives in one subclass below.
 """
 
+from dataclasses import replace
 from math import prod
 
 from .targets import AiMXRuntimeConfig, PIMGemmProfileSpec, PIMGemvProfileSpec, UPMEMRuntimeConfig
-from .types import TRITON_BLOCK, ceil_div
+from .types import TRITON_BLOCK, PIMConfig, ceil_div
 
 
 AIMX_PMM_BYTES = 0x30000
@@ -136,6 +137,14 @@ class TargetModel:
     def unit_capacity(self):
         return self.profile.banks_per_unit * self.profile.bank_capacity_limit_bytes
 
+    def stage_target(self, problem):
+        """Target spec one GEMM of ``problem`` is tuned and compiled with."""
+        return self.target
+
+    def block(self, problem):
+        """Triton Block (m, n, k) of ``problem``."""
+        return TRITON_BLOCK
+
     def problem_reason(self, problem):
         return None
 
@@ -149,6 +158,16 @@ class TargetModel:
 
     def allocation_reason(self, problem, config):
         """Target allocation limits other than the unit capacity."""
+        return None
+
+    def resident_operand_reason(self, problem, config):
+        """Why the B operand, kept resident (the key/value cache), would be stored with more
+        padding than its own extent needs."""
+        return None
+
+    def resident_operand_config(self, problem):
+        """A config whose resident B has no extra padding, one device and one round; None if
+        the target has no such rule."""
         return None
 
     def access_allocations(self, problem, config):
@@ -236,12 +255,34 @@ class AiMXModel(TargetModel):
         return (runtime.batch, 4096,
                 max(256, runtime.matmul_k_alignment or 4096 // runtime.batch))
 
+    def stage_target(self, problem):
+        """GEMM batch = M 이상인 가장 작은 2의 거듭제곱, spec의 batch가 상한이다.
+
+        한 B 행을 batch 행이 함께 읽으므로 M ≥ batch이면 batch가 클수록 B 재읽기가 준다.
+        M < 8이면 batch를 M에 맞춰야 output block 행이 0으로 채워지지 않는다. GEMV는 batch 1 고정이다.
+        """
+        runtime = self.target.runtime_config
+        if problem.compute_kind != "matmul":
+            return self.target
+        batch = min(runtime.batch, 1 << (problem.M - 1).bit_length())
+        return replace(self.target, runtime_config=replace(runtime, batch=batch))
+
+    def _matmul_block(self):
+        # Block m이 batch보다 크면 M이 작은 GEMM도 Block m 행을 채워 output block 행이 0으로 남는다.
+        return (min(TRITON_BLOCK[0], self.target.runtime_config.batch),) + TRITON_BLOCK[1:]
+
+    def block(self, problem):
+        if problem.compute_kind != "matmul":
+            return TRITON_BLOCK
+        return self._matmul_block()
+
     @property
     def gemm_profile_spec(self):
         unit = self._compute_unit("matmul")
+        block = self._matmul_block()
         return PIMGemmProfileSpec(
-            TRITON_BLOCK, "float16", "float32",
-            tuple(size // block for size, block in zip(unit, TRITON_BLOCK)))
+            block, "float16", "float32",
+            tuple(size // axis for size, axis in zip(unit, block)))
 
     @property
     def gemv_profile_spec(self):
@@ -268,10 +309,28 @@ class AiMXModel(TargetModel):
             return "AiMX host buffer는 bfloat16/float16/float32여야 한다"
         return None
 
-    def mapping_reason(self, problem, partitions):
-        if partitions[2] != 1:
-            return "AiMX cross-device combine은 미구현이므로 p_k=1이어야 한다"
+    def resident_operand_reason(self, problem, config):
+        if problem.compute_kind != "matmul":
+            return None
+        _, group_n, group_k = group_extent(config)
+        # B Group panel은 행(K)을 256, 열(N)을 4096 원소로 올려 저장한다. Group 경계와 빈 Group마다
+        # padding이 다시 생기면 상주 영역과 그 쓰기가 그만큼 커진다.
+        rows = config.tile_k * _round_up(group_k, 256)
+        cols = config.tile_n * _round_up(group_n, 4096)
+        if (rows, cols) != (_round_up(problem.K, 256), _round_up(problem.N, 4096)):
+            return (f"AiMX stores the resident B as {rows} x {cols}; it needs "
+                    f"{_round_up(problem.K, 256)} x {_round_up(problem.N, 4096)}")
         return None
+
+    def resident_operand_config(self, problem):
+        # Group: m는 batch 행, n은 N(4096 이하면 전체, 넘으면 4096), k는 256. Tile이 문제 전체를 덮는다.
+        block_m, block_n, block_k = self.block(problem)
+        group_m = self.target.runtime_config.batch
+        group_n = min(4096, _round_up(problem.N, block_n))
+        return PIMConfig(block_m, block_n, block_k,
+                         group_m // block_m, group_n // block_n, 256 // block_k,
+                         ceil_div(problem.M, group_m), ceil_div(problem.N, group_n), ceil_div(problem.K, 256),
+                         1, 1, 1)
 
     def allocation_reason(self, problem, config):
         allocations = aimx_runtime_allocations(problem, self.target, config)

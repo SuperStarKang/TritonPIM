@@ -18,6 +18,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <array>
 #include <cstdint>
 
 using namespace mlir;
@@ -52,6 +53,9 @@ struct StubEmitter {
   SmallVector<int64_t> slotInput, slotOutput;
   // slot 마다 aimx::AllocKind (0 data, 1 descriptor, 2 PMM). adapter 가 memory table 종류를 정한다.
   SmallVector<int64_t> slotKinds;
+  // slot 을 채우는 stage 의 group_layout 6칸과 transpose. 없으면 0. adapter 가 key/value cache 를
+  // 이 배치로 직접 써 넣는다.
+  SmallVector<std::array<int64_t, 7>> slotLayouts;
   int64_t modelDevices = 0;
   unsigned modelPlans = 0;
 
@@ -223,6 +227,13 @@ struct StubEmitter {
     os() << "};\n// slot 의 aimx::AllocKind: 0 data, 1 descriptor chain, 2 PMM\n"
          << "extern \"C\" const int64_t pim_model_slot_kind[" << slotBytes.size() << "] = {";
     list(slotKinds);
+    os() << "};\n// slot 마다 [useful_rows, useful_cols, physical_rows, physical_cols, row_groups, "
+         << "col_groups, transpose] (aimx.stage group_layout), stage 가 없으면 0\n"
+         << "extern \"C\" const int64_t pim_model_slot_layout[" << slotBytes.size() * 7 << "] = {";
+    for (auto [i, layout] : llvm::enumerate(slotLayouts)) {
+      os() << (i ? ", " : "");
+      list(layout);
+    }
     os() << "};\n";
   }
 
@@ -324,6 +335,11 @@ struct StubEmitter {
       if (slot < 0)
         return st.emitError("aimx-to-model-stub: a staged buffer must be a resident slot");
       slotInput[slot] = argument;
+      if (auto layout = st.getGroupLayoutAttr()) {
+        auto shape = layout.asArrayRef();
+        slotLayouts[slot] = {shape[0], shape[1], shape[2], shape[3], shape[4], shape[5],
+                             st.getTranspose() ? 1 : 0};
+      }
       e.indent(depth);
       // weight 인자: upload(1)·pack(2). activation 인자와 상수: 실행(0). chain(3): 둘 다 아님.
       if (argument >= 0)
@@ -362,6 +378,12 @@ struct StubEmitter {
         slotOutput[slot] = hostArgument(un.getDst());
         e.indent(depth);
         os() << "if (!_model->upload) {\n";
+      }
+      // p_k device의 partial은 device 순서(k 좌표 0이 대입, 나머지 누산)로 host에 더한다.
+      bool ordered = un->hasAttr("aimx.device_reduction");
+      if (ordered) {
+        e.indent(guarded);
+        os() << "#pragma omp ordered\n";
       }
       if (failed(emitUnstage(un, guarded)))
         return failure();
@@ -444,11 +466,15 @@ struct StubEmitter {
     }
     unsigned inner;
     std::string linear;
+    // p_k partial을 누산하는 unstage가 있으면 그 unstage만 반복 순서대로 실행한다.
+    bool ordered = false;
+    body.walk([&](aimx::UnstageOp un) { ordered |= un->hasAttr("aimx.device_reduction"); });
+    std::string orderedClause = ordered ? "ordered " : "";
     if (model) {
       // job = batch slot × device. job 마다 FPGA 하나와 context 하나를 쓴다.
       e.indent(depth);
-      os() << "#pragma omp parallel for num_threads(_model->batch_size * " << devices
-           << ") schedule(static)\n";
+      os() << "#pragma omp parallel for " << orderedClause << "num_threads(_model->batch_size * "
+           << devices << ") schedule(static)\n";
       e.indent(depth);
       os() << "for (int64_t _job = 0; _job < (int64_t)_model->batch_size * " << devices
            << "; _job++) {\n";
@@ -487,7 +513,7 @@ struct StubEmitter {
     } else {
       if (!counts.empty()) {
         e.indent(depth);
-        os() << "#pragma omp parallel for collapse(" << counts.size()
+        os() << "#pragma omp parallel for " << orderedClause << "collapse(" << counts.size()
              << ") num_threads(" << devices << ") schedule(static)\n";
       }
       for (auto [d, n] : llvm::enumerate(counts)) {
@@ -582,6 +608,7 @@ struct StubEmitter {
         slotInput.push_back(-1);
         slotOutput.push_back(-1);
         slotKinds.push_back(static_cast<int64_t>(b.kind));
+        slotLayouts.push_back({});
       }
       e.indent(depth);
       os() << "aimx_resident_buffer &" << n

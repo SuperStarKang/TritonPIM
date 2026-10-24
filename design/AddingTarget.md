@@ -69,8 +69,6 @@ lib/Dialect/<Target>/
 include/triton-shared/Conversion/PIMTo<Target>/
 lib/Conversion/PIMTo<Target>/
 lib/Target/<Target>/
-test/Conversion/PIMTo<Target>/
-test/Target/<Target>/
 ```
 
 Target IR에는 Common IR에 이미 있는 hierarchy나 mapping을 다른 이름으로 복제하지

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 import torch
 
-from ._autotuner import build_config_space, pim_hierarchy
+from ._autotuner import build_config_space, pim_hierarchy, target_model
 from .execution import gemm_problem
 from .config import PIMTorchConfig
 from .fx_analysis import analyze_fx_gemms
@@ -27,6 +27,8 @@ class StageKey:
     instances: int
     # operand마다 장치의 key/value cache 영역을 그대로 읽는지
     kv_mask: tuple
+    # cache operand가 cache window의 전치인지 (AiMX QK의 B = Kᵀ)
+    kv_transposed: bool
 
     @property
     def problem(self):
@@ -79,6 +81,7 @@ def stage_key(stage):
         weight_mask=tuple(stage.weight_mask),
         instances=stage.instance_count,
         kv_mask=tuple(stage.kv is not None and stage.kv[0] == operand for operand in range(2)),
+        kv_transposed=stage.kv is not None and stage.kv[2],
     )
 
 
@@ -109,15 +112,18 @@ def analyze_layer(layer, example_inputs, spec, kv):
     return list(classes.values()), assignment
 
 
-def stage_constraint(key, max_rounds, units):
+def stage_constraint(key, max_rounds, spec):
     """Static model-stage conditions.
 
     max_rounds bounds an activation stage's M/N/K scheduling rounds; without it
     the search would also measure one Block Group per round, thousands of rounds.
     A stage reading the key/value cache in place keeps every instance's part in
     memory, so all its instances run in one batch round on the units.
-    p_k is left to the target (AiMX rejects p_k > 1 in its mapping_reason).
+    p_k is left to the target's mapping_reason. The resident cache operand must not be
+    padded beyond its own extent (target resident_operand_reason).
     """
+    units = spec.common_profile.num_units
+    model = target_model(spec)
 
     def check(problem, config):
         rounds = pim_hierarchy(problem, config).scheduling_rounds
@@ -128,6 +134,10 @@ def stage_constraint(key, max_rounds, units):
         if key.has_kv and key.instances * config.p_m * config.p_n * config.p_k > units:
             return (f"key/value cache stages run all {key.instances} instances in one batch round; "
                     f"{config.p_m * config.p_n * config.p_k} units per instance exceed {units} units")
+        if key.has_kv:
+            reason = model.resident_operand_reason(problem, config)
+            if reason is not None:
+                return reason
         if rounds > max_rounds:
             return f"model stages allow at most {max_rounds} M/N/K rounds; got {rounds}"
         return None

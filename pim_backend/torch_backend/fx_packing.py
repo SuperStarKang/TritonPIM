@@ -232,6 +232,8 @@ def _stack_shared_rights(graph, gemms, members, spec):
 @cache
 def _cost(spec, problem):
     """Static packing cost at the most parallel frontier point; no execution seed is selected."""
+    # 묶은 GEMM이 실제로 compile될 target(AiMX GEMM batch)으로 잰다.
+    spec = target_model(spec).stage_target(problem)
     engine = ConstraintEngine(problem, spec)
     model = target_model(spec)
     space = build_config_space(problem, spec)

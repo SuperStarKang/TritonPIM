@@ -225,16 +225,6 @@ GEMM 예제 자료와 섞지 않는다.
 새 PIM은 target adapter에 `gemm_profile_spec`, 자원·mapping 제약,
 `launch_timing_name`을 제공하고 공통 GEMM을 lowering하면 같은 profiler를 사용한다.
 
-회귀 테스트는 사용자가 저장소 루트에서 실행한다. 하드웨어를 사용하지 않고 합성 자료로
-검사하며, 테스트 임시 파일도 프로젝트 결과 디렉터리 안에 만든다.
-
-```bash
-cd /home/dlrkdals/TritonPIM/triton_shared
-python -m unittest pim_backend.autotuner.test_saturation_seeds \
-  pim_backend.autotuner.test_gemv_saturation pim_backend.autotuner.test_seed_frontier \
-  pim_backend.autotuner.test_aimx_capacity
-```
-
 ## 탐색 흐름
 
 ```text
@@ -283,12 +273,6 @@ fusion에 필요한 전체 descriptor는 lowering에서 모두 합산해 최종 
 측정 결과의 `physical_allocations`에는 lowering이 생성한 device별 전체 할당 목록을
 기록하고, 측정된 후보의 `unit_memory_pressure`에는 이 목록을 사용한다.
 배치가 달라졌으므로 이전 버전의 컴파일·autotuning cache는 새 키로 구분한다.
-
-관련 Python 회귀 테스트는 저장소 루트에서 다음과 같이 실행한다.
-
-```sh
-python -m unittest pim_backend.autotuner.test_aimx_capacity
-```
 
 `PIMProblem`은 연산별 policy를 갖지 않는다. `compute_kind`는 PIM compute op의
 종류를 식별하는 의미 값이고, 각 `PIMAccess`는 unique buffer의 direction, dtype,

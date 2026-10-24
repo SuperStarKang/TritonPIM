@@ -321,16 +321,20 @@ class UPMEMModelRuntime:
         """Queue positions [start, stop) of cache for the next run of any stage reading the cache.
 
         Right before that run every queued position goes into the host image of the cache and
-        the whole cache range goes out in one transfer. cache is [heads, positions, ...] and
-        must keep those positions until then; instance i reads cache[stage.kv_heads[i]].
+        the whole cache range goes out in one transfer. cache is [positions, heads * head_dim]
+        and must keep those positions until then; instance i reads the columns
+        stage.kv_windows[i] of it.
         """
-        operand, _ = stage.kv
+        operand = stage.kv[0]
         m, n, k = stage.shape
-        if tuple(cache.shape[1:]) != ((m, k) if operand == 0 else (k, n)):
-            raise ValueError(f"{stage.name}: cache {tuple(cache.shape)} does not match operand {operand} "
-                             f"of (M, N, K) = {stage.shape}")
-        if not 0 <= start < stop <= cache.shape[1]:
-            raise ValueError(f"positions [{start}, {stop}) are outside the cache of {cache.shape[1]}")
+        windows = {stop - window_start for window_start, stop in stage.kv_windows}
+        if (windows != {k if operand == 0 else n}
+                or cache.shape[0] != (m if operand == 0 else k)
+                or max(stop for _, stop in stage.kv_windows) > cache.shape[1]):
+            raise ValueError(f"{stage.name}: cache {tuple(cache.shape)} with windows {stage.kv_windows} "
+                             f"does not match operand {operand} of (M, N, K) = {stage.shape}")
+        if not 0 <= start < stop <= cache.shape[0]:
+            raise ValueError(f"positions [{start}, {stop}) are outside the cache of {cache.shape[0]}")
         self.kv_pending.setdefault(stage, []).append((cache, start, stop))
 
     def _kv_layout(self, stage):
@@ -342,6 +346,8 @@ class UPMEMModelRuntime:
         """
         import torch
 
+        if stage.kv[2]:
+            raise ValueError(f"{stage.name}: UPMEM reads a cache window in place, not its transpose")
         (tile_rows, tile_cols), (rows, cols) = stage.kv_staging
         config = stage.config
         extent = config.execution_extent
@@ -366,7 +372,7 @@ class UPMEMModelRuntime:
         """The slot_bytes of every job's cache slot from the host cache, [jobs, len(slot_bytes)] int8."""
         import torch
 
-        operand, _ = stage.kv
+        operand = stage.kv[0]
         slot_rows, slot_cols = stage.kv_layout
         config = stage.config
         rows, cols = stage.kv_staging[1]
@@ -377,17 +383,19 @@ class UPMEMModelRuntime:
         positions, features = ((matrix_rows[:, None], matrix_cols[None]) if operand == 0
                                else (matrix_cols[None], matrix_rows[:, None]))
         positions, features = torch.broadcast_tensors(positions, features)
+        # 모든 window의 폭이 같다 (write_kv가 확인한다).
+        width = stage.kv_windows[0][1] - stage.kv_windows[0][0]
         # unit이 cache 끝을 넘어 맡는 자리는 생성 pack처럼 0이다.
-        inside = (positions < cache.shape[1]) & (features < cache.shape[2])
-        heads = torch.tensor(stage.kv_heads).reshape(-1, 1, 1, 1)
-        values = cache[heads, positions.clamp(max=cache.shape[1] - 1), features.clamp(max=cache.shape[2] - 1)]
+        inside = (positions < cache.shape[0]) & (features < width)
+        starts = torch.tensor([start for start, _ in stage.kv_windows]).reshape(-1, 1, 1, 1)
+        values = cache[positions.clamp(max=cache.shape[0] - 1), starts + features.clamp(max=width - 1)]
         return torch.where(inside, values, torch.zeros((), dtype=cache.dtype)).reshape(-1, len(slot_bytes)).contiguous()
 
     def _kv_bytes(self, stage, start, stop):
         """Bytes of a slot that hold positions [start, stop) in every unit; the whole slot if they span units."""
         import torch
 
-        operand, _ = stage.kv
+        operand = stage.kv[0]
         slot_rows, slot_cols = stage.kv_layout
         extent = stage.kv_staging[1][0 if operand == 0 else 1]
         if stop - start >= extent or start // extent != (stop - 1) // extent:
@@ -406,10 +414,10 @@ class UPMEMModelRuntime:
         binding = next(index for index, binding in enumerate(stage.bindings) if binding.role == KV)
         size = stage.bindings[binding].size
         self.library.upmem_model_kv_select(stage.handle, (ctypes.c_uint32 * jobs)(*range(jobs)), jobs)
-        heads = [cache[head].contiguous() for head in stage.kv_heads]
+        windows = [cache[:, start:stop].contiguous() for start, stop in stage.kv_windows]
         self.library.upmem_model_pools_acquire(stage.handle)
-        # 다른 operand는 KV_PACK에서 읽지 않는다. 같은 head를 넘긴다.
-        self.invoke(stage, tuple((head, head) for head in heads), stage.preparation_output,
+        # 다른 operand는 KV_PACK에서 읽지 않는다. 같은 window를 넘긴다.
+        self.invoke(stage, tuple((window, window) for window in windows), stage.preparation_output,
                     upload_weights=KV_PACK)
         packed = torch.empty(jobs * size, dtype=torch.int8)
         self.library.upmem_model_kv_gather(stage.handle, binding, packed.data_ptr())

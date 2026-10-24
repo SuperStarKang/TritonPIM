@@ -133,7 +133,7 @@ panel의 view라 hoist 이득이 없고, vACC 누산은 K Group 안에 A/B load�
 | 받는 것 | 어디서 | AiMX에서의 용도 |
 | --- | --- | --- |
 | Block / Block Group / Execution Tile | `#pim.block`, `#pim.block_group`, `#pim.execution_tile` | Group = tensor SSA 값 하나의 크기. Tile = `pim_exec` 한 번이 상주시키는 Group 묶음 |
-| device 분할 | `pim.partition`의 `#pim.device_mapping` | `aimx.foreach_device` counts. `p_k = 1`만 지원 |
+| device 분할 | `pim.partition`의 `#pim.device_mapping` | `aimx.foreach_device` counts. `p_k > 1`은 FPGA별 partial을 host에서 k 순서로 더한다(§5.8) |
 | placement | `pim.place` (`start`, `size`, `allocation_shape`, `strides`, `direction`, `shared_over`) | PIM DRAM 할당, stage/unstage |
 | access | `pim.access` (`origin`, `sizes`, `valid`, `pad`) | Group panel 위치, mask |
 | 계산 | `linalg.matmul`, `linalg.matvec`, identity-map `linalg.generic`, `linalg.fill`, `arith.add/sub/mulf` | descriptor program |
@@ -329,13 +329,20 @@ B(`b_mask|pim_mode|op`), C ← vACC(`c_mask|op`). mul: A(`a_mask|mul|pim_mode`),
 
 K가 여러 Execution Tile로 나뉘면(`pim.scheduling_axis = "reduction_k"`) vACC는
 `pim_exec`을 건너 살아남지 못한다. 각 Tile의 bf16 결과를 `aimx.unstage accumulate`가
-host에서 FP32로 더한다(첫 Tile은 대입). `p_k > 1`(device 사이 K 분할)은 지원하지 않는다.
+host에서 FP32로 더한다(첫 Tile은 대입).
+
+`p_k > 1`(FPGA 사이 K 분할)도 같은 경로다. FPGA마다 자기 K 구간의 partial을 vACC에서
+끝내고, combine 출력의 unstage가 `accumulate = (K round > 0) || (k 좌표 ≠ 0)`이 된다.
+FPGA thread가 동시에 같은 host 출력에 쓰지 않도록 lowering이 그 unstage에
+`aimx.device_reduction`을 붙이고, stub이 device loop에 `omp ... ordered`를, unstage에
+`#pragma omp ordered`를 낸다. stage·invoke는 FPGA마다 병렬이고 unstage만 device 순서(k = 0이
+대입, 이후 누산)로 실행되므로 결과는 실행마다 같다.
 
 ### 5.9 pass 옵션
 
 | 옵션 | pass 기본 | compiler 기본 (`PIMOptions`) | 뜻 |
 | --- | --- | --- | --- |
-| `batch` | 8 | `batch = 8` | GEMM output block 행 수. GEMV는 쓰지 않는다 |
+| `batch` | 8 | `batch = 8` | GEMM output block 행 수. torch 경로는 GEMM마다 `min(batch, M 이상 2의 거듭제곱)`으로 낮춘다(§9). GEMV는 쓰지 않는다 |
 | `persistent` | true | `aimx_persistent = True` | 할당·chain을 FPGA별로 상주 |
 | `matmul-row-alignment` | 0 (= `4096/b`) | `aimx_matmul_row_alignment = 4096` | GEMM B/C Group panel 행 pitch |
 | `matmul-useful-n-only` | false | `aimx_matmul_useful_n_only = True` | 유효 N microtile만 계산 |
@@ -464,13 +471,29 @@ thread별로 재사용한다(page fault 제거). stub은 `-O3`로 빌드한다.
 resident weight GEMM은 instance 1개, scheduling round 1회로 제한한다(`select_layer_config`).
 여러 round가 같은 buffer에 다른 weight tile을 올리면 상주가 성립하지 않기 때문이다.
 
+### 8.1 key/value cache 상주
+
+host cache는 `[위치, kv_heads × head_dim]`(한 행 = 토큰)이고, stage의 cache operand는 그 열
+window(연속된 head)이거나 그 전치다(QK의 B = Kᵀ). cache stage는 batch round 없이 instance i가
+FPGA `base + i` 하나를 혼자 쓴다(instance 수 ≤ FPGA 수, `devices = 1`). 그래서 window마다 주소가
+하나로 고정되고 chain도 바뀌지 않는다.
+
+| 항목 | 내용 |
+| --- | --- |
+| 주소 | cache operand slot은 memory table의 `("kv", layer, KEY/VALUE)` 항목이다. phase 영역 위 `[kv_base, capacity)`이고 별도 region에 묶인다. phase는 하나만 허용 |
+| 실행 | cache 인자는 weight처럼 실행(upload 0) 호출에서 stage하지 않는다 |
+| 배치 | model stub이 slot마다 `pim_model_slot_layout` (group_layout 6칸 + transpose)을 내보낸다. B 행 r, 열 c는 panel `(r / ur, c / uc)`(row-major), panel 안 `(r % ur, c % uc)`에 놓인다 |
+| 쓰기 | `write_kv`가 위치를 대기열에 넣고, 다음 cache stage 실행 직전에 region host shadow에 bf16으로 조립한 뒤 항목·FPGA마다 바뀐 byte 구간 하나를 `aimx_model_push_ranges`로 보낸다 |
+| 대조 | stage의 첫 쓰기에서 cache 전체를 stub pack(upload 2)으로 조립한 결과와 계산한 배치를 비교한다 |
+| 비용 | V(B 행 = 위치)는 새 위치의 행만 보낸다. Kᵀ(B 열 = 위치)는 새 위치가 모든 행에 걸쳐 있어 그 열 group의 panel 전체를 보낸다 |
+
 ---
 
 ## 9. autotuner 연동 (`autotuner/model.py`의 `AiMXModel`)
 
 | 항목 | GEMM (`matmul`) | GEMV (`matvec`) |
 | --- | --- | --- |
-| Block | `(8, 16, 16)` 고정 | `(8, 1, 16)` |
+| Block | `(min(8, b), 16, 16)` | `(8, 1, 16)` |
 | Group 상한 (`_compute_unit`) | `(b, 4096, max(256, kAlign))` | `(4096, 1, 256)` |
 | profile spec | Group `unit / Block`, f16 → f32 | Group `(512, 1, 16)`, f16 → f32 |
 | `scheduled_compute` | `tile_m·tile_n · roundup(Gm,b) · roundup(Gn,4096/b) · roundup(tile_k·macK, 256)` | `tile_m · roundup(Gm,4096) · tile_k · roundup(Gk,256)` |
@@ -478,8 +501,22 @@ resident weight GEMM은 instance 1개, scheduling round 1회로 제한한다(`se
 
 `aimx_runtime_allocations`는 lowering과 같은 식으로 PMM, A, Arel, B, C, descriptor chain
 하한을 계산한다(GEMV는 §5.2의 전치 크기). `ConstraintEngine`은 단일 할당 ≤ 1023 × 2 MiB,
-bank 사용량 ≤ `bank_capacity_limit_bytes`, `p_k = 1`을 검사한다. 최종 판정은 lowering의
+bank 사용량 ≤ `bank_capacity_limit_bytes`를 검사한다. 최종 판정은 lowering의
 용량 검사다.
+
+**GEMM batch는 GEMM마다 정한다.** `AiMXModel.stage_target(problem)`이 GEMM의 batch를
+`min(spec batch, M 이상인 가장 작은 2의 거듭제곱)`으로 바꾼 spec을 돌려주고,
+`block(problem)`이 Block m을 `min(8, batch)`로 둔다. 한 B 행을 batch 행이 함께 읽으므로
+M ≥ 8이면 8(B 재읽기 최소), M < 8이면 M에 맞춘 값이 output block 행 padding을 없앤다.
+torch 경로의 탐색(`tune_stage_class`), 기록 조회(`select_layer_config`), compile
+(`resolve_execution`), packing 비용(`fx_packing._cost`)이 모두 이 spec을 쓰므로 기록 key가
+일치한다. spec의 `batch`는 상한이다. GEMV는 batch 1 고정이라 spec을 바꾸지 않는다.
+
+| GEMM M | batch | Block m | output block |
+| --- | --- | --- | --- |
+| 2 | 2 | 2 | 2 × 2048 |
+| 3, 4 | 4 | 4 | 4 × 1024 |
+| 5 ~ 8 이상 | 8 | 8 | 8 × 512 |
 
 최종 config는 실측 `total_ms`(stage + invoke + unstage wall) 최소값이다. 정렬 키는 측정
 순서만 정한다.
@@ -515,7 +552,7 @@ kernel[grid](..., pim_target="aimx",
              num_units=1, base_fpga=0, batch=8,
              group_m=…, group_n=…, group_k=…,      # Block Group = Block 개수
              tile_m=…, tile_n=…, tile_k=…,          # Execution Tile = Group 개수
-             p_m=…, p_n=…, p_k=1)                   # device 분할, Π ≤ num_units
+             p_m=…, p_n=…, p_k=…)                   # device 분할, Π ≤ num_units
 ```
 
 ### 10.3 커널 조건
@@ -526,7 +563,6 @@ kernel[grid](..., pim_target="aimx",
 | tile tensor rank 1 또는 2, 정적 shape | 오류 |
 | 연산: matmul, matvec, identity-map elementwise add/sub/mul/extf, 상수 fill | 그 밖은 오류 |
 | K 누산은 positive-zero accumulator에서 시작 | vACC 경로 불가 → 오류 |
-| `p_k = 1` | 오류 (`cross-device pim.combine is not implemented`) |
 | mask는 §5.7 범위 | 오류 |
 | 할당 하나 ≤ 1023 × 2 MiB, bank 합 ≤ 용량 | 오류 |
 
@@ -632,10 +668,10 @@ Group M 256(W panel이 4096 폭으로 padding되어 B 저장·전송 2배)은 `h
 
 | 항목 | 상태 |
 | --- | --- |
-| GEMM batch 혼합 (예: M=12 → 8 + 4) | 미구현. 한 Tile에 batch 하나. M은 `roundup(Gm, b)`로 padding |
+| GEMM batch 혼합 (예: M=12 → 8 + 4) | 미구현. 한 Tile에 batch 하나. M은 `roundup(Gm, b)`로 padding. 혼합해도 B 읽기는 행 묶음 수(2)로 같고 descriptor만 12/16로 준다 |
 | B/C 행 pitch < 4096 | 하드웨어 미확인 (§11.2) |
 | GEMV W stage | §11.4: f32 23.8 ms, bf16 12.9 ms. `[K][M]` 배치(① 연속 복사)의 4096² 측정은 아직 없음. 호출마다 W를 올리는 측정이 autotuner 선택(Tile K)에 영향을 줌 |
-| device 사이 K 분할 (`p_k > 1`) | 미구현 |
+| device 사이 K 분할 (`p_k > 1`) | 구현 (§5.8). FPGA 실측 없음 |
 | Group마다 다른 mask | 미구현 |
 | A 재배치 융합 / host에서 Arel 직접 생성 | 미구현 |
 | GEMV 커널의 rank-1 masked x/y | 예제 커널은 full-block만 허용한다 (`examples/silent_pim/gemv.py`) |

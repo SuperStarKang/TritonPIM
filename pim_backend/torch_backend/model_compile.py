@@ -39,8 +39,9 @@ from .template import TORCH_GEMM_TEMPLATE_VERSION
 class StageModule(torch.nn.Module):
     """One stage class alone: a weight GEMM, or its independent activation GEMM instances.
 
-    A key/value cache class takes the cache first, [instances, ...], and instance i
-    reads cache[i] as its cache operand.
+    A key/value cache class takes the cache first, [positions, instances * width], and
+    instance i reads the column window i of width columns, or its transpose, as its cache
+    operand.
     """
 
     def __init__(self, key, weights):
@@ -67,9 +68,13 @@ class StageModule(torch.nn.Module):
             return self._gemm(*inputs)
         if self.key.has_kv:
             cache, *others = inputs
+            width = cache.shape[1] // self.key.instances
+            windows = [cache.narrow(1, instance * width, width) for instance in range(self.key.instances)]
+            if self.key.kv_transposed:
+                windows = [window.t() for window in windows]
             if self.key.kv_mask[0]:
-                return tuple(self._gemm(cache[instance], other) for instance, other in enumerate(others))
-            return tuple(self._gemm(other, cache[instance]) for instance, other in enumerate(others))
+                return tuple(self._gemm(window, other) for window, other in zip(windows, others))
+            return tuple(self._gemm(other, window) for window, other in zip(windows, others))
         return tuple(self._gemm(inputs[index], inputs[index + 1])
                      for index in range(0, len(inputs), 2))
 
@@ -93,8 +98,11 @@ def stage_inputs(key):
     if key.op == "aten.bmm.default":
         return (tensor(key.instances, m, k), tensor(key.instances, k, n))
     if key.has_kv:
-        cache, other = ((m, k), (k, n)) if key.kv_mask[0] else ((k, n), (m, k))
-        return (tensor(key.instances, *cache),) + tuple(tensor(*other) for _ in range(key.instances))
+        # cache operand가 (rows, cols)이면 cache window는 그것이거나(전치면) 그 전치다.
+        (rows, cols), other = ((m, k), (k, n)) if key.kv_mask[0] else ((k, n), (m, k))
+        if key.kv_transposed:
+            rows, cols = cols, rows
+        return (tensor(rows, key.instances * cols),) + tuple(tensor(*other) for _ in range(key.instances))
     return tuple(operand for _ in range(key.instances) for operand in (tensor(m, k), tensor(k, n)))
 
 
@@ -216,7 +224,7 @@ def cache_version(key):
     version = f"{TORCH_GEMM_TEMPLATE_VERSION}|model|{key.op}|w{mask}|x{key.instances}"
     # cache를 읽는 class는 같은 (M,N,K)의 activation class와 다른 것을 잰다 (cache 전송 없음).
     if key.has_kv:
-        version += "|kv" + "".join(str(int(flag)) for flag in key.kv_mask)
+        version += "|kv" + "".join(str(int(flag)) for flag in key.kv_mask) + ("t" if key.kv_transposed else "")
     return version
 
 
@@ -294,12 +302,14 @@ def widened_configs(stage_class, spec, cache_path):
     axis, shapes, instances = stage_class.origin
     key = stage_class.key
     index = "mnk".index(axis)
+    block_m = target_model(spec).block(key.problem)[0]
     configs = []
     for mnk in dict.fromkeys(shapes):
         member = replace(key, mnk=mnk, instances=instances)
-        config = PIMConfigCache(cache_path, template_version=cache_version(member)).lookup(member.problem, spec)
-        # member class를 잰 적이 없으면 넓힐 config가 없다.
-        if config is None:
+        config = PIMConfigCache(cache_path, template_version=cache_version(member)).lookup(
+            member.problem, target_model(spec).stage_target(member.problem))
+        # member class를 잰 적이 없으면 넓힐 config가 없다. M이 작은 member는 Block m(=batch)이 달라 넓히지 않는다.
+        if config is None or config.block_m != block_m:
             continue
         hierarchy = pim_hierarchy(member.problem, config)
         groups = math.ceil(key.mnk[index] / hierarchy.block_group_extent[index])
@@ -341,7 +351,7 @@ def member_classes(stage_class):
 
 def stage_config_space(key, spec):
     problem = key.problem
-    # target이 k를 device로 나눌 수 없으면(AiMX) seed도 k를 나누지 않는다. instance들이 unit을
+    # target이 k를 device로 나눌 수 없으면 seed도 k를 나누지 않는다. instance들이 unit을
     # 나눠 한 batch round에 함께 돌도록 instance 하나가 채울 unit 수를 정한다.
     split_k = target_model(spec).mapping_reason(problem, (1, 1, 2)) is None
     # instance가 unit보다 많으면(AiMX 2 FPGA의 head stage) instance 하나는 unit 하나를 쓴다.
@@ -356,11 +366,16 @@ def tune_stage_class(stage_class, spec, *, cache_path, search_budget, warmup, re
     """Measured candidates of one class that satisfy the model-stage constraints."""
     key = stage_class.key
     problem = key.problem
-    constraint = stage_constraint(key, max_stage_rounds(problem, spec), spec.common_profile.num_units)
+    # 이 class가 compile될 target(AiMX GEMM batch)으로 탐색하고 기록한다 (select_layer_config와 같은 key).
+    spec = target_model(spec).stage_target(problem)
+    constraint = stage_constraint(key, max_stage_rounds(problem, spec), spec)
     cache = PIMConfigCache(cache_path, template_version=cache_version(key))
     # packing member의 config를 넓힌 후보, 같은 context의 비슷한 shape config를 이 shape에 맞춘 후보
+    # cache stage는 상주 cache에 padding이 없는 config가 있어야 한다(stage_constraint). target이 하나를 낸다.
+    resident = target_model(spec).resident_operand_config(problem) if key.has_kv else None
     initial = tuple({config.key(): config for config in (
-        widened_configs(stage_class, spec, cache_path) + fitted_configs(key, spec, cache))}.values())
+        widened_configs(stage_class, spec, cache_path) + fitted_configs(key, spec, cache)
+        + (() if resident is None else (resident,)))}.values())
 
     print(f"[model compile] tune {key.label()} initial={[config.key() for config in initial]}", flush=True)
     # cache에 있는 후보만 쓰면 측정 프로세스를 띄우지 않는다(measure가 처음 불릴 때 띄운다).

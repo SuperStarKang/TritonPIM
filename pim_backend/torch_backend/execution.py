@@ -13,6 +13,7 @@ from ._autotuner import (
     heuristic_seeds,
     pim_hierarchy,
     pim_launch_options,
+    target_model,
     target_spec,
 )
 from .config import PIMTorchConfig, UnsupportedPIMGemm, validate_pim_options
@@ -106,8 +107,8 @@ def _cached_config(problem, target, torch_config):
 
 
 def resolve_execution(torch_config, problem):
-    target = (torch_config.spec if torch_config.spec is not None
-              else target_spec("upmem"))
+    target = target_model(torch_config.spec if torch_config.spec is not None
+                          else target_spec("upmem")).stage_target(problem)
 
     if torch_config.config is not None:
         config = torch_config.config
@@ -133,6 +134,8 @@ def select_layer_config(problem, target, torch_config, instance_count, *, has_we
     part of the cache in memory at once: one M/N/K round and every instance in one
     batch round.
     """
+    # 측정 기록은 GEMM마다 compile한 target(AiMX GEMM batch)으로 저장되어 있다.
+    target = target_model(target).stage_target(problem)
     if torch_config.config is not None:
         candidates = ((torch_config.config, 0.0),)
     elif torch_config.autotune_cache_path is not None:

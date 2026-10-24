@@ -420,7 +420,7 @@ AiMX FPGA)를 한 번만 연다. 후보마다 다음을 반복한다.
 |---|---|
 | 측정값 | E(weight 상주 후 실행의 중앙값), 첫 업로드 시간(`weight_upload`), 실측 footprint(`physical_allocations`) |
 | 실패 | 결과를 보내기 전에 측정 프로세스가 끝나면(`wait([connection, sentinel])`) 그 후보를 `correctness=False`, `exit_code`로 기록하고 선택에서 제외한다. 다음 후보는 새 측정 프로세스에서 잰다 |
-| 제약 | `stage_constraint`: weight stage는 M/N/K round 1, activation stage는 round ≤ `max_initial_scheduling_rounds`(4). p_k는 target이 정한다(AiMX는 `mapping_reason`이 p_k = 1만 허용) |
+| 제약 | `stage_constraint`: weight stage는 M/N/K round 1, activation stage는 round ≤ `max_initial_scheduling_rounds`(4). p_k는 target의 `mapping_reason`이 정한다 |
 | seed 공간 | `partition_axes`: target이 k를 나눌 수 없으면 k partition은 1뿐이다. `instance_units = units / instances`: instance 하나가 채울 unit 수 |
 | 초기 round 패턴 | weight stage는 (1, 1, 1)만 |
 | budget | class마다 `max_benchmarks`(기본 20), `max_generations`(기본 10) |

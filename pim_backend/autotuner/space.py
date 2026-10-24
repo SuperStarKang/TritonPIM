@@ -76,6 +76,7 @@ def axis_values(problem, spec, kind, axis):
 
 def build_config_space(problem, target, **overrides):
     fields = {
+        "block_values": target_model(target).block(problem),
         "partition_values": _powers_of_two(
             target.common_profile.num_units),
         "instance_units": target.common_profile.num_units,
