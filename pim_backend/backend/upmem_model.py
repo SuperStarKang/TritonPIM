@@ -126,17 +126,14 @@ class UPMEMModelRuntime:
         self.group_stats = {name: 0 for name, _ in TransferStats._fields_}
         # program_load_ms는 stage 실행 전 IRAM program 적재 시간, invoke_ms는 host pool 준비부터
         # 입력 전송·실행·출력 회수까지 native 호출 시간이다.
-        # kv_push_ms는 대기 중인 key/value cache 위치를 host image에 반영하고 바뀐 부분을 한 번 보낸
-        # 시간(prefill 위치는 cache 영역 전체, decode 위치는 scatter program 적재·전송·실행)이고,
-        # kv_layout_check_ms는 host 배치식을 생성 pack과 한 번 대조한 시간이다.
+        # kv_push_ms는 대기 중인 key/value cache 위치를 host image에 반영하고 cache 영역 전체를 한 번
+        # 보낸 시간이고, kv_layout_check_ms는 host 배치식을 생성 pack과 한 번 대조한 시간이다.
         self.totals = {"program_loads": 0, "device_compiles": 0, "weight_pushes": 0,
                        "program_load_ms": 0.0, "invoke_ms": 0.0, "kv_push_ms": 0.0, "kv_layout_check_ms": 0.0}
         # stage -> [(host cache, start, stop)]: cache를 읽는 다음 실행 전에 보낼 위치
         self.kv_pending = {}
         # [DPU, kv_bytes] int8: DPU마다 MRAM [kv_base, capacity)에 있어야 할 bytes. 처음 보낼 때 만든다.
         self.kv_image = None
-        # (upmem_kv_scatter program 경로, 단위 수 상한): cache stage가 있으면 bind가 만든다.
-        self.kv_scatter = None
         # (stage 이름, (M, N, K)) -> {"calls", "program_load_ms", "invoke_ms", "kv_push_ms"}.
         # 모든 layer의 같은 stage가 합쳐진다.
         self.stage_times = {}
@@ -160,7 +157,6 @@ class UPMEMModelRuntime:
             "kv_select": ([pointer, uints, uint], None),
             "kv_gather": ([pointer, uint, pointer], None),
             "kv_push_region": ([pointer, uint, pointer, uint], None),
-            "kv_scatter": ([pointer, uint, uint, pointer, pointer], None),
         }
         for name, (arguments, returns) in signatures.items():
             function = getattr(self.library, "upmem_model_" + name)
@@ -223,30 +219,9 @@ class UPMEMModelRuntime:
     def bind(self, plans, units):
         """Runtime: create the native handle of every placed stage on the open DPU set.
         Weights move only when a group is entered."""
-        import torch
-
         for plan in plans:
             for stage in plan.stages:
                 self._create_stage(stage, units)
-        cache_stages = [stage for plan in plans for stage in plan.stages if stage.kv is not None]
-        if not cache_stages:
-            return
-        # 위치 하나를 쓸 때 바뀌는 8 byte 단위 수의 상한(모든 cache stage의 합)으로 scatter program을 만든다.
-        # cache stage의 slot은 서로 겹치지 않고 8 byte 경계에서 시작하므로 stage마다 센 수를 더한다.
-        # 같은 config와 배치의 stage(layer마다 같은 stage)는 한 번만 센다.
-        counts = {}
-        for stage in cache_stages:
-            key = (stage.kv[0], stage.kv_staging, stage.config)
-            if key not in counts:
-                extent = stage.kv_staging[1][0 if stage.kv[0] == 0 else 1]
-                counts[key] = max(torch.unique(self._kv_bytes(stage, local, local + 1) // 8).numel()
-                                  for local in range(extent))
-        count = sum(counts[(stage.kv[0], stage.kv_staging, stage.config)] for stage in cache_stages)
-        capacity = count + count % 2
-        source = (Path(__file__).resolve().parent / "upmem_kv_scatter.c").read_text()
-        program = _build_program({"device": f"#define KV_CHUNKS {capacity}\n" + source,
-                                  "nr_tasklets": cache_stages[0].bundle["nr_tasklets"]}, {}, stats=self.totals)
-        self.kv_scatter = (program, capacity)
 
     def _pack_group(self, key):
         """Lay the group's weights out in the stage pools and build its block table.
@@ -443,12 +418,11 @@ class UPMEMModelRuntime:
         self.totals["kv_layout_check_ms"] += (time.perf_counter_ns() - start) / 1e6
 
     def _push_kv(self, stage):
-        """Write every queued position into the host image, then send what changed once.
+        """Write every queued position into the host image, then send the cache range once.
 
-        A write that covers whole slots (the prefill positions) sends the cache range
-        [kv_base, capacity), contiguous and at the same offset on every DPU. Otherwise the
-        changed 8 byte chunks of every layer, at the same offsets on every DPU, go to the
-        upmem_kv_scatter program in one transfer and one launch, and it writes them in place.
+        The range [kv_base, capacity) is contiguous and at the same offset on every DPU, so
+        one transfer covers every layer. The caller queues positions in bursts (the prefill
+        positions, then every few decode steps), so this runs only for those steps.
         stage is the one about to run; any stage reaches every DPU.
         """
         import torch
@@ -456,9 +430,6 @@ class UPMEMModelRuntime:
         memory = self.memory
         if self.kv_image is None:
             self.kv_image = torch.zeros((len(stage.physical_mapping), memory.kv_bytes), dtype=torch.int8)
-        whole = False
-        # image 안에서 바뀐 byte (모든 DPU 공통)
-        changed = []
         for pending, writes in self.kv_pending.items():
             binding, = [binding for binding in pending.bindings if binding.role == KV]
             # 이 stage의 cache slot이 image 안에서 시작하는 byte
@@ -469,24 +440,9 @@ class UPMEMModelRuntime:
                     pending.kv_checked = True
                 slot_bytes = self._kv_bytes(pending, start, stop)
                 self.kv_image[:, base + slot_bytes] = self._kv_images(pending, cache, slot_bytes)[pending.kv_jobs]
-                whole = whole or slot_bytes.numel() == binding.size
-                changed.append(base + slot_bytes)
         self.kv_pending.clear()
-        if whole:
-            self.library.upmem_model_kv_push_region(stage.handle, MRAM_BASE + memory.kv_base,
-                                                    self.kv_image.data_ptr(), memory.kv_bytes)
-            return
-        chunks = torch.unique(torch.cat(changed) // 8)
-        count = chunks.numel()
-        program, capacity = self.kv_scatter
-        if count > capacity:
-            raise ValueError(f"{count} changed cache chunks exceed the {capacity} of the scatter program")
-        addresses = torch.zeros(capacity, dtype=torch.int32)
-        addresses[:count] = MRAM_BASE + memory.kv_base + chunks * 8
-        data = torch.zeros((self.kv_image.shape[0], capacity), dtype=torch.int64)
-        data[:, :count] = self.kv_image.view(torch.int64)[:, chunks]
-        self.totals["program_loads"] += self.library.upmem_runtime_load(program.encode())
-        self.library.upmem_model_kv_scatter(stage.handle, count, capacity, addresses.data_ptr(), data.data_ptr())
+        self.library.upmem_model_kv_push_region(stage.handle, MRAM_BASE + memory.kv_base,
+                                                self.kv_image.data_ptr(), memory.kv_bytes)
 
     def enter_layer(self, plan):
         # group이 바뀔 때만 그 group 전체 weight를 한 번에 보낸다 (pack은 대개 앞 group 실행 중에 끝나 있다).

@@ -216,6 +216,12 @@ UPMEM의 head별 GEMV는 matvec이라 QK의 행렬이 `(K[h]ᵀ)ᵀ` = K[h] 그�
 V[h]ᵀ(열 = 위치)다(`upmem_model._positions_on_rows`). unit c는 위치 `[c·S, (c+1)·S)`를 가지므로
 장치 출력 순서가 토큰 순서와 같다.
 
+두 target의 생성 loop는 쓰기 주기도 같다. 장치는 위치 `[0, flushed)`를 가지고, 그 뒤 decode 위치
+`[flushed, position)`(최대 TAIL − 1 = 15개)과 새 token 자신은 decode layer가 host cache에서 읽어 CPU에서
+attention에 합친다. tail이 TAIL개가 되면 그 위치를 `write_kv`로 한 번에 보낸다. UPMEM adapter는 대기
+위치를 host image에 반영한 뒤 cache 영역 `[kv_base, capacity)` 전체를 모든 DPU에 같은 offset으로 한 번
+전송한다(prefill 위치도 같은 경로).
+
 ### 2.7 config 대응
 
 packing 후에는 원래 GEMM 여러 개가 packed GEMM 하나가 된다. `build_layer_plan`은 원래 GEMM

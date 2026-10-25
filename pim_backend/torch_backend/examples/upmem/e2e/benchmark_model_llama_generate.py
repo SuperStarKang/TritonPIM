@@ -1,21 +1,23 @@
 """Checkpoint Llama-family (Llama-2-7b, Llama-3-8B) generation through model compile.
 
-One request: a 1024-token prefill, then --max-new-tokens - 1 decode steps, greedy, on
+One request: a --prompt-tokens prefill (1024 by default), then --max-new-tokens - 1 decode steps, greedy, on
 2048 DPUs with 16 tasklets (e2e/llama_generation.py). Both phases are compiled
 together: the decode configs are chosen for that many steps per request. The decode
 GEMMs that read the INT8 key/value cache (key cache x query, probability x value cache)
 read it in place from the top of every DPU's MRAM; the prefill weights may use that range,
-since the cache is written only when decode starts. After each prefill layer its 1024
-positions, and after each decode step the new position of every layer, are queued; right
+since the cache is written only when decode starts. After each prefill layer its prompt
+positions, and every TAIL decode steps the last TAIL positions of every layer, are queued;
+in between, the decode layers read those positions from the host cache on the CPU. Right
 before the first cache stage of the next step runs, every queued position goes into the
-host image of the cache. The prefill positions go out as the whole cache range in one
-transfer; a decode position goes out as its changed 8 byte chunks of every layer, at the
-same offsets on every DPU, in one transfer to a small scatter program that writes them in
-place (one extra program load and launch per step). The cache scales stay on the host. The
+host image of the cache and the whole cache range goes out in one transfer, at the same
+offset on every DPU. The cache scales stay on the host. The
 first decode step includes the decode weight upload, which overwrites the prefill
 weights, the prefill cache transfer and a one-time check of the host cache layout
-against the generated pack. The token IDs
-go to the report; e2e/check_llama_generate_cpu.py compares them with the CPU layers.
+against the generated pack. Every decode step is split like a run_upmem.py request
+(upmem_workloads.PartitionTimer): CPU, weight upload, program load, cache push, the native
+stages of every PIM call (h2d, kernel, d2h, reduction, host layout), the rest of the
+invoke, and other; the report keeps the first step and the mean of the others. The token
+IDs go to the report; e2e/check_llama_generate_cpu.py compares them with the CPU layers.
 Compile and resource open/close are excluded.
 
   ../cmd.sh benchmark_model_llama_generate.py --checkpoint <dir> --prompt-file prompt.txt \\
@@ -27,6 +29,7 @@ from dataclasses import asdict
 import json
 import logging
 import math
+import os
 from pathlib import Path
 import statistics
 import sys
@@ -42,12 +45,37 @@ from triton.backends.pim.residency import KEY, VALUE
 
 from torch_backend import compile_model
 from torch_backend._autotuner import DEFAULT_CACHE_PATH
-from e2e.llama_generation import PROMPT_TOKENS, decode_example, decode_kv_inputs, generate, generation_layers
+from e2e.llama_generation import PROMPT_TOKENS, TAIL, decode_example, decode_kv_inputs, generate, generation_layers
 from e2e.llama_workloads import KV_MODES
+from upmem_workloads import HOST_LAYOUT_STAGES, NATIVE_STAGES, PartitionTimer
 
 
 def plan_launches(plan):
     return sum(stage.batch_rounds * math.prod(stage.mnk_rounds) for stage in plan.stages)
+
+
+def step_breakdown(step_ms, layers_ms, totals, partitions):
+    """One decode step in the items of a run_upmem.py request; totals are the runtime counters
+    of the step and partitions the PartitionTimer records of its decode layers."""
+    native = {name: sum(record["native_ms"][name] for record in partitions.values() if record["where"] == "PIM")
+              for name in NATIVE_STAGES}
+    breakdown = {
+        # decode layer 밖(embedding, host cache 쓰기와 전송 대기열, norm/lm_head/argmax)과 CPU partition
+        "cpu_ms": step_ms - layers_ms + sum(record["wall_ms"] for record in partitions.values()
+                                            if record["where"] == "CPU"),
+        "weight_upload_ms": totals["pack_wall_ms"] + totals["upload_wall_ms"],
+        "program_load_ms": totals["program_load_ms"],
+        "kv_push_ms": totals["kv_push_ms"],
+        "h2d_ms": native["h2d"],
+        "kernel_ms": native["kernel"],
+        "d2h_ms": native["d2h"],
+        "reduction_ms": native["reduction"],
+        "host_layout_ms": sum(native[name] for name in HOST_LAYOUT_STAGES),
+        "invoke_outside_native_ms": totals["invoke_ms"] - sum(native.values()),
+    }
+    # partition 사이 FX 처리, _LayerGemm의 입력 contiguous·출력 할당, exit_layer
+    breakdown["other_ms"] = step_ms - sum(breakdown.values())
+    return breakdown
 
 
 def main():
@@ -57,8 +85,9 @@ def main():
     parser.add_argument("--report-dir", type=Path, required=True)
     parser.add_argument("--kv", choices=KV_MODES, default="share", help="how a prefill query head reads its KV head")
     parser.add_argument("--cache", default=DEFAULT_CACHE_PATH)
+    parser.add_argument("--prompt-tokens", type=int, default=PROMPT_TOKENS, help="prefill length")
     parser.add_argument("--max-new-tokens", type=int, default=128,
-                        help="tokens the request generates; the key/value cache holds 1024 + this many positions")
+                        help="tokens the request generates; the key/value cache holds the prompt + this many positions")
     parser.add_argument("--max-benchmarks", type=int, default=20, help="per stage class")
     parser.add_argument("--max-generations", type=int, default=10)
     parser.add_argument("--local-capacity-limit-bytes", type=int, required=True,
@@ -77,15 +106,15 @@ def main():
         ).cpu().eval().requires_grad_(False)
         config = model.config
         layers = config.num_hidden_layers
-        capacity = PROMPT_TOKENS + args.max_new_tokens
-        prefill_layers, decode_layers = generation_layers(model, args.kv)
+        capacity = args.prompt_tokens + args.max_new_tokens
+        prefill_layers, decode_layers = generation_layers(model, args.kv, args.prompt_tokens)
 
         print(f"Compiling {layers} prefill and {layers} decode layers ({steps} decode steps per request) ...",
               flush=True)
-        prefill_example = (torch.zeros((1, PROMPT_TOKENS, config.hidden_size), dtype=torch.float32), ())
+        prefill_example = (torch.zeros((1, args.prompt_tokens, config.hidden_size), dtype=torch.float32), ())
         compiled = compile_model(
             {"prefill": (prefill_layers, prefill_example),
-             "decode": (decode_layers, decode_example(model, capacity))},
+             "decode": (decode_layers, decode_example(model, args.prompt_tokens, capacity))},
             kv_inputs={"decode": decode_kv_inputs}, repeats={"prefill": 1, "decode": steps},
             target="upmem", units=2048,
             runtime_options={"nr_tasklets": 16,
@@ -111,20 +140,32 @@ def main():
             prefill_launches = sum(plan_launches(plan) for plan in session.plans["prefill"])
             decode_launches = sum(plan_launches(plan) for plan in session.plans["decode"])
             input_ids = tokenizer(prompt, return_tensors="pt", truncation=True,
-                                  max_length=PROMPT_TOKENS)["input_ids"]
+                                  max_length=args.prompt_tokens)["input_ids"]
+            if tuple(input_ids.shape) != (1, args.prompt_tokens):
+                raise ValueError(f"the prompt must contain at least {args.prompt_tokens} tokens including "
+                                 f"special tokens")
             decode_stages = {(stage.name, tuple(stage.shape)): stage
                              for plan in session.plans["decode"] for stage in plan.stages}
-            # step별 decode layer 전체(session.run_model) 시간과 그 안에서 cache 위치를 보낸 시간
+            # step별 decode layer 전체(session.run_model) 시간, 그 step의 runtime 계수 증가분,
+            # partition 기록. 계수는 Python dict만 읽으므로 step 시간에 native 호출을 더하지 않는다.
             decode_layers_ms = []
-            decode_kv_push_ms = []
+            decode_totals = []
+            decode_partitions = []
             runtime = session.backend.model
+            timer = PartitionTimer(session.plans["decode"])
+
+            def counters():
+                return {**runtime.totals, **runtime.loader.totals}
 
             def run_decode(*inputs):
+                timer.reset()
+                before_step = counters()
                 start = time.perf_counter_ns()
-                pushed = runtime.totals["kv_push_ms"]
                 outputs = session.run_model("decode", *inputs)
                 decode_layers_ms.append((time.perf_counter_ns() - start) / 1e6)
-                decode_kv_push_ms.append(runtime.totals["kv_push_ms"] - pushed)
+                after_step = counters()
+                decode_totals.append({name: after_step[name] - before_step[name] for name in after_step})
+                decode_partitions.append(timer.partitions)
                 return outputs
 
             # (시작 위치, ms): store 호출마다 key와 value 위치를 전송 대기열에 넣는 시간
@@ -158,25 +199,18 @@ def main():
     assert transfers["device_compiles"] == 0
 
     step_ms = result["step_ms"]
-    # 첫 step은 decode weight 업로드를 포함하므로 step과 layer 시간은 두 번째 step부터 평균한다.
+    breakdowns = [step_breakdown(*step) for step in zip(step_ms, decode_layers_ms, decode_totals, decode_partitions,
+                                                         strict=True)]
+    decode_kv_push_ms = [totals["kv_push_ms"] for totals in decode_totals]
+    # 첫 step은 decode weight 업로드, prefill cache 전송, 배치 대조를 포함하므로 따로 두고 나머지를 평균한다.
     # stage 시간은 step마다 같은 일을 하므로 전체 합을 step 수로 나눈다.
-    layers_ms = statistics.mean(decode_layers_ms[1:])
-    program_load_ms = sum(times["program_load_ms"] for times in stage_times.values()) / steps
-    invoke_ms = sum(times["invoke_ms"] for times in stage_times.values()) / steps
-    kv_queue_ms = statistics.mean(ms for start, ms in kv_writes if start >= PROMPT_TOKENS)
-    kv_push_ms = statistics.mean(decode_kv_push_ms[1:])
     breakdown = {
         "step_ms": statistics.mean(step_ms[1:]),
-        "decode_layers_ms": layers_ms,
-        "program_load_ms": program_load_ms,
-        "invoke_ms": invoke_ms,
-        # 대기 중인 새 위치를 cache stage 실행 직전에 보낸 시간 (32 layer × key/value)
-        "kv_push_ms": kv_push_ms,
-        # layer 안에서 stage 실행 밖의 시간: CPU partition, stage 입력 준비, graph 해석
-        "cpu_in_layers_ms": layers_ms - program_load_ms - invoke_ms - kv_push_ms,
-        # layer 밖의 나머지: embedding, host cache 쓰기와 전송 대기열, norm/lm_head/argmax
-        "host_outside_layers_ms": statistics.mean(step_ms[1:]) - layers_ms,
-        "kv_queue_ms_per_store": kv_queue_ms,
+        "decode_layers_ms": statistics.mean(decode_layers_ms[1:]),
+        **{name: statistics.mean(step[name] for step in breakdowns[1:]) for name in breakdowns[0]},
+        # 보낸 step 하나의 cache 전송 시간: step i 끝에 store한 위치는 step i + 1에서 보낸다 (TAIL, 2·TAIL, ...).
+        "kv_push_ms_per_flush": statistics.mean(decode_kv_push_ms[TAIL::TAIL]),
+        "kv_queue_ms_per_store": statistics.mean(ms for start, ms in kv_writes if start >= args.prompt_tokens),
         "stages": [{"name": name, "mnk": list(mnk), "instances": decode_stages[name, mnk].instance_count,
                     "calls_per_step": times["calls"] / steps,
                     "program_load_ms": times["program_load_ms"] / steps,
@@ -188,22 +222,24 @@ def main():
         "status": "execution_complete", "runtime": "model_compile",
         "checkpoint": str(args.checkpoint.resolve()),
         "prompt_file": str(args.prompt_file.resolve()),
-        "scope": f"one request: {PROMPT_TOKENS}-token prefill, then {steps} greedy decode steps",
+        "scope": f"one request: {args.prompt_tokens}-token prefill, then {steps} greedy decode steps",
         "measurement_scope": (
             "first token: embedding, prefill layers, host key/value cache write and transfer queue, "
-            "norm/lm_head/argmax; decode step: embedding, decode layers (each cache stage first sends "
-            "its queued positions, then reads the cache in place), host cache write of the new "
-            "position, norm/lm_head/argmax; the first step also sends the prefill cache and checks "
+            "norm/lm_head/argmax; decode step: embedding, decode layers (the first cache stage sends "
+            "the queued positions, if any, then the stages read the cache in place; the tail positions "
+            "join on the CPU), host cache write of the new position and, every TAIL steps, the transfer "
+            "queue, norm/lm_head/argmax; the first step also sends the prefill cache and checks "
             "the host layout once; excludes tokenization, compile and resource open/close"
         ),
         "layers": layers, "heads": config.num_attention_heads, "kv_heads": config.num_key_value_heads,
-        "kv": args.kv, "max_new_tokens": args.max_new_tokens, "cache_positions": capacity,
+        "kv": args.kv, "prompt_tokens": args.prompt_tokens, "max_new_tokens": args.max_new_tokens,
+        "cache_positions": capacity, "kv_tail": TAIL,
         "kv_cache_location": "device (scales on the host)", "kv_cache_dtype": "int8",
         "device_kv_bytes": memory.kv_bytes,
         "first_step_kv_push_ms": decode_kv_push_ms[0],
         "kv_layout_check_ms": after["kv_layout_check_ms"] - before["kv_layout_check_ms"],
         "prefill_groups": prefill.groups, "decode_groups": decode.groups,
-        "cpu_threads": torch.get_num_threads(),
+        "cpu_threads": torch.get_num_threads(), "omp_num_threads": os.getenv("OMP_NUM_THREADS", ""),
         "versions": {"torch": torch.__version__, "triton": triton.__version__},
         "target": asdict(session.spec),
         "compile": compile_report,
@@ -217,6 +253,7 @@ def main():
         "token_ids": result["tokens"],
         "text": tokenizer.decode(result["tokens"]),
         "transfers": transfers,
+        "first_step_breakdown": breakdowns[0],
         "decode_step_breakdown": breakdown,
     }
     (args.report_dir / "report.json").write_text(
@@ -227,9 +264,9 @@ def main():
           f"kv_bytes={transfers['kv_bytes']} first_step_kv_push_ms={decode_kv_push_ms[0]:.1f} "
           f"kv_layout_check_ms={report['kv_layout_check_ms']:.1f}", flush=True)
     print(f"decode step (mean after the first): step={breakdown['step_ms']:.1f} "
-          f"layers={layers_ms:.1f} program_load={program_load_ms:.1f} invoke={invoke_ms:.1f} "
-          f"kv_push={kv_push_ms:.1f} cpu_in_layers={breakdown['cpu_in_layers_ms']:.1f} "
-          f"host_outside_layers={breakdown['host_outside_layers_ms']:.1f} ms", flush=True)
+          f"layers={breakdown['decode_layers_ms']:.1f} kv_push per flush={breakdown['kv_push_ms_per_flush']:.1f} ms",
+          flush=True)
+    print("  " + " ".join(f"{name}={breakdown[name]:.1f}" for name in breakdowns[0]), flush=True)
     for stage in breakdown["stages"]:
         print(f"  {stage['name']} mnk={tuple(stage['mnk'])} x{stage['instances']}: "
               f"calls/step={stage['calls_per_step']:.0f} program_load={stage['program_load_ms']:.1f} "

@@ -119,21 +119,6 @@ void upmem_model_kv_push_region(struct upmem_model_kernel *kernel, uint32_t addr
     kernel->stats.kv_bytes += (uint64_t)kernel->units * length;
 }
 
-void upmem_model_kv_scatter(struct upmem_model_kernel *kernel, uint32_t count, uint32_t capacity,
-                            const uint32_t *addresses, const uint64_t *data) {
-    // 적재된 upmem_kv_scatter program에 단위 수와 주소(공통)를 broadcast하고, DPU마다 capacity개
-    // 단위의 값을 보낸 뒤 실행한다. data는 DPU마다 capacity개이며 앞의 count개만 쓰인다.
-    DPU_ASSERT(dpu_broadcast_to(kernel->set, "kv_count", 0, &count, sizeof(count), DPU_XFER_DEFAULT));
-    DPU_ASSERT(dpu_broadcast_to(kernel->set, "kv_address", 0, addresses,
-                                (size_t)capacity * sizeof(uint32_t), DPU_XFER_DEFAULT));
-    for (uint32_t physical = 0; physical < kernel->units; ++physical)
-        DPU_ASSERT(dpu_prepare_xfer(kernel->dpus[physical], (void *)(data + (size_t)physical * capacity)));
-    DPU_ASSERT(dpu_push_xfer(kernel->set, DPU_XFER_TO_DPU, "kv_data", 0,
-                             (size_t)capacity * sizeof(uint64_t), DPU_XFER_DEFAULT));
-    DPU_ASSERT(dpu_launch(kernel->set, DPU_SYNCHRONOUS));
-    kernel->stats.kv_bytes += (uint64_t)kernel->units * count * sizeof(uint64_t);
-}
-
 static int model_active(struct upmem_model_kernel *kernel, uint32_t physical) {
     uint32_t logical = kernel->mapping[physical];
     return logical != UINT32_MAX

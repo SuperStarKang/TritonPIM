@@ -64,7 +64,7 @@ def main():
                               truncation=True, max_length=PROMPT_TOKENS)["input_ids"]
         if tuple(input_ids.shape) != (1, PROMPT_TOKENS):
             raise ValueError(f"the prompt must have {PROMPT_TOKENS} tokens, got {tuple(input_ids.shape)}")
-        prefill_layers, decode_layers = generation_layers(model, args.kv)
+        prefill_layers, decode_layers = generation_layers(model, args.kv, PROMPT_TOKENS)
         embedded = model.model.embed_tokens(input_ids)
 
         # Hugging Face FP32: checkpoint layer마다 출력 hidden을 hook으로 받는다.
@@ -106,10 +106,10 @@ def main():
         print(f"C3b next token: fp32={next_token(model, reference[-1])} w8a8={next_token(model, prefill_hidden)}",
               flush=True)
 
-        # C2: 위치 0..1022만 유효한 prefill cache로 token 1023을 decode한다.
+        # C2: 위치 0..1022만 유효한 prefill cache로 token 1023을 decode한다 (tail 없음).
         position = PROMPT_TOKENS - 1
         decoded, *_ = run_layers(decode_layers, *decode_inputs(
-            model, model.model.embed_tokens(input_ids[:, position:]), position, cache))
+            model, model.model.embed_tokens(input_ids[:, position:]), position, position, cache))
         last_row = prefill_hidden[:, position:]
         decode_error, decode_cosine = compare(decoded, last_row)
         print(f"C2 decode vs prefill row {position}: max_abs={(decoded - last_row).abs().max().item():.3e} "

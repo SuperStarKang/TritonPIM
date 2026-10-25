@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from e2e.llama_generation import PROMPT_TOKENS, generate, generation_layers, run_layers
+from e2e.llama_generation import generate, generation_layers, run_layers
 
 
 def main():
@@ -36,9 +36,9 @@ def main():
         model = AutoModelForCausalLM.from_pretrained(
             checkpoint, local_files_only=True, dtype=torch.float32, attn_implementation="eager",
         ).cpu().eval().requires_grad_(False)
-        prefill_layers, decode_layers = generation_layers(model, report["kv"])
+        prefill_layers, decode_layers = generation_layers(model, report["kv"], report["prompt_tokens"])
         input_ids = tokenizer(Path(report["prompt_file"]).read_text(encoding="utf-8"), return_tensors="pt",
-                              truncation=True, max_length=PROMPT_TOKENS)["input_ids"]
+                              truncation=True, max_length=report["prompt_tokens"])["input_ids"]
         # CPU layer는 host cache를 그대로 읽으므로 store할 곳이 없다.
         result = generate(model, input_ids, report["max_new_tokens"],
                           lambda hidden, cache, after_layer: run_layers(

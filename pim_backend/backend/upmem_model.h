@@ -70,10 +70,6 @@ void upmem_model_kv_select(struct upmem_model_kernel *kernel, const uint32_t *jo
 void upmem_model_kv_gather(struct upmem_model_kernel *kernel, uint32_t binding, uint8_t *images);
 void upmem_model_kv_push_region(struct upmem_model_kernel *kernel, uint32_t address,
                                 const uint8_t *images, uint32_t length);
-// upmem_kv_scatter program이 적재된 상태에서 호출한다. addresses는 capacity개(공통),
-// data는 DPU마다 capacity개의 8 byte 값이고, 앞의 count개가 MRAM에 쓰인다.
-void upmem_model_kv_scatter(struct upmem_model_kernel *kernel, uint32_t count, uint32_t capacity,
-                            const uint32_t *addresses, const uint64_t *data);
 void upmem_model_transfer(struct upmem_model_kernel *kernel, uint32_t binding,
                           int output);
 void upmem_model_metadata(struct upmem_model_kernel *kernel, const char *symbol);
