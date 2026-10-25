@@ -41,6 +41,19 @@ KEY = "key"
 VALUE = "value"
 
 
+def token_rows(cache, positions, start, stop):
+    """Columns [start, stop) of the token-row view of a host key/value cache, at positions.
+
+    The host cache of a layer is [kv_heads, positions, head_dim], one KV head after another.
+    A cache stage names the KV heads it reads as columns of the view [positions, kv_heads *
+    head_dim] (stage.kv_windows); start and stop fall on head boundaries. positions is an
+    index tensor or a slice. Returns a copy, [len(positions), stop - start].
+    """
+    head_dim = cache.shape[2]
+    heads = cache[start // head_dim:stop // head_dim, positions]
+    return heads.permute(1, 0, 2).reshape(heads.shape[1], stop - start)
+
+
 @dataclass(frozen=True)
 class UnitResources:
     units: int

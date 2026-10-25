@@ -8,7 +8,9 @@ group's weight range. Entering the first layer of a group copies its images with
 one transfer per (region, FPGA) and drops them; the group's layers then run
 without further uploads. While a group runs, a background thread packs the next
 group: pack calls write host memory only, since PIM computation and DMA to the
-same FPGA cannot overlap.
+same FPGA cannot overlap. The only group of a phase (every layer resident) is
+uploaded once before anything runs, so it is packed and sent one region at a time
+with the same transfers, and the host holds one region's image instead of the group's.
 
 Buffer addresses come from the memory table, laid out as the weights of every
 slot, the state of every slot (descriptor chain, PMM), then the activation
@@ -35,7 +37,7 @@ import ctypes
 import time
 
 from .compiler import _run_translate
-from .residency import INPUT, OUTPUT, STATE, WEIGHT, OperandRequirement, StageRequirement
+from .residency import INPUT, OUTPUT, STATE, WEIGHT, OperandRequirement, StageRequirement, token_rows
 from .runtime import GroupLoader, current_invocation, group_order
 
 # operand 시작 주소 정렬. data buffer는 16 KB 정렬이 필요하고(8 KB면 결과가 틀린다, batch 8 실측),
@@ -374,39 +376,53 @@ class AiMXModelRuntime:
         stage.function(ctypes.byref(stage.call), *call_arguments)
 
     def _pack_group(self, key):
-        """Host images of one group's weight range, one per FPGA; the range starts at offset 0.
+        """Host images of one group's weight range, one per FPGA, for _push_group.
 
         Pack calls write host memory only, so this may run while other stages compute.
-        Returns ({FPGA: image}, bytes of the range).
+        The only group of a phase (every layer resident) is uploaded once, before anything
+        runs, so there is nothing to overlap: its packing is left to _push_group, which packs
+        and sends one region at a time and so holds one region's image, not the group's.
+        Returns (key, [(images {FPGA: image}, start, stop)]) or (key, None) for that case.
         """
+        if self.layout.groups == 1:
+            return key, None
         layers = self.plans_of_group[key]
-        weight_bytes = sum(self.layout.slot_weight_bytes[:len(layers)])
-        weight_stages = [(plan, stage) for plan in layers for stage in plan.stages if any(stage.weight_mask)]
+        return key, [self._pack_range(layers, 0, sum(self.layout.slot_weight_bytes[:len(layers)]))]
+
+    def _pack_range(self, layers, start, stop):
+        """Images of the weight table range [start, stop) of layers, one per FPGA; start is a
+        region start. A slot's weights never cross a region, so a stage is in or out whole."""
+        weight_stages = []
+        for plan in layers:
+            for stage in plan.stages:
+                if not any(stage.weight_mask):
+                    continue
+                entry = next(self.memory.entries[(plan.phase, plan.index, stage.name, index)]
+                             for index, kind in enumerate(stage.slot_table_kinds) if kind == WEIGHT)
+                if start <= entry.offset < stop:
+                    weight_stages.append((stage, entry))
         # stage가 image 안 자기 buffer 자리에 바로 조립한다. 아무도 쓰지 않는 정렬 간격은 0으로 읽힌다.
-        images = {fpga: self.library.aimx_host_image_create(weight_bytes)
-                  for fpga in sorted({fpga for _, stage in weight_stages for fpga in stage.fpgas})}
-        for plan, stage in weight_stages:
-            entry = next(self.memory.entries[(plan.phase, plan.index, stage.name, index)]
-                         for index, kind in enumerate(stage.slot_table_kinds) if kind == WEIGHT)
+        images = {fpga: self.library.aimx_host_image_create(stop - start)
+                  for fpga in sorted({fpga for stage, _ in weight_stages for fpga in stage.fpgas})}
+        for stage, entry in weight_stages:
             # stub은 weight buffer(VA v)를 host + (v - pack_va)에 쓴다. pack_va를 그 FPGA에서
-            # offset 0이 있을 VA로 두면 image 안의 위치가 table offset과 같아진다.
+            # table offset start가 있을 VA로 두면 image 안의 위치가 table offset - start가 된다.
             stage.pack_hosts = (ctypes.c_void_p * len(stage.fpgas))(*(images[fpga] for fpga in stage.fpgas))
             stage.pack_vas = (ctypes.c_uint64 * len(stage.fpgas))(
-                *(self._address(entry, fpga, "va") - entry.offset for fpga in stage.fpgas))
+                *(self._address(entry, fpga, "va") - entry.offset + start for fpga in stage.fpgas))
             stage.call.pack_hosts = ctypes.cast(stage.pack_hosts, ctypes.POINTER(ctypes.c_void_p))
             stage.call.pack_vas = ctypes.cast(stage.pack_vas, ctypes.POINTER(ctypes.c_uint64))
             self._call(stage, stage.preparation_matrices, stage.preparation_output, upload=2)
         # 이 thread의 host 조립 buffer를 돌려준다. 다른 thread는 계속 stage를 실행하고 있을 수 있다.
         self.library.aimx_host_cache_clear_thread()
-        return images, weight_bytes
+        return images, start, stop
 
-    def _push_group(self, packed):
-        """One transfer per region the group's weight range covers, on every FPGA."""
-        images, weight_bytes = packed
-        items = [(self.regions[(index, fpga)], image + chunk_start,
-                  min(chunk_start + size, weight_bytes) - chunk_start)
+    def _push_range(self, images, start, stop):
+        """One transfer per region the range [start, stop) covers, on every FPGA of images."""
+        items = [(self.regions[(index, fpga)], image + chunk_start - start,
+                  min(chunk_start + size, stop) - chunk_start)
                  for fpga, image in images.items()
-                 for index, (chunk_start, size) in enumerate(self.chunks) if chunk_start < weight_bytes]
+                 for index, (chunk_start, size) in enumerate(self.chunks) if start <= chunk_start < stop]
         if not items:
             return
         regions, hosts, sizes = zip(*items)
@@ -415,10 +431,30 @@ class AiMXModelRuntime:
             (ctypes.c_void_p * len(items))(*hosts), (ctypes.c_int64 * len(items))(*sizes))
         self.totals["weight_bytes"] += sum(sizes)
 
-    def _release_group(self, packed):
-        images, weight_bytes = packed
+    def _destroy_range(self, images, start, stop):
         for image in images.values():
-            self.library.aimx_host_image_destroy(image, weight_bytes)
+            self.library.aimx_host_image_destroy(image, stop - start)
+
+    def _push_group(self, packed):
+        key, pieces = packed
+        if pieces is not None:
+            for piece in pieces:
+                self._push_range(*piece)
+            return
+        # 유일한 group: region마다 pack → push → 해제. 전송 수는 group을 한 번에 pack할 때와 같다.
+        layers = self.plans_of_group[key]
+        weight_bytes = sum(self.layout.slot_weight_bytes[:len(layers)])
+        for chunk_start, size in self.chunks:
+            if chunk_start >= weight_bytes:
+                continue
+            piece = self._pack_range(layers, chunk_start, min(chunk_start + size, weight_bytes))
+            self._push_range(*piece)
+            self._destroy_range(*piece)
+
+    def _release_group(self, packed):
+        _, pieces = packed
+        for piece in pieces or ():
+            self._destroy_range(*piece)
 
     def enter_layer(self, plan):
         # group이 바뀔 때만 그 group의 weight를 한 번 올린다 (pack은 대개 앞 group 실행 중에 끝나 있다).
@@ -430,8 +466,9 @@ class AiMXModelRuntime:
     def write_kv(self, stage, cache, start, stop):
         """Queue positions [start, stop) of cache for the next run of any stage reading the cache.
 
-        cache is [positions, heads * head_dim]; instance i reads the columns stage.kv_windows[i],
-        transposed if stage.kv says so. cache must keep those positions until they are sent.
+        cache is [kv_heads, positions, head_dim]; instance i reads the columns stage.kv_windows[i]
+        of its token-row view (residency.token_rows), transposed if stage.kv says so. cache must
+        keep those positions until they are sent.
         """
         operand, _, transposed = stage.kv
         if operand != 1 or stage.slot_layouts[stage.kv_slot][6]:
@@ -440,8 +477,8 @@ class AiMXModelRuntime:
         # B는 [K, N]이다. 전치 cache operand(Kᵀ)는 열이 위치, 아니면 행이 위치다.
         positions, features = (n, k) if transposed else (k, n)
         if ({window_stop - window_start for window_start, window_stop in stage.kv_windows} != {features}
-                or cache.shape[0] != positions
-                or max(window_stop for _, window_stop in stage.kv_windows) > cache.shape[1]):
+                or cache.shape[1] != positions
+                or max(window_stop for _, window_stop in stage.kv_windows) > cache.shape[0] * cache.shape[2]):
             raise ValueError(f"{stage.name}: cache {tuple(cache.shape)} with windows {stage.kv_windows} "
                              f"does not match the B operand of (M, N, K) = {stage.shape}")
         if not 0 <= start < stop <= positions:
@@ -468,8 +505,7 @@ class AiMXModelRuntime:
         """BF16 bits of one instance's cache window at positions, [len(positions), width]."""
         import torch
 
-        window_start, window_stop = stage.kv_windows[instance]
-        return cache[positions, window_start:window_stop].to(torch.bfloat16).view(torch.int16)
+        return token_rows(cache, positions, *stage.kv_windows[instance]).to(torch.bfloat16).view(torch.int16)
 
     @staticmethod
     def _int16_view(address, bytes):
@@ -483,7 +519,7 @@ class AiMXModelRuntime:
 
         start = time.perf_counter_ns()
         entry = stage.kv_entry
-        positions = torch.arange(cache.shape[0])
+        positions = torch.arange(cache.shape[1])
         offsets = self._kv_offsets(
             stage, positions, torch.arange(stage.kv_windows[0][1] - stage.kv_windows[0][0])).flatten()
         images = [self.library.aimx_host_image_create(entry.bytes) for _ in stage.fpgas]
@@ -495,10 +531,10 @@ class AiMXModelRuntime:
         stage.call.pack_vas = ctypes.cast(stage.pack_vas, ctypes.POINTER(ctypes.c_uint64))
         # pack은 cache operand만 조립한다. A 자리에는 아무 tensor나 둔다.
         placeholder = torch.empty((1, 1), dtype=cache.dtype)
-        matrices = tuple(
-            (placeholder, (cache[:, window_start:window_stop].t() if stage.kv[2]
-                           else cache[:, window_start:window_stop]).contiguous())
-            for window_start, window_stop in stage.kv_windows)
+        windows = [token_rows(cache, slice(None), *window) for window in stage.kv_windows]
+        # stage는 cache operand를 연속 배치로 compile했다 (_LayerGemm.prepare).
+        matrices = tuple((placeholder, (window.t() if stage.kv[2] else window).contiguous())
+                         for window in windows)
         self._call(stage, matrices, stage.preparation_output, upload=2)
         for instance, image in enumerate(images):
             expected = torch.zeros(entry.bytes // 2, dtype=torch.int16)

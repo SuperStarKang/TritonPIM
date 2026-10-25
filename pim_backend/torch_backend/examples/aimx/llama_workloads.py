@@ -81,19 +81,24 @@ def reference_layer(layer, hidden, cosine, sine):
 
 
 class CheckpointLinear(torch.nn.Module):
-    """HF Linear weight [out, in] stored as a BF16 [in, padded out] GEMM operand."""
+    """HF Linear weight [out, in] BF16; the GEMM operand is its transpose view [in, out].
+
+    The buffer is the checkpoint tensor itself (a BF16 checkpoint is not copied); the PIM
+    stage reads the view through its strides. padded_features adds zero output rows, a
+    padded copy, for the prefill layer's N in 512 columns.
+    """
 
     def __init__(self, linear, padded_features=None):
         super().__init__()
         if linear.bias is not None:
             raise ValueError("this experiment requires bias-free projections")
-        weight = linear.weight.detach().t().to(torch.bfloat16).contiguous()
+        weight = linear.weight.detach().to(torch.bfloat16)
         padding = (padded_features or linear.out_features) - linear.out_features
-        self.register_buffer("weight", torch.nn.functional.pad(weight, (0, padding)))
+        self.register_buffer("weight", torch.nn.functional.pad(weight, (0, 0, 0, padding)) if padding else weight)
         self.out_features = linear.out_features
 
     def forward(self, activation):
-        output = torch.mm(activation.reshape(-1, activation.shape[-1]).bfloat16(), self.weight).float()
+        output = torch.mm(activation.reshape(-1, activation.shape[-1]).bfloat16(), self.weight.t()).float()
         if output.shape[-1] != self.out_features:
             output = output[:, :self.out_features].contiguous()
         return output.reshape(*activation.shape[:-1], self.out_features)

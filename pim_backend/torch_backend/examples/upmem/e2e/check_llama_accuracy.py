@@ -109,8 +109,7 @@ def main():
         # C2: 위치 0..1022만 유효한 prefill cache로 token 1023을 decode한다.
         position = PROMPT_TOKENS - 1
         decoded, *_ = run_layers(decode_layers, *decode_inputs(
-            model, model.model.embed_tokens(input_ids[:, position:]), position, cache,
-            torch.arange(cache[0][0].shape[1])))
+            model, model.model.embed_tokens(input_ids[:, position:]), position, cache))
         last_row = prefill_hidden[:, position:]
         decode_error, decode_cosine = compare(decoded, last_row)
         print(f"C2 decode vs prefill row {position}: max_abs={(decoded - last_row).abs().max().item():.3e} "

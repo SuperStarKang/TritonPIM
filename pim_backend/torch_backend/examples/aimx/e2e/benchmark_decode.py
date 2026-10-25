@@ -70,7 +70,7 @@ def main():
 
     with torch.no_grad():
         token, caches = prefill_caches(model, input_ids, capacity)
-        layers = [LlamaAimxDecodeLayer(layer, index, args.fpgas).eval()
+        layers = [LlamaAimxDecodeLayer(layer, index).eval()
                   for index, layer in enumerate(model.model.layers)]
         # CPU 기준: 같은 layer를 eager로 돌린다. store는 할 일이 없다.
         reference_tokens, reference_logits, reference_ms = generate(
@@ -95,9 +95,6 @@ def main():
               f"p_b={stage.p_b} rounds={stage.batch_rounds} config={stage.config.key()}", flush=True)
 
     with compiled.session as session:
-        # AiMX cache stage는 instance마다 모든 위치를 가지므로 위치 순서를 바꾸지 않는다.
-        if not torch.equal(session.kv_rows("decode"), torch.arange(capacity)):
-            raise ValueError("the AiMX cache rows must be the positions in order")
         for layer, (key_cache, value_cache) in enumerate(caches):
             session.write_kv(layer, KEY, key_cache, 0, args.prompt_tokens)
             session.write_kv(layer, VALUE, value_cache, 0, args.prompt_tokens)

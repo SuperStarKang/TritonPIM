@@ -26,11 +26,6 @@ from attention.int8_workloads import rotate_half
 KV_MODES = ("share", "repeat")
 
 
-def token_rows(tensor):
-    """[kv_heads, positions, width] -> [positions, kv_heads * width]: one row per token, heads side by side."""
-    return tensor.transpose(0, 1).reshape(tensor.shape[1], -1)
-
-
 def quantize_rows(activation):
     """INT8 values and the FP32 scale [..., 1] of every row (last axis): absmax / 127."""
     # 모두 0인 행(compile 예제 입력)은 scale이 0이 되지 않게 해서 0으로 양자화한다.
@@ -140,16 +135,15 @@ class LlamaPrefillLayer(torch.nn.Module):
 class LlamaDecodeLayer(torch.nn.Module):
     """One new token through the projections of a prefill layer, reading the key/value cache.
 
-    caches holds, per layer, the INT8 key [capacity, kv_heads * head_dim] after RoPE (one
-    row per position, KV head h in columns [h * head_dim, (h + 1) * head_dim)), its scale
-    [capacity, kv_heads], the INT8 value and its scale, quantized as the prefill layer
-    quantizes them; valid [1, capacity] marks the positions already written. A query head
-    reads the column window of its KV head. The new token's own key and value are not in
-    the cache: its score and its value join the attention on the CPU, so this layer only
-    reads the cache. The caller writes the returned (key, key scale, value, value scale)
-    rows [1, ...] at the token position after the step. Every GEMM has one output row or column (decode GEMV): the
-    projections and the probability x value cache read one row, the key cache x query
-    one column.
+    caches holds, per layer, the INT8 key [kv_heads, capacity, head_dim] after RoPE, its scale
+    [kv_heads, capacity], the INT8 value and its scale, quantized as the prefill layer
+    quantizes them; positions are token positions and valid [1, capacity] marks those already
+    written. A query head reads its KV head h // group. The new token's own key and value are
+    not in the cache: its score and its value join the attention on the CPU, so this layer
+    only reads the cache. The caller writes the returned (key [kv_heads, head_dim], key scale
+    [kv_heads], value, value scale) at the token position after the step. Every GEMM has one
+    output row (decode GEMV): the projections, query x key[h]^T and probability x value[h],
+    the cache operand on the right as in the AiMX decode layer (examples/aimx/llama_decode.py).
     """
 
     def __init__(self, prefill, index):
@@ -164,9 +158,13 @@ class LlamaDecodeLayer(torch.nn.Module):
         self.head_dim = prefill.head_dim
         self.hidden_size = prefill.hidden_size
 
+    def window(self, cache, head):
+        """The cache [capacity, head_dim] of the KV head that query head reads."""
+        return cache[head // self.group]
+
     def forward(self, activation, cosine, sine, valid, caches, new):
         key_cache, key_cache_scale, value_cache, value_cache_scale = caches[self.index]
-        capacity = key_cache.shape[0]
+        capacity = key_cache.shape[1]
         normalized, normalized_scale = quantize_rows(self.input_layernorm(activation))
         query = self.q_proj(normalized, normalized_scale).reshape(self.heads, 1, self.head_dim)
         key = self.k_proj(normalized, normalized_scale).reshape(self.kv_heads, 1, self.head_dim)
@@ -176,16 +174,15 @@ class LlamaDecodeLayer(torch.nn.Module):
         value, value_scale = quantize_rows(value)
 
         cache_scores = torch.stack([
-            torch._int_mm(key_cache.narrow(1, head // self.group * self.head_dim, self.head_dim),
-                          query[head].reshape(self.head_dim, 1).contiguous()).reshape(capacity)
+            torch._int_mm(query[head], self.window(key_cache, head).t()).reshape(capacity)
             for head in range(self.heads)])
         own_key = key.repeat_interleave(self.group, dim=0)
         own_scores = (query.to(torch.int32) * own_key.to(torch.int32)).sum(dim=-1)
         # cache 위치 0..capacity-1 다음에 새 위치 하나가 붙는다. scale도 같은 순서로 잇는다.
         scores = torch.cat((cache_scores, own_scores), dim=1)
-        key_scales = torch.cat((key_cache_scale.t(), key_scale.reshape(self.kv_heads, 1)), dim=1
+        key_scales = torch.cat((key_cache_scale, key_scale.reshape(self.kv_heads, 1)), dim=1
                                ).repeat_interleave(self.group, dim=0)
-        value_scales = torch.cat((value_cache_scale.t(), value_scale.reshape(self.kv_heads, 1)), dim=1
+        value_scales = torch.cat((value_cache_scale, value_scale.reshape(self.kv_heads, 1)), dim=1
                                  ).repeat_interleave(self.group, dim=0)
         scores = scores.float() * query_scale.reshape(self.heads, 1) * key_scales / math.sqrt(self.head_dim)
         visible = torch.cat((valid, torch.ones((1, 1), dtype=torch.bool)), dim=1)
@@ -194,7 +191,7 @@ class LlamaDecodeLayer(torch.nn.Module):
 
         cache_outputs = torch.stack([
             torch._int_mm(weighted[head, :capacity].reshape(1, capacity).contiguous(),
-                          value_cache.narrow(1, head // self.group * self.head_dim, self.head_dim)
+                          self.window(value_cache, head)
                           ).reshape(self.head_dim)
             for head in range(self.heads)])
         own_value = value.repeat_interleave(self.group, dim=0).reshape(self.heads, self.head_dim)
@@ -207,5 +204,6 @@ class LlamaDecodeLayer(torch.nn.Module):
                  * self.up_proj(normalized, normalized_scale))
         output = hidden + self.down_proj(*quantize_rows(gated))
         # Session은 tuple 출력을 다음 layer의 위치 인자로 넘긴다. cache는 읽기만 하고 그대로 넘긴다.
-        return output, cosine, sine, valid, caches, new + (tuple(
-            token_rows(part) for part in (key, key_scale, value, value_scale)),)
+        # key/value [kv_heads, 1, head_dim], scale [kv_heads, 1, 1] -> 위치 하나의 값
+        return output, cosine, sine, valid, caches, new + (
+            (key[:, 0], key_scale[:, 0, 0], value[:, 0], value_scale[:, 0, 0]),)

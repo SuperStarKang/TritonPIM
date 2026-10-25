@@ -13,7 +13,7 @@ from triton.runtime.cache import get_cache_manager
 
 from .compiler import _run_translate
 from .residency import INPUT as INPUT_KIND, OUTPUT as OUTPUT_KIND, WEIGHT as WEIGHT_KIND
-from .residency import OperandRequirement, StageRequirement
+from .residency import OperandRequirement, StageRequirement, token_rows
 from .upmem_artifact import (
     INPUT, KV, MRAM_BASE, OUTPUT, WEIGHT, TransferStats, _artifact_bindings, _build_program, _staging_layout,
 )
@@ -50,6 +50,17 @@ def _build_model_host(bundle, runtime_path):
             "-Wl,-rpath," + str(Path(runtime_path).parent), "-o", str(library),
         ])
         return cache.put(library.read_bytes(), "model_host.so", binary=True)
+
+
+def _positions_on_rows(stage):
+    """Whether the cache positions run along the rows of the GEMV matrix of stage.
+
+    A cache stage is a GEMV (execution.gemm_problem): its matrix is the left operand, or the
+    transpose of the right one. An operand that is the transpose of the cache window swaps
+    rows and columns once more.
+    """
+    operand, _, transposed = stage.kv
+    return (operand == 0) != transposed
 
 
 class ModelCompileInvocation:
@@ -321,20 +332,24 @@ class UPMEMModelRuntime:
         """Queue positions [start, stop) of cache for the next run of any stage reading the cache.
 
         Right before that run every queued position goes into the host image of the cache and
-        the whole cache range goes out in one transfer. cache is [positions, heads * head_dim]
+        the whole cache range goes out in one transfer. cache is [kv_heads, positions, head_dim]
         and must keep those positions until then; instance i reads the columns
-        stage.kv_windows[i] of it.
+        stage.kv_windows[i] of its token-row view (residency.token_rows), or their transpose if
+        stage.kv says so.
         """
-        operand = stage.kv[0]
+        operand, _, transposed = stage.kv
         m, n, k = stage.shape
+        rows, cols = (m, k) if operand == 0 else (k, n)
+        # operand가 window의 전치면 위치가 열 쪽이다.
+        positions, width = (cols, rows) if transposed else (rows, cols)
         windows = {stop - window_start for window_start, stop in stage.kv_windows}
-        if (windows != {k if operand == 0 else n}
-                or cache.shape[0] != (m if operand == 0 else k)
-                or max(stop for _, stop in stage.kv_windows) > cache.shape[1]):
+        if (windows != {width}
+                or cache.shape[1] != positions
+                or max(stop for _, stop in stage.kv_windows) > cache.shape[0] * cache.shape[2]):
             raise ValueError(f"{stage.name}: cache {tuple(cache.shape)} with windows {stage.kv_windows} "
                              f"does not match operand {operand} of (M, N, K) = {stage.shape}")
-        if not 0 <= start < stop <= cache.shape[0]:
-            raise ValueError(f"positions [{start}, {stop}) are outside the cache of {cache.shape[0]}")
+        if not 0 <= start < stop <= cache.shape[1]:
+            raise ValueError(f"positions [{start}, {stop}) are outside the cache of {cache.shape[1]}")
         self.kv_pending.setdefault(stage, []).append((cache, start, stop))
 
     def _kv_layout(self, stage):
@@ -346,8 +361,6 @@ class UPMEMModelRuntime:
         """
         import torch
 
-        if stage.kv[2]:
-            raise ValueError(f"{stage.name}: UPMEM reads a cache window in place, not its transpose")
         (tile_rows, tile_cols), (rows, cols) = stage.kv_staging
         config = stage.config
         extent = config.execution_extent
@@ -372,37 +385,38 @@ class UPMEMModelRuntime:
         """The slot_bytes of every job's cache slot from the host cache, [jobs, len(slot_bytes)] int8."""
         import torch
 
-        operand = stage.kv[0]
         slot_rows, slot_cols = stage.kv_layout
         config = stage.config
         rows, cols = stage.kv_staging[1]
         # (p_m, 길이), (p_k, 길이): stage 행렬 안의 행과 열
         matrix_rows = (torch.arange(config.p_m) * rows).reshape(-1, 1) + slot_rows[slot_bytes]
         matrix_cols = (torch.arange(config.p_k) * cols).reshape(-1, 1) + slot_cols[slot_bytes]
-        # 왼쪽 operand는 행이 위치, 오른쪽 operand(행렬이 Bᵀ)는 열이 위치다.
-        positions, features = ((matrix_rows[:, None], matrix_cols[None]) if operand == 0
+        positions, features = ((matrix_rows[:, None], matrix_cols[None]) if _positions_on_rows(stage)
                                else (matrix_cols[None], matrix_rows[:, None]))
         positions, features = torch.broadcast_tensors(positions, features)
         # 모든 window의 폭이 같다 (write_kv가 확인한다).
         width = stage.kv_windows[0][1] - stage.kv_windows[0][0]
         # unit이 cache 끝을 넘어 맡는 자리는 생성 pack처럼 0이다.
-        inside = (positions < cache.shape[0]) & (features < width)
+        inside = (positions < cache.shape[1]) & (features < width)
         starts = torch.tensor([start for start, _ in stage.kv_windows]).reshape(-1, 1, 1, 1)
-        values = cache[positions.clamp(max=cache.shape[0] - 1), starts + features.clamp(max=width - 1)]
+        # token-row view의 열 c는 KV head c // head_dim의 c % head_dim번째 값이다.
+        columns = starts + features.clamp(max=width - 1)
+        head_dim = cache.shape[2]
+        values = cache[columns // head_dim, positions.clamp(max=cache.shape[1] - 1), columns % head_dim]
         return torch.where(inside, values, torch.zeros((), dtype=cache.dtype)).reshape(-1, len(slot_bytes)).contiguous()
 
     def _kv_bytes(self, stage, start, stop):
         """Bytes of a slot that hold positions [start, stop) in every unit; the whole slot if they span units."""
         import torch
 
-        operand = stage.kv[0]
+        on_rows = _positions_on_rows(stage)
         slot_rows, slot_cols = stage.kv_layout
-        extent = stage.kv_staging[1][0 if operand == 0 else 1]
+        extent = stage.kv_staging[1][0 if on_rows else 1]
         if stop - start >= extent or start // extent != (stop - 1) // extent:
             return torch.arange(slot_rows.numel())
         # 모든 unit이 같은 배치이므로 unit 안 위치 번호가 같은 자리를 함께 쓴다. 그 위치를 맡지 않은
         # unit의 그 자리는 host cache의 현재 값을 다시 쓴다.
-        local = slot_rows if operand == 0 else slot_cols
+        local = slot_rows if on_rows else slot_cols
         return torch.nonzero((local >= start % extent) & (local <= (stop - 1) % extent)).flatten()
 
     def _check_kv_layout(self, stage, cache):
@@ -414,10 +428,12 @@ class UPMEMModelRuntime:
         binding = next(index for index, binding in enumerate(stage.bindings) if binding.role == KV)
         size = stage.bindings[binding].size
         self.library.upmem_model_kv_select(stage.handle, (ctypes.c_uint32 * jobs)(*range(jobs)), jobs)
-        windows = [cache[:, start:stop].contiguous() for start, stop in stage.kv_windows]
+        windows = [token_rows(cache, slice(None), *window) for window in stage.kv_windows]
+        # stage는 cache operand를 연속 배치로 compile했다 (_LayerGemm.prepare).
+        operands = [(window.t() if stage.kv[2] else window).contiguous() for window in windows]
         self.library.upmem_model_pools_acquire(stage.handle)
         # 다른 operand는 KV_PACK에서 읽지 않는다. 같은 window를 넘긴다.
-        self.invoke(stage, tuple((window, window) for window in windows), stage.preparation_output,
+        self.invoke(stage, tuple((operand, operand) for operand in operands), stage.preparation_output,
                     upload_weights=KV_PACK)
         packed = torch.empty(jobs * size, dtype=torch.int8)
         self.library.upmem_model_kv_gather(stage.handle, binding, packed.data_ptr())

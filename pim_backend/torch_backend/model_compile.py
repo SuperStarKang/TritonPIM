@@ -39,9 +39,8 @@ from .template import TORCH_GEMM_TEMPLATE_VERSION
 class StageModule(torch.nn.Module):
     """One stage class alone: a weight GEMM, or its independent activation GEMM instances.
 
-    A key/value cache class takes the cache first, [positions, instances * width], and
-    instance i reads the column window i of width columns, or its transpose, as its cache
-    operand.
+    A key/value cache class takes the cache first, [instances, positions, width], and
+    instance i reads cache[i], or its transpose, as its cache operand.
     """
 
     def __init__(self, key, weights):
@@ -68,8 +67,7 @@ class StageModule(torch.nn.Module):
             return self._gemm(*inputs)
         if self.key.has_kv:
             cache, *others = inputs
-            width = cache.shape[1] // self.key.instances
-            windows = [cache.narrow(1, instance * width, width) for instance in range(self.key.instances)]
+            windows = [cache[instance] for instance in range(self.key.instances)]
             if self.key.kv_transposed:
                 windows = [window.t() for window in windows]
             if self.key.kv_mask[0]:
@@ -98,11 +96,11 @@ def stage_inputs(key):
     if key.op == "aten.bmm.default":
         return (tensor(key.instances, m, k), tensor(key.instances, k, n))
     if key.has_kv:
-        # cache operand가 (rows, cols)이면 cache window는 그것이거나(전치면) 그 전치다.
+        # cache operand가 (rows, cols)이면 cache의 head 하나는 그것이거나(전치면) 그 전치다.
         (rows, cols), other = ((m, k), (k, n)) if key.kv_mask[0] else ((k, n), (m, k))
         if key.kv_transposed:
             rows, cols = cols, rows
-        return (tensor(rows, key.instances * cols),) + tuple(tensor(*other) for _ in range(key.instances))
+        return (tensor(key.instances, rows, cols),) + tuple(tensor(*other) for _ in range(key.instances))
     return tuple(operand for _ in range(key.instances) for operand in (tensor(m, k), tensor(k, n)))
 
 
@@ -327,14 +325,12 @@ def member_classes(stage_class):
     assignment = {}
     for sources in stage_class.stage_sources:
         if axis == "n":
-            # member마다 원래 GEMM 하나이고, 이어 붙인 weight의 열 구간 하나를 쓴다.
+            # member마다 원래 GEMM 하나이고, 이어 붙인 weight(fx_packing.ConcatenatedWeight)의 part 하나를 쓴다.
             parts = []
-            start = 0
-            for source, mnk in zip(sources, shapes, strict=True):
-                weights = tuple(None if weight is None else weight[:, start:start + mnk[1]]
+            for index, (source, mnk) in enumerate(zip(sources, shapes, strict=True)):
+                weights = tuple(None if weight is None else weight.parts[index]
                                 for weight in stage_class.weights)
                 parts.append(((source,), mnk, weights))
-                start += mnk[1]
         else:
             # 원래 GEMM들이 instance로 묶인 stage 하나가 된다.
             parts = [(sources, shapes[0], stage_class.weights)]

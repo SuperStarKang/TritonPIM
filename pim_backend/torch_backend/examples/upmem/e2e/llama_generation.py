@@ -2,14 +2,14 @@
 
 The prefill layers return the INT8 key and value of their 1024 positions with one scale
 per (head, position); after each prefill layer the host writes them into that layer's
-cache, which holds 1024 + new tokens positions. Each decode step feeds the last token at
-the next position through the decode layers, which read the cache and return the new key
-and value with their scales; the host writes them after the step. Position p sits at cache
-row rows[p] (on PIM the cyclic order of PIMSession.kv_rows, so the written positions fill
-every unit evenly); the key, the value, their scales and the valid mask share that order.
-After every write, store(layer, cache, start, stop) is told which rows changed: on PIM it
-sends them to the device cache the decode layers read in place (decode_kv_inputs), on the
-CPU it does nothing. The scales stay on the host.
+cache, [kv_heads, 1024 + new tokens, head_dim] (the scales [kv_heads, positions]), the
+layout the AiMX decode layer uses too. Each decode step feeds the last token at the next
+position through the decode layers, which read the cache and return the new key and value
+with their scales; the host writes them at that position after the step. Positions are
+token positions: each PIM target places them on its units in its own layout. After every
+write, store(layer, cache, start, stop) is told which positions changed: on PIM it sends
+them to the device cache the decode layers read in place (decode_kv_inputs), on the CPU it
+does nothing. The scales stay on the host.
 run_prefill and run_decode chain the layers of a phase, so a PIMSession phase and the
 CPU layers go through the same loop.
 """
@@ -19,7 +19,7 @@ import time
 import torch
 from triton.backends.pim.residency import KEY, VALUE
 
-from e2e.llama_workloads import LlamaDecodeLayer, LlamaPrefillLayer, quantize_rows, token_rows
+from e2e.llama_workloads import LlamaDecodeLayer, LlamaPrefillLayer, quantize_rows
 
 
 PROMPT_TOKENS = 1024
@@ -28,10 +28,11 @@ PROMPT_TOKENS = 1024
 class GenerationPrefillLayer(LlamaPrefillLayer):
     def forward(self, hidden, cache):
         hidden, key, value = super().forward(hidden)
-        # decode가 읽는 cache: prefill attention이 쓴 양자화 값과 scale을 토큰 행으로 둔다.
-        # [1024, kv_heads·head_dim], [1024, kv_heads]
-        return hidden, cache + (tuple(token_rows(part) for part in (*quantize_rows(key[0]),
-                                                                     *quantize_rows(value[0]))),)
+        # decode가 읽는 cache: prefill attention이 쓴 양자화 값 [kv_heads, 1024, head_dim]과
+        # scale [kv_heads, 1024]
+        key, key_scale = quantize_rows(key[0])
+        value, value_scale = quantize_rows(value[0])
+        return hidden, cache + ((key, key_scale[..., 0], value, value_scale[..., 0]),)
 
 
 def generation_layers(model, kv):
@@ -49,24 +50,19 @@ def generation_layers(model, kv):
 
 
 def empty_caches(config, capacity):
-    """Per layer: INT8 key, its scale, INT8 value, its scale; one row per position."""
-    shape = (capacity, config.num_key_value_heads * config.head_dim)
-    scale_shape = (capacity, config.num_key_value_heads)
+    """Per layer: INT8 key [kv_heads, capacity, head_dim], its scale [kv_heads, capacity], INT8 value, its scale."""
+    shape = (config.num_key_value_heads, capacity, config.head_dim)
+    scale_shape = (config.num_key_value_heads, capacity)
     return tuple((torch.zeros(shape, dtype=torch.int8), torch.zeros(scale_shape, dtype=torch.float32),
                   torch.zeros(shape, dtype=torch.int8), torch.zeros(scale_shape, dtype=torch.float32))
                  for _ in range(config.num_hidden_layers))
 
 
-def decode_inputs(model, hidden, position, caches, rows):
-    """First decode layer inputs for the token at position; the cache holds positions 0..position-1.
-
-    rows[p] is the cache row of position p, so the rows of the earlier positions are valid.
-    """
+def decode_inputs(model, hidden, position, caches):
+    """First decode layer inputs for the token at position; the cache holds positions 0..position-1."""
     cosine, sine = model.model.rotary_emb(hidden, position_ids=torch.tensor([[position]]))
-    capacity = caches[0][0].shape[0]
-    valid = torch.zeros(capacity, dtype=torch.bool)
-    valid[rows[:position]] = True
-    return hidden, cosine, sine, valid.unsqueeze(0), caches, ()
+    capacity = caches[0][0].shape[1]
+    return hidden, cosine, sine, (torch.arange(capacity) < position).unsqueeze(0), caches, ()
 
 
 def decode_kv_inputs(index, inputs):
@@ -78,9 +74,7 @@ def decode_kv_inputs(index, inputs):
 def decode_example(model, capacity):
     """Example inputs of the first decode layer at the first decode position."""
     hidden = torch.zeros((1, 1, model.config.hidden_size), dtype=torch.float32)
-    # 행 순서는 compile 뒤에 정해진다. 예시 입력은 shape만 쓰이므로 위치 순서로 둔다.
-    return decode_inputs(model, hidden, PROMPT_TOKENS, empty_caches(model.config, capacity),
-                         torch.arange(capacity))
+    return decode_inputs(model, hidden, PROMPT_TOKENS, empty_caches(model.config, capacity))
 
 
 def run_layers(layers, *inputs, after_layer=None):
@@ -92,29 +86,25 @@ def run_layers(layers, *inputs, after_layer=None):
     return inputs
 
 
-def generate(model, input_ids, new_tokens, rows, run_prefill, run_decode, store):
+def generate(model, input_ids, new_tokens, run_prefill, run_decode, store):
     """Greedy token ids of one request and the wall time of the first token and of every step.
 
-    rows[p] is the cache row of position p (PIMSession.kv_rows, or torch.arange for position
-    order). run_prefill(hidden, cache, after_layer) runs the prefill layers; run_decode(*inputs)
-    the decode layers. store(layer, cache, start, stop) follows every cache write of rows
-    [start, stop) of a layer; both times include it. The cache holds PROMPT_TOKENS + new_tokens
-    positions; the last token is never fed back.
+    run_prefill(hidden, cache, after_layer) runs the prefill layers; run_decode(*inputs) the
+    decode layers. store(layer, cache, start, stop) follows every cache write of positions
+    [start, stop) of a layer; both times include it. The cache holds PROMPT_TOKENS +
+    new_tokens positions; the last token is never fed back.
     """
     if tuple(input_ids.shape) != (1, PROMPT_TOKENS):
         raise ValueError(f"the prompt must have {PROMPT_TOKENS} tokens, got {tuple(input_ids.shape)}")
     capacity = PROMPT_TOKENS + new_tokens
-    if tuple(rows.shape) != (capacity,):
-        raise ValueError(f"rows order {tuple(rows.shape)} positions; the cache holds {capacity}")
     caches = empty_caches(model.config, capacity)
 
     def write_prefill(index, outputs):
         # layer index가 막 쓴 cache는 출력 cache tuple의 마지막 항목이다.
         _, prefill_cache = outputs
         for part, written in zip(caches[index], prefill_cache[index], strict=True):
-            part[rows[:PROMPT_TOKENS]] = written
-        # prefill 위치의 행은 연속이 아닐 수 있으므로 cache 전체를 알린다.
-        store(index, caches[index], 0, capacity)
+            part[:, :PROMPT_TOKENS] = written
+        store(index, caches[index], 0, PROMPT_TOKENS)
 
     start = time.perf_counter_ns()
     hidden, _ = run_prefill(model.model.embed_tokens(input_ids), (), write_prefill)
@@ -125,12 +115,11 @@ def generate(model, input_ids, new_tokens, rows, run_prefill, run_decode, store)
     for position in range(PROMPT_TOKENS, PROMPT_TOKENS + new_tokens - 1):
         start = time.perf_counter_ns()
         hidden = model.model.embed_tokens(token.reshape(1, 1))
-        hidden, *_, new = run_decode(*decode_inputs(model, hidden, position, caches, rows))
-        row = rows[position].item()
+        hidden, *_, new = run_decode(*decode_inputs(model, hidden, position, caches))
         for layer, (cache, new_parts) in enumerate(zip(caches, new, strict=True)):
             for part, written in zip(cache, new_parts, strict=True):
-                part[row:row + 1].copy_(written)
-            store(layer, cache, row, row + 1)
+                part[:, position] = written
+            store(layer, cache, position, position + 1)
         token = model.lm_head(model.model.norm(hidden[:, -1, :])).argmax(dim=-1)
         tokens.append(token.item())
         step_ms.append((time.perf_counter_ns() - start) / 1e6)

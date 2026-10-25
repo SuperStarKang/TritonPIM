@@ -673,6 +673,6 @@ Group M 256(W panel이 4096 폭으로 padding되어 B 저장·전송 2배)은 `h
 | GEMV W stage | §11.4: f32 23.8 ms, bf16 12.9 ms. `[K][M]` 배치(① 연속 복사)의 4096² 측정은 아직 없음. 호출마다 W를 올리는 측정이 autotuner 선택(Tile K)에 영향을 줌 |
 | device 사이 K 분할 (`p_k > 1`) | 구현 (§5.8). FPGA 실측 없음 |
 | Group마다 다른 mask | 미구현 |
-| A 재배치 융합 / host에서 Arel 직접 생성 | 미구현 |
+| A 재배치 융합 / host에서 Arel 직접 생성 | 미구현. host Arel로 채널마다 다른 vecA를 주는 것은 실측 확인, 설계 보류 ([AiMX_ChannelUnits.md](AiMX_ChannelUnits.md)) |
 | GEMV 커널의 rank-1 masked x/y | 예제 커널은 full-block만 허용한다 (`examples/silent_pim/gemv.py`) |
 | stage와 invoke 겹치기 | 없음. `pim_exec`가 동기이고 FPGA마다 host thread 하나 |

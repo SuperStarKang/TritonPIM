@@ -74,7 +74,7 @@ def main():
         hf_tokens = model.generate(input_ids, max_new_tokens=args.new_tokens, do_sample=False)[
             0, args.prompt_tokens:].tolist()
         token, caches = prefill_caches(model, input_ids, capacity)
-        layers = [LlamaAimxDecodeLayer(layer, index, args.fpgas).eval()
+        layers = [LlamaAimxDecodeLayer(layer, index).eval()
                   for index, layer in enumerate(model.model.layers)]
         cpu_tokens, cpu_logits, cpu_ms = generate(
             model, token, copy.deepcopy(caches), args.prompt_tokens, args.new_tokens,
@@ -107,9 +107,6 @@ def main():
         print(f"  stage {stage}", flush=True)
 
     with compiled.session as session:
-        # AiMX cache stage는 instance마다 모든 위치를 가지므로 위치 순서를 바꾸지 않는다.
-        if not torch.equal(session.kv_rows("decode"), torch.arange(capacity)):
-            raise ValueError("the AiMX cache rows must be the positions in order")
         prompt_caches = copy.deepcopy(caches)
 
         def write_all(cache_pairs, stop):

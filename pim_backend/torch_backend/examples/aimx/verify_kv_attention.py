@@ -1,10 +1,11 @@
 """Decode attention reading a device-resident key/value cache on AiMX: QK and PV against torch BF16.
 
-The host cache is [positions, kv_heads * head_dim], one row per token. FPGA f owns the
-consecutive KV heads of column window f, so every cache stage runs one instance per FPGA
-in one round and its window stays at one address:
-  QK  scores[f]  = q_rows[f] (rows x W) @ key_cache[:, window f].T   B = K window^T, positions on N
-  PV  context[f] = p_rows[f] (rows x C) @ value_cache[:, window f]   B = V window, positions on K
+The host cache is [kv_heads, positions, head_dim]. FPGA f owns the consecutive KV heads of
+group f, side by side (cat of cache[h] along the columns: the window f of the token-row view),
+so every cache stage runs one instance per FPGA in one round and its window stays at one
+address:
+  QK  scores[f]  = q_rows[f] (rows x W) @ window f(key).T   B = K window^T, positions on N
+  PV  context[f] = p_rows[f] (rows x C) @ window f(value)   B = V window, positions on K
 rows = heads / fpgas query heads, W = kv_heads * head_dim / fpgas. The rows are random here:
 the check is the GEMM over the resident cache, not the attention block structure.
 
@@ -30,16 +31,18 @@ from torch_backend._autotuner import DEFAULT_CACHE_PATH
 
 
 class Attention(torch.nn.Module):
-    def __init__(self, fpgas, width):
+    def __init__(self, fpgas, heads_per_fpga):
         super().__init__()
         self.fpgas = fpgas
-        self.width = width
+        self.heads_per_fpga = heads_per_fpga
+
+    def window(self, cache, f):
+        """KV heads of FPGA f side by side, [positions, heads_per_fpga * head_dim]."""
+        return torch.cat([cache[f * self.heads_per_fpga + head] for head in range(self.heads_per_fpga)], dim=1)
 
     def forward(self, q_rows, p_rows, key_cache, value_cache):
-        scores = tuple(torch.mm(q_rows[f], key_cache.narrow(1, f * self.width, self.width).t())
-                       for f in range(self.fpgas))
-        context = tuple(torch.mm(p_rows[f], value_cache.narrow(1, f * self.width, self.width))
-                        for f in range(self.fpgas))
+        scores = tuple(torch.mm(q_rows[f], self.window(key_cache, f).t()) for f in range(self.fpgas))
+        context = tuple(torch.mm(p_rows[f], self.window(value_cache, f)) for f in range(self.fpgas))
         return scores, context
 
 
@@ -76,9 +79,9 @@ def main():
     width = args.kv_heads * args.head_dim // args.fpgas
 
     generator = torch.Generator().manual_seed(0)
-    module = Attention(args.fpgas, width).eval()
-    key_cache = torch.randn((args.positions, args.kv_heads * args.head_dim), generator=generator).bfloat16()
-    value_cache = torch.randn((args.positions, args.kv_heads * args.head_dim), generator=generator).bfloat16()
+    module = Attention(args.fpgas, args.kv_heads // args.fpgas).eval()
+    key_cache = torch.randn((args.kv_heads, args.positions, args.head_dim), generator=generator).bfloat16()
+    value_cache = torch.randn((args.kv_heads, args.positions, args.head_dim), generator=generator).bfloat16()
     inputs = (torch.randn((args.fpgas, rows, width), generator=generator).bfloat16(),
               (torch.softmax(torch.randn((args.fpgas, rows, args.positions), generator=generator), dim=-1)
                * 2.0 ** args.p_scale).bfloat16(),
@@ -109,8 +112,9 @@ def main():
 
         # 마지막 위치만 host에서 바꾸고 그 위치만 쓴다. 장치는 새 값과 나머지 옛 값을 함께 읽어야 한다.
         start = args.positions - args.append
-        key_cache[start:] = torch.randn((args.append, key_cache.shape[1]), generator=generator).bfloat16()
-        value_cache[start:] = torch.randn((args.append, value_cache.shape[1]), generator=generator).bfloat16()
+        key_cache[:, start:] = torch.randn((args.kv_heads, args.append, args.head_dim), generator=generator).bfloat16()
+        value_cache[:, start:] = torch.randn((args.kv_heads, args.append, args.head_dim),
+                                             generator=generator).bfloat16()
         session.write_kv(0, KEY, key_cache, start, args.positions)
         session.write_kv(0, VALUE, value_cache, start, args.positions)
         report(f"append {args.append}", session, inputs, module, kv_bytes)

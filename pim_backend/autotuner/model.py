@@ -185,6 +185,11 @@ class TargetModel:
         """Compute points one Execution Tile occupies, padding included."""
         return prod(config.execution_extent)
 
+    def minimum_compute(self, problem):
+        """Compute points the whole problem occupies under any config: the padding the
+        target's compute width itself adds, and no more."""
+        return prod(problem.axis_extents)
+
     def physical_pressure(self, plans):
         """Unit memory pressure of the allocation plans reported by lowering."""
         return max(sum(plan) for plan in plans) / self.unit_capacity
@@ -374,6 +379,14 @@ class AiMXModel(TargetModel):
             * ceil_div(gn, 4096 // batch) * (4096 // batch)
             * ceil_div(config.tile_k * mac_k, 256) * 256
         )
+
+    def minimum_compute(self, problem):
+        # scheduled_compute와 같은 단위로 문제 전체를 올린다.
+        if problem.compute_kind == "matvec":
+            return _round_up(problem.M, 4096) * _round_up(problem.K, 256)
+        batch = self.target.runtime_config.batch
+        return (_round_up(problem.M, batch) * _round_up(problem.N, 4096 // batch)
+                * _round_up(problem.K, 256))
 
     def physical_pressure(self, plans):
         return max(

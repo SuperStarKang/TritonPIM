@@ -223,10 +223,10 @@ class PIMSession:
 
         phases maps each phase name, in execution order, to (layers, example_inputs,
         configure). kv_inputs maps a phase to kv(index, inputs) -> {KEY/VALUE: tensor}:
-        the inputs of layer index that are its host key/value cache, [positions,
-        heads * head_dim]; a GEMM operand that is such an input or a column window of it
-        (consecutive heads) reads the device cache region in place instead of being sent
-        (write_kv fills the region). The session keeps the
+        the inputs of layer index that are its host key/value cache, [kv_heads, positions,
+        head_dim]; a GEMM operand that is one KV head of it, cache[h], or its transpose reads
+        the device cache region in place instead of being sent (write_kv fills the region).
+        The session keeps the
         compiled plans; entering it allocates the units, checks their count against
         the spec and binds the compiled stages.
         """
@@ -307,8 +307,9 @@ class PIMSession:
     def write_kv(self, layer, kind, cache, start, stop):
         """Copy positions [start, stop) of a host cache into the device region of (layer, kind).
 
-        cache is the whole host cache of that layer and kind, [positions, heads * head_dim],
-        as the kv_inputs of compile() return it. The adapter may send the positions later,
+        cache is the whole host cache of that layer and kind, [kv_heads, positions, head_dim],
+        as the kv_inputs of compile() return it; positions are token positions, and the adapter
+        places them on its units in its own layout. The adapter may send the positions later,
         but before the next run of a stage that reads the region; cache must keep them
         until then.
         """
@@ -319,40 +320,6 @@ class PIMSession:
             raise ValueError(f"no stage of layer {layer} reads the {kind} cache")
         for stage in stages:
             self.backend.model.write_kv(stage, cache, start, stop)
-
-    def kv_rows(self, phase):
-        """The host cache row of every token position, for the stages of phase that read the cache.
-
-        A reading stage splits the cache rows over P units that hold S rows each, unit c
-        holding rows [c·S, (c+1)·S). Position p goes to unit p mod P at its local row p // P,
-        so the positions written so far fill every unit evenly; attention does not depend on
-        the order, as long as the key, the value, their scales and the mask share it. Every
-        reading stage must split the rows the same way; the result has P·S rows.
-        """
-        import torch
-
-        self._check_owner()
-        splits = {}
-        for plan in self.plans[phase]:
-            for stage in plan.stages:
-                if stage.kv is None:
-                    continue
-                config = stage.config
-                operand, _, transposed = stage.kv
-                # 위치 축: 왼쪽 operand는 M(전치면 K), 오른쪽 operand는 K(전치면 N)
-                if operand == 0:
-                    axis = 2 if transposed else 0
-                else:
-                    axis = 1 if transposed else 2
-                units = (config.p_m, config.p_n, config.p_k)[axis]
-                # unit 하나가 모든 위치를 가지면 순서를 바꿀 일이 없으므로 위치 수만 센다.
-                splits[stage.name] = (units, config.execution_extent[axis] if units > 1 else stage.shape[axis])
-        if len(set(splits.values())) != 1:
-            raise ValueError(f"{phase}: the cache stages split the positions as {splits} "
-                             f"(units, rows per unit); they must agree")
-        (units, rows), = set(splits.values())
-        positions = torch.arange(units * rows)
-        return positions % units * rows + positions // units
 
     def release(self):
         """Release the prepared layers and keep the units allocated; prepare() can follow."""

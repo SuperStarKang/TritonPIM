@@ -1,14 +1,16 @@
 """Llama-family decode on AiMX with the key/value cache resident on the FPGAs.
 
-The host cache of a layer is key, value [capacity, kv_heads * head_dim] BF16, one row per
-position, after RoPE. FPGA f owns the KV heads of column window f (kv_heads / fpgas heads,
-W = kv_heads * head_dim / fpgas columns) and the query heads that read them (rows = heads /
-fpgas). Every attention GEMM is one instance per FPGA:
-  QK  [rows, W] @ key window^T  -> [rows, capacity]   row r holds its query only in the
-                                                      columns of its KV head (zeros elsewhere)
-  PV  [rows, capacity] @ value window -> [rows, W]    row r keeps the columns of its KV head
-MHA (rows 16 x 1 KV head each) and GQA (group query heads per KV head) differ only in
-which columns a row uses.
+The host cache of a layer is key, value [kv_heads, capacity, head_dim] BF16 after RoPE, the
+same layout as the Hugging Face cache and the UPMEM decode layer; positions are token
+positions and each target places them on its units in its own layout. The layer is written
+per query head h, reading its KV head h // group:
+  QK  q_h [1, head_dim] @ key[h // group]^T   -> [1, capacity]
+  PV  p_h [1, capacity] @ value[h // group]   -> [1, head_dim]
+The compiler packs them for the target (torch_backend/fx_packing.py, rules (4) and (5)):
+a cache stage runs one instance per unit in one round, so on AiMX (one unit per FPGA) the
+heads of consecutive windows become one GEMM per FPGA over their union window, the query
+rows zero outside their own KV head (QK) and each output row keeping its own KV head's
+columns (PV). MHA and GQA differ only in how many rows read one KV head.
 
 The device holds positions [0, flushed). A new token's key and value go into the host cache
 right after its step; positions [flushed, position) are the tail, at most TAIL - 1, and
@@ -28,7 +30,7 @@ TAIL = 16
 
 
 class LlamaAimxDecodeLayer(torch.nn.Module):
-    def __init__(self, layer, index, fpgas):
+    def __init__(self, layer, index):
         super().__init__()
         config = layer.self_attn.config
         self.index = index
@@ -36,32 +38,25 @@ class LlamaAimxDecodeLayer(torch.nn.Module):
         self.kv_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
         self.group = self.heads // self.kv_heads
-        if self.heads % fpgas or self.kv_heads % fpgas:
-            raise ValueError(f"{self.heads} query and {self.kv_heads} KV heads must split over {fpgas} FPGAs")
-        self.fpgas = fpgas
-        self.rows = self.heads // fpgas
-        self.width = self.kv_heads * self.head_dim // fpgas
         self.input_layernorm = CheckpointRMSNorm(layer.input_layernorm)
         self.post_attention_layernorm = CheckpointRMSNorm(layer.post_attention_layernorm)
         self.q_proj = CheckpointLinear(layer.self_attn.q_proj)
         self.k_proj = CheckpointLinear(layer.self_attn.k_proj)
         self.v_proj = CheckpointLinear(layer.self_attn.v_proj)
         self.o_proj = CheckpointLinear(layer.self_attn.o_proj)
-        # prefill layer(LlamaAimxLayer)와 같이 Gate/Up은 N을 512 단위로 올려 계산하고 앞 열만 쓴다.
-        padded = -(-config.intermediate_size // 512) * 512
-        self.gate_proj = CheckpointLinear(layer.mlp.gate_proj, padded)
-        self.up_proj = CheckpointLinear(layer.mlp.up_proj, padded)
+        # decode GEMV는 출력을 장치가 4096 lane 단위로 채우므로 host에서 pad하지 않는다 (복사 없음).
+        self.gate_proj = CheckpointLinear(layer.mlp.gate_proj)
+        self.up_proj = CheckpointLinear(layer.mlp.up_proj)
         self.down_proj = CheckpointLinear(layer.mlp.down_proj)
         self.scaling = layer.self_attn.scaling
-        # FPGA f의 행 r(query head f·rows + r)이 자기 window 안에서 읽는 KV head: one-hot [fpgas, rows, window head 수]
-        heads_per_window = self.kv_heads // fpgas
-        local = ((torch.arange(self.heads) // self.group).reshape(fpgas, self.rows)
-                 - (torch.arange(fpgas) * heads_per_window).reshape(fpgas, 1))
-        self.register_buffer("select", torch.nn.functional.one_hot(local, heads_per_window).to(torch.bfloat16))
+
+    def window(self, cache, head):
+        """The cache [capacity, head_dim] of the KV head that query head reads."""
+        return cache[head // self.group]
 
     def forward(self, hidden, cosine, sine, device_valid, tail_rows, tail_valid, caches, new):
         key_cache, value_cache = caches[self.index]
-        capacity = key_cache.shape[0]
+        capacity = key_cache.shape[1]
         normalized = self.input_layernorm(hidden)
         query = self.q_proj(normalized).reshape(self.heads, self.head_dim)
         key = self.k_proj(normalized).reshape(self.kv_heads, self.head_dim)
@@ -70,29 +65,26 @@ class LlamaAimxDecodeLayer(torch.nn.Module):
         query = (query * rotation[0] + rotate_half(query) * rotation[1]).bfloat16()
         key = (key * rotation[0] + rotate_half(key) * rotation[1]).bfloat16()
 
-        # QK on PIM: 행마다 자기 KV head 열에만 q를 두고 나머지는 0이다.
-        spread = (query.reshape(self.fpgas, self.rows, 1, self.head_dim) * self.select.unsqueeze(-1)
-                  ).reshape(self.fpgas, self.rows, self.width)
+        # QK on PIM: query head마다 자기 KV head window를 읽는다.
         device_scores = torch.cat([
-            torch.mm(spread[f], key_cache.narrow(1, f * self.width, self.width).t())
-            for f in range(self.fpgas)]).float()
+            torch.mm(query[head].reshape(1, self.head_dim), self.window(key_cache, head).t())
+            for head in range(self.heads)]).float()
         # tail과 자기 위치는 CPU. query head h는 KV head h // group을 읽는다.
-        tail_keys = key_cache[tail_rows].reshape(TAIL, self.kv_heads, self.head_dim).repeat_interleave(self.group, dim=1)
-        tail_scores = torch.einsum("hd,thd->ht", query.float(), tail_keys.float())
+        tail_keys = key_cache[:, tail_rows].repeat_interleave(self.group, dim=0)
+        tail_scores = torch.einsum("hd,htd->ht", query.float(), tail_keys.float())
         own_scores = (query.float() * key.repeat_interleave(self.group, dim=0).float()).sum(dim=-1, keepdim=True)
         scores = torch.cat((device_scores.masked_fill(~device_valid, float("-inf")),
                             tail_scores.masked_fill(~tail_valid.reshape(1, TAIL), float("-inf")),
                             own_scores), dim=1) * self.scaling
         probability = torch.softmax(scores, dim=-1)
 
-        # PV on PIM: 결과 행마다 자기 KV head 열만 남긴다.
-        device_probability = probability[:, :capacity].bfloat16().reshape(self.fpgas, self.rows, capacity)
+        # PV on PIM: query head마다 자기 KV head window를 읽는다.
+        device_probability = probability[:, :capacity].bfloat16()
         device_context = torch.cat([
-            (torch.mm(device_probability[f], value_cache.narrow(1, f * self.width, self.width))
-             .reshape(self.rows, -1, self.head_dim) * self.select[f].unsqueeze(-1)).sum(dim=1)
-            for f in range(self.fpgas)]).float()
-        tail_values = value_cache[tail_rows].reshape(TAIL, self.kv_heads, self.head_dim).repeat_interleave(self.group, dim=1)
-        tail_context = torch.einsum("ht,thd->hd", probability[:, capacity:capacity + TAIL], tail_values.float())
+            torch.mm(device_probability[head].reshape(1, capacity), self.window(value_cache, head))
+            for head in range(self.heads)]).float()
+        tail_values = value_cache[:, tail_rows].repeat_interleave(self.group, dim=0)
+        tail_context = torch.einsum("ht,htd->hd", probability[:, capacity:capacity + TAIL], tail_values.float())
         own_context = probability[:, -1:] * value.repeat_interleave(self.group, dim=0).float()
         context = (device_context + tail_context + own_context).reshape(1, 1, self.heads * self.head_dim)
 
@@ -101,13 +93,12 @@ class LlamaAimxDecodeLayer(torch.nn.Module):
         gated = torch.nn.functional.silu(self.gate_proj(normalized)) * self.up_proj(normalized)
         output = hidden + self.down_proj(gated)
         # Session은 tuple 출력을 다음 layer의 위치 인자로 넘긴다. cache는 읽기만 하고 그대로 넘긴다.
-        return (output, cosine, sine, device_valid, tail_rows, tail_valid, caches,
-                new + ((key.reshape(1, -1), value.reshape(1, -1)),))
+        return (output, cosine, sine, device_valid, tail_rows, tail_valid, caches, new + ((key, value),))
 
 
 def empty_caches(config, capacity):
-    """Per layer: BF16 key and value [capacity, kv_heads * head_dim]."""
-    shape = (capacity, config.num_key_value_heads * config.head_dim)
+    """Per layer: BF16 key and value [kv_heads, capacity, head_dim]."""
+    shape = (config.num_key_value_heads, capacity, config.head_dim)
     return tuple((torch.zeros(shape, dtype=torch.bfloat16), torch.zeros(shape, dtype=torch.bfloat16))
                  for _ in range(config.num_hidden_layers))
 
@@ -116,7 +107,7 @@ def decode_inputs(model, hidden, position, flushed, caches):
     """First decode layer inputs for the token at position: the device holds [0, flushed),
     the tail [flushed, position) is read from the host cache."""
     cosine, sine = model.model.rotary_emb(hidden, position_ids=torch.tensor([[position]]))
-    capacity = caches[0][0].shape[0]
+    capacity = caches[0][0].shape[1]
     tail = torch.arange(flushed, flushed + TAIL)
     return (hidden, cosine, sine, (torch.arange(capacity) < flushed).unsqueeze(0),
             tail.clamp(max=capacity - 1), tail < position, caches, ())
@@ -134,9 +125,9 @@ def prefill_caches(model, input_ids, capacity):
     caches = empty_caches(model.config, capacity)
     prompt = input_ids.shape[1]
     for (key_cache, value_cache), layer in zip(caches, output.past_key_values.layers, strict=True):
-        # [1, kv_heads, prompt, head_dim] -> 위치마다 한 행
-        key_cache[:prompt] = layer.keys[0].transpose(0, 1).reshape(prompt, -1)
-        value_cache[:prompt] = layer.values[0].transpose(0, 1).reshape(prompt, -1)
+        # Hugging Face cache [1, kv_heads, prompt, head_dim]와 같은 배치다.
+        key_cache[:, :prompt] = layer.keys[0]
+        value_cache[:, :prompt] = layer.values[0]
     return output.logits[:, -1].argmax(dim=-1), caches
 
 
@@ -147,7 +138,7 @@ def generate(model, token, caches, prompt, new_tokens, run_decode, store, head, 
     the argmax (teacher forcing), so two runs see the same inputs at every step. Returns the
     token ids (the first one included), the logits of every step and step times in ms.
     """
-    capacity = caches[0][0].shape[0]
+    capacity = caches[0][0].shape[1]
     if prompt + new_tokens > capacity:
         raise ValueError(f"{prompt} + {new_tokens} positions exceed the cache capacity {capacity}")
     tokens = [token.item()]
@@ -159,8 +150,8 @@ def generate(model, token, caches, prompt, new_tokens, run_decode, store, head, 
         hidden = model.model.embed_tokens(token.reshape(1, 1)).float()
         hidden, *_, new = run_decode(*decode_inputs(model, hidden, position, flushed, caches))
         for (key_cache, value_cache), (key, value) in zip(caches, new, strict=True):
-            key_cache[position] = key[0]
-            value_cache[position] = value[0]
+            key_cache[:, position] = key
+            value_cache[:, position] = value
         if position + 1 - flushed == TAIL:
             for layer, cache in enumerate(caches):
                 store(layer, cache, flushed, position + 1)

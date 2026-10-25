@@ -137,14 +137,11 @@ def main():
                 session.write_kv(layer, VALUE, value_cache, start, stop)
                 kv_writes.append((start, (time.perf_counter_ns() - begin) / 1e6))
 
-            # 위치 p의 cache 행: 위치 조각마다 고르게 채우는 순환 배치
-            rows = session.kv_rows("decode")
-            print(f"cache rows of positions 0..9: {rows[:10].tolist()}", flush=True)
             before = session.stats()
             with torch._dynamo.config.patch(error_on_recompile=True):
                 print(f"Executing one request: prefill -> {steps} decode steps", flush=True)
                 result = generate(
-                    model, input_ids, args.max_new_tokens, rows,
+                    model, input_ids, args.max_new_tokens,
                     lambda hidden, cache, after_layer: session.run_model(
                         "prefill", hidden, cache, after_layer=after_layer),
                     run_decode, store)
@@ -202,8 +199,6 @@ def main():
         "layers": layers, "heads": config.num_attention_heads, "kv_heads": config.num_key_value_heads,
         "kv": args.kv, "max_new_tokens": args.max_new_tokens, "cache_positions": capacity,
         "kv_cache_location": "device (scales on the host)", "kv_cache_dtype": "int8",
-        # 위치 p의 cache 행. check_llama_generate_cpu.py가 같은 순서로 실행한다.
-        "kv_rows": rows.tolist(),
         "device_kv_bytes": memory.kv_bytes,
         "first_step_kv_push_ms": decode_kv_push_ms[0],
         "kv_layout_check_ms": after["kv_layout_check_ms"] - before["kv_layout_check_ms"],
