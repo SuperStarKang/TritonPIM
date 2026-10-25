@@ -16,7 +16,9 @@ weights, the prefill cache transfer and a one-time check of the host cache layou
 against the generated pack. Every decode step is split like a run_upmem.py request
 (upmem_workloads.PartitionTimer): CPU, weight upload, program load, cache push, the native
 stages of every PIM call (h2d, kernel, d2h, reduction, host layout), the rest of the
-invoke, and other; the report keeps the first step and the mean of the others. The token
+invoke, and other; the report keeps the first step and the mean of the others, and
+<report-dir>/step_breakdown.csv has every step (also in PIM-LLM's items h2d, d2h, pim, cpu)
+and mean_after_first, <report-dir>/gemm.csv every PIM partition per step. The token
 IDs go to the report; e2e/check_llama_generate_cpu.py compares them with the CPU layers.
 Compile and resource open/close are excluded.
 
@@ -47,7 +49,9 @@ from torch_backend import compile_model
 from torch_backend._autotuner import DEFAULT_CACHE_PATH
 from e2e.llama_generation import PROMPT_TOKENS, TAIL, decode_example, decode_kv_inputs, generate, generation_layers
 from e2e.llama_workloads import KV_MODES
-from upmem_workloads import HOST_LAYOUT_STAGES, NATIVE_STAGES, PartitionTimer
+from upmem_workloads import (
+    HOST_LAYOUT_STAGES, NATIVE_STAGES, PartitionTimer, gemm_rows, mean_row, pimllm_items, write_csv,
+)
 
 
 def plan_launches(plan):
@@ -258,6 +262,12 @@ def main():
     }
     (args.report_dir / "report.json").write_text(
         json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    rows = [{"step": index, "position": args.prompt_tokens + index, "step_ms": ms, "layers_ms": layers_ms,
+             **pimllm_items(ms, step), **{"detail_" + name: value for name, value in step.items()}}
+            for index, (ms, layers_ms, step) in enumerate(zip(step_ms, decode_layers_ms, breakdowns, strict=True))]
+    write_csv(args.report_dir / "step_breakdown.csv", rows + [mean_row("mean_after_first", rows[1:])])
+    # 첫 step은 decode weight 업로드와 prefill cache 전송을 포함하므로 뺀 step 평균이다.
+    write_csv(args.report_dir / "gemm.csv", gemm_rows(decode_partitions[1:]))
     print(f"first_token_ms={report['first_token_ms']:.1f} first_step_ms={report['first_step_ms']:.1f} "
           f"step_ms_median={report['step_ms_median_after_first']:.1f} total_ms={report['total_ms']:.1f} "
           f"weight_pushes={transfers['weight_pushes']} launches={transfers['launches']} "
@@ -273,7 +283,8 @@ def main():
               f"invoke={stage['invoke_ms']:.1f} kv_push={stage['kv_push_ms']:.1f} ms/step", flush=True)
     print(f"token_ids={result['tokens']}", flush=True)
     print(f"text={report['text']!r}", flush=True)
-    print(f"Execution report saved to {args.report_dir.resolve() / 'report.json'}", flush=True)
+    print(f"Execution report saved to {args.report_dir.resolve() / 'report.json'} "
+          f"(+ step_breakdown.csv, gemm.csv)", flush=True)
 
 
 if __name__ == "__main__":

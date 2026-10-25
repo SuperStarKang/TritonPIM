@@ -6,16 +6,25 @@ e2e/llama_workloads.py on a prompt of --seq tokens up to the first greedy token:
 the layers before the DPUs are opened, then --repeat requests run; request 0 is cold
 and includes the first weight push. Every request records its per-layer time and a
 breakdown into CPU, weight upload, program load and the native stages of every PIM
-call (h2d, kernel, d2h, ...), in <report-dir>/report.json.
+call (h2d, kernel, d2h, ...), in <report-dir>/report.json. The same numbers also go to
+two CSV files in <report-dir>, laid out like PIM-LLM's export_run_llm_breakdown.py:
+  forward_breakdown.csv  one row per request (iter 0 is cold) and warm_mean: the time
+                         from the embedding to the first token (first_token_ms, without
+                         tokenization) in PIM-LLM's items h2d (with the weight upload),
+                         d2h, pim (kernel) and cpu (the rest), their shares, then every
+                         breakdown item as detail_* (they add up to ttft_ms)
+  gemm.csv               one row per PIM partition, the mean of the warm requests
 """
 
 import argparse
+import csv
 import ctypes
 from dataclasses import asdict
 from functools import partial
 import json
 import os
 from pathlib import Path
+import statistics
 import sys
 import time
 
@@ -39,6 +48,53 @@ NATIVE_STAGES = pim_driver._STAGE_NAMES["upmem"]
 # 전송·launch·split-K 합산을 뺀 native 구간: host pool 준비와 layout 변환
 HOST_LAYOUT_STAGES = tuple(name for name in NATIVE_STAGES
                            if name not in ("h2d", "kernel", "d2h", "reduction"))
+
+
+def pimllm_items(total_ms, breakdown):
+    """total_ms in PIM-LLM's items: h2d (with the weight upload), d2h, pim (kernel), cpu (the rest)."""
+    h2d = breakdown["h2d_ms"] + breakdown["weight_upload_ms"]
+    items = {"h2d_ms": h2d, "d2h_ms": breakdown["d2h_ms"], "pim_ms": breakdown["kernel_ms"],
+             "cpu_ms": total_ms - h2d - breakdown["d2h_ms"] - breakdown["kernel_ms"]}
+    items.update({name.replace("_ms", "_pct"): 100 * value / total_ms for name, value in list(items.items())})
+    return items
+
+
+def mean_row(label, rows):
+    """The mean of every numeric column of rows; the first column holds label."""
+    first, *names = rows[0]
+    return {first: label, **{name: statistics.mean(row[name] for row in rows) for name in names}}
+
+
+def gemm_rows(records):
+    """One row per PIM partition: the mean over records, PartitionTimer.partitions of each run."""
+    rows = []
+    for name, record in records[0].items():
+        if record["where"] != "PIM":
+            continue
+        m, n, k = record["mnk"]
+
+        def mean(value):
+            return statistics.mean(value(run[name]) for run in records)
+
+        native = {stage: mean(lambda run: run["native_ms"][stage]) for stage in NATIVE_STAGES}
+        rows.append({
+            "partition": name, "stage": record["stage"], "m": m, "n": n, "k": k,
+            "instances": record["instances"], "calls": mean(lambda run: run["calls"]),
+            "wall_ms": mean(lambda run: run["wall_ms"]),
+            "h2d_ms": native["h2d"], "kernel_ms": native["kernel"], "d2h_ms": native["d2h"],
+            "reduction_ms": native["reduction"],
+            "host_layout_ms": sum(native[stage] for stage in HOST_LAYOUT_STAGES),
+        })
+    return rows
+
+
+def write_csv(path, rows):
+    with open(path, "w", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({name: f"{value:.3f}" if isinstance(value, float) else value
+                             for name, value in row.items()})
 
 
 class PartitionTimer:
@@ -248,7 +304,15 @@ def run_llama(args, inductor_overrides, runtime_options):
     args.report_dir.mkdir(parents=True, exist_ok=True)
     (args.report_dir / "report.json").write_text(
         json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
-    print(f"Execution report saved to {(args.report_dir / 'report.json').resolve()}", flush=True)
+    rows = [{"iter": index, "seq": args.seq, "ttft_ms": request["ttft_ms"],
+             "first_token_ms": request["model_to_token_ms"], "layers_ms": request["layers_ms"],
+             **pimllm_items(request["model_to_token_ms"], request["breakdown"]),
+             **{"detail_" + name: value for name, value in request["breakdown"].items()}}
+            for index, request in enumerate(requests)]
+    write_csv(args.report_dir / "forward_breakdown.csv", rows + [mean_row("warm_mean", rows[1:])])
+    write_csv(args.report_dir / "gemm.csv", gemm_rows([request["partitions"] for request in requests[1:]]))
+    print(f"Execution report saved to {(args.report_dir / 'report.json').resolve()} "
+          f"(+ forward_breakdown.csv, gemm.csv)", flush=True)
 
 
 def main(description, inductor_overrides, runtime_options):

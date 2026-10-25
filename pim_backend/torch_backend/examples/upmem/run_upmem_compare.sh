@@ -3,7 +3,9 @@
 # prefill은 prefill만 담은 session(run_upmem.py, cold 1회 + warm 2회), decode는 prefill과 함께 compile한
 # 생성 session(e2e/benchmark_model_llama_generate.py, 127 step)이다. CPU thread는 PIM-LLM과 같은 8개다.
 # conda activate pim_triton 후 실행한다. cmd.sh가 sudo와 UPMEM_BACKEND=hw를 붙인다.
-# 결과는 e2e/compare/<model>_s<seq>_{prefill,decode}/이고, summarize_compare.py가 PIM-LLM과 함께 표로 만든다.
+# 결과는 e2e/compare/<model>_s<seq>_prefill/{report.json,forward_breakdown.csv,gemm.csv}와
+# e2e/compare/<model>_s<seq>_decode/{report.json,step_breakdown.csv,gemm.csv}이다. summarize_compare.py가
+# PIM-LLM과 함께 표로 만들어 e2e/compare/{summary.md,compare_prefill.csv,decode.csv}에 둔다.
 set -euo pipefail
 
 cd "$(dirname "$0")"
