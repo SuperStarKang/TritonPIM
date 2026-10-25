@@ -44,13 +44,13 @@ def main():
 
     with torch.no_grad():
         tokenizer, model = load_llama(args.checkpoint)
-        cosine, sine = position_embeddings(model)
+        cosine, sine = position_embeddings(model, SEQUENCE)
         # lm_head와 최종 norm은 CPU에서 FP32로 계산한다 (lm_head 32000 x 4096, 0.5 GB).
         norm = copy.deepcopy(model.model.norm).float()
         lm_head = copy.deepcopy(model.lm_head).float()
 
         start = time.perf_counter_ns()
-        reference = model.model.embed_tokens(prompt_ids(tokenizer, prompt)).float()
+        reference = model.model.embed_tokens(prompt_ids(tokenizer, prompt, SEQUENCE)).float()
         for layer in model.model.layers:
             reference = reference_layer(layer, reference, cosine, sine)
         reference_logits = lm_head(norm(reference[:, -1, :]))
@@ -81,7 +81,7 @@ def main():
                 for step in range(count):
                     before = session.stats()
                     start = time.perf_counter_ns()
-                    embedded = model.model.embed_tokens(prompt_ids(tokenizer, prompt)).float()
+                    embedded = model.model.embed_tokens(prompt_ids(tokenizer, prompt, SEQUENCE)).float()
                     tokenized_at = time.perf_counter_ns()
                     hidden = session.run_model("prefill", embedded)
                     layers_at = time.perf_counter_ns()

@@ -50,8 +50,8 @@ def main():
 
     with torch.no_grad():
         tokenizer, model = load_llama(args.checkpoint)
-        cosine, sine = position_embeddings(model)
-        hidden = model.model.embed_tokens(prompt_ids(tokenizer, args.prompt_file.read_text(encoding="utf-8"))).float()
+        cosine, sine = position_embeddings(model, SEQUENCE)
+        hidden = model.model.embed_tokens(prompt_ids(tokenizer, args.prompt_file.read_text(encoding="utf-8"), SEQUENCE)).float()
         for layer in model.model.layers[:args.layer]:
             hidden = reference_layer(layer, hidden, cosine, sine)
         start = time.perf_counter_ns()
