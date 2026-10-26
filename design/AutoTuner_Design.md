@@ -2,7 +2,8 @@
 
 구현: [pim_backend/autotuner](../pim_backend/autotuner). AutoTuner가 고르는 값의 의미는
 [PIM Common IR 설계](PIMCommonIR_Design.md) 3.1절과 7절, UPMEM에서의 쓰임은
-[UPMEM Target 설계](UPMEMTarget_Implementation.md) 4절을 따른다.
+[UPMEM Target 설계](UPMEMTarget_Implementation.md) 4절, AiMX에서의 쓰임은
+[Silent-PIM 설계](Silent-PIM_Design.md) 9절을 따른다.
 
 ## 1. 역할
 
@@ -15,7 +16,7 @@ end-to-end 시간이 가장 짧은 후보를 선택한다.
 **근거**
 
 - seed 알고리즘은 하나다. target 이름으로 분기하지 않는다(`space.py`).
-- target 차이는 `TargetModel`이 내는 숫자(용량, padding, 허용 mapping)로만 들어온다
+- target 차이는 `TargetModel`이 내는 숫자(Block, 용량, padding, 허용 mapping)로만 들어온다
   (`model.py`).
 - seed는 측정 없이 계산한다. 단일 unit profiling 결과(`performance.py`)는 seed에 쓰지
   않는다. 최종 선택은 실제 실행 시간으로만 한다(`search.py`).
@@ -80,7 +81,8 @@ Tile이 bank 상주량을 만든다.
 
 **근거**
 
-- `TRITON_BLOCK = (8, 16, 16)`은 모든 target이 공유한다(`types.py`).
+- Block은 `TargetModel.block(problem)` 하나다. 기본은 `TRITON_BLOCK = (8, 16, 16)`이고
+  AiMX matmul만 Block m을 `min(8, batch)`로 둔다(`types.py`, `model.py`).
 - `GROUP_VALUES`는 4096까지 열려 있다. AiMX의 n 4096 폭도 Block 16 × Group 256으로
   만들 수 있다(`space.py`).
 
@@ -88,7 +90,7 @@ Tile이 bank 상주량을 만든다.
 
 | 계층 | 다루는 자원 | 결정 방식 |
 |---|---|---|
-| Triton Block | 프로그램 단위 | `(8,16,16)` 고정. extent 1인 축은 1 |
+| Triton Block | 프로그램 단위 | `TargetModel.block` 고정. extent 1인 축은 1 |
 | Block Group | device 1개의 연산 능력, local memory | 순위 규칙 상위 `block_group_top_k`(2)개 |
 | Execution Tile | device 1개의 bank 용량 | seed: 병렬도 단계와 round 패턴에서 역산. LFBO: ladder 이웃 |
 | Device Partition | device 여러 개의 병렬성 | 병렬도 단계 seed + 측정 |
@@ -112,12 +114,12 @@ seed 계산(A) → 정적 제약(B) → 초기 측정(C) → LFBO 탐색(D) → 
  Triton kernel + tensors → PIMProblem          PIMTargetSpec → TargetModel
                     │                                     │
  ═════════ Stage A: seed (측정 없음) ══════════════════════╪═══════════
-   A1 Triton Block      (8,16,16)                           │
+   A1 Triton Block      TargetModel.block ◄──────────────────┤
    A2 Block Group       rank_block_groups → 상위 2개 ◄──────┤ group_reason, local capacity,
                     │                                       │ scheduled_compute, access_allocations
    A3 병렬도 단계        A_max, A_max/2, … , A_max/16 ◄──────┤ num_units, mapping_reason
    A4 round·P·Tile      round 패턴 → P → tile = ceil(grid/(P·round))
-                    │   → 안전 경계 → 비용 순 선택 ◄────────┘ allocations, unit capacity
+                    │   → 안전 경계 → 비용 순 선택 ◄────────┘ allocations, minimum_compute
  ═══════════════════╪═══════════════════════════════════════════════
    B  Constraint        ConstraintEngine.check
    C  초기 측정          initial → seed[0] → warm-cache → seed[1:] → structured
@@ -135,33 +137,43 @@ seed, constraint, feature는 [model.py](../pim_backend/autotuner/model.py)의 `T
 
 **근거**
 
-- UPMEM lane 규칙은 lowering이 Block Group의 출력 m 행을 모든 tasklet에 똑같이 나누기
-  때문이다(`PIMToUPMEMPass.cpp` `rowSliceOf`). `lanes = nr_tasklets` 또는 `lanes_per_core`.
-  Block m이 8이어도 Group m이 2 이상이면 16 tasklet 조건을 만족한다.
-- AiMX Block Group 상한은 저장 padding 없이 device 하나가 계산하는 단위다. 그보다 큰 범위는
-  Execution Tile이 bank에 상주시킨다.
-- AiMX 할당은 GEMM/GEMV 상주량의 하한 추정이다. scratch, 상수, fusion 할당은 lowering이 최종
-  검사한다. constraint를 통과해도 lowering이 용량 초과를 진단할 수 있고, 그 경우 다른
-  config로 대체하지 않는다.
+- UPMEM lane 규칙은 모든 tasklet이 Block Group 하나의 출력 m 행을 똑같이 나눠 계산하기
+  때문이다. `lanes = nr_tasklets` 또는 `lanes_per_core`. Block m이 8이어도 Group m이 2
+  이상이면 16 tasklet 조건을 만족한다.
+- AiMX Block Group 상한(`_compute_unit`)은 저장 padding 없이 device 하나가 계산하는
+  단위다. 그보다 큰 범위는 Execution Tile이 bank에 상주시킨다.
+- AiMX 할당(`aimx_runtime_allocations`)은 GEMM/GEMV 상주량의 하한 추정이다. scratch,
+  상수, fusion 할당은 compile된 Common IR과 lowering의 할당 보고가 최종이다.
 - access 할당은 전송량 feature와 compute/byte에, overhead 할당은 용량 검사에만 쓴다.
+- `stage_target`: AiMX GEMM은 한 B 행을 batch 행이 함께 읽으므로 M ≥ batch이면 batch가
+  클수록 B 재읽기가 줄고, M < 8이면 batch를 M에 맞춰야 output block 행이 0으로 채워지지
+  않는다. 이 target이 같은 문제의 탐색, cache key, compile에 함께 쓰인다(9.2~9.4절).
+- `minimum_compute`는 target 연산 폭이 문제 전체에 강제하는 padding만 포함한다. 어떤
+  config로도 줄일 수 없는 padding이므로 seed 안전 경계(6.4절)에서 뺀다.
 
 **예시**
 
 | 질의 | 쓰는 곳 | UPMEM | AiMX |
 |---|---|---|---|
+| `stage_target(problem)` | 모델 stage, torch 실행, packing 비용 | spec 그대로 | matmul: `batch = min(spec batch, M 이상인 가장 작은 2의 거듭제곱)`. 그 밖은 spec 그대로 |
+| `block(problem)` | A1 | `(8,16,16)` | matmul: `(min(8, batch),16,16)`, 그 밖: `(8,16,16)` |
 | `problem_reason` | 제약 | 없음 | matmul·matvec, bf16/fp16/fp32 |
 | `group_reason(extent)` | Block Group | `extent_m % lanes ≠ 0`이면 거부 | matmul: extent > `(batch, 4096, max(256, matmul_k_alignment 또는 4096/batch))`, matvec: extent > `(4096, 1, 256)`이면 거부 |
 | `local_capacity` | Block Group | `local_capacity_limit_bytes`(기본 46,680 B) | 0(검사 생략) |
-| `scheduled_compute` | 순위, feature | 논리 compute | matmul: m→batch, n→4096/batch, k→256 올림. matvec: m→4096, k→256 올림 |
+| `scheduled_compute` | 순위, feature, 안전 경계 | 논리 compute | matmul: m→batch, n→4096/batch, k→Group마다 256/batch로 올린 뒤 Tile 합을 256으로 올림. matvec: m→4096, k→256 올림 |
+| `minimum_compute` | 안전 경계 | `Π problem` | matmul: M→batch, N→4096/batch, K→256 올림. matvec: M→4096, K→256 올림 |
 | `access_allocations` | 순위, 제약, feature | 논리 footprint | A/B/C(물리 padding 포함). matvec은 W→B, x→A, y→C |
 | `overhead_allocations` | 제약, feature | 없음 | PMM, Arel, descriptor chain |
 | `allocation_reason` | 제약 | 없음 | 단일 할당 ≤ 1023×2 MiB, bank interleave footprint ≤ bank 용량 |
 | `unit_capacity` | 제약 | `banks_per_unit × bank_capacity`(기본 60 MiB) | 같음 |
-| `num_units`, `mapping_reason(p)` | Partition | profile 값, 없음 | `/dev/pl_dma*` 수, `p_k ≠ 1` 거부 |
+| `num_units` | Partition | profile 값(기본 2048) | profile 값(기본 `/dev/pl_dma*` 수) |
+| `mapping_reason(p)` | Partition | 없음 | 없음(split-K `p_k > 1` 허용) |
+| `resident_operand_reason` | 모델 kv stage 제약 | 없음 | matmul: 상주 B의 저장 크기 `tile_k·⌈group_k⌉₂₅₆ × tile_n·⌈group_n⌉₄₀₉₆`가 `⌈K⌉₂₅₆ × ⌈N⌉₄₀₉₆`와 다르면 거부 |
+| `resident_operand_config` | 모델 kv stage 초기 후보 | None | Group `(batch, min(4096, ⌈N⌉_block_n), 256)`/Block, Tile이 문제 전체를 덮고 P=(1,1,1) |
 | `physical_pressure(plans)` | 측정 후 feature | 할당 합 / unit 용량 | bank interleave 바이트 / bank 용량 |
 | `launch_timing_name` | 단일 unit 측정 | `kernel` | `invoke` |
 | `shared_activation_scratch` | 모델 runtime | True | False |
-| `gemm_profile_spec` | 단일 unit 측정 | Block (8,16,16), int8→int32, Group (lanes/8, 2, 1) | Block (8,16,16), fp16→fp32, Group = 연산 단위 / Block |
+| `gemm_profile_spec` | 단일 unit 측정 | Block (8,16,16), int8→int32, Group (lanes/8, 2, 1) | Block `(min(8,batch),16,16)`, fp16→fp32, Group = 연산 단위 / Block |
 | `gemv_profile_spec` | 단일 unit 측정 | Block (2^a,1,64), int32→int32, Group (lanes/2^a,1,1) | Block (8,1,16), fp16→fp32, Group (512,1,16) |
 
 ## 6. Stage A: seed
@@ -172,7 +184,8 @@ seed, constraint, feature는 [model.py](../pim_backend/autotuner/model.py)의 `T
 
 **내용**
 
-`block_values = TRITON_BLOCK = (8,16,16)`이고 extent가 1인 축은 1로 고정한다.
+`build_config_space`가 `block_values = TargetModel.block(problem)`으로 두고, extent가 1인
+축은 1로 고정한다.
 
 **근거**
 
@@ -181,8 +194,9 @@ seed, constraint, feature는 [model.py](../pim_backend/autotuner/model.py)의 `T
 **예시**
 
 ```text
-GEMM (1024,6144,4096) → Block (8,16,16)
-GEMV (4096,1,4096)    → Block (8,1,16)
+UPMEM GEMM (1024,6144,4096)  → Block (8,16,16)
+GEMV (4096,1,4096)           → Block (8,1,16)
+AiMX GEMM M=4 (batch 4)      → Block (4,16,16)
 ```
 
 ### 6.2 A2 Block Group — `rank_block_groups`
@@ -197,8 +211,7 @@ Group 축마다 `GROUP_VALUES = (1, 2, 4, …, 4096)`를 조합하고 tile=(1,1,
 
 - key 1은 device 내부 연산 활용도다. 문제 경계 padding과 target 고유 padding을 모두 포함한다.
 - key 2는 뒤 계층의 선택지를 지킨다. Block Group 하나가 문제 전체가 되면 Partition 단계에서
-  비교할 대상이 사라진다. `mapping_reason`을 반영하므로 AiMX에서는 k 방향 grid가 병렬성으로
-  계산되지 않는다.
+  비교할 대상이 사라진다. `legal_partitions`(`mapping_reason` 포함) 기준이다.
 - key 3은 할당 바이트 기준이므로 저장 padding(AiMX의 n 4096 폭)을 반영한다.
 - 모든 키가 같으면 정렬 전 순서(Group m → n → k 오름차순 열거)를 유지한다. Python 정렬은
   `reverse=True`에서도 같은 키의 원래 순서를 유지한다.
@@ -248,6 +261,8 @@ units  = A_max >> level      (level ≥ 1에서 units < A_max / parallel_floor(1
   작게 유지하기 위함이다.
 - Block Group 하나에서 나오는 seed는 최대 9개(level 0: (1,1,1)에서 2개 + round 2 패턴
   3개, level 1~4: 1개씩)이고 두 Block Group을 합치면 최대 18개다.
+- padding ratio의 기준은 `minimum_compute`다. AiMX처럼 연산 폭이 문제보다 큰 target에서도
+  config가 더하는 padding만 잰다.
 
 **예시**
 
@@ -263,7 +278,7 @@ units  = A_max >> level      (level ≥ 1에서 units < A_max / parallel_floor(1
 | 안전 경계 (`_safe_initial_schedule`) | 기본값 |
 |---|---|
 | schedule utilization = useful tiles / (rounds × active units) | ≥ 0.5 |
-| padding ratio (`scheduled_compute` 기준) | ≤ 0.5 |
+| padding ratio = (rounds × active × `scheduled_compute` − `minimum_compute`) / (rounds × active × `scheduled_compute`) | ≤ 0.5 |
 | scheduling rounds | ≤ 4 |
 | reduction contributions (`rounds_k · p_k`, reduction이 있을 때) | ≤ 64 |
 
@@ -325,7 +340,7 @@ tile과 P의 곱이 grid를 정확히 덮으면 utilization은 1이다. 예를 �
 **내용**
 
 `ConstraintEngine.check`는 compile 전에 실행할 수 없는 후보만 거부하고 거부 사유 문자열을
-돌려준다. Block 값이 `TRITON_BLOCK`인지는 검사하지 않는다. 다른 Block으로 측정한 cache
+돌려준다. Block 값이 `TargetModel.block`인지는 검사하지 않는다. 다른 Block으로 측정한 cache
 기록도 유효한 후보로 남는다.
 
 **근거**
@@ -406,7 +421,7 @@ option이나 IR 속성이 되지 않는다. 입력 벡터는 knob 12개(`log2` B
 | `stage_bytes` | Σ_입력 rounds × (access 축의 partition 곱) × tile 바이트 |
 | `h2d_bytes`, `d2h_bytes` | rounds × active × 입력/출력 tile 바이트 |
 | `reduction_bytes` | 최종 출력 바이트 × (`rounds_k · p_k` − 1) |
-| `padding_ratio` | 1 − useful compute / scheduled compute |
+| `padding_ratio` | 1 − Π problem / scheduled compute |
 | `local_memory_pressure`, `unit_memory_pressure` | Block Group 바이트 / local 용량, Execution Tile 바이트 / unit 용량 |
 
 ### 8.3 LFBO
@@ -426,7 +441,7 @@ Block/Group/Tile/partition fragment로 되돌리고, 그 fragment의 이웃을 �
 - `tile_ladder`는 tile (1,1,1)에서 unit 용량이 허용하는 동안 compute/byte가 가장 좋은 축을
   키운 뒤(`tile_growth`), 나눌 수 있는 축 중 compute/byte 손실이 가장 작은 축을 줄여 grid가
   최대 active unit을 채울 때까지 내려가는 점의 열이다. seed가 아니라 LFBO 이웃 생성과
-  `torch_backend/fx_packing.py` `_cost`(packing 정적 비용)에 쓴다.
+  packing 정적 비용(9.4절)에 쓴다.
 
 **예시**
 
@@ -467,7 +482,7 @@ JSON 파일 하나에 저장한다. 기본 경로는 `workspace/Experiment/Autot
 | 항목 | 내용 |
 |---|---|
 | key | `M×N×K` + context |
-| context | `CACHE_SCHEMA`, input/output dtype, compute kind, access별 direction/axes/dtype/layout/irregular, common profile 값(target, num_units, banks, cores, lanes, 용량 2개), runtime config 타입과 값, template version, compiler version |
+| context | `CACHE_SCHEMA`, input/output dtype, compute kind, access별 direction/axes/dtype/layout/irregular, common profile 값(target, num_units, banks, cores, lanes, 용량 2개), runtime config 타입과 값(AiMX batch 포함), template version, compiler version |
 | hit | `complete=True` entry가 있으면 `tune`은 탐색 없이 저장된 best를 반환 |
 | 부분 기록 | `complete=False`, records만 보존 |
 | warm-start | `lookup_similar`: 같은 context에서 `Σ |log2(shape 비)|`가 작은 best 최대 3개 |
@@ -485,10 +500,11 @@ seed로 실행하고, 그 밖에는 `tune`을 돌린다.
 **근거**
 
 - 환경 변수 `PIM_AUTOTUNE`, `PIM_RETUNE`이 `search`, `retune` 인자를 덮는다(`"1"`만 참).
-- 측정은 warmup 1회 뒤 `reps`(기본 3)회의 median이다. `pim_driver.timing` 단계별 median도
-  함께 기록한다.
-- 정확성 검사: `ref_fn`이 있으면 전체 비교, 없으면 행·열을 최대 32개씩 표본 추출해 비교,
-  `check_correctness=False`이면 `correctness=None`(성능 후보로는 사용).
+- 측정은 warmup 1회 뒤 `reps`(기본 3)회의 median이다. `pim_driver.timing` 단계별 median과
+  `pim_driver.aimx_allocations`(`physical_allocations`)도 함께 기록한다.
+- 정확성 검사: `ref_fn`이 있으면 전체 `allclose`, 없으면 행·열을 최대 32개씩 표본 추출해
+  `rtol/atol` 또는 `rel_l2`로 비교, `check_correctness=False`이면 `correctness=None`(성능
+  후보로는 사용). 검사 방식과 허용 오차는 cache template version에 들어간다.
 - `pim_launch_options`가 config와 target spec을 compiler 옵션으로 옮긴다.
 
 **예시**
@@ -503,12 +519,13 @@ def gemm(a, b, *, config):
 
 **내용**
 
-`torch_backend/execution.py` `resolve_execution`은 config를 다음 우선순위로 정한다.
+`torch_backend/execution.py` `resolve_execution`은 target을 `stage_target(problem)`으로 바꾼
+뒤 config를 다음 우선순위로 정한다.
 
 **근거**
 
-- `PIMTorchConfig` 주석: cache miss는 seed로 대체하지 않고 오류를 낸다. 무엇으로 실행됐는지
-  알 수 없게 되기 때문이다.
+- `PIMTorchConfig` 주석(`config.py`): cache miss는 seed로 대체하지 않고 오류를 낸다. 무엇으로
+  실행됐는지 알 수 없게 되기 때문이다.
 - 선택한 config도 `ConstraintEngine.check`를 다시 통과해야 한다.
 
 **예시**
@@ -516,46 +533,99 @@ def gemm(a, b, *, config):
 | 순위 | 출처 |
 |---|---|
 | 1 | `PIMTorchConfig.config` |
-| 2 | `autotune_cache_path`의 best (miss면 오류) |
+| 2 | `autotune_cache_path`의 best (template `TORCH_GEMM_TEMPLATE_VERSION`, miss면 오류) |
 | 3 | `_seed_config`: `heuristic_seeds`의 첫 유효 후보 |
 
 ### 9.3 모델 stage 경로
 
 **내용**
 
-`torch_backend/model_compile.py`는 모델의 stage class마다 `tune`을 부른다. 공간, 호출자
-제약, 초기 후보, cache template version을 stage class에 맞춰 바꾼다. 측정은 weight 또는
-key/value cache가 이미 상주한 상태의 실행 시간이다.
+`torch_backend/model_compile.py` `compile_model`은 phase마다 첫 layer를 stage class로 나누고
+(`model_policy.py` `analyze_layer`), class마다 측정 후보를 모은 뒤(`tune_phase`), packing과
+class별 config를 함께 고르고(`select_phase`), 모든 layer를 그 config로 compile한다. 측정은
+weight 또는 key/value cache가 이미 상주한 상태의 실행 시간 E와 weight 업로드 시간 U다.
 
 **근거**
 
-- `stage_config_space`: `partition_axes = (True, True, mapping_reason(p_k=2) is None)`,
-  `instance_units = max(1, num_units // instances)`, weight 또는 key/value cache를 쓰는
-  stage는 `initial_round_patterns = ((1,1,1),)`.
-- `stage_constraint`(`model_policy.py`): weight stage와 key/value cache stage는 M/N/K round
-  1개, key/value cache stage는 `instances × p_m·p_n·p_k ≤ num_units`, 모든 stage는
-  round ≤ `max_initial_scheduling_rounds`(4).
-- `initial` = `widened_configs`(packing member의 best에서 packed 축 tile만 늘린 후보) +
-  `fitted_configs`(비슷한 shape best의 tile을 round 1개가 되도록 맞춘 후보).
+- `StageKey` 종류(`label`): weight operand가 있으면 weight, 장치 key/value cache를 그대로
+  읽으면 kv, 둘 다 아니면 activation.
+- `tune_stage_class`: `stage_target(problem)`으로 탐색·기록하고, `initial` =
+  `widened_configs` + `fitted_configs` + (kv class면) `resident_operand_config`. cache hit으로
+  `tune`이 탐색하지 않으면 아직 재지 않은 `initial` 후보를 따로 재서 기록에 더한다. 측정
+  프로세스가 실패한 기록(`correctness=False`)과 현재 제약을 통과하지 못한 기록은 후보에서 뺀다.
+- `stage_config_space`: `partition_axes = (True, True, mapping_reason(p=(1,1,2)) is None)`,
+  `instance_units = max(1, num_units // instances)`, weight/kv class는
+  `initial_round_patterns = ((1,1,1),)`.
+- `stage_constraint`(`model_policy.py`): weight·kv stage는 M/N/K round 1개, kv stage는
+  `instances × p_m·p_n·p_k ≤ num_units`(모든 instance가 한 batch round)와
+  `resident_operand_reason` 통과, 모든 stage는 round ≤ `max_initial_scheduling_rounds`(4).
+  `p_k`는 target의 `mapping_reason`에 맡긴다.
+- `widened_configs`: packed class가 이어 붙인 member class의 best에서 packed 축 tile만 늘린
+  후보. Block m이 다른 member(M이 작아 batch가 다른 경우)는 쓰지 않는다. `fitted_configs`:
+  같은 context의 비슷한 shape best 최대 4개의 tile을 round 1개가 되도록 맞춘 후보.
 - `cache_version`: `TORCH_GEMM_TEMPLATE_VERSION|model|op|w<weight mask>|x<instances>`에
-  key/value cache class는 `|kv<mask>`를 붙인다.
-- 기록: `correctness=None`, `timings=(("weight_upload", ms),)`, `physical_allocations` =
-  (weight, state, input, output[, kv]) 바이트.
-- session 실행 시 `select_layer_config`(`execution.py`)가 cache의 측정 기록 중 실제 unit 수에
-  맞는 것을 `batch rounds × total_ms` 최소로 고른다. weight 상주 stage는 instance 1개·round 1개,
-  key/value cache 상주 stage는 M/N/K round 1개·batch round 1개여야 한다.
+  kv class는 `|kv<mask>`(전치면 `t`)를 붙인다.
+- 기록: `correctness=None`, `timings=(("weight_upload", U),)`, `physical_allocations` =
+  (weight, state, input, output[, kv]) 바이트(`Footprint`).
 
 **예시**
 
 ```text
-compile_model
-  └ tune_phase → stage class마다 tune(problem, spec, measurer.measure,
-                                      space=stage_config_space, constraint=stage_constraint,
-                                      initial=widened + fitted)
-  └ select_phase → class마다 측정 후보 하나 선택 (packing 선택과 함께)
-session 실행
-  └ select_layer_config → p_b = min(instances, num_units // units),
-                          batch rounds = ceil(instances / p_b)
+compile_model(phases, repeats={phase: 실행 횟수})     # None이면 모든 phase 1
+  1 tune_phase       class마다 tune_stage_class (packed class는 member class를 먼저)
+  2 kv_bytes_bound   layers × Σ kv class (count × 측정 후보 중 최대 kv 바이트)
+                     → 첫 kv phase부터 capacity = unit 용량 − 모든 phase의 최대 bound
+  3 select_phase     packed class(origin이 있는 class: 같은 activation의 weight를 n으로
+                     이어 붙인 QKV·gate/up, 같은 B를 읽는 GEMM을 m으로 쌓은 것)마다
+                     pack/separate 2^n 조합 전부에 select_configs → 한 layer 시간 최소
+  4 session.compile  configure_with(choice): class의 config, pack=GEMM이 separate가 아님
+                     compile된 layer 0의 stage가 고른 class와 같은지 검사
+```
+
+`select_configs(classes, candidates, capacity, layers, repeats)`는 class마다 측정 후보 하나를
+고르는 multiple-choice knapsack이다. `repeats`는 한 request에서 phase를 실행하는 횟수다
+(prefill 1, decode는 생성 token 수 − 1).
+
+| plan | 한 layer 시간 | 용량 조건 |
+|---|---|---|
+| reloaded | `Σ count × repeats × (E + U)` | `slot + max input + max output ≤ capacity` |
+| resident | `Σ count × (repeats × E + U)` | `layers × slot + max input + max output ≤ capacity` |
+
+```text
+slot   = Σ count × (weight + state)          scratch = max input + max output
+frontier: class를 하나씩 더하며 (시간, slot) 순으로 정렬하고,
+          앞선(더 빠른) 선택이 slot·input·output 모두 같거나 작으면 버린다 (Pareto)
+plan마다 용량을 만족하는 가장 빠른 선택 → 두 plan 중 엄격히 더 짧은(<) 쪽
+repeats = 1이면 두 시간이 같아 reloaded가 남는다
+```
+
+session 실행 시 `select_layer_config`(`execution.py`)는 `stage_target`으로 바꾼 target에서
+config를 정한다. compile된 layer는 고른 config를 그대로 받고, `autotune_cache_path`만 주면
+측정 기록 중 실제 unit 수에 맞는 것을 `batch rounds × total_ms` 최소로 고른다. weight stage는
+instance 1개·round 1개, kv stage는 M/N/K round 1개·batch round 1개여야 한다
+(`p_b = min(instances, num_units // units)`, `batch rounds = ceil(instances / p_b)`).
+
+### 9.4 GEMM packing 비용 — `fx_packing._cost`
+
+**내용**
+
+`torch_backend/fx_packing.py`의 block-diagonal packing(`_block_diagonal`)은 member p개를
+`[A1 | … | Ap] @ blockdiag(B1 … Bp)`로 묶을지 AutoTuner의 정적 모델로 정한다. 실행하지 않는다.
+
+**근거**
+
+- `_cost(spec, problem)`: `stage_target(problem)`에서 `rank_block_groups` 상위 Block Group의
+  `tile_ladder` 마지막 점(가장 병렬인 점)과 `best_partitions` 첫 유효 partition으로
+  `(tiles × scheduled_compute, tiles × Σ access_allocations)`를 낸다.
+- 묶음 수 count마다 비용 × (member 수 / count)를 비교한다. compute가 묶지 않을 때 이하인
+  count 중 access 바이트가 가장 작은(같으면 큰) count를 고르고, 1이면 묶지 않는다.
+
+**예시**
+
+```text
+count ∈ {member 수의 약수}:  problem = (m, count·n, count·k)
+free  = {count | compute(count) ≤ compute(1)}
+count = argmin over free of (bytes(count), −count)
 ```
 
 ## 10. 단일 unit 측정 도구
@@ -578,15 +648,15 @@ Tile을 키우며 throughput 포화점을 측정하는 독립 도구다. seed �
 - 결과는 `single_unit.csv`(측정마다 즉시 기록)와 `performance.json`(schema
   `pim-single-unit-saturation-v2`)이다. 저장 경로는 프로젝트 안이어야 한다(`project_path`).
 - GEMV profiling의 dtype은 target의 `gemv_profile_spec`을 따른다(UPMEM int32→int32, AiMX
-  fp16→fp32). AiMX의 정확도 검사는 `x[::256] = 1`, 기대값 `ceil(K/256)`이다
-  ([Silent-PIM 설계](Silent-PIM_Design.md) §9).
+  fp16→fp32). AiMX의 정확도 검사는 vACC 수치 특성 때문에 `x[::256] = 1`, 기대값
+  `ceil(K/256)`이다([Silent-PIM 설계](Silent-PIM_Design.md) 11.3절).
 
 **예시**
 
 ```text
 Block 후보 b:
   group_k = 1, 2, 4, …   (제약 또는 측정 상한까지, 안정되면 중단) → 가장 빠른 Group g
-  tile_k  = 1, 2, 4, …   (g 고정, 안정될 때까지)                  → saturation work
+  tile_k  = 2, 4, 8, …   (g 고정, 안정될 때까지)                  → saturation work
 ```
 
 ## 11. Target lowering과의 경계

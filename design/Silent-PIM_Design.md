@@ -8,14 +8,14 @@ Placed PIM Common IR을 Silent-PIM(AiMX) FPGA의 CDMA descriptor chain으로 내
 | 근거 | 경로 |
 | --- | --- |
 | 기계 상수·opcode | `~/pim_aimx_sw/pim_sw/src/pim_math_src/pim_math.h` |
-| 참조 matmul | `~/pim_aimx_sw/pim_sw/src/pim_math_src/matmul.c` (`_matmul_silent`, `_gemm_silent`) |
-| 참조 host 배치 | `~/pim_aimx_sw/ubench/matmul/matmul.cpp` |
-| AiMX dialect | `include/triton-shared/Dialect/PIMTarget/AiMX/IR/AiMXDialect.{h,td}`, `lib/Dialect/PIMTarget/AiMX/IR/AiMXDialect.cpp` |
-| lowering | `lib/Conversion/PIMToAiMX/PIMToAiMXPass.cpp`, `DescriptorBuilder.cpp` |
+| 참조 matmul | `~/pim_aimx_sw/pim_sw/src/pim_math_src/matmul.c` |
+| AiMX dialect | `include/triton-shared/Dialect/PIMTarget/AiMX/IR/AiMXDialect.{h,td}`, `AiMXFootprint.h`, `lib/Dialect/PIMTarget/AiMX/IR/AiMXDialect.cpp` |
+| lowering | `lib/Conversion/PIMToAiMX/PIMToAiMXPass.cpp`, `DescriptorBuilder.cpp`, `include/triton-shared/Conversion/PIMToAiMX/Passes.td` |
 | codegen | `lib/Target/AiMX/AiMXToDescriptors.cpp`, `AiMXToRuntimeStub.cpp`, `DescriptorReuse.h` |
 | runtime | `pim_backend/backend/aimx_runtime.h`, `aimx_resident_runtime.cpp` |
 | Python | `pim_backend/backend/{compiler,driver,target}.py`, `aimx_adapter.py`, `aimx_model.py` |
-| autotuner | `pim_backend/autotuner/{model,gemm,gemv}.py` |
+| autotuner | `pim_backend/autotuner/model.py` (`AiMXModel`, `aimx_runtime_allocations`) |
+| 예제 | `pim_backend/examples/silent_pim/`, `pim_backend/torch_backend/examples/aimx/` |
 
 PIM Common IR은 이 target을 위해 고치지 않는다. AiMX는 Common이 정한 Block, Block Group,
 Execution Tile, device mapping, K 누산 순서, host 전송 순서를 그대로 받고 **물리 저장
@@ -25,42 +25,42 @@ Execution Tile, device mapping, K 누산 순서, host 전송 순서를 그대로
 
 ## 1. 하드웨어
 
-### 1.1 구성
+### 1.1 구성 (`backend/target.py`)
 
 | 항목 | 값 |
 | --- | --- |
 | unit | FPGA 1장 = GDDR6 칩 8개 (칩당 4 GB, 2 channel) |
-| channel / bank | 16 channel × 16 bank = 256 bank |
+| channel / bank | 16 channel × 16 bank = 256 bank (`banks_per_unit`) |
 | ALU (lane) | bank당 16 → **4096 lane** |
 | 물리 용량 | 32 GB (bank 128 MB) |
-| 할당 가능 용량 | runtime heap `0x1FEE00000` (8 GB − 18 MB). 넘으면 `PIM] OOM`으로 종료 |
+| 할당 가능 용량 | FPGA당 runtime heap `0x1FEE00000` (8 GB − 18 MB). 넘으면 vendor runtime이 `PIM] OOM`으로 종료 |
 | column 접근 | 256 bit = bf16 16개 |
 | 데이터 형식 | PIM DRAM 안은 언제나 bfloat16 |
 
-`backend/target.py`는 `bank_capacity_limit_bytes = heap / 256 = 33,480,704`로 Common
-profile에 싣는다. 물리 bank 용량(128 MB)은 상수로만 기록한다.
+Common profile의 `bank_capacity_limit_bytes`는 `0x1FEE00000 / 256 = 33,480,704`다
+(`AIMX_BANK_CAPACITY_BYTES`). 물리 bank 용량(128 MB)은 상수로만 둔다.
 
 ### 1.2 기계 상수 (`AiMXDialect.h`)
 
 | 상수 | 값 | 뜻 |
 | --- | --- | --- |
-| `kNumChannels` | 16 | descriptor group의 record 수 |
+| `kNumChannels` / `kNumBanks` / `kALUSize` | 16 / 16 / 16 | channel, channel당 bank, bank당 lane |
 | `kTypeSize` | 2 | bf16 |
 | `kBurstSize` | 32 B | DRAM burst = bank 하나의 lane 16개 |
 | `kRegSize` | 256 원소 | vecA 한 번 적재가 담는 K |
 | `kPIMWidth` | 512 B | channel 하나의 operand 폭 |
-| `kDeviceWidth` | 8192 B | lane 4096개 × 2 B |
-| `kLanes` | 4096 | output block 원소 수 |
+| `kDeviceWidth` / `kLanes` | 8192 B / 4096 | lane 4096개 × 2 B |
 | `kStrideShift` | 33 | pitch를 주소에 `addr \| (pitch << 33)`로 싣는다 |
-| `kGroupBytes` | 512 B | descriptor group = record 32 B × 16 |
+| `kRecordBytes` / `kGroupBytes` | 32 B / 512 B | descriptor group = record 32 B × 16 |
 | `kPMMSize` / `kVACCOffset` / `kPMMAlign` | `0x30000` / `0x10000` / 256 KiB | vACC = PMM + `0x10000` |
 | `kMaxRuntimeAllocationBytes` | 1023 × 2 MiB | vendor allocator가 크기를 `int`로 받아 2 GiB에서 overflow |
 
 ### 1.3 descriptor
 
-`pim_isa_32_t`는 Xilinx CDMA scatter-gather descriptor 그대로다(next, src, dst, len,
-status). PIM 동작은 `status`의 flag로 지정한다. memory controller에는 평범한 DMA로
-보인다(**silent**).
+`pim_isa_32_t`는 Xilinx CDMA scatter-gather descriptor다(next, src, dst, len, status).
+PIM 동작은 `status`의 flag로 지정하고, memory controller에는 평범한 DMA로 보인다
+(**silent**). descriptor 안의 src/dst는 **절대 물리 주소**(`addr | pitch << 33`)이고 device가
+주소를 계산하지 않는다. 그래서 chain은 buffer 물리 주소에 묶인다(§7.3, §8).
 
 ```text
 (src, src_pitch) ──[opcode, batch]──► (dst, dst_pitch),  len byte
@@ -77,12 +77,10 @@ status). PIM 동작은 `status`의 flag로 지정한다. memory controller에는
 | 15–17 | batch 코드 | 1 → 0, 2 → bit15, 4 → bit16, 8 → bit15\|16 |
 | 18 | `stride` | src/dst 상위 비트의 pitch 사용 |
 
-- `aimx.desc` 하나 = descriptor group 하나 = 같은 내용의 record 16개.
-  **실행되는 것은 첫 record 하나다.** 모든 record의 `next`가 다음 group을 가리켜
-  CDMA가 group마다 첫 record만 걷는다(FPGA 실측, §11).
+- `aimx.desc` 하나 = descriptor group 하나 = 같은 내용의 record 16개(`PIM_RD_INSTR_MC`).
 - `len`은 **출력** byte 수다.
 - batch 비트는 flag enum에 없다. `aimx.descriptor_program`의 `batch`에서 codegen이
-  유도한다.
+  유도한다(`batchBits`).
 
 ### 1.4 output block, batch, vecA
 
@@ -94,11 +92,10 @@ b = 1     b = 8
 1 × 4096  8 × 512
 ```
 
-- A는 vecA에 그대로 들어가지 않는다. `bc|tp` descriptor가 A를 **Arel**(A의 16배 크기)로
-  재배치한다. 순열은 FPGA 실측으로 확정됐다:
-  `Arel[c*256 + g*16 + t] = A[16c + t]` (`m=1, k=256, b=1`).
-- vACC는 lane당 22 bit 한 칸이다. output block 하나를 다 누산하고 drain해야 다음
-  block으로 갈 수 있다.
+- A는 vecA에 그대로 들어가지 않는다. `bc|tp` descriptor가 A를 **Arel**(A의 16배 크기,
+  `× kNumChannels`)로 재배치한다. 순열은 [AiMX_ChannelUnits.md](AiMX_ChannelUnits.md) §1에 있다.
+- vACC는 output block 하나 깊이다. block 하나를 다 누산하고 drain해야 다음 block으로
+  갈 수 있고 `pim_exec`을 건너 살아남지 못한다.
 
 ---
 
@@ -119,12 +116,16 @@ Triton kernel
   ▼ AiMX target IR (host op + descriptor program)
   │ triton-shared-translate --aimx-to-runtime-stub  → stub.cpp
   │ triton-shared-translate --aimx-to-descriptors   → aimx_descriptors.h
-  │ (모델 session은 --aimx-to-model-stub)
+  │ (모델 session은 같은 target IR을 --aimx-to-model-stub으로)
   ▼ driver.py: g++ -O3 -fopenmp → pim_host.so  (+ libaimx_resident_<hash>.so, libpim.so)
 ```
 
-AiMX가 `--pim-reuse-execution-tile-inputs`를 빼는 이유: AiMX의 `pim.load`는 상주
-panel의 view라 hoist 이득이 없고, vACC 누산은 K Group 안에 A/B load가 직접 있어야 한다.
+- `--pim-reuse-execution-tile-inputs`를 빼는 이유: AiMX의 `pim.load`는 상주 panel의 view라
+  hoist 이득이 없고, vACC 누산은 K Group 안에 A/B load가 직접 있어야 한다.
+- 마지막 `-canonicalize`를 빼는 이유: 일반 SCF canonicalization이 1회 loop과 그 축 속성을
+  지울 수 있다. AiMX는 그 loop/combine 구조를 그대로 읽는다.
+- bundle에는 stub, descriptors, `aimx_allocations`, `target_ir`(model stub 재번역용)가 들어간다
+  (`_aimx_to_artifact`).
 
 ---
 
@@ -160,9 +161,9 @@ Common loop 제거.
 | op | 하는 일 |
 | --- | --- |
 | `aimx.acquire n` | FPGA n개 확보 |
-| `aimx.foreach_device %set axes [m,n,k] counts [...]` | device 좌표 loop. `aimx.persistent`이면 할당·chain을 FPGA별로 상주 |
-| `aimx.alloc %dev bytes B align A kind <data\|descriptor\|pmm>` | PIM DRAM 할당. 크기는 compile time 상수 |
-| `aimx.stage %src origin sizes strides pad_to pitch [transpose] into %buf {group_layout \| group_rows/cols, shared_over}` | host gather + bf16 변환 + 0 padding + 업로드 |
+| `aimx.foreach_device %set axes [m,n,k] counts [...]` | device 좌표 loop. counts의 곱 = acquire 수. `aimx.persistent`이면 할당·chain을 FPGA별로 상주 |
+| `aimx.alloc %dev bytes B align A kind <data\|descriptor\|pmm>` | PIM DRAM 할당. 크기는 compile time 상수. pmm은 `0x30000` B·256 KiB 정렬, descriptor는 512 B 배수 |
+| `aimx.stage %src origin sizes strides pad_to pitch [transpose] into %buf {group_layout, shared_over}` | host gather + bf16 변환 + 0 padding + 업로드 |
 | `aimx.build_descriptors @prog(args) into %chain` | descriptor program을 chain에 펼친다. `scf.execute_region {no_inline}` 안에서만 |
 | `aimx.invoke %dev, %chain` | `pim_exec`. 끝날 때까지 기다린다 |
 | `aimx.unstage %buf into %dst origin sizes strides pitch accumulate [transpose] {group_layout}` | download + bf16 → host 타입 + 대입 또는 누산 |
@@ -170,7 +171,8 @@ Common loop 제거.
 
 `group_layout = [useful_rows, useful_cols, physical_rows, physical_cols, row_groups,
 col_groups]`은 **물리 순서**다. Group panel은 group grid에서 row-major로 이어진다.
-`transpose`가 붙으면 host 행이 물리 열, host 열이 물리 행이다.
+`transpose`가 붙으면 host 행이 물리 열, host 열이 물리 행이다. dialect에는 주기 배치
+`group_rows`/`group_cols`도 있고 stub이 처리하지만, 현재 lowering은 `group_layout`만 낸다.
 
 ### 4.3 descriptor program
 
@@ -188,6 +190,9 @@ program의 `batch`는 {1, 2, 4, 8}만 허용한다.
 ---
 
 ## 5. `--convert-pim-to-aimx`
+
+pass 진입 조건: target profile이 `aimx`이고 `banks_per_unit == kNumBanks × kNumChannels`(256),
+`bank_capacity_limit_bytes > 0`, `pim-form-host-plan`이 끝난 IR.
 
 ### 5.1 device 하나의 구조
 
@@ -209,17 +214,19 @@ scf.for (Common scheduling rounds)                ← 그대로 유지
 ```
 
 - PMM을 가장 먼저 잡는 이유: `pim_private_malloc`이 `pim_malloc`이 이미 내준 주소를
-  돌려준 사례가 있다. stub은 모든 data buffer가 `[PMM, PMM+0x30000)`과 겹치지 않는지
-  실행 시점에 검사한다.
-- 용량: 모든 할당의 `Σ ceil(bytes/8192) × 32`를 bank 사용량으로 보고
-  `bank_capacity_limit_bytes`를 넘으면 오류다. 결과는 `aimx.allocations`,
-  `aimx.bank_bytes`, `aimx.descriptor_bytes` 속성에 남는다.
+  돌려줄 수 있다. 비상주 stub은 모든 data buffer가 `[PMM, PMM+0x30000)`과 겹치지 않는지
+  실행 시점에 검사하고, 상주 runtime은 모든 buffer 쌍이 겹치지 않는지 검사한다.
+- 용량: 할당마다 `ceil(bytes/8192) × 32`를 bank 사용량으로 더해 `bank_capacity_limit_bytes`를
+  넘으면 오류다. 할당 하나가 `kMaxRuntimeAllocationBytes`를 넘어도 오류다. 결과는
+  `aimx.allocations`, `aimx.bank_bytes`, `aimx.descriptor_bytes` 속성에 남는다.
+- chain 크기 = descriptor group 수 × 512 B. group 수는 program이 desc를 내는 자리에서 loop
+  반복 수를 곱해 센다(`ProgramBuilder::desc`, `DeviceLowering::append`).
 
 ### 5.2 물리 layout 규칙
 
 tensor SSA 값마다 `Layout {usefulRows, usefulCols, rows, cols, transposed}`를 둔다.
 useful은 Common Group의 논리 크기, rows/cols는 물리 크기다. SSA로 연결된 값(loop carry,
-같은 access, elementwise 피연산자)은 한 layout을 공유한다.
+같은 access, elementwise 피연산자, MAC accumulator와 결과)은 한 layout을 공유한다.
 
 | 연산 | operand | 물리 rows | 물리 cols | 비고 |
 | --- | --- | --- | --- | --- |
@@ -239,7 +246,8 @@ A pitch 조건 `kAlign`: gather가 256 원소씩 읽으므로 256의 배수이�
 
 ### 5.3 placement와 Group panel
 
-`pim.place` 하나가 PIM DRAM 할당 하나다.
+`pim.place` 하나가 PIM DRAM 할당 하나다. 같은 memref의 동일한 입력/출력 placement는
+저장소를 공유한다(나중의 `pim.load`가 앞의 store를 봐야 한다).
 
 ```text
 row_groups = allocation_rows / usefulRows,  col_groups = allocation_cols / usefulCols
@@ -261,10 +269,10 @@ device 좌표가 지워진다. 그래서 descriptor 주소가 round마다 같고
 `pim.temporal_reduction` loop이 다음 조건을 모두 만족하면 `lowerMACReduction`이 처리한다.
 
 - accumulator가 positive-zero `linalg.fill` 하나
-- loop 몸체 = A load, B load, `linalg.matmul`/`linalg.matvec`, yield (index 연산과 float 상수만 추가 허용)
-- MAC 피연산자는 `pim.load` 결과다. bf16 입력을 `.to(tl.float32)`로 넓힌 GEMV는 Common
-  `--pim-form-compute`가 `extf`를 벗겨 `linalg.matvec(bf16, bf16, f32 acc)`로 만들고, 넓히기는
-  matvec 몸체 안에 남는다(`validateMAC`가 허용)
+- loop 몸체 = A load, B load, `linalg.matmul`/`linalg.matvec`, yield (`pim.access`, index
+  연산, float 상수만 추가 허용)
+- MAC 피연산자가 같은 loop 몸체의 `pim.load` 결과다. MAC 몸체 안의 `arith.extf`(bf16 입력을
+  넓힌 것)는 `validateMAC`이 허용한다
 - MAC 결과가 다음 K Group으로만 전달됨
 
 ```text
@@ -279,8 +287,9 @@ device 좌표가 지워진다. 그래서 descriptor 주소가 round마다 같고
 ```
 
 - `columns`: `matmul-useful-n-only`이면 `roundup(Gn, 4096/b)`, 아니면 물리 cols 전체.
-- Arel 크기: `K-Group 수 × rows × roundup(Gk,256) × 2 × 16`. 다음 M/N Group이 재사용한다.
-- 조건을 만족하지 않는 MAC(`lowerMAC`)은 Group마다 partial을 따로 계산해 ADD한다.
+- Arel 크기: `K-Group 수 × rows × roundup(Gk,256) × 2 × 16`. 같은 lowering 위치의 모든
+  M/N Group이 재사용한다. K-Group 수가 이 용량을 넘으면 `aimx.require`가 멈춘다.
+- 조건을 만족하지 않는 MAC(`lowerMAC`)은 partial을 따로 계산해(`buildMatmul`) accumulator에 ADD한다.
 
 ### 5.5 GEMV: `yᵀ = xᵀ · Wᵀ`
 
@@ -297,10 +306,10 @@ device 좌표가 지워진다. 그래서 descriptor 주소가 round마다 같고
 | K step | `256/b` | 256 |
 
 - W와 x, y의 stage/unstage에 `transpose`가 붙는다. stub이 host `(m, k)`를 panel
-  `[k × pc + m]`에 쓴다.
-- b=1이라 K step이 256이고 Gk가 256의 배수가 아니면 Group 안의 0 행을 읽는다. 끝의
-  padding MAC은 생기지 않는다.
-- Arel은 `K-Group 수 × 256 × 2 × 16`으로 작다. weight는 재배치되지 않는다.
+  `[k × pc + m]`에 쓴다(§7.4).
+- K step이 256이므로 MAC 길이가 언제나 256의 배수다. 끝의 padding MAC은 생기지 않고,
+  Gk가 256의 배수가 아니면 panel 안의 0 행을 읽는다.
+- Arel은 `K-Group 수 × roundup(Gk,256) × 2 × 16`이다. weight는 재배치되지 않는다.
 
 ### 5.6 그 밖의 연산
 
@@ -308,7 +317,7 @@ device 좌표가 지워진다. 그래서 descriptor 주소가 round마다 같고
 | --- | --- |
 | `pim.load` | placement panel을 scratch로 copy (snapshot) |
 | `pim.store` | scratch → placement panel copy |
-| `pim.combine kind="add"` | 서로 다른 M/N 출력에 단독 기여함이 증명되면 copy, 아니면 ADD. 대상 placement는 0으로 초기화 |
+| `pim.combine kind="add"` | 서로 다른 M/N 출력에 단독 기여함이 증명되면 copy, 아니면 ADD. 대상 placement는 0으로 초기화. 다른 kind는 오류 |
 | `linalg.fill` (상수) | scalar global을 stage로 채운 상수 buffer |
 | identity-map `linalg.generic`, `arith.add/sub/mulf` | elementwise descriptor |
 | `arith.extf` (elementwise generic 안) | 입력 view를 그대로 쓴다. 저장 형식이 bf16이라 값이 같다 |
@@ -325,26 +334,26 @@ B(`b_mask|pim_mode|op`), C ← vACC(`c_mask|op`). mul: A(`a_mask|mul|pim_mode`),
   placement 전체 범위로 옮긴다.
 - Group마다 다른 mask, mask가 걸린 read/write alias는 오류다.
 
-### 5.8 Execution Tile 사이의 K
+### 5.8 Execution Tile·FPGA 사이의 K
 
-K가 여러 Execution Tile로 나뉘면(`pim.scheduling_axis = "reduction_k"`) vACC는
-`pim_exec`을 건너 살아남지 못한다. 각 Tile의 bf16 결과를 `aimx.unstage accumulate`가
-host에서 FP32로 더한다(첫 Tile은 대입).
+K가 여러 Execution Tile로 나뉘면(`pim.scheduling_axis = "reduction_k"`) 각 Tile의 bf16
+결과를 `aimx.unstage accumulate`가 host에서 더한다(첫 Tile은 대입). host 타입이 f32면
+FP32 누산이고, f16/bf16이면 Tile마다 그 타입으로 반올림된다(`addBF16`).
 
 `p_k > 1`(FPGA 사이 K 분할)도 같은 경로다. FPGA마다 자기 K 구간의 partial을 vACC에서
 끝내고, combine 출력의 unstage가 `accumulate = (K round > 0) || (k 좌표 ≠ 0)`이 된다.
-FPGA thread가 동시에 같은 host 출력에 쓰지 않도록 lowering이 그 unstage에
-`aimx.device_reduction`을 붙이고, stub이 device loop에 `omp ... ordered`를, unstage에
-`#pragma omp ordered`를 낸다. stage·invoke는 FPGA마다 병렬이고 unstage만 device 순서(k = 0이
-대입, 이후 누산)로 실행되므로 결과는 실행마다 같다.
+lowering이 그 unstage에 `aimx.device_reduction`을 붙이고, stub이 device loop에
+`omp ... ordered`를, unstage에 `#pragma omp ordered`를 낸다. stage·invoke는 FPGA마다
+병렬이고 unstage만 device 순서(k = 0이 대입, 이후 누산)로 실행되므로 결과는 실행마다 같다.
+model stub도 job loop에 같은 절을 낸다.
 
 ### 5.9 pass 옵션
 
 | 옵션 | pass 기본 | compiler 기본 (`PIMOptions`) | 뜻 |
 | --- | --- | --- | --- |
-| `batch` | 8 | `batch = 8` | GEMM output block 행 수. torch 경로는 GEMM마다 `min(batch, M 이상 2의 거듭제곱)`으로 낮춘다(§9). GEMV는 쓰지 않는다 |
+| `batch` | 8 | `batch = 8` | GEMM output block 행 수. torch 경로는 GEMM마다 낮춘다(§9). GEMV는 쓰지 않는다 |
 | `persistent` | true | `aimx_persistent = True` | 할당·chain을 FPGA별로 상주 |
-| `matmul-row-alignment` | 0 (= `4096/b`) | `aimx_matmul_row_alignment = 4096` | GEMM B/C Group panel 행 pitch |
+| `matmul-row-alignment` | 0 (= `4096/b`) | `aimx_matmul_row_alignment = 4096` | GEMM B/C Group panel 행 pitch. `4096/b`의 배수 |
 | `matmul-useful-n-only` | false | `aimx_matmul_useful_n_only = True` | 유효 N microtile만 계산 |
 | `matmul-k-alignment` | 0 (= `4096/b`) | `aimx_matmul_k_alignment = 0` | GEMM A 행(K) pitch |
 
@@ -352,33 +361,33 @@ FPGA thread가 동시에 같은 host 출력에 쓰지 않도록 lowering이 그 
 
 ## 6. descriptor program (`DescriptorBuilder.cpp`)
 
-view 인자는 `(buffer, byte offset, byte pitch)`다. 개수는 생성 위치에서 함께 센다
-(`ProgramBuilder::desc`).
+view 인자는 `(buffer, byte offset, byte pitch)`다.
 
 | program | 반복 | descriptor | len | opcode |
 | --- | --- | --- | --- | --- |
 | `copy` | rows·cols / 4096 | src → dst | 8192 | `copy` |
 | `elementwise` | rows·cols / 4096 | A, B, C 3개 | 8192 | §5.6 |
 | `matmul_relayout` | `m/b` × `k/256` | ① A gather (A view, pitch) | 512 | `pim_mode\|stride` |
-| | | ② Arel 쓰기 (`row·k·32 + (col/256)·8192·b`) | `8192·b` | `bc\|tp` |
+| | | ② Arel 쓰기 (`slot + row·k·32 + (col/256)·8192·b`) | `8192·b` | `bc\|tp` |
 | `matmul_accumulate` | `K / (256/b)` | ① Arel | 8192 | `a_mask\|matmul\|pim_mode` |
 | | | ② B (`k·pitch`) | `8192/b` | `b_mask\|matmul\|pim_mode\|stride` |
 | `matmul_padding` | 0 MAC 수 | accumulate와 같음 (0 영역) | | |
 | `matmul_drain` | 1 | vACC (pitch `8192/b`) → C (pitch) | `8192/b` | `c_mask\|matmul\|stride` |
-| `matmul`/`matvec` | relayout + output block × K + drain | K Group 누산이 아닌 MAC | | |
+| `matmul`/`matvec` | relayout + output block × K + drain | K Group 누산이 아닌 MAC (`buildMatmul`) | | |
 
 ### 6.1 `--aimx-to-descriptors`
 
 program마다 `static uint32_t aimx_prog_<name>(pim_isa_32_t *code, uint32_t cap,
-uint32_t idx, uint64_t *next, int fpga_id, ...)`를 낸다. record 수가 `cap`을 넘으면
-쓰기 전에 멈춘다. status word = opcode | batch 비트. 주소 재사용 분류가
-`Addresses`인 program은 주소만 고치는 `aimx_patch_<name>`도 낸다.
+uint32_t idx, uint64_t *next, int fpga_id, ...)`를 낸다. buffer 인자는 물리 주소다.
+record 수가 `cap`을 넘으면 쓰기 전에 멈춘다. status word = opcode | batch 비트.
+주소 재사용 분류가 `Addresses`인 program은 주소만 고치는 `aimx_patch_<name>`도 낸다
+(`aimx_patch_descriptor_addresses`가 record 16개의 src/dst만 바꾼다).
 
 ### 6.2 chain 규약
 
-- chain buffer의 첫 group 다음(`pa + 512`)부터 group을 쌓는다.
+- chain의 `next`는 `pa + 512`에서 시작한다.
 - `pim_args.desc_idx = idx - 1`, `desc_last = next - 1024` (마지막 group 시작).
-- chain은 자기 물리 주소를 담으므로 `pim_exec`가 끝나기 전에는 어떤 buffer도 놓지 않는다.
+- chain은 buffer 물리 주소를 담으므로 `pim_exec`가 끝나기 전에는 어떤 buffer도 놓지 않는다.
 
 ---
 
@@ -391,7 +400,7 @@ extern "C" void <kernel>(T* a0, T* a1, ...) {
   static std::mutex _host_mutex; ...
   aimx_runtime_init(AIMX_BASE_FPGA, <acquired>);   // init_mpim_drv, FPGA 범위 검사
   for (Common rounds) {
-    #pragma omp parallel for collapse(..) num_threads(P)   // FPGA마다 host thread 하나
+    #pragma omp parallel for [ordered] collapse(..) num_threads(P)   // FPGA마다 host thread 하나
     for (device 좌표) {
       int _fpga = AIMX_BASE_FPGA + linear(좌표);
       aimx_resident_context *_resident = aimx_resident_acquire(KEY ":site", _fpga, N);
@@ -402,15 +411,17 @@ extern "C" void <kernel>(T* a0, T* a1, ...) {
 
 - `aimx_require`는 `exit()`로 끝낸다. vendor가 hugepage를 돌려주는 경로가 `atexit`뿐이라
   `abort()`하면 hugepage가 샌다.
-- host ↔ PIM 전송은 2 MiB씩 나눠 `datacopy_*`를 부른다(큰 요청에서 커널 `kmalloc`
-  ENOMEM 실측).
+- host ↔ PIM 전송은 2 MiB씩 나눠 `datacopy_*`를 부른다(`AIMX_DMA_CHUNK_BYTES`; 큰 요청에서
+  커널 `kmalloc` ENOMEM 실측).
+- 비상주(`persistent=false`) 경로는 매 호출 `pim_malloc`/`pim_free`한다.
 
 ### 7.2 상주 (`aimx.persistent`)
 
-`aimx_resident_acquire(plan, fpga, buffers)`는 FPGA마다 plan 하나를 캐시한다. plan key는
-`AIMX_KERNEL_KEY`(stub·descriptor·runtime·base_fpga 해시) + site다. key나 buffer 수가
-바뀌면 buffer와 chain을 함께 버리고 다시 잡는다. 같은 kernel의 다음 호출은 할당 없이
-같은 주소를 쓴다.
+`aimx_resident_acquire(plan, fpga, buffers)`는 FPGA마다 plan 하나를 캐시하고 lease(mutex)를
+잡는다. plan key는 `AIMX_KERNEL_KEY`(stub·descriptor·include·`aimx_runtime.h`·base_fpga·resident
+runtime 해시) + site다. key나 buffer 수가 바뀌면 buffer와 chain을 함께 버리고 다시 잡는다.
+같은 kernel의 다음 호출은 할당 없이 같은 주소를 쓴다. `aimx_resident_alloc`은 물리 주소가
+33 bit 안이고 할당이 물리적으로 선형인지 검사한다.
 
 ### 7.3 chain 재사용 (`DescriptorReuse.h`)
 
@@ -418,8 +429,8 @@ construction 경계마다 descriptor 인자의 불변성을 분류한다.
 
 | 분류 | 조건 | 동작 |
 | --- | --- | --- |
-| `Unchanged` | 모든 주소·loop 범위가 상주 buffer·device 좌표·상수에만 의존 | `_resident->ready`이면 build·업로드 생략. 업로드 뒤 host record 페이지 반납 |
-| `Addresses` | loop 구조는 같고 주소만 바뀜 | `aimx_patch_*`로 src/dst만 고쳐 다시 업로드 |
+| `Unchanged` | 모든 주소·loop 범위가 상주 buffer·device 좌표·상수에만 의존 | `_resident->ready`이면 build·업로드 생략. 업로드 뒤 host record 페이지 반납(`MADV_DONTNEED`) |
+| `Addresses` | loop 구조는 같고 주소만 바뀜 | `ready`이면 `aimx_patch_*`로 src/dst만 고쳐 다시 업로드 |
 | `Rebuild` | 그 밖 | 매번 build·업로드 |
 
 동적 상한 `min(tileGroups, remaining)`은 full tile일 때만 `ready`를 세우고, tail은
@@ -430,12 +441,13 @@ construction 경계마다 descriptor 인자의 불변성을 분류한다.
 | 경로 | 조건 | 동작 |
 | --- | --- | --- |
 | `group_layout` | 모든 placement (현재 lowering) | panel마다 유효 행·열 복사, 행 끝과 panel 끝만 memset |
-| `group_layout` + `transpose` | GEMV의 W, x, y | panel `(k, m)` ← host `(m, k)`. host 행 stride가 1이면(이미 물리 순서, torch `x·W`) 물리 행마다 연속 복사, 아니면 32×32 block으로 전치한다. host 32행을 바깥에 두고 K-Group·K를 안쪽에서 끝까지 돌아 행마다 순차로 읽고(prefetch, TLB), panel에는 64 B씩 쓴다. 순회 순서만 다르고 결과는 같다 |
+| `group_layout` + `transpose` | GEMV의 W, x, y | panel `(k, m)` ← host `(m, k)`. host 행 stride가 1이면(host가 이미 물리 순서) 물리 행마다 연속 복사, 아니면 32×32 block으로 전치한다. host 32행을 바깥에 두고 K-Group·K를 안쪽에서 끝까지 돌며, panel에는 64 B씩 쓴다 |
 | `shared_over` | broadcast 입력 | 공유 좌표 조합마다 host pool 한 칸. 처음 온 thread만 변환(`std::call_once`), 전송은 FPGA마다 |
-| unstage `accumulate` | K Tile 2번째부터 | bf16 → float 덧셈 |
+| unstage `accumulate` | K Tile 2번째부터, `p_k`의 k ≠ 0 | bf16 → host 타입 덧셈 |
 
-host 변환: f32 → bf16은 round-to-nearest-even, f16 → bf16은 65,536칸 표, bf16은 그대로. 조립 buffer는
-thread별로 재사용한다(page fault 제거). stub은 `-O3`로 빌드한다.
+host 변환: f32 → bf16은 round-to-nearest-even, f16 → bf16은 65,536칸 표, bf16은 그대로
+복사. 비상주 경로의 조립 buffer는 thread별 cache(`aimx_host_buffer`, 8칸)로 재사용한다.
+stub은 `-O3`로 빌드한다.
 
 ### 7.5 timing
 
@@ -454,38 +466,61 @@ thread별로 재사용한다(page fault 제거). stub은 `-O3`로 빌드한다.
 
 ---
 
-## 8. 모델 session (`--aimx-to-model-stub`)
+## 8. 모델 session (`--aimx-to-model-stub`, `aimx_model.py`)
 
-`PIMSession` 경로는 같은 target IR을 model stub으로 다시 번역한다. 상세는
-[Model Runtime 설계](ModelRuntime_Design.md)에 있다. AiMX 쪽 차이만 적는다.
+`PIMSession` 경로는 같은 target IR을 model stub으로 다시 번역한다. 공통 정책은
+[Model Runtime 설계](ModelRuntime_Design.md)에 있다. AiMX 쪽만 적는다.
+
+### 8.1 stub
 
 | 항목 | 내용 |
 | --- | --- |
-| context | session이 FPGA별로 만든 `aimx_resident_context`를 인자로 받는다. kernel key로 찾지 않는다 |
-| 실행 단위 | job = batch slot × device. job마다 FPGA 하나, context 하나 |
-| 호출 종류 (`upload`) | 0 실행 (activation stage, invoke, unstage), 1 weight 업로드, 2 pack (host image에만 조립), 3 chain build만 |
-| 표 | `pim_model_slot_bytes/input/output/kind`로 slot 크기와 역할을 Python에 알린다 |
-| 주소 | memory table: weight → state(chain, PMM) → activation scratch. region 하나 = `pim_malloc` 하나(≤ 1023 × 2 MiB) |
-| 정렬 | operand 시작을 256 KiB로 맞춘다. data buffer 8 KiB 정렬은 batch 8에서 결과가 틀렸다(실측) |
+| 인자 | `aimx_model_call *` + kernel 인자 + grid 3개. context와 FPGA 번호는 session이 넘긴다(`AIMX_BASE_FPGA`, `AIMX_KERNEL_KEY` 없음) |
+| 실행 단위 | job = batch slot × device. job마다 FPGA 하나, context 하나. instance를 `batch_size`개씩 돈다 |
+| 호출 종류 (`upload`) | 0 실행 (activation·상수 stage, invoke, unstage), 1 weight를 device에 stage, 2 pack (weight를 job의 host image에만 조립, device 접근 없음), 3 chain build·업로드만. Python은 0, 2, 3을 쓴다 |
+| 표 | `pim_model_slot_count/argument_count/device_count`, slot마다 `pim_model_slot_bytes/input/output/kind/layout`(layout = `group_layout` 6칸 + transpose) |
+
+### 8.2 주소와 context (`AiMXModelRuntime.place` / `bind`)
+
+| 항목 | 내용 |
+| --- | --- |
+| phase | 하나만 배치한다. phase가 둘 이상이면 `place`가 `NotImplementedError` |
+| memory table | slot들의 weight → slot들의 state(chain, PMM) → activation scratch. key/value cache는 그 위 `[kv_base, capacity)` |
+| region | table을 조각 경계에서 잘라 region 하나 ≤ 1023 × 2 MiB(`MAX_REGION_BYTES`). region = FPGA마다 `pim_malloc` 하나 + 같은 크기의 host shadow. cache 항목은 별도 region에 묶는다 |
+| 정렬 | operand 크기를 256 KiB(`OPERAND_ALIGNMENT`)로 올려 모든 offset을 정렬한다 |
+| context | `aimx_model_create`가 slot마다 buffer를 table 주소(va), 용량, host shadow 위치에 놓는다 |
+| slot 공유 | slot을 공유하는 layer들은 그 slot 첫 layer의 context·descriptor chain을 함께 쓴다. `_create_stage`는 `slot_bytes`, table 종류, offset, job 수가 같아야 한다 |
+| chain | 물리 주소를 담으므로 slot마다 하나. `bind`에서 slot owner stage마다 `upload=3`으로 한 번 만들어 올린다(`chain_build_ms`) |
 
 resident weight GEMM은 instance 1개, scheduling round 1회로 제한한다(`select_layer_config`).
 여러 round가 같은 buffer에 다른 weight tile을 올리면 상주가 성립하지 않기 때문이다.
 
-### 8.1 key/value cache 상주
+### 8.3 weight 업로드 (`GroupLoader`)
 
-host cache는 `[위치, kv_heads × head_dim]`(한 행 = 토큰)이고, stage의 cache operand는 그 열
-window(연속된 head)이거나 그 전치다(QK의 B = Kᵀ). cache stage는 batch round 없이 instance i가
-FPGA `base + i` 하나를 혼자 쓴다(instance 수 ≤ FPGA 수, `devices = 1`). 그래서 window마다 주소가
-하나로 고정되고 chain도 바뀌지 않는다.
+- group에 들어갈 때(`enter_layer`) 그 group의 weight를 올린다. pack 호출(`upload=2`)이 group의
+  weight 범위를 FPGA마다 host image 하나에 조립하고, `aimx_model_push`가 (region, FPGA)마다 한 번
+  전송한다. 다음 group의 pack은 background thread에서 실행과 겹친다(pack은 host만 쓴다).
+- group이 하나뿐이면(모든 layer 상주) 실행 전에 region 하나씩 pack → push → 해제한다. host는
+  region 하나의 image만 쥔다.
+
+### 8.4 key/value cache 상주
+
+host cache는 layer마다 `[kv_heads, positions, head_dim]`이다. cache stage의 B는 token-row view
+`[positions, kv_heads × head_dim]`의 열 window(연속된 KV head를 열로 이어 붙인 것, `stage.kv_windows`,
+`residency.token_rows`)이거나 그 전치(QK의 B = Kᵀ)다.
 
 | 항목 | 내용 |
 | --- | --- |
-| 주소 | cache operand slot은 memory table의 `("kv", layer, KEY/VALUE)` 항목이다. phase 영역 위 `[kv_base, capacity)`이고 별도 region에 묶인다. phase는 하나만 허용 |
-| 실행 | cache 인자는 weight처럼 실행(upload 0) 호출에서 stage하지 않는다 |
-| 배치 | model stub이 slot마다 `pim_model_slot_layout` (group_layout 6칸 + transpose)을 내보낸다. B 행 r, 열 c는 panel `(r / ur, c / uc)`(row-major), panel 안 `(r % ur, c % uc)`에 놓인다 |
-| 쓰기 | `write_kv`가 위치를 대기열에 넣고, 다음 cache stage 실행 직전에 region host shadow에 bf16으로 조립한 뒤 항목·FPGA마다 바뀐 byte 구간 하나를 `aimx_model_push_ranges`로 보낸다 |
-| 대조 | stage의 첫 쓰기에서 cache 전체를 stub pack(upload 2)으로 조립한 결과와 계산한 배치를 비교한다 |
-| 비용 | V(B 행 = 위치)는 새 위치의 행만 보낸다. Kᵀ(B 열 = 위치)는 새 위치가 모든 행에 걸쳐 있어 그 열 group의 panel 전체를 보낸다 |
+| 실행 | cache stage는 `devices = 1`, batch round 1회여야 한다(`_create_stage`). instance i가 FPGA `base + i`를 혼자 쓰므로 window 주소가 하나로 고정되고 chain도 바뀌지 않는다 |
+| 주소 | cache operand slot은 memory table의 `("kv", layer, KEY/VALUE)` 항목이다. capacity에서 아래로 layer마다 key, value 순서로 놓인다(`plan_memory`). 실행(upload 0) 호출에서 stage하지 않는다 |
+| 배치 | B 행 r, 열 c는 panel `(r // ur, c // uc)`(row-major), panel 안 `(r % ur, c % uc)`(`_kv_offsets`, `pim_model_slot_layout`) |
+| 쓰기 | `write_kv`는 B operand이고 stage layout이 비전치인 cache만 받는다. 위치를 대기열에 넣고, 다음 cache stage 실행 직전(`_push_kv`)에 region host shadow에 bf16으로 조립한 뒤 (항목, FPGA)마다 바뀐 byte 구간 `[최소 offset, 최대 offset]` 하나를 `aimx_model_push_ranges`로 보낸다 |
+| 대조 | stage의 첫 push에서 cache 전체를 stub pack(upload 2)으로 조립한 결과와 계산한 배치를 비교한다(`_check_kv_layout`) |
+| 비용 | V(B 행 = 위치)는 새 위치의 행 구간만 보낸다. Kᵀ(B 열 = 위치)는 새 위치가 모든 행에 걸쳐 있어 구간이 그 panel의 거의 전체가 된다 |
+
+cache 항목의 offset은 layer마다 다르다. slot을 공유하는 layer들은 `_create_stage`의 offset
+일치 조건을 통과하지 못하므로, cache를 읽는 AiMX decode는 layer마다 slot이 따로인
+**group 하나**(모든 layer 상주)에서만 실행된다.
 
 ---
 
@@ -493,16 +528,19 @@ FPGA `base + i` 하나를 혼자 쓴다(instance 수 ≤ FPGA 수, `devices = 1`
 
 | 항목 | GEMM (`matmul`) | GEMV (`matvec`) |
 | --- | --- | --- |
-| Block | `(min(8, b), 16, 16)` | `(8, 1, 16)` |
+| Block | `(min(8, b), 16, 16)` | `(8, 1, 16)` (`TRITON_BLOCK`) |
 | Group 상한 (`_compute_unit`) | `(b, 4096, max(256, kAlign))` | `(4096, 1, 256)` |
 | profile spec | Group `unit / Block`, f16 → f32 | Group `(512, 1, 16)`, f16 → f32 |
 | `scheduled_compute` | `tile_m·tile_n · roundup(Gm,b) · roundup(Gn,4096/b) · roundup(tile_k·macK, 256)` | `tile_m · roundup(Gm,4096) · tile_k · roundup(Gk,256)` |
 | operand 대응 | A(m,k), B(k,n), C(m,n) | W(m,k) → B, x(k) → A, y(m) → C |
 
-`aimx_runtime_allocations`는 lowering과 같은 식으로 PMM, A, Arel, B, C, descriptor chain
-하한을 계산한다(GEMV는 §5.2의 전치 크기). `ConstraintEngine`은 단일 할당 ≤ 1023 × 2 MiB,
-bank 사용량 ≤ `bank_capacity_limit_bytes`를 검사한다. 최종 판정은 lowering의
-용량 검사다.
+- `aimx_runtime_allocations`는 lowering과 같은 식으로 PMM, A, Arel, B, C, descriptor chain
+  하한을 계산한다(GEMV는 §5.2의 전치 크기). `allocation_reason`은 단일 할당 ≤ 1023 × 2 MiB,
+  bank 사용량 ≤ `bank_capacity_limit_bytes`를 검사한다. 최종 판정은 lowering의 용량 검사다.
+- `mapping_reason`을 두지 않으므로 `p_k > 1`도 후보다(§5.8).
+- cache stage: `resident_operand_reason`은 상주 B가 `roundup(K,256) × roundup(N,4096)`보다 크게
+  저장되는 config를 거부하고, `resident_operand_config`는 그 조건을 만족하는 config 하나
+  (Group m = batch, n = min(4096, N), k = 256, Tile이 문제 전체)를 탐색 초기값으로 낸다.
 
 **GEMM batch는 GEMM마다 정한다.** `AiMXModel.stage_target(problem)`이 GEMM의 batch를
 `min(spec batch, M 이상인 가장 작은 2의 거듭제곱)`으로 바꾼 spec을 돌려주고,
@@ -516,19 +554,19 @@ torch 경로의 탐색(`tune_stage_class`), 기록 조회(`select_layer_config`)
 | --- | --- | --- | --- |
 | 2 | 2 | 2 | 2 × 2048 |
 | 3, 4 | 4 | 4 | 4 × 1024 |
-| 5 ~ 8 이상 | 8 | 8 | 8 × 512 |
+| 5 이상 | 8 | 8 | 8 × 512 |
 
-최종 config는 실측 `total_ms`(stage + invoke + unstage wall) 최소값이다. 정렬 키는 측정
-순서만 정한다.
+torch 경로에서 M = 1 또는 N = 1인 GEMM은 matvec 문제로 바뀐다(`execution.gemm_problem`).
+최종 config는 실측 `total_ms` 최소값이다.
 
 | 진입점 | 용도 |
 | --- | --- |
-| `examples/silent_pim/autotune_gemm.py` | GEMM 탐색, `--profile-only`로 단일 FPGA 포화점 |
+| `examples/silent_pim/autotune_gemm.py` | GEMM 탐색, `--profile-only`로 단일 FPGA profiling |
 | `examples/silent_pim/autotune_gemv.py` | GEMV 탐색(rel L2 ≤ 2% 판정), `--profile-only` |
-| `torch_backend` (`model_compile.tune_stage_class`) | 모델 stage. decode의 M=1/N=1 GEMM은 matvec 문제로 튜닝 |
+| `torch_backend` (`model_compile.tune_stage_class`) | 모델 stage |
 
-GEMV 단일 FPGA 프로파일의 정확도 검사는 `x[::256] = 1`, 기대값 `ceil(K/256)`이다.
-ones·ones는 부분합이 1024를 넘어 vACC가 작은 곱을 버린다(§11.3).
+GEMV 단일 FPGA profiling의 정확도 검사(`autotuner/gemv.py`)는 `x[::256] = 1`, 기대값
+`ceil(K/256)`이다. ones·ones는 부분합이 1024를 넘어 vACC가 작은 곱을 버린다(§11.3).
 
 ---
 
@@ -538,11 +576,11 @@ ones·ones는 부분합이 1024를 넘어 vACC가 작은 곱을 버린다(§11.3
 
 | 조건 | 값 / 확인 |
 | --- | --- |
-| driver | `/dev/pl_dma*`가 보여야 한다 (`aimx_unit_count`) |
-| vendor 소스 | `export AIMX_PIM_SW=$HOME/pim_aimx_sw/pim_sw` (`pim_math.h`가 설치되지 않는다) |
+| driver | `num_units`를 주지 않으면 `/dev/pl_dma*` 개수를 쓴다 (`aimx_unit_count`) |
+| vendor 소스 | `export AIMX_PIM_SW=$HOME/pim_aimx_sw/pim_sw` (`pim_math.h`를 소스 트리에서 읽는다) |
 | 라이브러리 | `$AIMX_PIM_SW/lib/libpim.so`를 경로로 직접 링크한다. `-lm` 필요 (`pow` 미해결) |
-| 빌드 | `g++ -O3 -std=c++17 -fopenmp -Wno-narrowing -Wno-write-strings` (driver가 수행) |
-| FPGA 범위 | `[base_fpga, base_fpga + num_units)`가 보이는 FPGA 수 안이어야 한다 (`aimx_runtime_init`가 검사) |
+| 빌드 | `g++ -O3 -std=c++17 -fopenmp -Wno-unused-function -Wno-narrowing -Wno-write-strings` (driver가 수행) |
+| FPGA 범위 | `[base_fpga, base_fpga + num_units)`가 보이는 FPGA 수 안이어야 한다 (`aimx_runtime_init`, `AiMXAdapter.open`) |
 | 프로세스 | 상주 상태는 fork로 물려받을 수 없다 (자식에서 `_exit(1)`) |
 
 ### 10.2 launch 옵션
@@ -561,7 +599,7 @@ kernel[grid](..., pim_target="aimx",
 | --- | --- |
 | host tensor dtype bf16 / f16 / f32 | 오류 (`tensor storage supports BF16/F16/F32`) |
 | tile tensor rank 1 또는 2, 정적 shape | 오류 |
-| 연산: matmul, matvec, identity-map elementwise add/sub/mul/extf, 상수 fill | 그 밖은 오류 |
+| 연산: matmul, matvec, identity-map elementwise add/sub/mul/extf, 상수 fill, `pim.combine` add | 그 밖은 오류 |
 | K 누산은 positive-zero accumulator에서 시작 | vACC 경로 불가 → 오류 |
 | mask는 §5.7 범위 | 오류 |
 | 할당 하나 ≤ 1023 × 2 MiB, bank 합 ≤ 용량 | 오류 |
@@ -571,34 +609,31 @@ kernel[grid](..., pim_target="aimx",
 | 조건 | 이유 |
 | --- | --- |
 | GEMM `Gn`을 4096의 배수로 | B/C panel 행이 4096 원소다. `Gn = 512`면 B/C가 8배 |
-| GEMM/GEMV `Gk`를 256의 배수로 | B 행이 256 단위로 채워진다. 원본도 `q_size % 256 != 0`을 거부한다 |
+| GEMM/GEMV `Gk`를 256의 배수로 | B 행이 256 단위로 채워진다 |
 | GEMV `Gm`을 4096으로 | output block이 M 4096이다. `Gm = 32`면 lane 32/4096만 쓴다 |
-| N(GEMM) 또는 M(GEMV)이 4096 미만인 행렬 | 4096까지 padding은 피할 수 없다 (원본도 `CHUNK = 4096` padding) |
+| N(GEMM) 또는 M(GEMV)이 4096 미만인 행렬 | 4096까지 padding은 피할 수 없다 |
 
 autotuner의 Group 상한(§9)이 이 크기를 1순위로 고른다.
 
 ---
 
-## 11. FPGA 실측으로 확인된 사실
+## 11. FPGA로 확인된 사실
 
 ### 11.1 descriptor와 주소
 
 | 사실 | 근거 |
 | --- | --- |
-| stride shift는 33 | `matmul.c`의 모든 stride 자리가 `<< 33`이고, `kStrideShift = 33`으로 만든 GEMM·GEMV chain(B·C가 pitch ≠ len)이 FPGA에서 맞는다 |
-| group 16 record 중 첫 record만 실행 | record마다 다른 src를 넣은 결과와 모두 같게 쓴 결과가 byte 단위로 동일 (`~/kangmlee/test/e11_perch`) |
-| A 재배치 순열 | `Arel[c*256 + g*16 + t] = A[16c + t]` (`m=1, k=256, b=1`) |
-| 한 chain에 K·N 여러 block | `./matmul 1 8192 28672 1`이 `r` 7회 × `q` 32회를 chain 하나로 실행 |
-| B 한 행(4096)을 b=8이면 512 폭 창 8개로 읽음 | `~/kangmlee/test/e12_narrow_n`, `m=8 k=256 n=4096`, `r_size=4096` 전부 일치 |
+| stride shift는 33 | `matmul.c`의 stride 자리가 `<< 33`. `kStrideShift`, resident runtime이 PA < 2³³을 검사 |
+| `len`은 출력 byte 수. 입력 크기를 주면 그만큼만 쓰이고 나머지는 이전 내용이 남는다 | `AiMXDialect.td`의 `aimx.desc` 설명 |
+| `pim_private_malloc`이 `pim_malloc`이 내준 주소를 돌려줄 수 있다 | PMM 우선 할당과 겹침 검사 (`AiMXToRuntimeStub.cpp`) |
 
-### 11.2 행 pitch
+### 11.2 행 pitch와 정렬
 
-| 대상 | 결과 |
-| --- | --- |
-| GEMM B/C Group panel 행 pitch 512 (b=8) | config마다 틀리고 같은 입력 2회 실행 결과도 다름. 4096으로 바꾸면 모델과 일치 → compiler 기본 4096 |
-| GEMM A 행 pitch `4096/b` (b=8: 512), 2048 | 4096과 bit 동일, 2회 실행 동일 |
-| 모델 경로 operand 정렬 8 KiB (b=8) | 결과가 틀림 → 256 KiB로 정렬 |
-| B/C 행 pitch < 4096 (전체 N이 4096 미만) | **미확인.** `~/kangmlee/test/e12_narrow_n`을 `M=8 N=512`로 실행해야 한다 |
+| 대상 | 결과 | 반영 |
+| --- | --- | --- |
+| GEMM B/C Group panel 행 pitch 512 (b=8) | 실행마다 결과가 다름 | `aimx_matmul_row_alignment = 4096` |
+| GEMM A 행 pitch `4096/b` (b=8: 512) | 4096과 같은 결과 | `aimx_matmul_k_alignment = 0` (= `4096/b`). 검증 스크립트 `torch_backend/examples/aimx/verify_k_alignment.py` |
+| 모델 경로 data buffer 정렬 8 KiB (b=8) | 결과가 틀림 | `OPERAND_ALIGNMENT = 256 KiB` (PMM 정렬과 같다) |
 
 ### 11.3 vACC 수치 특성
 
@@ -610,11 +645,9 @@ vACC lane = 부호 1 + 그룹 지수 G 5 bit + 가수 16 bit (22 bit), 값 `±�
 | 16 | 4 ~ 1024 | 1/64 | \|p\| < 2⁻⁷ |
 | 17 | 1024 ~ 262144 | 4 | \|p\| < 2 |
 
-- G 차이 −1인 곱은 8 bit 밀어 더하고, −2 이하는 버린다. G는 커지기만 한다.
-- drain은 절사다. 가수가 0이면 `±2^(8G−127)`을 낸다(G=16이면 ±2.0).
-- 0-상쇄 부호: 가수가 0이면 부호는 그 단계에 들어온 곱의 부호다(vendor 시뮬레이터와
-  다른 유일한 점). 이 규칙을 넣은 Python MAC 모델이 FPGA와 bit 단위로 일치한다.
-- 입력 0은 누산을 바꾸지 않는다. 그래서 0 padding은 결과에 영향이 없다.
+- G 차이 −1인 곱은 8 bit 밀어 더하고, −2 이하는 버린다. G는 커지기만 한다. 그래서 같은
+  부호 부분합이 1024를 넘으면 작은 곱이 버려진다.
+- 입력 0은 누산을 바꾸지 않는다. 0 padding은 결과에 영향이 없다.
 
 정확도 (M=128, N=512, K=4096, FP64 대비 relative L2):
 
@@ -624,43 +657,7 @@ vACC lane = 부호 1 + 그룹 지수 G 5 bit + 가수 16 bit (22 bit), 값 `±�
 | positive \|N\|·\|N\| | 0.61% | 0.63% | **48.5%** (1024 포화) |
 | llm N(0,1)·N(0,0.02) | 0.40% | 0.41% | 0.79% |
 
-무난한 범위는 Execution Tile K `256 ~ 1024`다. compiler는 FP32 누산이나 CPU와의 bit
-일치를 약속하지 않는다.
-
-### 11.4 GEMV 실측 (2026-10-25, FPGA 1장)
-
-`examples/silent_pim/autotune_gemv.py --m 4096 --k 4096`, llm 분포, 선택 config는 모두
-Block (8,1,16), Group (512,1,16) → extent (4096,1,256), Tile (1,1,4), P (1,1,1)이다.
-
-| 단계 | 입력 | `layout_in` | `h2d` | `invoke` | wall | rel L2 |
-| --- | --- | --- | --- | --- | --- | --- |
-| 전치 배치 도입 (host 행 → panel 열) | f32 | 33.865 ms | 9.200 ms | 0.658 ms | 44.898 ms | 0.479% |
-| block 전치, K 바깥 | f32 | 30.622 ms | 10.095 ms | 0.662 ms | 42.488 ms | 0.479% |
-| block 전치, M 32행 바깥 (현재) | f32 | 23.828 ms | 8.968 ms | 0.653 ms | 34.626 ms | 0.479% |
-| 같음 + bf16 입력 (변환 없음) | bf16 | **12.949 ms** | 9.737 ms | 0.655 ms | **24.449 ms** | **0.410%** |
-
-- 단일 스레드 하한 참고: 연속 f32 → bf16 변환 1,678만 원소(torch)가 10.6 ms.
-- rel L2는 f32 입력이면 입력의 bf16 양자화 오차를 포함한다. bf16 입력의 0.410%는 PIM 누산
-  오차만이고 §11.3의 llm 바닥(약 0.40%)과 같다.
-- 전치 배치 이전에는 같은 GEMV가 output block `8×512` 중 `8×1`만 유효했다(lane 1/512).
-
-**호출마다 W를 stage하는 경로는 host가 지배한다.** bf16에서도 `layout_in + h2d`가 wall의
-93%다. 모델 session처럼 W가 상주하면 호출마다 `invoke`와 x/y 전송만 남는다.
-
-**K Tile 크기에 따라 `layout_in`이 달라진다** (bf16, Group (512,1,16) 고정, autotune 측정):
-
-| Tile K (K-Group 수) | K Tile 수 | W stage buffer | `layout_in` | `invoke` | `d2h` | wall |
-| --- | --- | --- | --- | --- | --- | --- |
-| 16 | 1 | 32 MiB | 24.99 ms | 0.63 ms | 0.08 ms | 35.66 ms |
-| 8 | 2 | 16 MiB | 19.73 ms | 0.64 ms | 0.16 ms | 30.25 ms |
-| 4 | 4 | 8 MiB | 14.19 ms | 0.65 ms | 0.32 ms | 25.31 ms |
-
-조립 buffer가 작을수록 host cache에 남아 조립이 빠르다(추정). 그래서 autotuner가 Tile K 4를
-고른다. W가 상주하는 경로에서는 `layout_in`이 없으므로 이 근거가 사라지고, `d2h`와 host
-FP32 합산이 적은 Tile K 16이 유리할 수 있다.
-
-Group M 256(W panel이 4096 폭으로 padding되어 B 저장·전송 2배)은 `h2d`가 18 ms로 두 배가
-되어 모두 졌다(§10.4).
+compiler는 FP32 누산이나 CPU와의 bit 일치를 약속하지 않는다.
 
 ---
 
@@ -668,11 +665,11 @@ Group M 256(W panel이 4096 폭으로 padding되어 B 저장·전송 2배)은 `h
 
 | 항목 | 상태 |
 | --- | --- |
-| GEMM batch 혼합 (예: M=12 → 8 + 4) | 미구현. 한 Tile에 batch 하나. M은 `roundup(Gm, b)`로 padding. 혼합해도 B 읽기는 행 묶음 수(2)로 같고 descriptor만 12/16로 준다 |
-| B/C 행 pitch < 4096 | 하드웨어 미확인 (§11.2) |
-| GEMV W stage | §11.4: f32 23.8 ms, bf16 12.9 ms. `[K][M]` 배치(① 연속 복사)의 4096² 측정은 아직 없음. 호출마다 W를 올리는 측정이 autotuner 선택(Tile K)에 영향을 줌 |
-| device 사이 K 분할 (`p_k > 1`) | 구현 (§5.8). FPGA 실측 없음 |
-| Group마다 다른 mask | 미구현 |
-| A 재배치 융합 / host에서 Arel 직접 생성 | 미구현. host Arel로 채널마다 다른 vecA를 주는 것은 실측 확인, 설계 보류 ([AiMX_ChannelUnits.md](AiMX_ChannelUnits.md)) |
+| GEMM batch 혼합 (예: M=12 → 8 + 4) | 미구현. 한 MAC에 batch 하나, M은 `roundup(Gm, b)`로 padding |
+| B/C 행 pitch < 4096 | 하드웨어 미확인. `matmul-row-alignment=0`(= `4096/b`)은 비교용으로만 남아 있다 |
+| Group마다 다른 mask, mask가 걸린 read/write alias | 미구현 (lowering 오류) |
 | GEMV 커널의 rank-1 masked x/y | 예제 커널은 full-block만 허용한다 (`examples/silent_pim/gemv.py`) |
-| stage와 invoke 겹치기 | 없음. `pim_exec`가 동기이고 FPGA마다 host thread 하나 |
+| A 재배치 융합 / host에서 Arel 직접 생성 | 미구현. 채널마다 다른 vecA는 실측 확인, 설계 보류 ([AiMX_ChannelUnits.md](AiMX_ChannelUnits.md)) |
+| 모델 session의 phase 둘 이상 | 미구현 (`AiMXModelRuntime.place`). 예제는 prefill과 decode phase를 따로 compile한다 (`torch_backend/examples/aimx/run_aimx_{prefill,decode}.sh`) |
+| cache stage의 slot 공유 | 불가 (§8.4). cache를 읽는 decode는 group 하나 |
+| stage와 invoke 겹치기 | 없음. `pim_exec`가 동기이고 FPGA마다 host thread 하나. 모델 경로는 다음 group의 host pack만 실행과 겹친다 |

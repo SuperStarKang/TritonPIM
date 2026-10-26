@@ -49,7 +49,8 @@ Op만 가진다. `pim.device`는 계획 형성 중간 표현이고 `pim-form-hos
 **근거**
 
 - 최종 IR에 `pim.device`가 남으면 Target이 진단한다
-  ([PIMToUPMEMPass.cpp](../lib/Conversion/PIMToUPMEM/PIMToUPMEMPass.cpp) 진입부).
+  ([PIMToUPMEMPass.cpp](../lib/Conversion/PIMToUPMEM/PIMToUPMEMPass.cpp),
+  [PIMToAiMXPass.cpp](../lib/Conversion/PIMToAiMX/PIMToAiMXPass.cpp)의 `pim::DeviceOp` walk).
 - `PartitionOp::verify`가 입력별 전송 1회, 출력별 회수 1회, launch 1개, 전송 순서를
   검사한다([PIMDialect.cpp](../lib/Dialect/PIM/IR/PIMDialect.cpp)).
 
@@ -124,15 +125,17 @@ Common verifier는 partition 곱, Device당 고정 할당 바이트, local tile 
 
 **예시**
 
-[target.py](../pim_backend/backend/target.py)의 UPMEM 기본값:
+[target.py](../pim_backend/backend/target.py)의 `upmem_target_spec`/`aimx_target_spec`
+기본값(옵션 0일 때):
 
-| 필드 | 값 |
-|---|---|
-| `num_units` | 2048 |
-| `banks_per_unit`, `cores_per_bank` | 1, 1 |
-| `lanes_per_core` | 16 |
-| `bank_capacity_limit_bytes` | 60 MiB |
-| `local_capacity_limit_bytes` | 46680 |
+| 필드 | UPMEM | AiMX |
+|---|---|---|
+| `num_units` | 2048 | `/dev/pl_dma*` 개수(`aimx_unit_count`) |
+| `banks_per_unit` | 1 | 256 (16 channel × 16 bank) |
+| `cores_per_bank` | 1 | 1 |
+| `lanes_per_core` | 16 | 16 |
+| `bank_capacity_limit_bytes` | 60 MiB | runtime heap `0x1FEE00000` / 256 |
+| `local_capacity_limit_bytes` | 46680 | 0 (local memory 없음) |
 
 ### 3.3 공유 축 `shared_over`
 
@@ -176,7 +179,7 @@ loop의 역할은 속성으로 명시하고 뒤 pass는 이 속성만 읽는다.
 
 | 표식 | 붙이는 pass | 의미 |
 |---|---|---|
-| `pim.axis="m"/"n"` | build-logical-grid | source grid에서 복원한 출력 병렬 축 |
+| `pim.axis = #pim.axis<"m"/"n">` | build-logical-grid | source grid에서 복원한 출력 병렬 축 |
 | `pim.reduction="add"` | form-compute | Linalg가 SCF 누산기를 add로 갱신 |
 | `pim.scheduling_axis` | map-devices | Host round loop(`n`, `m`, `reduction_k`) |
 | `pim.temporal_reduction` | map-devices | Device가 현재 round에 도는 local K loop |
@@ -211,7 +214,7 @@ TTShared IR
   pim-form-execution-tiles    (tile-m/n/k)
   pim-map-devices             (p-m/p-n/p-k)
   pim-place-data → pim-verify
-  pim-reuse-execution-tile-inputs → pim-verify     (UPMEM만)
+  pim-reuse-execution-tile-inputs (UPMEM만) → pim-verify
   pim-form-host-plan → pim-verify → cse → canonicalize(UPMEM만)
 Target lowering
 ```

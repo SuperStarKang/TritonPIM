@@ -20,6 +20,10 @@ tasklet, 물리 DPU 위치, SDK 전송 단위로 구체화한다. Target은 part
 - 논리 공유 관계만으로는 실제 rank/member/CI 위치를 알 수 없다.
 - Host가 쓰는 metadata와 DPU가 읽는 metadata는 같은 ABI여야 한다.
 - WRAM 공유, tasklet 행 분할, DMA 완료 동기화는 Target의 책임이다.
+- [compiler.py](../pim_backend/backend/compiler.py) `_pim_common_to_upmem`이
+  `--convert-pim-to-upmem=host-threads=<host_threads> nr-tasklets=<nr_tasklets>`(기본 8, 0)를
+  실행하고, `_upmem_to_artifact`가 `--upmem-to-host`/`--upmem-to-device` 결과와 device 소스의
+  `// pim.lanes = N`에서 읽은 tasklet 수를 `{host, device, target_ir, nr_tasklets}` 번들로 묶는다.
 
 **예시**
 
@@ -29,7 +33,7 @@ Common 최종 IR: partition { place, broadcast/scatter, launch, gather }
     ▼
 UPMEM IR: upmem.* + memref/scf/linalg/arith
     ├─ upmem-to-host        → Host C++: pool, 패킹, 전송, launch, 회수/합산
-    ├─ upmem-to-model-host  → 모델 세션용 Host C++ (ModelRuntime 설계)
+    ├─ upmem-to-model-host  → 모델 세션용 Host C++ (7.4절)
     └─ upmem-to-device      → DPU C: MRAM/metadata 선언, WRAM, DMA, 계산, barrier
 ```
 
@@ -193,7 +197,8 @@ loop 밖에, dealloc은 그 뒤에 둔다.
 - 0 초기화로 tail round의 padding에 이전 round 값이 남지 않는다.
 - 마지막 tile이 부분 tile이면 tile loop를 올림으로 돌고 tile 안에서 `size` 밖을
   건너뛴다.
-- 복사 원소 수가 `host_threads × 512`를 넘으면 바깥 tile loop를 OpenMP로 나눈다.
+- `host_threads > 1`이면 바깥 tile loop에 `#pragma omp parallel for collapse(rank)`를 붙이고,
+  (올림 tile 수의 곱 × tile 원소 수) > `host_threads × 512`일 때만 병렬로 돈다.
   `host_threads`는 이 복사 loop의 병렬도이며 SDK 전송 worker 수가 아니다.
 
 **예시**
@@ -240,14 +245,14 @@ N            = Pm × Pn × Pk
 비용(G)       = Σ_i bytes_i × N / 공유배수_i(G)
 ```
 
-`P=[4,32,16]`, A/DPU = B/DPU = 448 KiB (A는 n 공유, B는 m 공유):
+`P=[4,32,16]`, A/DPU = B/DPU = 448 KiB (A는 n 공유, B는 m 공유). `Pm=4`라 `gm ≤ 4`다.
 
 | G | 비용 ∝ 1/gn + 1/gm | 결과 |
 |---|---|---|
 | [1,8,1] | 1.125 | |
-| [2,4,1] | 0.75 | 선택 (먼저 열거됨) |
+| [2,2,2] | 1.0 | |
+| [2,4,1] | 0.75 | 선택 (곱 8로 동률, 먼저 열거됨) |
 | [4,2,1] | 0.75 | |
-| [8,1,1] | 1.125 | |
 
 ### 6.2 실행 시 topology 연결
 
@@ -377,7 +382,10 @@ __host struct _pim_metadata_t _pim_metadata;   // DPU 쪽 선언
 
 **근거**
 
-- `upmem_runtime.c` `upmem_runtime_reserve`, `upmem_runtime_load`.
+- `upmem_runtime.c` `upmem_runtime_reserve`, `upmem_runtime_load`. 새 집합은
+  `dpu_alloc(n, "sgXferEnable=true,sgXferMaxBlocksPerDpu=1024")`로 잡는다.
+- 상주 블록이 집합을 소유하면 `upmem_resident_acquire`로 넘기고, session이 열린 상태에서
+  상주 블록 없이 호출하면 abort한다(`upmem_acquire`).
 - 계측 슬롯: prepare, h2d, kernel, d2h, reduction, buffer_alloc, buffer_free, acquire,
   buffer_init, layout_a, layout_b, layout_other, layout_c. h2d는 prepare+push를 포함한다.
 - `operand_role`이 `lhs`/`rhs`인 stage는 layout_a/layout_b, 그 밖의 입력(matvec 포함)은
@@ -389,6 +397,43 @@ __host struct _pim_metadata_t _pim_metadata;   // DPU 쪽 선언
 _pim_start(H2D); push A; push B; push metadata; _pim_stop(H2D);
 _pim_start(KERNEL); dpu_launch(...); _pim_stop(KERNEL);
 ```
+
+같은 이름 순서가 [driver.py](../pim_backend/backend/driver.py) `_STAGE_NAMES["upmem"]`이고,
+launcher는 `pim_timing_ms`를 그 순서로 읽는다(`pim_timing_version = 3`).
+
+### 7.4 모델 세션용 Host 번역
+
+**내용**
+
+`upmem-to-model-host`는 같은 UPMEM IR을 `struct upmem_model_kernel *_model`을 첫 인자로 받는
+진입 함수로 낸다. 집합·배정·pool·전송은 세션 객체가 소유하고, 생성 코드는 batch 안의 job마다
+stage와 metadata만 채운다. 세션 쪽 동작은 [ModelRuntime 설계](ModelRuntime_Design.md)가 다룬다.
+
+**근거**
+
+- `UPMEMToHost.cpp`의 `model` 분기, `emitModelForeachUnit`, `emitStage`, `emitGather`,
+  `emitForeachGroup`.
+- `upmem_model_wants`는 `upload_weights`가 `UPMEM_MODEL_KV_PACK`이면 KV 역할 binding 중
+  선택된 job만, 그 밖에는 weight 또는 input 역할 binding만 참으로 돌려준다
+  ([upmem_model.c](../pim_backend/backend/upmem_model.c)).
+
+**예시**
+
+| UPMEM IR | `upmem-to-host` | `upmem-to-model-host` |
+|---|---|---|
+| 모듈 선언 | 없음 | `pim_model_pool_count`, `pim_model_pool_bytes[]`, `pim_model_metadata_bytes`, `pim_model_device_mapping[]` |
+| 함수 본문 | 1회 실행 | `for (batch_base = 0; batch_base < instances; batch_base += batch_size)` |
+| `memref.alloc/dealloc` | `malloc`/`free` | `_model->pools[i]`, 해제 없음 |
+| `upmem.acquire` / `bind_devices` | `upmem_acquire` / `upmem_bind_devices` | `_model->set` / `_model->mapping` |
+| `upmem.stage` | 대표 DPU에서 패킹 | `upmem_model_wants(_model, binding, _job)`이 참인 job만 패킹 |
+| `upmem.to_mram` | prepare + push | `_model->pointers[binding][_job]` 기록 후 `upmem_model_transfer(_model, binding, 0)` |
+| metadata | 연속 구간별 push | `_model->metadata`에 기록 후 `upmem_model_metadata` |
+| `upmem.launch` | `dpu_launch` | `upmem_model_launch(_model)` |
+| `upmem.gather` | prepare + push FROM_DPU | `upmem_model_transfer(_model, binding, 1)` |
+| `foreach_group` + `unstage` | 항상 | `_model->upload_weights == 0`일 때만 |
+
+`_job = _batch_slot × 논리 DPU 수 + _u`이고, stage·unstage의 host 원본은
+`_model->arguments[_instance × argument_count + i]`다.
 
 ## 8. Device 계산과 DMA
 
@@ -584,7 +629,7 @@ DPU(pm,pn,pk): A[256pm:+256, 1792pk:+1792]   448 KiB  shared_over=[n]
 Host pool: A 4×16=64 slot, B 32×16=512 slot, C 2048 slot
 G = [2,4,1] (6.1절 표)
 DPU local loop: m 4 × n 4 × k 14 Group
-WRAM: A 8 KiB + B 8 KiB + C 16 KiB = 32 KiB  (≤ 46680)
+WRAM: A 8 KiB + B 8 KiB + C 16 KiB = 32 KiB  (≤ local_capacity_limit_bytes 기본 46680, pim-verify 검사)
 tasklet 16: C·A 4행씩, B 공유
 DMA chunk: A 16행×4, B 32행×4, C 8행×8 (각 2048 B)
 Host: 같은 (pm,pn)의 pk=0..15 partial 합산
@@ -599,6 +644,8 @@ P=[16,1,8](DPU 128개)을 가정한다.
 
 **근거**
 
+- 커널이 A와 x를 INT32로 넓힌 뒤 곱해도 `PIMFormComputePass.cpp` `formMatvec`가 sign
+  extension 앞의 INT8 값으로 `linalg.matvec`를 만든다. 그래서 WRAM의 A·x는 i8이고 누산만 i32다.
 - x만 m을 공유하므로 `gm`이 클수록 비용이 줄고, `gm·gn·gk ≤ 8`에서 `G=[8,1,1]`이다.
 - 6.2절 식에 `G=[8,1,1]`, `P=[16,1,8]`을 대입하면 묶음 `j`는 `k = j % 8`,
   `m = (j / 8) × 8 + CI`다.

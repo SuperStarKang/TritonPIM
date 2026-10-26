@@ -3,385 +3,217 @@
 ## 역할과 수명
 
 **내용**
-PIMSession은 모델 전체의 Device, Weight, KV, staging memory를 소유한다.
-LayerPlan은 Transformer Block 또는 MoE Block 하나의 CPU/PIM 실행 계획이다.
-Device는 모델 시작에 한 번 확보하고 Session 종료에 한 번 해제한다.
+PIMSession은 adapter(장치), 요청 단계(phase)별 LayerPlan, 메모리 table을 소유한다.
+LayerPlan은 Torch block 하나를 CPU partition과 PIM stage로 나눈 실행 계획이다.
+장치는 Session 진입(`__enter__`)에서 한 번 확보하고 `close()`에서 한 번 해제한다.
 
 **근거**
-- Weight 교체와 KV 수명은 Layer 사이에 걸쳐 있다.
-- CPU/PIM 분할과 GEMM 배정은 각 Layer의 shape와 의존성에 따라 결정된다.
+- [runtime.py](../pim_backend/backend/runtime.py) `PIMSession`: `plans`(phase → LayerPlan tuple), `memory`(MemoryTable), `weight_table`, `kv_table`, `loaded_layer`.
+- [model.py](../pim_backend/torch_backend/model.py) `LayerPlan`: `index`, `phase`, `graph`(분할된 FX), `stages`(`_LayerGemm`), `exported_graph`.
+- Session은 중첩할 수 없고 연 thread와 context에서만 쓸 수 있다(`_check_owner`).
 
 **예시**
 
 | PIMSession | LayerPlan |
 |---|---|
-| 실제 자원과 topology | Layer 연산 그래프 |
-| 모델 전체 Weight/KV table | CPU/PIM partition |
-| 현재 Layer weight와 프로그램 | GEMM별 config와 artifact |
-| 메모리 주소와 staging buffer | instance 대응, p_b, round, unit mapping |
-| 모델의 Layer 실행 순서 | 컴파일된 Layer 실행 |
+| adapter와 model runtime (`backend`, `backend.model`) | 분할된 FX graph (CPU partition + PIM stage) |
+| `plans[phase]`: phase별 layer 실행 순서 | stage별 config, `p_b`, batch round, M/N/K round |
+| `memory`: 모든 phase와 KV 영역의 offset table | `phase`, `index`, `backend_plan`(slot, group, bytes) |
+| `weight_table`: `(phase, layer, stage, operand)` → weight 배치 | weight operand(frozen tensor, view, `ConcatenatedWeight`) |
+| `run_model(phase, ...)`, `write_kv(...)` | `run_model(*inputs)`: 분할 graph 실행 |
 
 ## 준비 과정
 
 **내용**
-Session이 먼저 Device를 확보한 뒤 Torch block을 FX로 분석하고 LayerPlan을 생성한다.
-LayerPlan은 전달받은 실제 자원으로 config를 선택하고 CPU/PIM 구간을 준비한다.
-전체 Layer의 메모리 요구량을 모은 뒤 Session의 adapter가 주소와 최종 device artifact를 확정한다.
-컴파일과 고정 buffer 준비는 반복 실행 경로에서 수행하지 않는다.
+`compile(phases, kv_inputs=)`는 장치를 확보하기 전에 모든 phase를 준비하고, Session 진입이 장치 확보와 bind를 한다.
+`prepare(phases, kv_inputs=)`는 이미 열린 Session 안에서 준비와 bind를 함께 한다.
+두 경로 모두 `_build`에서 export, config, native 컴파일, 메모리 배치를 하며 장치에 접근하지 않는다.
 
 **근거**
-- Execution Tile 크기가 local layout과 MRAM 사용량을 정한다.
-- 모델 전체 저장 공간의 소유자는 Session이다.
-- Device 확보와 tensor 주소 배정은 별도 단계다. 공용 주소를 정하려면 전체 Layer의 요구량이 필요하다.
+- `phases`는 실행 순서의 `{phase: (layers, example_inputs, configure)}`이다. `configure(gemms, spec)`는 원래 FX GEMM 이름 → `PIMTorchConfig`를 돌려준다.
+- `kv_inputs[phase](index, inputs)`는 그 layer 입력 중 host key/value cache를 `{KEY/VALUE: tensor}`로 알려준다.
+- `__enter__`는 compile된 Session이면 실제 unit 수가 spec과 다를 때 `ValueError`를 낸다.
 
 **예시**
 
 ```text
-PIMSession 진입: Device alloc / 실제 자원 조회
+PIMSession.compile(phases)                       (장치 없음)
+  _build
+    adapter.begin_model                          model runtime 생성
+    phase마다, layer마다
+      torch.export → analyze_fx_gemms → configure
+      build_layer_plan(kv=...)                   freeze, packing, stage 묶음, split_module
+      plan.plan_model                            stage마다 select_layer_config + PIM native 컴파일
+      plan.compile_cpu                           CPU partition Inductor 컴파일, 출력 → 다음 layer 예제 입력
+    plan_memory(resources, {phase: requirements}) 메모리 table (TorchIntegration §3)
+    adapter.prepare_model(plans, memory)         table offset 배치 (UPMEM: program link)
     │
-session.prepare(torch_blocks, example_inputs, configure=...)
+with session:                                    open → unit 수 확인 → bind_model → weight_table
+    session.write_kv(...)                        host cache 위치 → 장치 cache 영역
+    session.run_model(phase, *inputs)
     │
-    ├─ adapter.begin_model: 타깃 실행 상태 생성
-    │
-    ├─ Layer별 준비
-    │    ├─ FX 분석 → LayerPlan 생성
-    │    ├─ CPU/PIM 분할 / config / Execution Tile / p_b / round
-    │    ├─ PIM 컴파일 준비: buffer 요구량 확보
-    │    └─ CPU 컴파일 준비 출력 → 다음 Layer의 예제 입력
-    │
-    └─ adapter.prepare_model
-         └─ 전체 Layer의 Weight/scratch 배치 / 최종 ELF / native binding
-    │
-session.run_model: 준비한 Layer들을 순서대로 실행
-    │
-Session 종료: Device free
+close                                            model runtime, 장치 해제
 ```
 
-## Execution Tile과 Batch GEMM
+`prepare()` 경로는 `release()`로 model runtime만 해제하고 장치를 유지한 채 다시 `prepare()`할 수 있다
+(stage 측정이 이 경로를 쓴다, [model_compile.py](../pim_backend/torch_backend/model_compile.py) `measure_stage`).
+
+## LayerPlan: CPU partition과 PIM stage
 
 **내용**
-GEMM 코드를 head별로 나누지 않는다. 같은 프로그램이 처리할 Execution Tile의 크기와 배정 수를 선택한다.
-Block–Block Group–Execution Tile은 instance 내부 계산을 표현한다.
-p_b는 Torch runtime의 instance 병렬성이며 Common IR의 축으로 추가하지 않는다.
+`build_layer_plan`은 export graph를 정규화하고 weight를 상수로 freeze한 뒤 GEMM packing을 적용한다.
+weight GEMM과 `bmm`은 각자 stage 하나이고, 같은 depth·op·shape·dtype·config·cache 읽기 방식의 독립 activation GEMM은 instance로 묶어 stage 하나가 된다.
+stage 앞뒤에서 graph를 잘라(`split_module`) CPU partition과 PIM stage를 번갈아 둔다.
 
 **근거**
-- E_d = block_d × group_d × tile_d.
-- P = p_m × p_n × p_k, p_b = min(H, floor(R / P)), R_b = ceil(H / p_b).
-- 자원 한도는 p_b × P ≤ R이다.
+- `_freeze_graph`: parameter, buffer와 weight만 읽는 view/copy(`t`, `transpose`, `permute`, `view`, `reshape`, `contiguous`, `clone`, `detach`, `_to_copy`)를 graph 상수로 바꾼다.
+- `CompileModelCPU`: PIM stage가 없는 partition은 Inductor(`backend="inductor"`)로 컴파일하고, stage는 CPU reference로 계산해 다음 layer의 예제 입력을 만든다.
+- weight를 가진 `bmm`은 `_LayerGemm.prepare`가 거부한다("resident batched weights require expert placement support").
 
 **예시**
 
-32개 head의 Q[1024,128] × Kᵀ[128,1024], Block=(16,16,32), Group=(1,1,1):
+| stage 종류 | 묶음 | operand 전달 |
+|---|---|---|
+| weight GEMM | 단독, instance 1 | weight는 stage가 가짐, 실행 인자는 placeholder |
+| activation GEMM | 같은 key의 독립 GEMM → instance | 매 실행 연속 사본 전달 |
+| cache GEMM | 같은 cache 종류·operand·전치 여부끼리만 | host cache 자체 전달 (pointer만 쓰임, 장치 영역을 읽음) |
+| `bmm` | batch 차원이 instance | instance별 연속 사본 |
 
-| R | Tile | Execution Tile | partition | p_b | Batch round |
-|---:|---|---|---|---:|---:|
-| 2048 | (8,8,4) | (128,128,128) | (8,8,1) | 32 | 1 |
-| 512 | (8,8,4) | (128,128,128) | (8,8,1) | 8 | 4 |
-| 512 | (16,16,4) | (256,256,128) | (4,4,1) | 32 | 1 |
-
-```text
-batch round
-  └─ 기존 M/N/K round
-       ├─ instance별 입력 packing
-       ├─ DPU마다 다른 데이터를 같은 local slot에 H2D
-       ├─ 전체 집합 synchronous launch
-       ├─ D2H
-       └─ instance/tile 위치로 복원, 필요하면 K 부분합 누적
-```
-
-첫 BMM은 p_k=1이다. p_k=1이어도 K가 Execution Tile보다 크면 K round가 필요하다.
-Physical DPU 번호를 head 내부 좌표로 직접 해석하지 않고 배정표를 사용한다.
-마지막 batch의 빈 배정은 device에서 계산하지 않으며 출력 복원에서 제외한다.
-DPU 하나는 해당 M/N/K round에 배정된 Execution Tile을 처리한다. Round가 여러 개이면
-같은 DPU가 다음 tile의 데이터를 받아 동일 프로그램으로 계산한다.
-
-## Layer와 전체 모델 실행
+## Execution Tile과 batch round
 
 **내용**
-LayerPlan은 CPU/PIM stage의 의존성을 보존하며 동일 형태의 독립 GEMM을 묶는다.
-Session은 Layer 진입 시 weight를 올리고 해당 Layer 내부에서는 유지한다.
-QK와 PV는 별도 stage/config이며 같은 stage의 instance들이 프로그램을 공유한다.
+같은 프로그램이 Execution Tile을 처리하고, instance(독립 GEMM)는 unit 집합을 나눠 동시에 실행한다.
+`p_b`는 instance 병렬성이며 Common IR 축이 아니다.
 
 **근거**
-- QK와 PV의 shape가 다르므로 같은 config나 ELF를 강제하지 않는다.
-- Q/K/V activation과 모델 weight WQ/WK/WV는 다른 tensor이다.
+- [execution.py](../pim_backend/torch_backend/execution.py) `select_layer_config`: `P = p_m·p_n·p_k`, `p_b = min(instances, ⌊units / P⌋)`, batch round = `⌈instances / p_b⌉`.
+- weight stage는 instance 1개와 M/N/K round 1이어야 한다. cache stage는 M/N/K round 1과 batch round 1이어야 한다.
+- UPMEM은 마지막 batch에서 배정이 없는 DPU를 비활성으로 표시하고 전송에서 뺀다([upmem_model.c](../pim_backend/backend/upmem_model.c) `model_active`, `_pim_model_active`).
 
 **예시**
 
-```text
-Session: Layer weight 업로드
-                  │
-CPU Norm → PIM Q/K/V projection → CPU head/position 처리
-                  │
-              Session KV 접근
-                  │
-PIM batched QK → CPU softmax → PIM batched PV
-                  │
-CPU head 결합 → PIM output projection → CPU residual/norm
-                  │
-          PIM/CPU FFN → CPU residual
-                  │
-             다음 Layer 입력
-```
+32개 instance, Execution Tile 하나에 partition `(8,8,1)`(P = 64):
 
-```text
-모델 입력 처리
-    │
-Session: Layer 0 weight → Compiled LayerPlan 0 ↔ KV[0]
-    │
-Session: Layer 1 weight → Compiled LayerPlan 1 ↔ KV[1]
-    │
-   ...
-    │
-Session: Layer L-1 weight → Compiled LayerPlan L-1 ↔ KV[L-1]
-    │
-모델 출력 처리
-```
+| units | p_b | batch round |
+|---:|---:|---:|
+| 2048 | 32 | 1 |
+| 512 | 8 | 4 |
 
-## 최소 상태와 메모리 배치
+## 모델 실행
 
 **내용**
-Activation은 매 호출 전송하고 scratch는 출력 회수 후 덮어쓴다.
-Activation residency, ready, generation, completion token, overwrite 추적은 새 모델 실행 경로에 넣지 않는다.
-Weight/KV의 저장 위치는 준비 단계에 정하며 실행 중 자동 migration하지 않는다.
+`run_model(phase, *inputs, after_layer=None)`은 그 phase의 layer를 순서대로 실행하고 tuple 출력을 다음 layer의 positional 입력으로 넘긴다.
+layer마다 `enter_layer` → `plan.run_model` → `exit_layer` 순서이며, `enter_layer`는 `(phase, group)`이 바뀔 때만 그 group의 weight를 올린다.
+group 업로드 순서와 background pack은 target 중립인 `GroupLoader`가 맡는다.
 
 **근거**
-- 동기식 H2D/launch/D2H와 고정 배정으로 scratch 수명을 결정할 수 있다.
-- 모델 전체 weight를 table에 등록하는 것과 전부 device에 상주시키는 것은 다르다.
+- `group_order(memory)`: 한 요청이 들어가는 `(phase, group)` 순서.
+- `GroupLoader.enter`: 이미 올라간 key면 아무것도 하지 않는다. 아니면 pack 결과(background 결과 또는 즉시 pack) → push → host 사본 해제 → 다음 key의 pack을 thread로 시작한다.
+- pack은 host 메모리만 쓰므로 앞 group 실행과 겹친다. push(장치 전송)는 같은 장치의 PIM 연산과 겹칠 수 없다.
 
 **예시**
 
-| 상태 | 내용 |
+```text
+order = [(prefill, 0), (prefill, 1), ..., (decode, 0), ...]
+
+enter(key)
+  key == loaded            → 업로드 없음
+  else                     → pack(대개 background에서 끝남) → push → release
+                             다음 key pack 시작 (thread "pim-pack-<phase>-group<g>")
+마지막 phase의 마지막 group 다음 → 그 phase의 첫 group (decode step 반복)
+```
+
+| 경우 | 업로드 |
 |---|---|
-| weight_table | Layer/operand별 host tensor, shard, device slot |
-| kv_table | Layer별 K/V 저장소, capacity, 현재 길이 |
-| loaded_layer | 현재 device weight 영역의 Layer |
-| loaded_program | 현재 적재된 device 프로그램 |
-| scratch | 준비된 고정 layout과 재사용 staging buffer |
+| phase 하나, groups = 1 | 첫 요청에서 한 번, 이후 없음 |
+| groups > 1 | phase를 실행할 때마다 모든 group 재업로드 |
+| 여러 phase | phase가 바뀔 때 다음 phase의 첫 group이 앞 phase 영역을 덮어씀 |
 
-```text
-보존되는 KV 저장소
-현재 Layer의 weight 영역
-공용 activation/output scratch
-```
+`exit_layer`: AiMX는 아무것도 해제하지 않는다. UPMEM은 그 layer stage의 host pool을 놓는다
+([aimx_model.py](../pim_backend/backend/aimx_model.py), [upmem_model.py](../pim_backend/backend/upmem_model.py)).
 
-KV는 준비 시 정한 CPU 또는 PIM 위치를 사용한다. 첫 구현에서 지원하는 저장 위치를 API와 예제에 명시한다.
-한 Layer weight 상주 정책에서는 다음 모델 순회 때 weight를 다시 전송한다.
-
-## 공통 상주 정책 (P-1 / P-2)
+## 메모리 table
 
 **내용**
-무엇을 device에 남길지는 target과 무관한 `ResidencyPlanner`(`backend/residency.py`)가 결정한다.
-Adapter는 실제 자원(unit 수, unit당 용량)과 stage별 요구량(weight, state, 공용 scratch의
-unit당 byte)만 보고한다. Planner는 아래 순서로 처음 만족하는 정책을 고르고, `PIMSession.run_model`은
-그 정책에 따라 layer 진입과 종료 때 adapter의 `enter_layer`/`exit_layer`를 호출한다.
+무엇을 어디에 둘지는 target 중립인 `plan_memory`([residency.py](../pim_backend/backend/residency.py))가 정한다.
+adapter는 unit 수, unit당 용량, stage operand별 unit당 bytes와 종류(weight, state, input, output, key, value)만 보고한다.
+상세 규칙은 [TorchIntegration.md](TorchIntegration.md) §3이다.
 
 **근거**
-- Weight는 요청 사이에 바뀌지 않는다. 용량이 허락하면 다시 보낼 이유가 없다.
-- State는 weight가 아니면서 device에 상주하는 것이다. AiMX에서는 descriptor chain, PMM,
-  Arel, activation buffer이고, UPMEM에서는 MRAM을 쓰지 않으므로 0이다.
-  prefill에서는 state가 weight보다 커질 수 있어서(AiMX chain), weight와 분리해서 판단한다.
-- 공용 scratch는 모든 stage가 같은 영역을 쓰므로 최댓값만 더한다. stage마다 자기 activation
-  buffer를 갖는 target은 그 크기를 state로 보고하고 scratch는 0으로 보고한다.
-- Stage가 일부 unit만 쓰더라도 첫 unit은 모든 stage가 쓴다. 그래서 stage 요구량을 모두 더한
-  값을 unit 하나의 상한으로 사용한다(보수적 판단).
+- `RuntimeBackend.resources()`: `UnitResources(units, banks_per_unit × bank_capacity_limit_bytes)`.
+- `RuntimeBackend.requirements(plans)`: `StageRequirement(layer, stage, operands)`.
+- 모든 unit이 같은 배치이므로 offset table 하나가 모든 unit에 쓰인다.
 
 **예시**
 
 ```text
-W_l = layer l의 weight 합, S_l = layer l의 state 합, X = 공용 input + output scratch 최댓값
-cap = unit당 용량 (adapter 보고)
-
-P-1 model    Σ_l W_l + Σ_l S_l + X ≤ cap   모든 layer의 weight와 state를 상주
-P-2 layer    max_l (W_l + S_l) + X ≤ cap      layer 하나만 상주, layer마다 weight와 state를 교체
-그 외        준비 단계에서 오류 (필요량과 용량을 보고)
+offset 0                                              kv_base                capacity
+│ phase 영역 (phase마다 offset 0부터, 서로 덮어씀)     │ key/value cache 영역        │
+│ slot weight들 │ slot state들 │ input │ output │      │ … │ L1 V │ L1 K │ L0 V │ L0 K │
 ```
 
-| 정책 | `enter_layer` | `exit_layer` | 요청당 weight 전송 |
-|---|---|---|---|
-| P-1 model | 첫 진입에서만 weight upload + state 생성 | 없음 | session 동안 1회 |
-| P-2 layer | weight upload | weight와 state 해제 | layer마다 |
+| target | state | 주소 |
+|---|---|---|
+| UPMEM | 0 (program은 IRAM) | `MRAM_BASE + offset`으로 stage program을 link (`place`) |
+| AiMX | descriptor chain, PMM | table을 region(≤ 1023 × 2 MiB)으로 잘라 FPGA마다 할당, region 주소 + offset |
 
-모든 adapter가 이 정책을 따른다. Target별 차이는 보고하는 숫자와 배치 방법뿐이다.
-
-| target | state | 공용 scratch | 정책별 배치 |
-|---|---|---|---|
-| UPMEM | 0 (프로그램은 IRAM) | 입력·출력 MRAM scratch 1벌 | P-1: layer마다 다른 weight 주소(누적), P-2: 모든 layer가 같은 weight 영역을 재사용. stage 프로그램은 배치된 주소로 link |
-| AiMX | descriptor chain, PMM, Arel, activation buffer | 0 (stage마다 자기 buffer) | (stage, FPGA)별 context. P-2는 layer 퇴장 시 모두 해제 |
-
-작은 모델은 P-1이 되어 두 번째 요청부터 weight를 보내지 않고, Llama-2-7B INT8처럼
-전체 weight가 MRAM을 넘으면 P-2가 되어 layer마다 weight를 보낸다.
-
-## Config와 cache
+## Key/value cache
 
 **내용**
-기존 config 후보와 측정 비용을 사용한다. 예상 BMM 비용은 우선 R_b × 기존 GEMM 비용으로 비교한다.
-이 값은 후보 순위를 위한 추정이며 실제 BMM latency는 별도로 측정한다.
-프로그램 key에서 head 번호와 입력 주소는 제외하되 실제 codegen/layout 의존성은 유지한다.
+장치 cache는 layer마다 KEY, VALUE 영역에 있고, cache를 읽는 stage operand는 그 영역을 그대로 읽는다.
+`write_kv(layer, kind, cache, start, stop)`는 host cache `[kv_heads, positions, head_dim]`의 위치 범위를 그 layer에서 해당 cache를 읽는 모든 stage의 adapter에 넘긴다.
+adapter는 위치를 대기열에 넣고, cache를 읽는 stage가 다음에 실행되기 직전에 보낸다.
 
 **근거**
-- 작은 tile의 여러 batch round와 큰 tile의 한 round는 서로 다른 전송·계산 비용을 갖는다.
-- 같은 Execution Tile 크기만으로 dtype, tasklet, symbol 주소까지 같다고 보장할 수 없다.
+- `PIMSession.write_kv`: `stage.kv[1] == kind`인 stage가 없으면 `ValueError`.
+- AiMX `_push_kv`: 위치를 region host shadow에 stub 배치(`pim_model_slot_layout`)로 쓰고 항목마다 바뀐 byte 구간만 `aimx_model_push_ranges`로 보낸다.
+- UPMEM `_push_kv`: DPU별 host image에 반영한 뒤 `[kv_base, capacity)` 전체를 한 번 보낸다(`upmem_model_kv_push_region`).
 
 **예시**
 
-```text
-compile count: 새 artifact 생성 횟수
-program load count: device 프로그램 적재 횟수
-launch count: 실제 SDK launch 횟수
-```
+| API | 저장소 | 그래프 연결 |
+|---|---|---|
+| `write_kv` | 장치 KEY/VALUE 영역 | cache operand가 장치 영역을 읽음 (`kv_inputs`) |
+| `reserve_kv` / `append_kv` / `kv_view` | Session의 CPU `kv_table` (sequence 축은 끝에서 두 번째) | 없음, 호출자가 직접 사용 |
 
-## 구현 범위와 검증
-
-**내용**
-UPMEM, 정적 shape, 동기 실행, host 출력 회수를 먼저 구현한다.
-기존 resident API는 유지하고 모델용 API를 추가한다.
-사용자가 빌드와 검증을 실행하며, 코드 작성 과정에서는 실행 결과를 주장하지 않는다.
-
-**근거**
-- 기존 resident API의 전체 DPU/단일 round 가정과 새 BMM 실행을 분리해야 한다.
-- 모델 수명과 BMM 정확성을 함께 검증해야 한다.
-
-**예시**
-
-| 검증 | 기대 결과 |
-|---|---|
-| 여러 Layer 실행 | Device alloc/free 각각 1회 |
-| Layer 내부 여러 GEMM | Layer load 이후 weight H2D 없음 |
-| 서로 다른 head 입력 | 각 reference와 일치 |
-| Physical mapping 변경 | 동일한 논리 출력 |
-| 여러 batch/M/N/K round | 출력 복원 및 K 누적 정확 |
-| 마지막 불완전 batch | 빈 instance 실행/출력 사용 없음 |
-| 입력 내용 변경 | 항상 새 입력 계산 |
-| Layer 교체 | KV 내용 유지 |
-| 반복 실행 | 추가 compile 없음 |
-
-MoE는 고정 expert placement, capacity 기반 token packing과 출력 복원으로 확장한다.
-동적 expert 이동, weight 복제, 비동기 overlap, 전체 모델 weight 동시 상주는 후속 범위다.
-
-## 추가한 API와 실행 규칙
+## Config 선택
 
 **내용**
-`PIMSession.prepare()`는 열린 Session 안에서 Torch block들을 받아 FX 분석과 LayerPlan 생성을 수행한다.
-내부 분석 함수 `build_layer_plan()`은 device를 확보하거나 컴파일하지 않는다.
-LayerPlan은 Session이 전달한 target spec과 runtime으로 config 및 batch 배정을 준비한다.
-`run_model()`은 준비된 Layer 목록을 순서대로 실행하며 tuple 출력은 다음 Layer의 positional 입력으로 전달한다.
+stage config는 `select_layer_config`가 실제 unit 수로 고른다.
+명시 config가 있으면 그것을, 없으면 autotune cache의 측정 기록 중 제약을 만족하는 것에서 `batch round × total_ms`가 최소인 것을 쓴다.
+`compile_model`은 phase별로 고른 config를 명시 config로 넘긴다.
 
 **근거**
-- [model.py](../pim_backend/torch_backend/model.py)는 독립 GEMM을 묶고 CPU/PIM partition을 구성한다.
-- [runtime.py](../pim_backend/backend/runtime.py)는 자원 수명, Weight/KV table과 모델 실행 순서를 소유한다.
-- 모델 입력 embedding은 호출자가 처리한다. GEMM이 있는 최종 head는 LayerPlan으로 포함할 수 있다.
+- 명시 config도 cache 경로도 없으면 `ValueError("model layers require an explicit config or measured autotune records")`.
+- 측정 기록은 `target_model(spec).stage_target(problem)`(AiMX GEMM batch)으로 조회한다.
+- 모든 후보가 거부되면 후보별 거부 이유를 모아 `ValueError`를 낸다.
 
 **예시**
 
 ```python
-from torch_backend import PIMSession, PIMTorchConfig, target_spec
-
-
 def configure(gemms, spec):
-    return {
-        gemm.node: PIMTorchConfig(spec=spec, config=gemm_configs[gemm.mnk])
-        for gemm in gemms
-    }
+    return {gemm.node: PIMTorchConfig(spec=spec, config=configs[gemm.node]) for gemm in gemms}
 
-
-with PIMSession(target_spec("upmem", num_units=512, nr_tasklets=16)) as session:
-    plans = session.prepare(blocks, example_inputs, configure=configure)
-    output = session.run_model(*inputs)
+session = PIMSession(target_spec("upmem", num_units=2048, nr_tasklets=16))
+session.compile({"prefill": (layers, example_inputs, configure)})
+with session:
+    output = session.run_model("prefill", *inputs)
 ```
 
-`blocks`는 실행 순서의 Torch module 목록이고 `example_inputs`는 첫 block의 입력 tuple이다.
-`configure`는 실제 확보한 spec을 받아 GEMM별 명시적 config 또는 autotune cache 설정을 제공한다.
-위 예제의 `gemm_configs`는 `(M, N, K)`별 config 사전이다. 후보 선택과 batch 배정은 LayerPlan에서 수행한다.
-반환값 `plans`는 `session.layers`와 같은 tuple이며 index는 입력 block 순서대로 부여한다.
-
-| 준비 또는 실행 단계 | 실제 동작 |
-|---|---|
-| Session 진입 | DPU alloc 1회, SDK의 실제 확보 수 조회 |
-| Layer 분석 | Session 안에서 FX export 후 독립적인 동일 shape/dtype/config GEMM을 같은 의존성 깊이에서 묶음 |
-| Config 선택 | 명시한 config 또는 기존 cache records 중 `batch_rounds × total_ms` 최소값 |
-| 다음 Layer 입력 | CPU 컴파일 준비에서 계산한 출력을 다음 block의 예제 입력으로 전달 |
-| 메모리 배치 | 모델에서 가장 큰 Layer weight 영역 + 공용 입력/output scratch |
-| 컴파일 | 기존 GEMM template/packing 사용, 모델용 host entry와 주소가 확정된 ELF 생성 |
-| Layer 진입 | 해당 Layer의 모든 PIM weight slot을 한 번씩 업로드 |
-| Layer 내부 | CPU Inductor 구간과 native GEMM 구간 실행, weight H2D 생략 |
-| Batch round | 동일 프로그램 유지, instance별 입력 전송과 결과 회수 |
-| Session 종료 | Host staging과 DPU 해제 |
-
-Session이 공통 준비 순서를 제어하고 adapter는 타깃 실행 상태와 물리 배치만 관리한다.
-LayerPlan은 Session 객체 내부를 조회하지 않고 전달받은 spec과 runtime을 사용한다.
-`LayerPlan.exported_graph`는 benchmark의 원본 FX 그림 출력에 사용하며, 실행에는 분할된 `graph`를 사용한다.
-
-## 현재 구현 범위와 후속 작업
+## 통계
 
 **내용**
-이번 변경은 모델 수명 관리와 정적 BMM 실행 경로의 첫 구현이다.
-현재 자원 정보 중 DPU 수·topology는 SDK에서 얻고, 메모리 용량·tasklet 설정은 기존 target spec을 사용한다.
-사용자는 준비한 shape/dtype의 CPU 입력과 변경하지 않는 모델 weight를 사용한다.
+`session.stats()`는 adapter의 누적 통계를 돌려준다. group 업로드 통계 이름은 두 target이 같다.
+`group0_*`는 첫 key의 pack과 push로, 가릴 앞 실행이 없으므로 따로 누적한다.
 
 **근거**
-- 자원 spec과 config는 prepare에서 확정하며, 실행 중 재탐색하거나 자동 재준비하지 않는다.
-- Scratch는 매 round 전송·회수하고, 프로그램 교체는 기존 MRAM 보존용 ELF 연결 방식을 사용한다.
-- Cache 조회는 기존 key를 유지하므로 실제 자원 수와 일치하는 측정 records가 필요하다.
+- `GROUP_LOAD_STATS`: `weight_uploads`, `pack_wall_ms`, `background_pack_ms`, `upload_wall_ms`, `group0_pack_ms`, `group0_upload_ms`.
+- [upmem_adapter.py](../pim_backend/backend/upmem_adapter.py), [aimx_adapter.py](../pim_backend/backend/aimx_adapter.py) `stats`.
 
 **예시**
 
-| 항목 | 현재 구현 |
+| target | 통계 |
 |---|---|
-| Activation GEMM | FP32 mm/bmm, INT8 `_int_mm` 묶음; 여러 batch/M/N/K round |
-| Resident weight GEMM | 2차원 operand, instance 1개, M/N/K round 1회 |
-| Programs | Stage 내 head별 ELF 분리 없음; code/layout이 같은 artifact는 기존 cache로 공유 |
-| Physical mapping | Topology 순서와 instance 내부 logical unit 번호 분리 |
-| 마지막 batch | 비활성 DPU는 device 진입 시 반환, 전송·출력 복원 제외 |
-| KV | `reserve_kv`, `append_kv`, `kv_view`; CPU 저장소, sequence 축은 끝에서 두 번째 |
-| 준비된 plan | Session에 연결됨; 다른 Session에는 새 plan을 만들어 준비 |
-| 기존 API | `compile_layer/start/load_weights/run_layer` 경로는 제거됨 (model 경로만 유지) |
-| 남은 구현 | Attention 그래프의 KV 연결, PIM KV 저장, MoE expert placement/routing |
-
-KV API는 exported graph에 append/read 연산을 자동 삽입하지 않는다.
-실제 KV를 사용하는 attention 연결은 후속 구현이며, 현재 예제는 Layer 교체 중 보존 여부만 검증한다.
-전체 모델 weight 동시 상주와 weight GEMM의 여러 scheduling round도 후속 범위다.
-
-## 검증 방법과 측정값
-
-**내용**
-아래 명령은 사용자가 기존 TritonPIM 환경에서 실행한다. 이 변경 작성 과정에서는 빌드·테스트를 실행하지 않았다.
-장비 예제에는 설정된 SDK와 8개 이상의 사용 가능한 DPU가 필요하다.
-
-**근거**
-- Device compile/load/launch 횟수는 다른 사건이므로 `session.stats()`에서 구분한다.
-- 여러 M/N/K round의 GEMM 정확성과 2048-DPU 대규모 성능 측정은 별도 장비 검증이 남아 있다.
-
-**예시**
-
-프로젝트 루트 `/home/dlrkdals/TritonPIM` 기준:
-
-```bash
-cmake --build triton/build/cmake.linux-x86_64-cpython-3.12 \
-  --target triton-shared-opt triton-shared-translate
-
-python triton_shared/pim_backend/torch_backend/examples/upmem/torch_model_session.py
-```
-
-| 검증 | 기대 결과 |
-|---|---|
-| Python planner | 2048/512 DPU 예제 배정, 후보 비용 비교, QK/PV 의존성 유지 |
-| UPMEM Session | 실제 자원 수 사용, alloc/free 각 1회, 여러 Layer와 KV 보존 |
-| UPMEM Session | 준비 중 launch 없음, CPU tuple 출력의 다음 Layer 입력 연결 |
-| 장비 예제 | Layer마다 stage `(H,p_b,R_b) = (1,1,1), (5,2,3)` |
-| 장비 예제 | 모델 호출마다 `exact_match=True launches=8`, 동일 입력 buffer의 내용 변경 반영 |
-| 장비 예제 | 두 Layer의 weight H2D 합계 4096 bytes/call, Layer 내부 재전송 없음 |
-
-```text
-device_compiles: 이번 Session 준비 중 실제 생성한 새 DPU ELF 수 (cache hit 제외)
-program_loads: SDK dpu_load 호출 수
-launches: SDK synchronous launch 호출 수
-weight_bytes / activation_bytes / output_bytes: 실제 전송 payload
-metadata_bytes: tile metadata와 DPU 활성 값의 전송 payload
-resource_opens / resource_closes: DPU 집합 확보/해제 횟수
-```
-
-`device_compiles`는 Torch/MLIR/host compiler 호출 전체를 세는 값이 아니다.
-장비 예제의 `prepare_ms`, `latency_ms`는 host wall time이다.
-Session-first 경로의 `prepare_ms`에는 FX export와 LayerPlan 분석도 포함된다.
-새 준비 순서의 성능 영향은 별도 장비 측정으로 확인한다.
+| 공통 | `GROUP_LOAD_STATS` |
+| UPMEM | `TransferStats`(`weight_bytes`, `activation_bytes`, `output_bytes`, `metadata_bytes`, `launches`, `activation_hits`, `kv_bytes`), `program_loads`, `device_compiles`, `weight_pushes`, `program_load_ms`, `invoke_ms`, `kv_push_ms`, `kv_layout_check_ms`, `resource_opens`, `resource_closes` |
+| AiMX | `weight_bytes`, `invocations`, `run_wall_ms`, `chain_build_ms`, `kv_bytes`, `kv_push_ms`, `kv_layout_check_ms`, `breakdown`(stage 이름별 호출 수·wall·native 시간), `live_bytes`, `visible_fpgas`, `units` |
