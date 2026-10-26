@@ -8,7 +8,8 @@ fits, otherwise the first slots keep one layer each and the rest share the last 
 layer/benchmark_layer.py. --seq is the prompt length in tokens.
 
 Besides report.json, <report-dir>/forward_breakdown.csv has one row per request (iter 0 is the
-first request) and warm_mean, the mean of the later requests, in the columns of the UPMEM
+first request), warm_mean and warm_median (per column) of the later requests, with
+group0_load_ms (group 0's pack + push, inside h2d) and ttft_without_group0_load_ms, in the columns of the UPMEM
 run_upmem.py CSV: first_token_ms (embedding to the first token, without tokenization) in the
 items h2d (weight pack + push, desc_h2d, h2d), pim (invoke), d2h and cpu (the rest), their
 shares, then every breakdown item as detail_* (they add up to ttft_ms). gemm.csv (weight GEMMs)
@@ -21,7 +22,6 @@ over the later requests: calls, wall time and its native slots.
 
 import argparse
 import copy
-import csv
 import json
 from pathlib import Path
 import statistics
@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from experiment_common import (
     SLOTS, add_device_arguments, compile_session, memory_record, print_request, request_breakdown, stage_records,
+    stage_rows, write_csv,
 )
 from llama_workloads import (
     KV_MODES, SEQUENCE, LlamaAimxLayer, load_llama, position_embeddings, prompt_ids, reference_layer,
@@ -40,31 +41,6 @@ from llama_workloads import (
 import torch
 
 from torch_backend._autotuner import DEFAULT_CACHE_PATH
-
-
-def write_csv(path, rows):
-    with open(path, "w", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=list(rows[0]))
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({name: f"{value:.3f}" if isinstance(value, float) else value
-                             for name, value in row.items()})
-
-
-def stage_rows(stages, kind, samples):
-    """One row per stage of kind: the mean over samples of its run calls, summed over the layers."""
-    rows = []
-    for stage in stages:
-        if stage["kind"] != kind:
-            continue
-        m, n, k = stage["mnk"]
-        row = {"stage": stage["name"], "m": m, "n": n, "k": k, "instances": stage["instances"]}
-        for field in ("calls", "wall_ms", *SLOTS):
-            row[field] = statistics.mean(call["breakdown"]["run:" + stage["name"]][field] for call in samples)
-        # native 칸 밖: ctypes 호출, lock, stub 안의 측정되지 않은 구간
-        row["other_ms"] = row["wall_ms"] - sum(row[name] for name in SLOTS)
-        rows.append(row)
-    return rows
 
 
 def main():
@@ -219,16 +195,24 @@ def main():
                  "pim_ms": run["invoke"], "d2h_ms": run["d2h"]}
         items["cpu_ms"] = first_token_ms - sum(items.values())
         items.update({name.replace("_ms", "_pct"): 100 * value / first_token_ms for name, value in list(items.items())})
+        # group0_load_ms(group 0의 pack + push)는 detail_weight_upload_ms와 h2d_ms에 들어 있다.
         rows.append({"iter": index, "phase": call["phase"], "seq": args.seq, "ttft_ms": call["ttft_ms"],
+                     "group0_load_ms": call["group0_load_ms"],
+                     "ttft_without_group0_load_ms": call["ttft_without_group0_load_ms"],
                      "first_token_ms": first_token_ms, "layers_ms": call["layers_ms"], **items,
                      **{"detail_" + name: value for name, value in detail.items()}})
     if samples:
         names = [name for name in rows[0] if name not in ("iter", "phase", "seq")]
+        sample_rows = rows[1:]
         rows.append({"iter": "warm_mean", "phase": "sample", "seq": args.seq,
-                     **{name: statistics.mean(row[name] for row in rows[1:]) for name in names}})
+                     **{name: statistics.mean(row[name] for row in sample_rows) for name in names}})
+        # 열마다 따로 고른 중앙값이므로 이 행의 detail_* 합은 ttft_ms와 맞지 않을 수 있다.
+        rows.append({"iter": "warm_median", "phase": "sample", "seq": args.seq,
+                     **{name: statistics.median(row[name] for row in sample_rows) for name in names}})
         # weight GEMM(q/k/v/o, gate/up/down)과 attention의 activation GEMM(QK^T, PV)을 나눠 둔다.
-        write_csv(report_dir / "gemm.csv", stage_rows(stages, "weight", samples))
-        write_csv(report_dir / "attention.csv", stage_rows(stages, "activation", samples))
+        breakdowns = [call["breakdown"] for call in samples]
+        write_csv(report_dir / "gemm.csv", stage_rows(stages, "weight", breakdowns))
+        write_csv(report_dir / "attention.csv", stage_rows(stages, "activation", breakdowns))
     write_csv(report_dir / "forward_breakdown.csv", rows)
     print(f"report={report_dir / 'report.json'} (+ forward_breakdown.csv, gemm.csv, attention.csv)", flush=True)
 
