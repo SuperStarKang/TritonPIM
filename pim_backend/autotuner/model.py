@@ -328,13 +328,15 @@ class AiMXModel(TargetModel):
         return None
 
     def resident_operand_config(self, problem):
-        # Group: m는 batch 행, n은 N(4096 이하면 전체, 넘으면 4096), k는 256. Tile이 문제 전체를 덮는다.
+        # Group: m는 batch 행, n은 N(4096 이하면 전체, 넘으면 4096), k는 K(256 이하면 전체, 넘으면 256).
+        # Tile이 문제 전체를 덮는다. Group은 그 축의 Block 수를 넘을 수 없다(ConstraintEngine).
         block_m, block_n, block_k = self.block(problem)
         group_m = self.target.runtime_config.batch
         group_n = min(4096, _round_up(problem.N, block_n))
+        group_k = min(256, _round_up(problem.K, block_k))
         return PIMConfig(block_m, block_n, block_k,
-                         group_m // block_m, group_n // block_n, 256 // block_k,
-                         ceil_div(problem.M, group_m), ceil_div(problem.N, group_n), ceil_div(problem.K, 256),
+                         group_m // block_m, group_n // block_n, group_k // block_k,
+                         ceil_div(problem.M, group_m), ceil_div(problem.N, group_n), ceil_div(problem.K, group_k),
                          1, 1, 1)
 
     def allocation_reason(self, problem, config):

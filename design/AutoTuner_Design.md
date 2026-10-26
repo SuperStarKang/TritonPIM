@@ -169,7 +169,7 @@ seed, constraint, feature는 [model.py](../pim_backend/autotuner/model.py)의 `T
 | `num_units` | Partition | profile 값(기본 2048) | profile 값(기본 `/dev/pl_dma*` 수) |
 | `mapping_reason(p)` | Partition | 없음 | 없음(split-K `p_k > 1` 허용) |
 | `resident_operand_reason` | 모델 kv stage 제약 | 없음 | matmul: 상주 B의 저장 크기 `tile_k·⌈group_k⌉₂₅₆ × tile_n·⌈group_n⌉₄₀₉₆`가 `⌈K⌉₂₅₆ × ⌈N⌉₄₀₉₆`와 다르면 거부 |
-| `resident_operand_config` | 모델 kv stage 초기 후보 | None | Group `(batch, min(4096, ⌈N⌉_block_n), 256)`/Block, Tile이 문제 전체를 덮고 P=(1,1,1) |
+| `resident_operand_config` | 모델 kv stage 초기 후보 | None | Group `(batch, min(4096, ⌈N⌉_block_n), min(256, ⌈K⌉_block_k))`/Block, Tile이 문제 전체를 덮고 P=(1,1,1) |
 | `physical_pressure(plans)` | 측정 후 feature | 할당 합 / unit 용량 | bank interleave 바이트 / bank 용량 |
 | `launch_timing_name` | 단일 unit 측정 | `kernel` | `invoke` |
 | `shared_activation_scratch` | 모델 runtime | True | False |

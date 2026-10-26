@@ -540,7 +540,7 @@ cache 항목의 offset은 layer마다 다르다. slot을 공유하는 layer들�
 - `mapping_reason`을 두지 않으므로 `p_k > 1`도 후보다(§5.8).
 - cache stage: `resident_operand_reason`은 상주 B가 `roundup(K,256) × roundup(N,4096)`보다 크게
   저장되는 config를 거부하고, `resident_operand_config`는 그 조건을 만족하는 config 하나
-  (Group m = batch, n = min(4096, N), k = 256, Tile이 문제 전체)를 탐색 초기값으로 낸다.
+  (Group m = batch, n = min(4096, N), k = min(256, K), Tile이 문제 전체)를 탐색 초기값으로 낸다.
 
 **GEMM batch는 GEMM마다 정한다.** `AiMXModel.stage_target(problem)`이 GEMM의 batch를
 `min(spec batch, M 이상인 가장 작은 2의 거듭제곱)`으로 바꾼 spec을 돌려주고,
