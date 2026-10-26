@@ -46,7 +46,8 @@ prefill 토큰 수는 1024. 첫 인자로 모델(`llama2` = Llama-2-7b-hf, `llam
 | 3 | Autotuning 수렴 곡선 | `experiments/run_gemm.sh` (1과 같은 실행) | `gemms[].tuning[].best_ms` |
 | 4 | Attention | `experiments/run_attention.sh` | `summary.attention_ms`, `summary.kinds` |
 | 5 | e2e prefill | `experiments/run_e2e_prefill.sh` | `summary.ttft_ms`, `per_layer_ms` |
-| 5 | e2e decode | (decode 구현 후) | |
+| 6 | prefill (128/256/512/1024 token) | `experiments/run_prefill.sh` | `forward_breakdown.csv` warm_median `ttft_without_group0_load_ms`, `gemm.csv`, `attention.csv` |
+| 7 | decode (128/256/512/1024 token 뒤) | `experiments/run_decode.sh` | `step_breakdown.csv` mean_after_first `step_ms`, `gemm.csv`, `attention.csv` |
 
 ```bash
 for model in llama2 llama3; do
@@ -54,6 +55,13 @@ for model in llama2 llama3; do
   ./triton_shared/scripts/experiments/run_attention.sh $model 4 8
   ./triton_shared/scripts/experiments/run_e2e_prefill.sh $model 4 8
 done
+```
+
+6, 7은 모델 인자 없이 FPGA 개수만 받아 llama2, llama3와 네 길이를 모두 돈다. 결과는 `results/{prefill,decode}/<model>/f<N>/s<seq>/`의 CSV와 `log.txt` (prefill은 `report.json`도).
+
+```bash
+./triton_shared/scripts/experiments/run_prefill.sh 4 8
+./triton_shared/scripts/experiments/run_decode.sh 4 8
 ```
 
 autotune cache가 결과 폴더에 저장되므로, 같은 폴더로 다시 돌리면 탐색 없이 측정만 한다. 수렴 곡선을 다시 얻으려면 폴더를 지우고 실행한다.

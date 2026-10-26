@@ -85,8 +85,9 @@ class CheckpointLinear(torch.nn.Module):
     """HF Linear weight [out, in] BF16; the GEMM operand is its transpose view [in, out].
 
     The buffer is the checkpoint tensor itself (a BF16 checkpoint is not copied); the PIM
-    stage reads the view through its strides. padded_features adds zero output rows, a
-    padded copy, for the prefill layer's N in 512 columns.
+    stage reads the view through its strides, which only the decode GEMV does (a GEMM stage
+    makes a contiguous copy of a view, see PrefillLinear). padded_features adds zero output
+    rows, a padded copy.
     """
 
     def __init__(self, linear, padded_features=None):
@@ -100,6 +101,30 @@ class CheckpointLinear(torch.nn.Module):
 
     def forward(self, activation):
         output = torch.mm(activation.reshape(-1, activation.shape[-1]).bfloat16(), self.weight.t()).float()
+        if output.shape[-1] != self.out_features:
+            output = output[:, :self.out_features].contiguous()
+        return output.reshape(*activation.shape[:-1], self.out_features)
+
+
+class PrefillLinear(torch.nn.Module):
+    """HF Linear weight [out, in] stored once as the contiguous BF16 [in, padded out] GEMM operand.
+
+    A GEMM stage takes only contiguous weights; given the transpose view of CheckpointLinear it
+    copies it while the frozen graph keeps the checkpoint tensor, two copies of every weight.
+    This buffer is the only copy once the HF layer is released. padded_features pads N to it.
+    """
+
+    def __init__(self, linear, padded_features=None):
+        super().__init__()
+        if linear.bias is not None:
+            raise ValueError("this experiment requires bias-free projections")
+        weight = linear.weight.detach().t().to(torch.bfloat16).contiguous()
+        padding = (padded_features or linear.out_features) - linear.out_features
+        self.register_buffer("weight", torch.nn.functional.pad(weight, (0, padding)))
+        self.out_features = linear.out_features
+
+    def forward(self, activation):
+        output = torch.mm(activation.reshape(-1, activation.shape[-1]).bfloat16(), self.weight).float()
         if output.shape[-1] != self.out_features:
             output = output[:, :self.out_features].contiguous()
         return output.reshape(*activation.shape[:-1], self.out_features)
@@ -131,9 +156,9 @@ class LlamaAimxAttention(torch.nn.Module):
         self.qk_heads = qk_heads
         self.pv_heads = pv_heads
         self.kv = kv
-        self.q_proj = CheckpointLinear(layer.self_attn.q_proj)
-        self.k_proj = CheckpointLinear(layer.self_attn.k_proj)
-        self.v_proj = CheckpointLinear(layer.self_attn.v_proj)
+        self.q_proj = PrefillLinear(layer.self_attn.q_proj)
+        self.k_proj = PrefillLinear(layer.self_attn.k_proj)
+        self.v_proj = PrefillLinear(layer.self_attn.v_proj)
         self.scaling = layer.self_attn.scaling
         # prompt 길이는 RoPE 표의 위치 수다 (position_embeddings(model, sequence)).
         self.sequence = cosine.shape[1]
@@ -181,12 +206,12 @@ class LlamaAimxLayer(torch.nn.Module):
         self.input_layernorm = CheckpointRMSNorm(layer.input_layernorm)
         self.post_attention_layernorm = CheckpointRMSNorm(layer.post_attention_layernorm)
         self.self_attn = LlamaAimxAttention(layer, cosine, sine, qk_heads, pv_heads, kv)
-        self.o_proj = CheckpointLinear(layer.self_attn.o_proj)
+        self.o_proj = PrefillLinear(layer.self_attn.o_proj)
         # Gate/Up는 N을 512 단위로 올려 계산하고 앞 열만 쓴다 (Llama-2 11008 → 11264, Llama-3 14336 그대로).
         padded = -(-config.intermediate_size // 512) * 512
-        self.gate_proj = CheckpointLinear(layer.mlp.gate_proj, padded)
-        self.up_proj = CheckpointLinear(layer.mlp.up_proj, padded)
-        self.down_proj = CheckpointLinear(layer.mlp.down_proj)
+        self.gate_proj = PrefillLinear(layer.mlp.gate_proj, padded)
+        self.up_proj = PrefillLinear(layer.mlp.up_proj, padded)
+        self.down_proj = PrefillLinear(layer.mlp.down_proj)
 
     def forward(self, hidden):
         hidden = hidden + self.o_proj(self.self_attn(self.input_layernorm(hidden)))
