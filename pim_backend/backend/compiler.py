@@ -221,8 +221,6 @@ def _aimx_passes(options):
     # 넣지 않고 AiMX target option으로만 전달한다.
     tile = (f"--convert-pim-to-aimx=batch={options.batch} "
             f"persistent={str(options.aimx_persistent).lower()} "
-            f"matvec-row-alignment={options.aimx_matvec_row_alignment} "
-            f"matvec-first-n-only={str(options.aimx_matvec_first_n_only).lower()} "
             f"matmul-row-alignment={options.aimx_matmul_row_alignment} "
             f"matmul-useful-n-only={str(options.aimx_matmul_useful_n_only).lower()} "
             f"matmul-k-alignment={options.aimx_matmul_k_alignment}")
@@ -330,11 +328,6 @@ class PIMOptions:
     batch: int = 8
     # AiMX-only policy, not a change to Common IR arithmetic semantics.
     aimx_persistent: bool = True
-    # Matvec storage pitch is independent of the 4096/batch-column MAC microtile.
-    # Explicit 0/512 alignments retain the narrow-layout diagnostic paths.
-    aimx_matvec_row_alignment: int = 4096
-    # False retains the padded-N diagnostic; GEMM traversal is unaffected.
-    aimx_matvec_first_n_only: bool = True
     # GEMM B/C Group panel rows use the 4096-element all-bank width like matvec;
     # 512-element rows gave run-dependent FPGA results. 0 keeps the 4096/batch diagnostic.
     aimx_matmul_row_alignment: int = 4096
@@ -342,7 +335,7 @@ class PIMOptions:
     aimx_matmul_useful_n_only: bool = True
     # GEMM A row (K) pitch. MAC reads the 256-aligned relayout, so the pitch changes
     # only the A storage and its gather stride. 0 uses 4096/batch, the smallest pitch
-    # whose batch rows fill whole 8 KiB interleave units (FPGA-checked, design §18.8).
+    # whose batch rows fill whole 8 KiB interleave units (FPGA-checked, Silent-PIM_Design.md §11.2).
     aimx_matmul_k_alignment: int = 0
     def __post_init__(self):
         # target 없이 PIM을 쓰는 것은 의도된 사용이 아니므로 기본값으로 때우지 않고 바로 터뜨린다.
@@ -425,7 +418,7 @@ class PIMBackend(BaseBackend):
     @functools.lru_cache()
     def hash(self):
         # Regenerate artifacts when the Common/UPMEM execution plan changes.
-        return f"{self.target}-pim-common-ir-v10-model-batching-device-active-host-pools-upmem-metadata-v2-rhs-row-major-v1-timing-v3-aimx-bundle-target-ir-v1"
+        return f"{self.target}-pim-common-ir-v10-model-batching-device-active-host-pools-upmem-metadata-v2-rhs-row-major-v1-timing-v3-aimx-bundle-target-ir-v1-aimx-matvec-transposed-v1"
 
     def get_module_map(self) -> Dict[str, ModuleType]:
         return {}

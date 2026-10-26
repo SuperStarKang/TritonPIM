@@ -31,6 +31,8 @@ namespace mlir::triton {
 namespace {
 struct Layout {
   int64_t usefulRows, usefulCols, rows, cols;
+  // 물리 배열이 논리 tensor의 전치다: 물리 rows는 논리 열, 물리 cols는 논리 행을 담는다.
+  bool transposed = false;
 };
 struct View {
   Value buffer, offset, pitch;
@@ -50,12 +52,9 @@ class DeviceLowering {
 public:
   DeviceLowering(ModuleOp module, pim::PartitionOp device,
                  pim::TargetProfileAttr profile, int64_t batch,
-                 int64_t matvecRowAlignment, bool matvecFirstNOnly,
                  int64_t matmulRowAlignment, bool matmulUsefulNOnly,
                  int64_t matmulKAlignment, bool persistent, unsigned site)
       : module(module), device(device), profile(profile), batch(batch),
-        matvecRowAlignment(matvecRowAlignment),
-        matvecFirstNOnly(matvecFirstNOnly),
         matmulRowAlignment(matmulRowAlignment),
         matmulUsefulNOnly(matmulUsefulNOnly),
         matmulKAlignment(matmulKAlignment), persistent(persistent),
@@ -65,8 +64,6 @@ public:
 
   LogicalResult run() {
     auto partitions = device.getMapping().getPartitions().asArrayRef();
-    if (partitions[2] != 1)
-      return device.emitError("AiMX cross-device pim.combine is not implemented");
     if (failed(collectLayouts())) return failure();
     int64_t count;
     if (!aimx::checkedProduct({partitions[0], partitions[1], partitions[2]}, count) ||
@@ -158,8 +155,6 @@ private:
   pim::PartitionOp device;
   pim::TargetProfileAttr profile;
   int64_t batch;
-  int64_t matvecRowAlignment;
-  bool matvecFirstNOnly;
   int64_t matmulRowAlignment;
   bool matmulUsefulNOnly;
   int64_t matmulKAlignment;
@@ -400,23 +395,47 @@ private:
           if (failed(joinLayouts(place, accessValues.lookup(place.getAccess()),
                                  accessValues.lookup(other.getAccess())))) return failure();
 
-    llvm::DenseSet<Value> macValues;
+    llvm::DenseSet<Value> macValues, matmulValues;
     WalkResult macLayouts = device.walk([&](Operation *op) {
       if (!isa<linalg::MatmulOp, linalg::MatvecOp>(op)) return WalkResult::advance();
       for (Value operand : op->getOperands()) macValues.insert(layoutRoot(operand));
       auto &a = layouts[layoutRoot(op->getOperand(0))];
       auto &b = layouts[layoutRoot(op->getOperand(1))];
       auto &out = layouts[layoutRoot(op->getResult(0))];
+      if (isa<linalg::MatvecOp>(op)) {
+        // y = W·x를 yᵀ = xᵀ·Wᵀ로 실행한다: x가 A 한 행, Wᵀ가 B, y가 C 한 행이다.
+        // lane이 M 방향으로 가므로 batch는 1이고, B/C 행은 4096 lane 전체 폭이다.
+        for (Value value : {op->getOperand(0), op->getOperand(1), Value(op->getResult(0))}) {
+          Layout &layout = layouts[layoutRoot(value)];
+          if (matmulValues.contains(layoutRoot(value))) {
+            op->emitError("AiMX matvec and matmul cannot share one operand layout");
+            return WalkResult::interrupt();
+          }
+          if (!layout.transposed)
+            layout = {layout.usefulRows, layout.usefulCols, layout.usefulCols,
+                      layout.usefulRows, true};
+        }
+        // b=1에서 A 행 pitch는 4096의 배수여야 한다 (batch × pitch ≡ 0 mod 4096).
+        if (!aimx::checkedRoundUp(a.rows, aimx::kRegSize, a.rows) ||
+            !aimx::checkedRoundUp(a.cols, aimx::kLanes, a.cols) ||
+            !aimx::checkedRoundUp(b.cols, aimx::kLanes, b.cols) ||
+            !aimx::checkedRoundUp(out.cols, aimx::kLanes, out.cols)) {
+          op->emitError("AiMX MAC physical extent overflows");
+          return WalkResult::interrupt();
+        }
+        return WalkResult::advance();
+      }
+      for (Value value : op->getOperands()) matmulValues.insert(layoutRoot(value));
+      matmulValues.insert(layoutRoot(op->getResult(0)));
+      if (a.transposed || b.transposed || out.transposed) {
+        op->emitError("AiMX matvec and matmul cannot share one operand layout");
+        return WalkResult::interrupt();
+      }
       int64_t columnAlignment = aimx::kLanes / batch;
-      // Matvec storage defaults to 4096 elements, independently of MAC width.
-      if (isa<linalg::MatvecOp>(op) && matvecRowAlignment != 0)
-        columnAlignment = matvecRowAlignment;
-      if (isa<linalg::MatmulOp>(op) && matmulRowAlignment != 0)
-        columnAlignment = matmulRowAlignment;
+      if (matmulRowAlignment != 0) columnAlignment = matmulRowAlignment;
       // A의 K 저장 pitch. MAC은 K를 256 단위로만 채운 Arel을 읽으므로 계산 순서와 무관하다.
-      int64_t kAlignment = isa<linalg::MatmulOp>(op) ? matmulKAlignment : aimx::kLanes;
       if (!aimx::checkedRoundUp(a.rows, batch, a.rows) ||
-          !aimx::checkedRoundUp(a.cols, kAlignment, a.cols) ||
+          !aimx::checkedRoundUp(a.cols, matmulKAlignment, a.cols) ||
           !aimx::checkedRoundUp(b.rows, aimx::kRegSize, b.rows) ||
           !aimx::checkedRoundUp(b.cols, columnAlignment, b.cols) ||
           !aimx::checkedRoundUp(out.rows, batch, out.rows) ||
@@ -549,10 +568,14 @@ private:
       auto rows = getConstantIntValue(mapped(place.getAllocationShape()[0]));
       auto cols = type.getRank() == 1 ? std::optional<int64_t>(1)
                                      : getConstantIntValue(mapped(place.getAllocationShape()[1]));
+      if (!rows || !cols || *rows % layout.usefulRows || *cols % layout.usefulCols)
+        return place.emitError("AiMX needs a representable fixed Common allocation_shape");
+      // 전치 배치에서는 논리 행 group이 물리 열 group, 논리 열 group이 물리 행 group이다.
+      int64_t rowGroups = *rows / layout.usefulRows, colGroups = *cols / layout.usefulCols;
+      if (layout.transposed) std::swap(rowGroups, colGroups);
       int64_t physicalRows, physicalCols, bytes;
-      if (!rows || !cols || *rows % layout.usefulRows || *cols % layout.usefulCols ||
-          !aimx::checkedProduct({*rows / layout.usefulRows, layout.rows}, physicalRows) ||
-          !aimx::checkedProduct({*cols / layout.usefulCols, layout.cols}, physicalCols) ||
+      if (!aimx::checkedProduct({rowGroups, layout.rows}, physicalRows) ||
+          !aimx::checkedProduct({colGroups, layout.cols}, physicalCols) ||
           !aimx::checkedProduct({physicalRows, physicalCols, aimx::kTypeSize}, bytes))
         return place.emitError("AiMX needs a representable fixed Common allocation_shape");
       Placement placement{place, {}, physicalRows, physicalCols};
@@ -575,7 +598,8 @@ private:
             previous.rows == physicalRows && previous.cols == physicalCols &&
             previous.view.layout.usefulRows == layout.usefulRows &&
             previous.view.layout.usefulCols == layout.usefulCols &&
-            previous.view.layout.rows == layout.rows && previous.view.layout.cols == layout.cols) {
+            previous.view.layout.rows == layout.rows && previous.view.layout.cols == layout.cols &&
+            previous.view.layout.transposed == layout.transposed) {
           placement.view = previous.view;
           break;
         }
@@ -746,17 +770,23 @@ private:
     if (result.size() == 1) result.push_back(c(b, extra));
     return result;
   }
+  // group_layout은 물리 순서다. 전치 배치의 host 행/열 교환은 stage/unstage의 transpose가 맡는다.
+  DenseI64ArrayAttr groupLayout(OpBuilder &b, const Placement &placement) {
+    const auto &layout = placement.view.layout;
+    int64_t usefulRows = layout.transposed ? layout.usefulCols : layout.usefulRows;
+    int64_t usefulCols = layout.transposed ? layout.usefulRows : layout.usefulCols;
+    return b.getDenseI64ArrayAttr({usefulRows, usefulCols, layout.rows, layout.cols,
+                                   placement.rows / layout.rows, placement.cols / layout.cols});
+  }
   void stage(OpBuilder &b, const Placement &placement, ArrayAttr sharedOver) {
     auto place = placement.source;
-    const auto &layout = placement.view.layout;
     b.create<aimx::StageOp>(
         loc, mapped(place.getBuffer()), hostValues(b, place.getStart(), 0),
         hostValues(b, placement.sizes, 1), hostValues(b, place.getStrides(), 0),
         ValueRange{c(b, placement.rows), c(b, placement.cols)}, c(b, placement.cols),
-        placement.view.buffer, TypeAttr::get(b.getBF16Type()), UnitAttr(),
-        DenseI64ArrayAttr(), DenseI64ArrayAttr(), sharedOver, b.getDenseI64ArrayAttr({
-        layout.usefulRows, layout.usefulCols, layout.rows, layout.cols,
-        placement.rows / layout.rows, placement.cols / layout.cols}));
+        placement.view.buffer, TypeAttr::get(b.getBF16Type()),
+        placement.view.layout.transposed ? b.getUnitAttr() : UnitAttr(),
+        DenseI64ArrayAttr(), DenseI64ArrayAttr(), sharedOver, groupLayout(b, placement));
   }
   void unstage(OpBuilder &b, const Placement &placement) {
     Value accumulate = c(b, 0);
@@ -771,16 +801,23 @@ private:
           break;
         }
       }
+    // p_k device의 partial: k 좌표 0만 대입하고 나머지는 stub이 k 순서로 누산한다.
+    bool deviceReduction =
+        placement.combine && device.getMapping().getPartitions().asArrayRef()[2] > 1;
+    if (deviceReduction) {
+      Value later = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne,
+                                           mapped(device.getBody().front().getArgument(2)), c(b, 0));
+      accumulate = b.create<arith::SelectOp>(loc, later, c(b, 1), accumulate);
+    }
     auto place = placement.source;
-    const auto &layout = placement.view.layout;
-    b.create<aimx::UnstageOp>(
+    auto unstaged = b.create<aimx::UnstageOp>(
         loc, placement.view.buffer, mapped(place.getBuffer()),
         hostValues(b, place.getStart(), 0), hostValues(b, placement.sizes, 1),
         hostValues(b, place.getStrides(), 0), c(b, placement.cols), accumulate,
-        TypeAttr::get(b.getBF16Type()), UnitAttr(), DenseI64ArrayAttr(),
-        DenseI64ArrayAttr(), b.getDenseI64ArrayAttr({
-        layout.usefulRows, layout.usefulCols, layout.rows, layout.cols,
-        placement.rows / layout.rows, placement.cols / layout.cols}));
+        TypeAttr::get(b.getBF16Type()),
+        placement.view.layout.transposed ? b.getUnitAttr() : UnitAttr(),
+        DenseI64ArrayAttr(), DenseI64ArrayAttr(), groupLayout(b, placement));
+    if (deviceReduction) unstaged->setAttr("aimx.device_reduction", b.getUnitAttr());
   }
   FailureOr<View> accessView(pim::AccessOp access) {
     auto found = placements.find(access.getId());
@@ -800,12 +837,19 @@ private:
       col = localOffset(mapped(access.getOrigin()[1]), mapped(placement.source.getStart()[1]));
     Value rowGroup = code.create<arith::DivSIOp>(loc, row, c(code, view.layout.usefulRows));
     Value colGroup = code.create<arith::DivSIOp>(loc, col, c(code, view.layout.usefulCols));
-    Value panel = add(mul(rowGroup, c(code, placement.cols / view.layout.cols)), colGroup);
+    int64_t physicalRowGroups = placement.rows / view.layout.rows;
+    int64_t physicalColGroups = placement.cols / view.layout.cols;
+    // 전치 배치에서는 논리 열 group이 물리 행 group, 논리 행 group이 물리 열 group이다.
+    bool transposed = view.layout.transposed;
+    Value panel = transposed ? add(mul(colGroup, c(code, physicalColGroups)), rowGroup)
+                             : add(mul(rowGroup, c(code, physicalColGroups)), colGroup);
+    int64_t rowGroups = transposed ? physicalColGroups : physicalRowGroups;
+    int64_t colGroups = transposed ? physicalRowGroups : physicalColGroups;
     Value innerRow = code.create<arith::RemSIOp>(loc, row, c(code, view.layout.usefulRows));
     Value innerCol = code.create<arith::RemSIOp>(loc, col, c(code, view.layout.usefulCols));
     for (auto [coordinate, remainder, extent] : {
-             std::tuple{row, innerRow, placement.rows / view.layout.rows * view.layout.usefulRows},
-             std::tuple{col, innerCol, placement.cols / view.layout.cols * view.layout.usefulCols}}) {
+             std::tuple{row, innerRow, rowGroups * view.layout.usefulRows},
+             std::tuple{col, innerCol, colGroups * view.layout.usefulCols}}) {
       code.create<aimx::RequireOp>(loc,
           code.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, remainder, c(code, 0)),
           code.getStringAttr("AiMX access must start at a contiguous group boundary"));
@@ -864,9 +908,12 @@ private:
         TypeAttr::get(type), initial, globals.getUnitAttr(), IntegerAttr());
     Value source = setup.create<memref::GetGlobalOp>(loc, type, symbol);
     Value zero = c(setup, 0);
+    // 원본이 scalar 하나라 전치 배치도 물리 순서의 유효 크기로 채우면 된다.
+    int64_t rows = layout.transposed ? layout.usefulCols : layout.usefulRows;
+    int64_t cols = layout.transposed ? layout.usefulRows : layout.usefulCols;
     setup.create<aimx::StageOp>(
         loc, source, ValueRange{zero, zero},
-        ValueRange{c(setup, layout.usefulRows), c(setup, layout.usefulCols)},
+        ValueRange{c(setup, rows), c(setup, cols)},
         ValueRange{zero, zero}, ValueRange{c(setup, layout.rows), c(setup, layout.cols)},
         c(setup, layout.cols), view.buffer, TypeAttr::get(setup.getBF16Type()), UnitAttr(),
         DenseI64ArrayAttr(), DenseI64ArrayAttr(), ArrayAttr(), DenseI64ArrayAttr());
@@ -950,6 +997,11 @@ private:
         View view;
         if (failed(constant(scalar.getValue(), layout, view))) return failure();
         values[scalar.getResult()] = view;
+      } else if (auto ext = dyn_cast<arith::ExtFOp>(op)) {
+        // PIM DRAM 값은 언제나 bf16이라 넓히기는 저장된 값을 바꾸지 않는다.
+        auto view = valueView(ext.getIn());
+        if (failed(view)) return failure();
+        values[ext.getResult()] = *view;
       } else if (failed(lowerBinary(&op, layout))) return failure();
     }
     return success();
@@ -997,25 +1049,29 @@ private:
   LogicalResult lowerMAC(Operation *op) {
     if (failed(validateMAC(op))) return failure();
     bool vector = isa<linalg::MatvecOp>(op);
-    auto a = valueView(op->getOperand(0)), b = valueView(op->getOperand(1));
+    // matvec은 yᵀ = xᵀ·Wᵀ다: x가 vecA 쪽 A 한 행(batch 1), W가 B, 출력 lane이 M이다.
+    auto a = valueView(op->getOperand(vector ? 1 : 0));
+    auto b = valueView(op->getOperand(vector ? 0 : 1));
     auto acc = valueView(op->getOperand(2));
     if (failed(a) || failed(b) || failed(acc)) return failure();
     Layout layout = layouts.lookup(op->getResult(0));
+    int64_t reduction = layouts.lookup(op->getOperand(0)).usefulCols;
     View partial, out, zero;
     if (failed(scratch(layout, partial)) || failed(scratch(layout, out)) ||
         failed(constant(setup.getFloatAttr(setup.getBF16Type(), 0.0), layout, zero)) ||
         failed(copy(zero, partial))) return failure();
     int64_t kPhysical, arelBytes;
-    if (!aimx::checkedRoundUp(a->layout.usefulCols, aimx::kRegSize, kPhysical) ||
+    if (!aimx::checkedRoundUp(reduction, aimx::kRegSize, kPhysical) ||
         !aimx::checkedProduct({layout.rows, kPhysical, aimx::kTypeSize, aimx::kNumChannels}, arelBytes))
       return op->emitError("AiMX MAC relayout extent overflows");
     Value arel;
     if (failed(allocate(arelBytes, aimx::AllocKind::Data, arel))) return failure();
     int64_t columns = layout.usefulCols;
-    if (!vector && !matmulUsefulNOnly) columns = layout.cols;
+    if (!matmulUsefulNOnly) columns = layout.cols;
+    if (vector) columns = layout.usefulRows;
     if (failed(append(aimx::buildMatmul(module, name(vector ? "matvec" : "matmul"),
-                                       batch, layout.usefulRows, a->layout.usefulCols,
-                                       columns), {*a, *b, partial}, ValueRange{arel, pmm})) ||
+                                       vector ? 1 : batch, vector ? 1 : layout.usefulRows,
+                                       reduction, columns), {*a, *b, partial}, ValueRange{arel, pmm})) ||
         failed(binary(aimx::Opcode::add, *acc, partial, out))) return failure();
     values[op->getResult(0)] = out;
     return success();
@@ -1263,6 +1319,10 @@ private:
     if (failed(capacity)) return failure();
     Layout layout = layouts.lookup(loop.getResult(0));
     int64_t logicalK = layouts.lookup(loadA.getResult()).usefulCols;
+    // matvec은 yᵀ = xᵀ·Wᵀ다: x가 vecA로 재배치되고 W가 B로 읽히며 batch는 1이다.
+    bool vector = isa<linalg::MatvecOp>(mac);
+    pim::LoadOp macA = vector ? loadB : loadA, macB = vector ? loadA : loadB;
+    int64_t macBatch = vector ? 1 : batch;
     int64_t physicalK, arelGroupBytes, arelBytes;
     if (!aimx::checkedRoundUp(logicalK, aimx::kRegSize, physicalK) ||
         !aimx::checkedProduct({layout.rows, physicalK, aimx::kTypeSize,
@@ -1311,21 +1371,22 @@ private:
     if (llvm::MulOverflow(outer, *capacity, repetitions))
       return loop.emitError("AiMX descriptor loop extent overflows");
     View relayout = mapGroup(prepare);
-    auto a = accessView(loadA.getAccess().getDefiningOp<pim::AccessOp>());
+    auto a = accessView(macA.getAccess().getDefiningOp<pim::AccessOp>());
     if (failed(a) || failed(append(aimx::buildMatmulRelayout(
-            module, name("matmul_relayout"), batch, layout.usefulRows, logicalK),
-            {*a, relayout}))) return failure();
+            module, name("matmul_relayout"), macBatch, vector ? 1 : layout.usefulRows,
+            logicalK), {*a, relayout}))) return failure();
     code.setInsertionPointAfter(prepare);
     repetitions = outer;
-    auto row = code.create<scf::ForOp>(loc, c(code, 0), c(code, layout.rows), c(code, batch));
+    auto row = code.create<scf::ForOp>(loc, c(code, 0), c(code, layout.rows), c(code, macBatch));
     code.setInsertionPoint(row.getBody()->getTerminator());
-    if (llvm::MulOverflow(repetitions, layout.rows / batch, repetitions))
+    if (llvm::MulOverflow(repetitions, layout.rows / macBatch, repetitions))
       return loop.emitError("AiMX output row extent overflows");
-    int64_t width = aimx::kLanes / batch;
-    // N=1 matvec needs one MAC/drain microtile even with wider storage rows.
-    int64_t columns = matvecFirstNOnly && isa<linalg::MatvecOp>(mac)
-                          ? width : layout.cols;
-    if (isa<linalg::MatmulOp>(mac) && matmulUsefulNOnly &&
+    int64_t width = aimx::kLanes / macBatch;
+    int64_t columns = layout.cols;
+    // matvec 출력 lane은 M 방향이다. 유효 M을 4096 폭 microtile로 올린 만큼만 계산한다.
+    if (vector && !aimx::checkedRoundUp(layout.usefulRows, width, columns))
+      return loop.emitError("AiMX useful matvec M extent overflows");
+    if (!vector && matmulUsefulNOnly &&
         !aimx::checkedRoundUp(layout.usefulCols, width, columns))
       return loop.emitError("AiMX useful GEMM N extent overflows");
     auto col = code.create<scf::ForOp>(loc, c(code, 0), c(code, columns), c(code, width));
@@ -1342,13 +1403,13 @@ private:
     relayout = mapGroup(accumulate);
     relayout.offset = add(relayout.offset, mul(row.getInductionVar(),
         c(code, physicalK * aimx::kTypeSize * aimx::kNumChannels)));
-    auto b = accessView(loadB.getAccess().getDefiningOp<pim::AccessOp>());
+    auto b = accessView(macB.getAccess().getDefiningOp<pim::AccessOp>());
     if (failed(b)) return failure();
     b->offset = add(b->offset, mul(col.getInductionVar(), c(code, aimx::kTypeSize)));
     if (failed(append(aimx::buildMatmulAccumulate(
-            module, name("matmul_accumulate"), batch, logicalK), {relayout, *b})))
+            module, name("matmul_accumulate"), macBatch, logicalK), {relayout, *b})))
       return failure();
-    int64_t stepK = aimx::kRegSize / batch;
+    int64_t stepK = aimx::kRegSize / macBatch;
     int64_t macK = ((logicalK + stepK - 1) / stepK) * stepK;
     if (macK % aimx::kRegSize != 0) {
       // Only the last group pads the complete MAC stream to a native K block.
@@ -1368,10 +1429,10 @@ private:
       zeroA.offset = add(zeroA.offset, c(code, (macK / stepK) * aimx::kDeviceWidth));
       zeroB.offset = add(zeroB.offset, mul(c(code, macK), zeroB.pitch));
       // Each repeated pair reads the same known-zero portion of the last panel.
-      if (llvm::MulOverflow(outputRepetitions, batch - 1, repetitions))
+      if (llvm::MulOverflow(outputRepetitions, macBatch - 1, repetitions))
         return loop.emitError("AiMX final K padding extent overflows");
       if (failed(append(aimx::buildMatmulAccumulate(
-              module, name("matmul_padding"), batch, stepK), {zeroA, zeroB})))
+              module, name("matmul_padding"), macBatch, stepK), {zeroA, zeroB})))
         return failure();
     }
     code.setInsertionPointAfter(accumulate);
@@ -1380,7 +1441,7 @@ private:
     output.offset = add(out.offset,
         add(mul(row.getInductionVar(), out.pitch),
             mul(col.getInductionVar(), c(code, aimx::kTypeSize))));
-    if (failed(append(aimx::buildMatmulDrain(module, name("matmul_drain"), batch),
+    if (failed(append(aimx::buildMatmulDrain(module, name("matmul_drain"), macBatch),
                       {output}, ValueRange{pmm}))) return failure();
     code.setInsertionPointAfter(nonempty);
     indices = outerIndices;
@@ -1470,11 +1531,6 @@ struct ConvertPIMToAiMXPass
       module.emitError("AiMX batch must be 1, 2, 4, or 8");
       return signalPassFailure();
     }
-    if (matvecRowAlignment < 0 ||
-        matvecRowAlignment % (aimx::kLanes / batch) != 0) {
-      module.emitError("AiMX matvec row alignment must be zero or a positive multiple of 4096/batch");
-      return signalPassFailure();
-    }
     if (matmulRowAlignment < 0 ||
         matmulRowAlignment % (aimx::kLanes / batch) != 0) {
       module.emitError("AiMX matmul row alignment must be zero or a positive multiple of 4096/batch");
@@ -1499,8 +1555,7 @@ struct ConvertPIMToAiMXPass
     module.walk([&](pim::PartitionOp device) { devices.push_back(device); });
     unsigned site = 0;
     for (pim::PartitionOp device : devices)
-      if (failed(DeviceLowering(module, device, profile, batch, matvecRowAlignment,
-                                matvecFirstNOnly, matmulRowAlignment,
+      if (failed(DeviceLowering(module, device, profile, batch, matmulRowAlignment,
                                 matmulUsefulNOnly, kAlignment, persistent,
                                 site++).run()))
         return signalPassFailure();

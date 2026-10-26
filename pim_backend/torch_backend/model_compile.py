@@ -1,9 +1,10 @@
 """Model compile time: tiling configs of one layer, then every layer compiled with them.
 
 compile_model analyzes the first layer into stage classes (after GEMM packing),
-measures each class with its weights already resident, chooses the packing and one
-measured config per class together (select_configs), and compiles every layer with
-those configs without allocating the device. plan_memory then fits as many layer slots as one unit holds: every layer
+measures each class with its weights (or the key/value cache it reads) already
+resident, chooses the packing and one measured config per class together
+(select_configs), and compiles every layer with those configs without allocating
+the device. plan_memory then fits as many layer slots as one unit holds: every layer
 keeps its own slot if all fit; otherwise layer i takes slot i mod slots and the
 layers of one group are uploaded together, overwriting only the weights. The
 returned session allocates, binds and runs at runtime.
@@ -20,6 +21,7 @@ import time
 
 import torch
 
+from triton.backends.pim.residency import KEY
 from triton.backends.pim.runtime import PIMSession
 
 from ._autotuner import (
@@ -35,7 +37,11 @@ from .template import TORCH_GEMM_TEMPLATE_VERSION
 
 
 class StageModule(torch.nn.Module):
-    """One stage class alone: a weight GEMM, or its independent activation GEMM instances."""
+    """One stage class alone: a weight GEMM, or its independent activation GEMM instances.
+
+    A key/value cache class takes the cache first, [instances, positions, width], and
+    instance i reads cache[i], or its transpose, as its cache operand.
+    """
 
     def __init__(self, key, weights):
         super().__init__()
@@ -59,6 +65,14 @@ class StageModule(torch.nn.Module):
             return self._gemm(left, right)
         if self.key.op == "aten.bmm.default":
             return self._gemm(*inputs)
+        if self.key.has_kv:
+            cache, *others = inputs
+            windows = [cache[instance] for instance in range(self.key.instances)]
+            if self.key.kv_transposed:
+                windows = [window.t() for window in windows]
+            if self.key.kv_mask[0]:
+                return tuple(self._gemm(window, other) for window, other in zip(windows, others))
+            return tuple(self._gemm(other, window) for window, other in zip(windows, others))
         return tuple(self._gemm(inputs[index], inputs[index + 1])
                      for index in range(0, len(inputs), 2))
 
@@ -81,13 +95,21 @@ def stage_inputs(key):
         return (tensor(m, k) if key.weight_mask[1] else tensor(k, n),)
     if key.op == "aten.bmm.default":
         return (tensor(key.instances, m, k), tensor(key.instances, k, n))
+    if key.has_kv:
+        # cache operand가 (rows, cols)이면 cache의 head 하나는 그것이거나(전치면) 그 전치다.
+        (rows, cols), other = ((m, k), (k, n)) if key.kv_mask[0] else ((k, n), (m, k))
+        if key.kv_transposed:
+            rows, cols = cols, rows
+        return (tensor(key.instances, rows, cols),) + tuple(tensor(*other) for _ in range(key.instances))
     return tuple(operand for _ in range(key.instances) for operand in (tensor(m, k), tensor(k, n)))
 
 
 def measure_stage(key, weights, session, config, *, warmup, repeat):
-    """E with the weights already resident, U of one upload, and measured footprint.
+    """E with the weights (or the key/value cache) already resident, U of one weight upload,
+    and measured footprint.
 
     session is open; the prepared stage is released afterwards and the units stay allocated.
+    The cache is not written: E does not depend on its values.
     """
     module = StageModule(key, weights).eval()
     inputs = stage_inputs(key)
@@ -98,7 +120,10 @@ def measure_stage(key, weights, session, config, *, warmup, repeat):
     # 후보마다 새로 컴파일한다. dynamo가 앞 후보의 컴파일 결과를 돌려주지 않게 한다.
     torch._dynamo.reset()
     with torch.no_grad():
-        plan, = session.prepare([module], inputs, configure=configure)
+        plan, = session.prepare(
+            {"stage": ([module], inputs, configure)},
+            kv_inputs={"stage": lambda index, inputs: {KEY: inputs[0]}} if key.has_kv else None,
+        )["stage"]
         stage, = plan.stages
         # packing이 측정할 stage의 shape를 바꾸지 않았는지 확인한다.
         if (tuple(stage.shape), stage.instance_count) != (key.mnk, key.instances):
@@ -109,19 +134,21 @@ def measure_stage(key, weights, session, config, *, warmup, repeat):
         session.backend.model.enter_layer(plan)
         upload_ms = (time.perf_counter_ns() - start) / 1e6
         for _ in range(warmup):
-            session.run_model(*inputs)
+            session.run_model("stage", *inputs)
         samples = []
         for _ in range(repeat):
             start = time.perf_counter_ns()
-            session.run_model(*inputs)
+            session.run_model("stage", *inputs)
             samples.append((time.perf_counter_ns() - start) / 1e6)
     session.release()
     return PIMBenchmarkResult(
         total_ms=statistics.median(samples),
         correctness=None,
         timings=(("weight_upload", upload_ms),),
+        # cache class는 cache 영역 bytes를 다섯째로 더한다 (Footprint.kv).
         physical_allocations=((requirement.weight_bytes, requirement.state_bytes,
-                               requirement.input_bytes, requirement.output_bytes),),
+                               requirement.input_bytes, requirement.output_bytes)
+                              + ((requirement.kv_bytes,) if key.has_kv else ()),),
     )
 
 
@@ -192,41 +219,56 @@ class Candidate:
 def cache_version(key):
     # E, U, footprint는 배치와 무관하다. stage class가 다르면 같은 (M,N,K)여도 측정 대상이 다르다.
     mask = "".join(str(int(flag)) for flag in key.weight_mask)
-    return f"{TORCH_GEMM_TEMPLATE_VERSION}|model|{key.op}|w{mask}|x{key.instances}"
+    version = f"{TORCH_GEMM_TEMPLATE_VERSION}|model|{key.op}|w{mask}|x{key.instances}"
+    # cache를 읽는 class는 같은 (M,N,K)의 activation class와 다른 것을 잰다 (cache 전송 없음).
+    if key.has_kv:
+        version += "|kv" + "".join(str(int(flag)) for flag in key.kv_mask) + ("t" if key.kv_transposed else "")
+    return version
 
 
-def select_configs(classes, candidates, capacity_bytes):
-    """One measured candidate per class with the smallest E + U of one layer that fits one unit.
+def select_configs(classes, candidates, capacity_bytes, *, layers, repeats):
+    """One measured candidate per class with the smallest time of one layer in one request.
 
-    classes maps a stage class key to its stage count in the layer. A cold request
-    runs every layer once and uploads its weights once, so the slot/group plan does
-    not change the time; a layer only has to fit one unit with the scratch. The slot
-    bytes add up over the stages, the scratch is the largest input plus the largest
-    output, so the search keeps every partial choice that no other choice beats in
-    slot bytes, input, output and time together (multiple-choice knapsack).
+    classes maps a stage class key to its stage count in the layer; one request runs
+    the phase repeats times (prefill once, decode once per generated token after the
+    first). Two memory plans give two times per layer:
+      reloaded  layer groups take turns in the slots, so every run uploads the weights
+                again: repeats * (E + U); one layer has to fit one unit with the scratch
+      resident  every layer keeps its own slot, so the weights are uploaded once:
+                repeats * E + U; all layers have to fit one unit with the scratch
+    With one run both times are E + U, and the reloaded plan, which fits more choices,
+    is kept. The slot bytes add up over the stages, the scratch is the largest input
+    plus the largest output, so the search keeps every partial choice that no other
+    choice beats in slot bytes, input, output and time together (multiple-choice knapsack).
     Returns (time_ms, slot_bytes, scratch_bytes, {key: candidate}) or None.
     """
-    # (slot bytes, 최대 input, 최대 output, 시간, 고른 후보)
-    frontier = [(0, 0, 0, 0.0, {})]
-    for key, count in classes.items():
-        extended = [(slot + count * (candidate.footprint.weight + candidate.footprint.state),
-                     max(largest_input, candidate.footprint.input),
-                     max(largest_output, candidate.footprint.output),
-                     elapsed + count * (candidate.execution_ms + candidate.upload_ms),
-                     {**chosen, key: candidate})
-                    for slot, largest_input, largest_output, elapsed, chosen in frontier
-                    for candidate in candidates[key]]
-        extended.sort(key=lambda option: (option[3], option[0]))
-        frontier = []
-        for option in extended:
-            # 시간이 더 짧은 선택이 bytes도 모두 같거나 작으면 이 선택은 쓸 일이 없다.
-            if not any(all(kept[axis] <= option[axis] for axis in range(3)) for kept in frontier):
-                frontier.append(option)
-    feasible = [option for option in frontier
-                if option[0] + option[1] + option[2] <= capacity_bytes]
-    if not feasible:
+    best = None
+    # (unit 하나에 함께 놓이는 layer 수, upload 횟수): reloaded, resident 순서
+    for resident_layers, uploads in ((1, repeats), (layers, 1)):
+        # (slot bytes, 최대 input, 최대 output, 시간, 고른 후보)
+        frontier = [(0, 0, 0, 0.0, {})]
+        for key, count in classes.items():
+            extended = [(slot + count * (candidate.footprint.weight + candidate.footprint.state),
+                         max(largest_input, candidate.footprint.input),
+                         max(largest_output, candidate.footprint.output),
+                         elapsed + count * (repeats * candidate.execution_ms
+                                            + uploads * candidate.upload_ms),
+                         {**chosen, key: candidate})
+                        for slot, largest_input, largest_output, elapsed, chosen in frontier
+                        for candidate in candidates[key]]
+            extended.sort(key=lambda option: (option[3], option[0]))
+            frontier = []
+            for option in extended:
+                # 시간이 더 짧은 선택이 bytes도 모두 같거나 작으면 이 선택은 쓸 일이 없다.
+                if not any(all(kept[axis] <= option[axis] for axis in range(3)) for kept in frontier):
+                    frontier.append(option)
+        feasible = [option for option in frontier
+                    if resident_layers * option[0] + option[1] + option[2] <= capacity_bytes]
+        if feasible and (best is None or feasible[0][3] < best[3]):
+            best = feasible[0]
+    if best is None:
         return None
-    slot, largest_input, largest_output, elapsed, chosen = feasible[0]
+    slot, largest_input, largest_output, elapsed, chosen = best
     return elapsed, slot, largest_input + largest_output, chosen
 
 
@@ -258,12 +300,14 @@ def widened_configs(stage_class, spec, cache_path):
     axis, shapes, instances = stage_class.origin
     key = stage_class.key
     index = "mnk".index(axis)
+    block_m = target_model(spec).block(key.problem)[0]
     configs = []
     for mnk in dict.fromkeys(shapes):
         member = replace(key, mnk=mnk, instances=instances)
-        config = PIMConfigCache(cache_path, template_version=cache_version(member)).lookup(member.problem, spec)
-        # member class를 잰 적이 없으면 넓힐 config가 없다.
-        if config is None:
+        config = PIMConfigCache(cache_path, template_version=cache_version(member)).lookup(
+            member.problem, target_model(spec).stage_target(member.problem))
+        # member class를 잰 적이 없으면 넓힐 config가 없다. M이 작은 member는 Block m(=batch)이 달라 넓히지 않는다.
+        if config is None or config.block_m != block_m:
             continue
         hierarchy = pim_hierarchy(member.problem, config)
         groups = math.ceil(key.mnk[index] / hierarchy.block_group_extent[index])
@@ -281,14 +325,12 @@ def member_classes(stage_class):
     assignment = {}
     for sources in stage_class.stage_sources:
         if axis == "n":
-            # member마다 원래 GEMM 하나이고, 이어 붙인 weight의 열 구간 하나를 쓴다.
+            # member마다 원래 GEMM 하나이고, 이어 붙인 weight(fx_packing.ConcatenatedWeight)의 part 하나를 쓴다.
             parts = []
-            start = 0
-            for source, mnk in zip(sources, shapes, strict=True):
-                weights = tuple(None if weight is None else weight[:, start:start + mnk[1]]
+            for index, (source, mnk) in enumerate(zip(sources, shapes, strict=True)):
+                weights = tuple(None if weight is None else weight.parts[index]
                                 for weight in stage_class.weights)
                 parts.append(((source,), mnk, weights))
-                start += mnk[1]
         else:
             # 원래 GEMM들이 instance로 묶인 stage 하나가 된다.
             parts = [(sources, shapes[0], stage_class.weights)]
@@ -305,13 +347,13 @@ def member_classes(stage_class):
 
 def stage_config_space(key, spec):
     problem = key.problem
-    # target이 k를 device로 나눌 수 없으면(AiMX) seed도 k를 나누지 않는다. instance들이 unit을
+    # target이 k를 device로 나눌 수 없으면 seed도 k를 나누지 않는다. instance들이 unit을
     # 나눠 한 batch round에 함께 돌도록 instance 하나가 채울 unit 수를 정한다.
     split_k = target_model(spec).mapping_reason(problem, (1, 1, 2)) is None
     # instance가 unit보다 많으면(AiMX 2 FPGA의 head stage) instance 하나는 unit 하나를 쓴다.
     overrides = {"partition_axes": (True, True, split_k),
                  "instance_units": max(1, spec.common_profile.num_units // key.instances)}
-    if key.has_weights:
+    if key.has_weights or key.has_kv:
         overrides["initial_round_patterns"] = ((1, 1, 1),)
     return build_config_space(problem, spec, **overrides)
 
@@ -320,11 +362,16 @@ def tune_stage_class(stage_class, spec, *, cache_path, search_budget, warmup, re
     """Measured candidates of one class that satisfy the model-stage constraints."""
     key = stage_class.key
     problem = key.problem
-    constraint = stage_constraint(key, max_stage_rounds(problem, spec))
+    # 이 class가 compile될 target(AiMX GEMM batch)으로 탐색하고 기록한다 (select_layer_config와 같은 key).
+    spec = target_model(spec).stage_target(problem)
+    constraint = stage_constraint(key, max_stage_rounds(problem, spec), spec)
     cache = PIMConfigCache(cache_path, template_version=cache_version(key))
     # packing member의 config를 넓힌 후보, 같은 context의 비슷한 shape config를 이 shape에 맞춘 후보
+    # cache stage는 상주 cache에 padding이 없는 config가 있어야 한다(stage_constraint). target이 하나를 낸다.
+    resident = target_model(spec).resident_operand_config(problem) if key.has_kv else None
     initial = tuple({config.key(): config for config in (
-        widened_configs(stage_class, spec, cache_path) + fitted_configs(key, spec, cache))}.values())
+        widened_configs(stage_class, spec, cache_path) + fitted_configs(key, spec, cache)
+        + (() if resident is None else (resident,)))}.values())
 
     print(f"[model compile] tune {key.label()} initial={[config.key() for config in initial]}", flush=True)
     # cache에 있는 후보만 쓰면 측정 프로세스를 띄우지 않는다(measure가 처음 불릴 때 띄운다).
@@ -350,8 +397,9 @@ def tune_stage_class(stage_class, spec, *, cache_path, search_budget, warmup, re
         if record["correctness"] is False or not engine.valid(config):
             continue
         timings = dict(record["timings"])
+        allocations = record["physical_allocations"][0]
         candidates.append(Candidate(config, record["total_ms"], timings["weight_upload"],
-                                    Footprint(*record["physical_allocations"][0])))
+                                    Footprint(*allocations) if key.has_kv else Footprint(*allocations, kv=0)))
     if not candidates:
         raise ValueError(f"{key.label()}: no measured config satisfies the model-stage constraints")
     return candidates
@@ -363,28 +411,18 @@ class CompiledModel:
     report: dict
 
 
-def compile_model(layers, example_inputs, *, target, units, runtime_options=None,
-                  cache_path=DEFAULT_CACHE_PATH, max_benchmarks=20, max_generations=10,
-                  warmup=1, repeat=3, seed=0):
-    """Compile time of a model whose layers share one structure; the session runs it at runtime.
+def tune_phase(phase, layers, example_inputs, spec, kv, *, cache_path, search_budget, warmup, repeat,
+               seed):
+    """Stage classes of the first layer of one phase and the measured candidates of every class.
 
-    1. analyze the first layer into stage classes
-    2. tune every class with its weights resident; a packed class also tunes its members
-    3. for every pack/separate choice of the packed classes, select_configs picks one
-       candidate per class; the choice with the smallest E + U of one layer wins
-    4. compile every layer with those configs; plan_memory places them in slots
+    kv is the first layer's {KEY/VALUE: cache input} or None (build_layer_plan).
     """
-    layers = tuple(layers)
-    spec = target_spec(target, num_units=units, **(runtime_options or {}))
-
     start = time.perf_counter_ns()
-    classes, assignment = analyze_layer(layers[0], example_inputs, spec)
+    classes, assignment = analyze_layer(layers[0], example_inputs, spec, kv)
     analysis_ms = (time.perf_counter_ns() - start) / 1e6
-    print(f"[model compile] target={target} units={units} layers={len(layers)} "
-          f"stage_classes={len(classes)}", flush=True)
+    print(f"[model compile] {phase}: stage_classes={len(classes)}", flush=True)
 
     start = time.perf_counter_ns()
-    search_budget = SearchBudget(max_generations=max_generations, max_benchmarks=max_benchmarks)
     candidates = {}
 
     def tune_once(stage_class):
@@ -401,8 +439,33 @@ def compile_model(layers, example_inputs, *, target, units, runtime_options=None
             for member in members[stage_class.key][0]:
                 tune_once(member)
         tune_once(stage_class)
+    return {"classes": classes, "assignment": assignment, "members": members, "candidates": candidates,
+            "analysis_ms": analysis_ms, "tuning_ms": (time.perf_counter_ns() - start) / 1e6}
 
-    capacity_bytes = spec.common_profile.banks_per_unit * spec.common_profile.bank_capacity_limit_bytes
+
+def kv_bytes_bound(tuned, layers):
+    """Per-unit cache bytes of the phase's layers under its largest measured cache candidates.
+
+    The cache sits below every phase area, so the configs are chosen for what is left
+    after this bound; the memory table then places the bytes the chosen configs need.
+    """
+    return layers * sum(
+        stage_class.count * max(candidate.footprint.kv for candidate in tuned["candidates"][stage_class.key])
+        for stage_class in tuned["classes"] if stage_class.key.has_kv)
+
+
+def select_phase(phase, tuned, capacity_bytes, *, layers, repeats):
+    """Packing and one config per class for the layers of one phase.
+
+    capacity_bytes is what one unit has for the phase area (below the key/value cache
+    once a phase reads it);
+    one request runs the phase repeats times.
+    """
+    start = time.perf_counter_ns()
+    classes = tuned["classes"]
+    members = tuned["members"]
+    candidates = tuned["candidates"]
+    assignment = dict(tuned["assignment"])
     packed_classes = [stage_class for stage_class in classes if stage_class.origin is not None]
     best = None
     packing = []
@@ -416,19 +479,21 @@ def compile_model(layers, example_inputs, *, target, units, runtime_options=None
                          else [stage_class]):
                 parts.setdefault(part.key, []).append(part)
         counts = {key: sum(part.count for part in group) for key, group in parts.items()}
-        selection = select_configs(counts, candidates, capacity_bytes)
+        selection = select_configs(counts, candidates, capacity_bytes,
+                                   layers=layers, repeats=repeats)
         packing.append({"separated": [key.label() for key in separated],
                         "layer_ms": None if selection is None else selection[0],
                         "slot_bytes": None if selection is None else selection[1],
                         "scratch_bytes": None if selection is None else selection[2]})
-        print(f"[model compile] separate={[key.label() for key in separated]} -> "
+        print(f"[model compile] {phase}: separate={[key.label() for key in separated]} -> "
               + ("no layer fits one unit" if selection is None else
-                 f"E+U {selection[0]:.1f} ms/layer, slot {selection[1]} B, scratch {selection[2]} B"),
+                 f"{repeats} runs {selection[0]:.1f} ms/layer, slot {selection[1]} B, "
+                 f"scratch {selection[2]} B"),
               flush=True)
         if selection is not None and (best is None or selection[0] < best[0][0]):
             best = (selection, separated, parts)
     if best is None:
-        raise ValueError(f"no choice of measured configs fits one layer in {capacity_bytes} bytes")
+        raise ValueError(f"{phase}: no choice of measured configs fits one layer in {capacity_bytes} bytes")
     (_, _, _, selected), separated_keys, parts = best
     separate = set()
     for key in separated_keys:
@@ -438,61 +503,139 @@ def compile_model(layers, example_inputs, *, target, units, runtime_options=None
     classes = [StageClass(key, sum(part.count for part in group), group[0].weights, group[0].origin,
                           [sources for part in group for sources in part.stage_sources])
                for key, group in parts.items()]
-    tuning_ms = (time.perf_counter_ns() - start) / 1e6
+    return {"selected": selected, "assignment": assignment, "separate": separate,
+            "classes": classes, "candidates": candidates, "packing": packing, "repeats": repeats,
+            "analysis_ms": tuned["analysis_ms"], "tuning_ms": tuned["tuning_ms"],
+            "selection_ms": (time.perf_counter_ns() - start) / 1e6}
+
+
+def compile_model(phases, *, target, units, kv_inputs=None, repeats=None, runtime_options=None,
+                  cache_path=DEFAULT_CACHE_PATH, max_benchmarks=20, max_generations=10,
+                  warmup=1, repeat=3, seed=0):
+    """Compile time of a model whose layers share one structure in every phase; the session runs it.
+
+    phases maps each phase name, in execution order, to (layers, example_inputs). kv_inputs
+    maps a phase to kv(index, inputs) -> {KEY/VALUE: tensor}, the host key/value cache
+    among the inputs of layer index; the GEMMs reading one head of it read the device
+    cache in place (PIMSession.compile, write_kv). Without kv_inputs the cache stays on
+    the host. repeats maps every phase to the times one request runs it (decode:
+    generated tokens - 1); None runs every phase once. Every phase overlays one area
+    from offset 0 and the cache sits at the top of the unit; the phases before the
+    first one that reads the cache run before it is written and are chosen for the
+    whole unit, the others for what the cache leaves:
+    1. analyze the first layer of every phase into stage classes
+    2. tune every class with its weights (or cache) resident; a packed class also tunes
+       its members
+    3. reserve the cache under the largest measured cache candidates (kv_bytes_bound)
+    4. for every pack/separate choice of the packed classes, select_configs picks one
+       candidate per class; the choice with the smallest time of one layer in one
+       request wins (E and U weighed by the repeats)
+    5. compile every layer of every phase with those configs; plan_memory places them
+    """
+    spec = target_spec(target, num_units=units, **(runtime_options or {}))
+    print(f"[model compile] target={target} units={units} phases={list(phases)}", flush=True)
+    search_budget = SearchBudget(max_generations=max_generations, max_benchmarks=max_benchmarks)
+    tuned = {phase: tune_phase(phase, tuple(layers), example_inputs, spec,
+                               None if kv_inputs is None or phase not in kv_inputs
+                               else kv_inputs[phase](0, example_inputs),
+                               cache_path=cache_path, search_budget=search_budget,
+                               warmup=warmup, repeat=repeat, seed=seed)
+             for phase, (layers, example_inputs) in phases.items()}
+    kv_bounds = {phase: kv_bytes_bound(tuned[phase], len(tuple(layers))) for phase, (layers, _) in phases.items()}
+    kv_bytes = max(kv_bounds.values())
+    unit_bytes = spec.common_profile.banks_per_unit * spec.common_profile.bank_capacity_limit_bytes
+    # plan_memory와 같은 규칙: cache를 처음 읽는 phase부터 cache 아래 영역만 쓴다.
+    first_reader = next((index for index, phase in enumerate(phases) if kv_bounds[phase]), len(phases))
+    capacity_bytes = {phase: unit_bytes - (kv_bytes if index >= first_reader else 0)
+                      for index, phase in enumerate(phases)}
+    print(f"[model compile] key/value cache bound {kv_bytes} bytes per unit; phase areas "
+          f"{capacity_bytes}", flush=True)
+    choices = {phase: select_phase(phase, tuned[phase], capacity_bytes[phase], layers=len(tuple(layers)),
+                                   repeats=1 if repeats is None else repeats[phase])
+               for phase, (layers, _) in phases.items()}
+
+    def configure_with(choice):
+        # 모든 layer의 GEMM 이름이 분석한 layer와 같다. 없는 이름은 KeyError로 드러난다.
+        def configure(gemms, spec):
+            return {gemm.node: PIMTorchConfig(spec=spec,
+                                              config=choice["selected"][choice["assignment"][gemm.node]].config,
+                                              pack=gemm.node not in choice["separate"])
+                    for gemm in gemms}
+        return configure
 
     start = time.perf_counter_ns()
     session = PIMSession(spec)
-
-    # 모든 layer의 GEMM 이름이 분석한 layer와 같다. 없는 이름은 KeyError로 드러난다.
-    def configure(gemms, spec):
-        return {gemm.node: PIMTorchConfig(spec=spec, config=selected[assignment[gemm.node]].config,
-                                          pack=gemm.node not in separate)
-                for gemm in gemms}
-
     torch._dynamo.reset()
-    session.compile(layers, example_inputs, configure=configure)
-    # packing 판단을 반영한 layer가 측정한 class와 같은 stage들로 나뉘었는지 확인한다.
-    compiled = Counter(stage_key(stage) for stage in session.layers[0].stages)
-    expected = Counter({stage_class.key: stage_class.count for stage_class in classes})
-    if compiled != expected:
-        raise ValueError(f"layer 0 compiled into stages {dict(compiled)}; the tuned classes are {expected}")
-    analyzed = [(tuple(stage.shape), stage.instance_count, tuple(stage.weight_mask))
-                for stage in session.layers[0].stages]
-    for plan in session.layers[1:]:
-        stages = [(tuple(stage.shape), stage.instance_count, tuple(stage.weight_mask))
-                  for stage in plan.stages]
-        if stages != analyzed:
-            raise ValueError(f"layer {plan.index} has stages {stages}; the analyzed layer has {analyzed}")
+    session.compile({phase: (layers, example_inputs, configure_with(choices[phase]))
+                     for phase, (layers, example_inputs) in phases.items()}, kv_inputs=kv_inputs)
+    for phase, plans in session.plans.items():
+        classes = choices[phase]["classes"]
+        # packing 판단을 반영한 layer가 측정한 class와 같은 stage들로 나뉘었는지 확인한다.
+        compiled = Counter(stage_key(stage) for stage in plans[0].stages)
+        expected = Counter({stage_class.key: stage_class.count for stage_class in classes})
+        if compiled != expected:
+            raise ValueError(f"{phase}: layer 0 compiled into stages {dict(compiled)}; "
+                             f"the tuned classes are {expected}")
+        analyzed = [(tuple(stage.shape), stage.instance_count, tuple(stage.weight_mask))
+                    for stage in plans[0].stages]
+        for plan in plans[1:]:
+            stages = [(tuple(stage.shape), stage.instance_count, tuple(stage.weight_mask))
+                      for stage in plan.stages]
+            if stages != analyzed:
+                raise ValueError(f"{phase}: layer {plan.index} has stages {stages}; "
+                                 f"the analyzed layer has {analyzed}")
     compile_ms = (time.perf_counter_ns() - start) / 1e6
     memory = session.memory
-    print(f"[model compile] slots={memory.slots} groups={memory.groups} "
-          f"bytes_per_unit={memory.bytes_per_unit} capacity={memory.capacity_bytes} "
-          f"analysis_ms={analysis_ms:.1f} tuning_ms={tuning_ms:.1f} compile_ms={compile_ms:.1f}", flush=True)
+    for phase, layout in memory.phases.items():
+        print(f"[model compile] {phase}: slots={layout.slots} groups={layout.groups} bytes={layout.bytes} "
+              f"analysis_ms={choices[phase]['analysis_ms']:.1f} tuning_ms={choices[phase]['tuning_ms']:.1f}",
+              flush=True)
+    print(f"[model compile] kv_bytes={memory.kv_bytes} kv_base={memory.kv_base} bytes_per_unit={memory.bytes_per_unit} "
+          f"capacity={memory.capacity_bytes} compile_ms={compile_ms:.1f}", flush=True)
+
+    def phase_report(phase, layers):
+        choice = choices[phase]
+        selected = choice["selected"]
+        return {
+            "layers": len(layers), "repeats": choice["repeats"],
+            # 한 번 실행할 때 weight 상주 실행 시간만 더한 값. weight 업로드와 CPU 시간은 들어가지 않는다.
+            "estimated_execution_ms": len(layers) * sum(
+                stage_class.count * selected[stage_class.key].execution_ms
+                for stage_class in choice["classes"]),
+            "analysis_ms": choice["analysis_ms"], "tuning_ms": choice["tuning_ms"],
+            "selection_ms": choice["selection_ms"],
+            "packing": choice["packing"],
+            "stage_classes": [{
+                "label": stage_class.key.label(),
+                "mnk": list(stage_class.key.mnk), "op": stage_class.key.op,
+                "weight_mask": list(stage_class.key.weight_mask),
+                "instances": stage_class.key.instances,
+                "stages_per_layer": stage_class.count,
+                "measured": len(choice["candidates"][stage_class.key]),
+                "selected": {"config": asdict(selected[stage_class.key].config),
+                             "execution_ms": selected[stage_class.key].execution_ms,
+                             # 격리 측정의 첫 업로드. group 진입 때 pack과 전송이 함께 일어나므로 둘 다 들어간다.
+                             "first_upload_ms": selected[stage_class.key].upload_ms,
+                             "footprint": asdict(selected[stage_class.key].footprint)},
+            } for stage_class in choice["classes"]],
+        }
 
     report = {
-        "target": target, "units": units, "spec": asdict(spec), "layers": len(layers),
-        "memory": {"slots": memory.slots, "groups": memory.groups,
-                   "slot_of_layer": memory.slot_of_layer, "group_of_layer": memory.group_of_layer,
-                   "slot_bytes": list(memory.slot_bytes),
-                   "scratch_bytes": memory.scratch_bytes, "bytes_per_unit": memory.bytes_per_unit,
-                   "capacity_bytes": memory.capacity_bytes},
-        # weight 상주 실행 시간만 더한 값. weight 업로드와 CPU 시간은 들어가지 않는다.
-        "estimated_execution_ms": len(layers) * sum(
-            stage_class.count * selected[stage_class.key].execution_ms for stage_class in classes),
-        "analysis_ms": analysis_ms, "tuning_ms": tuning_ms, "compile_ms": compile_ms,
-        "packing": packing,
-        "stage_classes": [{
-            "label": stage_class.key.label(),
-            "mnk": list(stage_class.key.mnk), "op": stage_class.key.op,
-            "weight_mask": list(stage_class.key.weight_mask),
-            "instances": stage_class.key.instances,
-            "stages_per_layer": stage_class.count,
-            "measured": len(candidates[stage_class.key]),
-            "selected": {"config": asdict(selected[stage_class.key].config),
-                         "execution_ms": selected[stage_class.key].execution_ms,
-                         # 격리 측정의 첫 업로드. group 진입 때 pack과 전송이 함께 일어나므로 둘 다 들어간다.
-                         "first_upload_ms": selected[stage_class.key].upload_ms,
-                         "footprint": asdict(selected[stage_class.key].footprint)},
-        } for stage_class in classes],
+        "target": target, "units": units, "spec": asdict(spec),
+        "memory": {"kv_bytes": memory.kv_bytes, "kv_base": memory.kv_base, "kv_bytes_bound": kv_bytes,
+                   "phase_capacity_bytes": capacity_bytes,
+                   "kv_regions": [{"layer": entry.layer, "kind": entry.kind, "offset": entry.offset,
+                                   "bytes": entry.bytes}
+                                  for key, entry in memory.entries.items() if key[0] == "kv"],
+                   "bytes_per_unit": memory.bytes_per_unit,
+                   "capacity_bytes": memory.capacity_bytes,
+                   "phases": {phase: {"slots": layout.slots, "groups": layout.groups,
+                                      "slot_of_layer": layout.slot_of_layer,
+                                      "group_of_layer": layout.group_of_layer,
+                                      "slot_bytes": list(layout.slot_bytes),
+                                      "scratch_bytes": layout.scratch_bytes, "bytes": layout.bytes}
+                              for phase, layout in memory.phases.items()}},
+        "compile_ms": compile_ms,
+        "phases": {phase: phase_report(phase, layers) for phase, (layers, _) in phases.items()},
     }
     return CompiledModel(session, report)

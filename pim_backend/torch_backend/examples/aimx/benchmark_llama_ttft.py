@@ -44,13 +44,13 @@ def main():
 
     with torch.no_grad():
         tokenizer, model = load_llama(args.checkpoint)
-        cosine, sine = position_embeddings(model)
+        cosine, sine = position_embeddings(model, SEQUENCE)
         # lm_head와 최종 norm은 CPU에서 FP32로 계산한다 (lm_head 32000 x 4096, 0.5 GB).
         norm = copy.deepcopy(model.model.norm).float()
         lm_head = copy.deepcopy(model.lm_head).float()
 
         start = time.perf_counter_ns()
-        reference = model.model.embed_tokens(prompt_ids(tokenizer, prompt)).float()
+        reference = model.model.embed_tokens(prompt_ids(tokenizer, prompt, SEQUENCE)).float()
         for layer in model.model.layers:
             reference = reference_layer(layer, reference, cosine, sine)
         reference_logits = lm_head(norm(reference[:, -1, :]))
@@ -68,10 +68,11 @@ def main():
         session, config_report = compile_session(
             blocks, (torch.zeros(1, SEQUENCE, model.config.hidden_size),), args)
         compile_ms = (time.perf_counter_ns() - start) / 1e6
-        plans = session.layers
+        plans = session.plans["prefill"]
         memory = session.memory
+        prefill = memory.phases["prefill"]
         print(f"compile_ms={compile_ms:.1f} layers={len(plans)} stages/layer={len(plans[0].stages)} "
-              f"slots={memory.slots} groups={memory.groups} bytes_per_fpga={memory.bytes_per_unit} "
+              f"slots={prefill.slots} groups={prefill.groups} bytes_per_fpga={memory.bytes_per_unit} "
               f"capacity={memory.capacity_bytes}", flush=True)
 
         with session:
@@ -80,9 +81,9 @@ def main():
                 for step in range(count):
                     before = session.stats()
                     start = time.perf_counter_ns()
-                    embedded = model.model.embed_tokens(prompt_ids(tokenizer, prompt)).float()
+                    embedded = model.model.embed_tokens(prompt_ids(tokenizer, prompt, SEQUENCE)).float()
                     tokenized_at = time.perf_counter_ns()
-                    hidden = session.run_model(embedded)
+                    hidden = session.run_model("prefill", embedded)
                     layers_at = time.perf_counter_ns()
                     logits = lm_head(norm(hidden[:, -1, :]))
                     token = logits.argmax(dim=-1).item()

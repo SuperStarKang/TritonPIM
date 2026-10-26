@@ -22,6 +22,8 @@ class AiMXAdapter:
             "aimx_model_region_destroy": ([ctypes.c_void_p], None),
             "aimx_model_push": ([ctypes.c_size_t, ctypes.POINTER(ctypes.c_void_p),
                                  ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_int64)], None),
+            "aimx_model_push_ranges": ([ctypes.c_size_t, ctypes.POINTER(ctypes.c_void_p),
+                                        ctypes.POINTER(ctypes.c_int64), ctypes.POINTER(ctypes.c_int64)], None),
             "aimx_model_create": ([ctypes.c_int, ctypes.c_size_t, ctypes.POINTER(ctypes.c_uint64),
                                    ctypes.POINTER(ctypes.c_int64), ctypes.POINTER(ctypes.c_void_p)],
                                   ctypes.c_void_p),

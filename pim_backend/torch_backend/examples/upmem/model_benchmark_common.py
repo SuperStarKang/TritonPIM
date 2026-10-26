@@ -108,7 +108,7 @@ def benchmark_model(model, inputs, args, *, scope, heads, expected_gemms, expect
         session = PIMSession(target_spec("upmem", num_units=2048, nr_tasklets=16))
         with session:
             start = time.perf_counter_ns()
-            plan, = session.prepare([model], inputs, configure=configure)
+            plan, = session.prepare({"model": ([model], inputs, configure)})["model"]
             prepare_ms = (time.perf_counter_ns() - start) / 1e6
             print(f"scope={scope} heads={heads} gemm_config={args.gemm_config} "
                   f"logical_gemms={len(labels)} planned_stages={len(plan.stages)}", flush=True)
@@ -137,7 +137,7 @@ def benchmark_model(model, inputs, args, *, scope, heads, expected_gemms, expect
             start = time.perf_counter_ns()
             # Use the session's weight loader once, matching the legacy layer benchmark boundary.
             session.backend.model.enter_layer(plan)
-            session.loaded_layer = plan.index
+            session.loaded_layer = (plan.phase, plan.index)
             weight_load_ms = (time.perf_counter_ns() - start) / 1e6
             after = session.stats()
             weight_load = {"weight_load_ms": weight_load_ms,

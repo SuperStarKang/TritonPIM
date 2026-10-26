@@ -106,10 +106,14 @@ def _env_flag(name, default):
 def pim_autotune(target=None, spec=None, cache_path=DEFAULT_CACHE_PATH,
                  budget=None, space_overrides=None, ref_fn=None, reps=3,
                  seed=0, search=True, retune=False, verbose=True,
-                 rtol=0.0, atol=0.0,
+                 rtol=0.0, atol=0.0, rel_l2=None,
                  template_version="pim-common-ir-semantic-schedule-v1",
                  check_correctness=True):
-    """Autotune ``fn(a, b, *, config)`` with Common IR configurations."""
+    """Autotune ``fn(a, b, *, config)`` with Common IR configurations.
+
+    The sampled check compares element-wise with ``rtol``/``atol``, or, when ``rel_l2``
+    is given, requires ``‖got - ref‖ / ‖ref‖ <= rel_l2`` over the sampled block.
+    """
     selected_target = spec if spec is not None else target_spec(target)
     overrides = space_overrides if space_overrides is not None else {}
 
@@ -121,7 +125,7 @@ def pim_autotune(target=None, spec=None, cache_path=DEFAULT_CACHE_PATH,
             cache_path,
             template_version=(
                 f"{template_version};verify={verify_kind};"
-                f"rtol={rtol};atol={atol}"),
+                f"rtol={rtol};atol={atol};rel_l2={rel_l2}"),
         )
 
         @functools.wraps(fn)
@@ -168,40 +172,51 @@ def pim_autotune(target=None, spec=None, cache_path=DEFAULT_CACHE_PATH,
             else:
                 rows = _sample_indices(problem.M)
                 cols = _sample_indices(problem.N)
+                # bf16 입력은 torch bf16 matmul 결과(bf16)와 bf16 값끼리 비교한다.
+                compare_dtype = torch.bfloat16 if a.dtype == torch.bfloat16 else out_dtype
                 ref_block = (
-                    a.index_select(0, rows).to(out_dtype)
-                    @ b.index_select(1, cols).to(out_dtype)
+                    a.index_select(0, rows).to(compare_dtype)
+                    @ b.index_select(1, cols).to(compare_dtype)
                 )
                 if verbose and isinstance(
                         selected_target.runtime_config, AiMXRuntimeConfig):
-                    # 입력 반올림만 분리하며 AiMX 내부 누산을 재현하지 않는다.
+                    # 입력 반올림과 기준값 dtype의 차이만 분리하며 AiMX 내부 누산을 재현하지 않는다.
                     ref_bf16_block = (
                         a.index_select(0, rows).to(torch.bfloat16).float()
                         @ b.index_select(1, cols).to(torch.bfloat16).float()
                     )
-                    input_rounding_error = (ref_bf16_block - ref_block).abs()
+                    reference_gap = (ref_bf16_block - ref_block.float()).abs()
                     print(
-                        "[verify-reference] BF16 inputs, FP32 matmul: "
-                        f"input_rounding_max_abs={input_rounding_error.max().item():.6g} "
-                        f"input_rounding_mean_abs={input_rounding_error.mean().item():.6g}",
+                        f"[verify-reference] {compare_dtype} matmul vs BF16-input FP32 matmul: "
+                        f"max_abs={reference_gap.max().item():.6g} "
+                        f"mean_abs={reference_gap.mean().item():.6g}",
                         flush=True,
                     )
 
                 def verify(out):
-                    got = out.index_select(0, rows).index_select(1, cols)
-                    ok = bool(torch.allclose(
-                        got, ref_block, rtol=rtol, atol=atol))
+                    got = out.index_select(0, rows).index_select(1, cols).to(compare_dtype)
+                    # 오차 계산만 float로 해서 지표에 반올림이 더해지지 않게 한다.
+                    error = (got.float() - ref_block.float()).abs()
+                    relative = (error.norm() / ref_block.float().norm()).item()
+                    if rel_l2 is not None:
+                        ok = relative <= rel_l2
+                    else:
+                        ok = bool(torch.allclose(got, ref_block, rtol=rtol, atol=atol))
                     if verbose and isinstance(
                             selected_target.runtime_config, AiMXRuntimeConfig):
-                        error = (got - ref_block).abs()
-                        bf16_error = (got - ref_bf16_block).abs()
-                        failed = ~torch.isclose(
-                            got, ref_block, rtol=rtol, atol=atol)
+                        bf16_error = (got.float() - ref_bf16_block).abs()
+                        if rel_l2 is not None:
+                            criterion = f"rel_l2<={rel_l2:g}"
+                            # 상대 L2 판정에서는 오차가 가장 큰 원소를 보인다.
+                            shown = [divmod(index, got.shape[1])
+                                     for index in error.flatten().topk(5).indices.tolist()]
+                        else:
+                            criterion = f"rtol={rtol:g} atol={atol:g}"
+                            shown = (~torch.isclose(got, ref_block, rtol=rtol, atol=atol)).nonzero()[:5].tolist()
                         print(
                             f"\n[verify] ok={ok} "
                             f"sampled={got.numel()}/{out.numel()} "
-                            f"failed={failed.sum().item()}/{got.numel()} "
-                            f"rtol={rtol:g} atol={atol:g} "
+                            f"{criterion} rel_l2={relative:.4%} "
                             f"max_abs={error.max().item():.6g} "
                             f"mean_abs={error.mean().item():.6g}",
                             flush=True,
@@ -214,13 +229,12 @@ def pim_autotune(target=None, spec=None, cache_path=DEFAULT_CACHE_PATH,
                             f"vs_bf16_input_ref_mean_abs={bf16_error.mean().item():.6g}",
                             flush=True,
                         )
-                        for i, j in failed.nonzero()[:5].tolist():
+                        for i, j in shown:
                             print(
                                 f"[verify] C[{rows[i].item()},{cols[j].item()}] "
                                 f"got={got[i, j].item():.9g} "
                                 f"ref={ref_block[i, j].item():.9g} "
                                 f"abs_error={error[i, j].item():.6g} "
-                                f"allowed={(atol + rtol * ref_block[i, j].abs()).item():.6g} "
                                 f"bf16_input_ref={ref_bf16_block[i, j].item():.9g} "
                                 f"abs_error_vs_bf16={bf16_error[i, j].item():.6g}",
                                 flush=True,

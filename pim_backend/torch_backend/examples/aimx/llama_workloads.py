@@ -60,40 +60,46 @@ def load_llama(checkpoint):
     return tokenizer, model
 
 
-def prompt_ids(tokenizer, prompt):
-    input_ids = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=SEQUENCE)["input_ids"]
-    if tuple(input_ids.shape) != (1, SEQUENCE):
-        raise ValueError(f"the prompt must contain at least {SEQUENCE} tokens including special tokens")
+def prompt_ids(tokenizer, prompt, sequence):
+    input_ids = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=sequence)["input_ids"]
+    if tuple(input_ids.shape) != (1, sequence):
+        raise ValueError(f"the prompt must contain at least {sequence} tokens including special tokens")
     return input_ids
 
 
-def position_embeddings(model):
-    """RoPE cos/sin of positions 0..SEQUENCE-1, each [1, SEQUENCE, head_dim] FP32."""
-    return model.model.rotary_emb(torch.zeros(1, SEQUENCE, model.config.hidden_size),
-                                  position_ids=torch.arange(SEQUENCE).unsqueeze(0))
+def position_embeddings(model, sequence):
+    """RoPE cos/sin of positions 0..sequence-1, each [1, sequence, head_dim] FP32."""
+    return model.model.rotary_emb(torch.zeros(1, sequence, model.config.hidden_size),
+                                  position_ids=torch.arange(sequence).unsqueeze(0))
 
 
 def reference_layer(layer, hidden, cosine, sine):
     """The Hugging Face decoder layer in FP32 (eager attention, additive causal mask)."""
-    mask = torch.full((SEQUENCE, SEQUENCE), torch.finfo(torch.float32).min).triu(1)
+    sequence = hidden.shape[1]
+    mask = torch.full((sequence, sequence), torch.finfo(torch.float32).min).triu(1)
     return copy.deepcopy(layer).float()(
         hidden, attention_mask=mask[None, None], position_embeddings=(cosine, sine))
 
 
 class CheckpointLinear(torch.nn.Module):
-    """HF Linear weight [out, in] stored as a BF16 [in, padded out] GEMM operand."""
+    """HF Linear weight [out, in] BF16; the GEMM operand is its transpose view [in, out].
+
+    The buffer is the checkpoint tensor itself (a BF16 checkpoint is not copied); the PIM
+    stage reads the view through its strides. padded_features adds zero output rows, a
+    padded copy, for the prefill layer's N in 512 columns.
+    """
 
     def __init__(self, linear, padded_features=None):
         super().__init__()
         if linear.bias is not None:
             raise ValueError("this experiment requires bias-free projections")
-        weight = linear.weight.detach().t().to(torch.bfloat16).contiguous()
+        weight = linear.weight.detach().to(torch.bfloat16)
         padding = (padded_features or linear.out_features) - linear.out_features
-        self.register_buffer("weight", torch.nn.functional.pad(weight, (0, padding)))
+        self.register_buffer("weight", torch.nn.functional.pad(weight, (0, 0, 0, padding)) if padding else weight)
         self.out_features = linear.out_features
 
     def forward(self, activation):
-        output = torch.mm(activation.reshape(-1, activation.shape[-1]).bfloat16(), self.weight).float()
+        output = torch.mm(activation.reshape(-1, activation.shape[-1]).bfloat16(), self.weight.t()).float()
         if output.shape[-1] != self.out_features:
             output = output[:, :self.out_features].contiguous()
         return output.reshape(*activation.shape[:-1], self.out_features)
@@ -129,15 +135,18 @@ class LlamaAimxAttention(torch.nn.Module):
         self.k_proj = CheckpointLinear(layer.self_attn.k_proj)
         self.v_proj = CheckpointLinear(layer.self_attn.v_proj)
         self.scaling = layer.self_attn.scaling
+        # prompt 길이는 RoPE 표의 위치 수다 (position_embeddings(model, sequence)).
+        self.sequence = cosine.shape[1]
         self.register_buffer("cosine", cosine[0].float().contiguous())
         self.register_buffer("sine", sine[0].float().contiguous())
-        self.register_buffer("mask", torch.ones(SEQUENCE, SEQUENCE, dtype=torch.bool).triu(1))
+        self.register_buffer("mask", torch.ones(self.sequence, self.sequence, dtype=torch.bool).triu(1))
 
     def forward(self, normalized):
         group = self.heads // self.kv_heads
-        query = self.q_proj(normalized).reshape(SEQUENCE, self.heads, self.head_dim).transpose(0, 1)
-        key = self.k_proj(normalized).reshape(SEQUENCE, self.kv_heads, self.head_dim).transpose(0, 1)
-        value = self.v_proj(normalized).reshape(SEQUENCE, self.kv_heads, self.head_dim).transpose(0, 1).bfloat16()
+        sequence = self.sequence
+        query = self.q_proj(normalized).reshape(sequence, self.heads, self.head_dim).transpose(0, 1)
+        key = self.k_proj(normalized).reshape(sequence, self.kv_heads, self.head_dim).transpose(0, 1)
+        value = self.v_proj(normalized).reshape(sequence, self.kv_heads, self.head_dim).transpose(0, 1).bfloat16()
         query = (query * self.cosine + rotate_half(query) * self.sine).bfloat16()
         key = (key * self.cosine + rotate_half(key) * self.sine).bfloat16()
         if self.kv == "repeat":
@@ -152,17 +161,17 @@ class LlamaAimxAttention(torch.nn.Module):
             right = block_diagonal([key[head // group].t() for head in heads])
             scores.append(torch.mm(left, right))
         # 열 순서가 head, key 위치이므로 [SEQ, heads, SEQ]로 보고 head마다 softmax한다.
-        scores = torch.cat(scores, dim=1).float().reshape(SEQUENCE, self.heads, SEQUENCE) * self.scaling
+        scores = torch.cat(scores, dim=1).float().reshape(sequence, self.heads, sequence) * self.scaling
         probability = torch.softmax(scores.masked_fill(self.mask[:, None, :], float("-inf")), dim=-1)
-        probability = probability.reshape(SEQUENCE, self.heads * SEQUENCE).bfloat16()
+        probability = probability.reshape(sequence, self.heads * sequence).bfloat16()
         outputs = []
         for first in range(0, self.heads, self.pv_heads):
             heads = range(first, first + self.pv_heads)
-            left = probability[:, first * SEQUENCE:(first + self.pv_heads) * SEQUENCE]
+            left = probability[:, first * sequence:(first + self.pv_heads) * sequence]
             right = block_diagonal([value[head // group] for head in heads])
             outputs.append(torch.mm(left, right))
         # [O_h | O_h+1 ...]의 열 순서가 곧 hidden 열 순서 head * head_dim + d다.
-        return torch.cat(outputs, dim=1).float().reshape(1, SEQUENCE, self.heads * self.head_dim)
+        return torch.cat(outputs, dim=1).float().reshape(1, sequence, self.heads * self.head_dim)
 
 
 class LlamaAimxLayer(torch.nn.Module):

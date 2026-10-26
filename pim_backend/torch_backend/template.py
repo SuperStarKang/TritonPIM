@@ -1,8 +1,10 @@
-"""Inductor TritonTemplate for one semantic GEMM reduction.
+"""Inductor TritonTemplates for one semantic GEMM or GEMV reduction.
 
-The source expresses only the M/N output grid and the complete semantic K
+The source expresses only the output grid and the complete semantic K
 reduction. ``p_k`` and ``tile_k`` are PIM Common IR scheduling values passed
 as backend options; they are absent from the source grid and output ABI.
+A GEMM with one output row or column is a GEMV; its template widens the
+matrix and the vector before multiplying, which lowers to linalg.matvec.
 """
 
 import sympy
@@ -109,4 +111,61 @@ pim_gemm_template = PIMTritonTemplate(
     name="pim_semantic_gemm",
     grid=pim_gemm_grid,
     source=PIM_GEMM_SOURCE,
+)
+
+
+@SymbolicGridFn
+def pim_gemv_grid(rows, meta, *, cdiv):
+    """The source grid contains only independent blocks of output rows."""
+    return (cdiv(rows, meta["BLOCK_M"]), 1, 1)
+
+
+# A (M × K)·B (K × N)에서 ROW_VECTOR이면 M = 1이다: 행렬은 Bᵀ (N × K)를 B의 stride로 읽고
+# vector는 A의 한 행이다. 아니면 N = 1이다: 행렬은 A, vector는 B의 한 열이다.
+# 출력은 행 수만큼의 1차원 buffer이고 lowering이 원래 (1, N) 또는 (M, 1)로 본다.
+PIM_GEMV_SOURCE = r"""
+{{def_kernel("A", "B")}}
+    {% if ROW_VECTOR %}
+    ROWS = {{rt_size("B", 1)}}
+    K = {{rt_size("B", 0)}}
+    stride_row = {{rt_stride("B", 1)}}
+    stride_k = {{rt_stride("B", 0)}}
+    stride_vector = {{rt_stride("A", 1)}}
+    matrix_ptr = B
+    vector_ptr = A
+    {% else %}
+    ROWS = {{rt_size("A", 0)}}
+    K = {{rt_size("A", 1)}}
+    stride_row = {{rt_stride("A", 0)}}
+    stride_k = {{rt_stride("A", 1)}}
+    stride_vector = {{rt_stride("B", 0)}}
+    matrix_ptr = A
+    vector_ptr = B
+    {% endif %}
+
+    offs_r = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_k = tl.arange(0, BLOCK_K)
+    acc = tl.zeros((BLOCK_M,), dtype=ACC_TYPE)
+
+    for k_block in range(0, tl.cdiv(K, BLOCK_K)):
+        k = k_block * BLOCK_K + offs_k
+        matrix = tl.load(
+            matrix_ptr + offs_r[:, None] * stride_row + k[None, :] * stride_k,
+            mask=(offs_r[:, None] < ROWS) & (k[None, :] < K),
+            other=0,
+        )
+        vector = tl.load(vector_ptr + k * stride_vector, mask=k < K, other=0)
+        # 곱하기 전에 누산 type으로 넓힌다. INT8은 lowering이 INT8 matvec로 만든다.
+        acc += tl.sum(matrix.to(ACC_TYPE) * vector.to(ACC_TYPE)[None, :], axis=1)
+
+    idx_r = offs_r
+    mask = idx_r < ROWS
+    {{store_output(("idx_r",), "acc", "mask", val_shape=("BLOCK_M",))}}
+"""
+
+
+pim_gemv_template = PIMTritonTemplate(
+    name="pim_semantic_gemv",
+    grid=pim_gemv_grid,
+    source=PIM_GEMV_SOURCE,
 )

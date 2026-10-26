@@ -6,8 +6,10 @@ resident and every layer uses those configs. A GEMM alone (gemm/) chooses its co
   autotune    measured search over the torch.compile path (A, B and C staged every launch)
 """
 
+import csv
 from dataclasses import asdict
 from pathlib import Path
+import statistics
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
@@ -41,7 +43,7 @@ def analytical_config(problem, spec, space):
 def compile_session(layers, example_inputs, args):
     """compile_model on the experiment's FPGAs: the unopened session and its config report."""
     compiled = compile_model(
-        layers, example_inputs, target="aimx", units=args.fpgas,
+        {"prefill": (layers, example_inputs)}, target="aimx", units=args.fpgas,
         runtime_options={"base_fpga": args.base_fpga},
         cache_path=args.cache, max_benchmarks=args.max_benchmarks,
     )
@@ -49,8 +51,9 @@ def compile_session(layers, example_inputs, args):
 
 
 def memory_record(memory):
-    """The session's memory plan for a report: slots, layers kept in their own slot, bytes."""
-    return {"slots": memory.slots, "groups": memory.groups, "slot_of_layer": memory.slot_of_layer,
+    """The session's memory plan for a report: slots and groups of the prefill phase, bytes."""
+    prefill = memory.phases["prefill"]
+    return {"slots": prefill.slots, "groups": prefill.groups, "slot_of_layer": prefill.slot_of_layer,
             "bytes_per_fpga": memory.bytes_per_unit, "capacity_bytes": memory.capacity_bytes}
 
 
@@ -70,6 +73,32 @@ def stage_records(plan):
         # 0 블록까지 포함해 PIM이 실제로 계산하는 연산 수
         "executed_operations": 2 * stage.shape[0] * stage.shape[1] * stage.shape[2] * stage.instance_count,
     } for stage in plan.stages]
+
+
+def stage_rows(stages, kind, breakdowns):
+    """One row per stage of kind (stage_records): the mean over breakdowns (each a request's or a
+    step's "run:<stage>" records, summed over the layers) of its calls, wall time and native slots."""
+    rows = []
+    for stage in stages:
+        if stage["kind"] != kind:
+            continue
+        m, n, k = stage["mnk"]
+        row = {"stage": stage["name"], "m": m, "n": n, "k": k, "instances": stage["instances"]}
+        for field in ("calls", "wall_ms", *SLOTS):
+            row[field] = statistics.mean(breakdown["run:" + stage["name"]][field] for breakdown in breakdowns)
+        # native 칸 밖: ctypes 호출, lock, stub 안의 측정되지 않은 구간
+        row["other_ms"] = row["wall_ms"] - sum(row[name] for name in SLOTS)
+        rows.append(row)
+    return rows
+
+
+def write_csv(path, rows):
+    with open(path, "w", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({name: f"{value:.3f}" if isinstance(value, float) else value
+                             for name, value in row.items()})
 
 
 def slot_totals(records):

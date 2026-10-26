@@ -59,8 +59,8 @@ def main():
 
     with torch.no_grad():
         tokenizer, model = load_llama(args.checkpoint)
-        cosine, sine = position_embeddings(model)
-        hidden = model.model.embed_tokens(prompt_ids(tokenizer, args.prompt_file.read_text(encoding="utf-8"))).float()
+        cosine, sine = position_embeddings(model, SEQUENCE)
+        hidden = model.model.embed_tokens(prompt_ids(tokenizer, args.prompt_file.read_text(encoding="utf-8"), SEQUENCE)).float()
         for layer in model.model.layers[:args.layer]:
             hidden = reference_layer(layer, hidden, cosine, sine)
         reference = reference_layer(model.model.layers[args.layer], hidden, cosine, sine)
@@ -71,10 +71,11 @@ def main():
         session, config_report = compile_session(
             [block], (torch.zeros(1, SEQUENCE, model.config.hidden_size),), args)
         compile_ms = (time.perf_counter_ns() - start) / 1e6
-        plan, = session.layers
+        plan, = session.plans["prefill"]
         stages = stage_records(plan)
         weight_stages = {stage["name"] for stage in stages if stage["kind"] == "weight"}
-        print(f"compile_ms={compile_ms:.1f} slots={session.memory.slots} groups={session.memory.groups} "
+        print(f"compile_ms={compile_ms:.1f} slots={session.memory.phases['prefill'].slots} "
+              f"groups={session.memory.phases['prefill'].groups} "
               f"bytes_per_fpga={session.memory.bytes_per_unit}", flush=True)
         for stage in stages:
             print(f"  stage={stage['name']} kind={stage['kind']} mnk={tuple(stage['mnk'])} "
@@ -90,7 +91,7 @@ def main():
                         session.backend.model.loaded_group = None
                     before = session.stats()
                     start = time.perf_counter_ns()
-                    output = session.run_model(hidden)
+                    output = session.run_model("prefill", hidden)
                     layers_ms = (time.perf_counter_ns() - start) / 1e6
                     call = {"phase": phase, **request_breakdown(before, session.stats(), weight_stages, layers_ms),
                             "cosine": torch.nn.functional.cosine_similarity(

@@ -1,7 +1,7 @@
-# GEMV(y = A·x, int32)의 최적 config를 PIM autotuner로 찾고, 그 config로 다시 측정한다.
+# GEMV(y = A·x, INT8 또는 INT32 입력, INT32 출력)의 최적 config를 PIM autotuner로 찾고, 그 config로 다시 측정한다.
 #
 # 실행:
-#   python autotune_gemv.py --m 4096 --k 4096 --max-benchmarks 30
+#   python autotune_gemv.py --m 4096 --k 4096 --dtype int8 --max-benchmarks 30
 #     cache에 이 shape가 있으면 탐색 없이 그 best를 측정한다. --retune이면 다시 탐색한다.
 #
 # 탐색 objective는 autotuner 기본값인 end-to-end wall time(매 호출 A 전송 포함, reps의 median)이다.
@@ -33,6 +33,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--m", type=int, required=True)
     parser.add_argument("--k", type=int, required=True)
+    parser.add_argument("--dtype", choices=("int8", "int32"), default="int32", help="A와 x의 dtype (출력은 INT32)")
     parser.add_argument("--num-units", type=int, default=2048, help="사용 가능한 DPU 수")
     parser.add_argument("--nr-tasklets", type=int, default=0, help="DPU당 tasklet 수. 0이면 lanes_per_core(16)")
     parser.add_argument("--max-benchmarks", type=int, default=30)
@@ -63,7 +64,7 @@ def main():
     print(f"UPMEM profile: num_units={profile.num_units}, "
           f"lanes_per_core={profile.lanes_per_core}, nr_tasklets={active_tasklets}, "
           f"local_capacity={profile.local_capacity_limit_bytes}")
-    problem = PIMProblem.matvec(args.m, args.k, input_dtype="int32", output_dtype="int32")
+    problem = PIMProblem.matvec(args.m, args.k, input_dtype=args.dtype, output_dtype="int32")
 
     if args.profile_only or args.calibrate_performance is not None:
         measured = profile_gemv(
@@ -75,9 +76,11 @@ def main():
         return
 
     torch.manual_seed(0)
-    a = torch.randint(0, 50, (args.m, args.k), dtype=torch.int32)
-    x = torch.randint(0, 50, (args.k,), dtype=torch.int32)
-    reference = torch.mv(a, x)
+    # INT8은 부호 있는 전체 범위를 쓴다. 기준값은 INT32로 넓혀 계산한다(torch.mv는 INT8 결과를 낸다).
+    low, high = (-128, 128) if args.dtype == "int8" else (0, 50)
+    a = torch.randint(low, high, (args.m, args.k), dtype=getattr(torch, args.dtype))
+    x = torch.randint(low, high, (args.k,), dtype=getattr(torch, args.dtype))
+    reference = torch.mv(a.to(torch.int32), x.to(torch.int32))
 
     def measure(config, reps):
         # 첫 호출에는 device.elf 컴파일과 DPU 예약이 섞이므로 측정에서 뺀다
@@ -113,7 +116,8 @@ def main():
     final = measure(best, args.repeat)
     assert final.correctness, f"결과 불일치: config={best.key()}"
 
-    print(f"\nM={args.m} K={args.k} nr_tasklets={args.nr_tasklets} from_cache={result.from_cache}")
+    print(f"\nM={args.m} K={args.k} dtype={args.dtype} nr_tasklets={args.nr_tasklets} "
+          f"from_cache={result.from_cache}")
     print(f"best: B=({best.block_m},{best.block_k}) G=({best.group_m},{best.group_k}) "
           f"tile=({best.tile_m},{best.tile_k}) P=({best.p_m},{best.p_n},{best.p_k}) "
           f"dpus={best.p_m * best.p_n * best.p_k}")

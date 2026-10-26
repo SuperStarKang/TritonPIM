@@ -28,22 +28,20 @@ def ConvertPIMToAiMX : Pass<"convert-pim-to-aimx", "mlir::ModuleOp"> {
     Fixed per-device allocations persist across calls when requested. A complete
     chain is reused when its addresses and control operands are invariant,
     including full-tile equality conditions on dynamic scheduling bounds.
-    Common cross-device K reduction is not implemented. AiMX uses BF16 physical
+    Cross-device K partials (p_k > 1) are unstaged in device order: the k = 0
+    device assigns, later devices add on the host. AiMX uses BF16 physical
     storage and native arithmetic; this pass does not promise IEEE-equivalent
     source floating-point results.
 
-    Matvec defaults to 4096-element B/C storage rows and one 4096/batch-column
-    MAC/drain microtile per output row batch. Storage pitch and compute extent
-    are independent; diagnostic options can select the previous layouts.
+    Matvec y = W·x runs as yᵀ = xᵀ·Wᵀ with batch 1: x is one relayout A row,
+    W is staged transposed as B [K × M], and y is one C row, so output lanes
+    follow M. B/C rows are 4096-element multiples; the batch option applies
+    to matmul only.
   }];
   let constructor = "mlir::triton::createConvertPIMToAiMXPass()";
   let options = [
     Option<"batch", "batch", "int64_t", "8",
            "AiMX matmul batch. 1, 2, 4, 8 중 하나.">,
-    Option<"matvecRowAlignment", "matvec-row-alignment", "int64_t", "4096",
-           "Matvec B/C row alignment in BF16 elements; defaults to 4096. Diagnostic 0 uses 4096/batch.">,
-    Option<"matvecFirstNOnly", "matvec-first-n-only", "bool", "true",
-           "Matvec vACC reduction computes the first 4096/batch columns; false also computes padded N microtiles for diagnostics.">,
     Option<"matmulRowAlignment", "matmul-row-alignment", "int64_t", "0",
            "GEMM B/C row alignment in BF16 elements; 0 preserves 4096/batch alignment. Used for layout comparisons.">,
     Option<"matmulUsefulNOnly", "matmul-useful-n-only", "bool", "false",

@@ -8,7 +8,9 @@
 enum upmem_resident_role {
     UPMEM_RESIDENT_WEIGHT = 1,
     UPMEM_RESIDENT_INPUT = 2,
-    UPMEM_RESIDENT_OUTPUT = 3
+    UPMEM_RESIDENT_OUTPUT = 3,
+    // 매 호출 보내지 않고 MRAM의 key/value cache 영역을 그대로 읽는 입력 (model path)
+    UPMEM_RESIDENT_KV = 4
 };
 
 struct upmem_resident_block;
@@ -22,6 +24,7 @@ struct upmem_resident_stats {
     uint64_t launches;
     uint64_t program_loads;
     uint64_t activation_hits;  // Retained in the stats ABI; always zero.
+    uint64_t kv_bytes;         // key/value cache writes (model path)
 };
 
 // Reset for each captured/executed GEMM and for the initial weight upload.

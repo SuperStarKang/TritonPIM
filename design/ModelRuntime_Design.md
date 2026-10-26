@@ -346,11 +346,9 @@ KV API는 exported graph에 append/read 연산을 자동 삽입하지 않는다.
 
 **내용**
 아래 명령은 사용자가 기존 TritonPIM 환경에서 실행한다. 이 변경 작성 과정에서는 빌드·테스트를 실행하지 않았다.
-`test_layer_bmm.py`는 FX 계획을, `test_model_session.py`는 실제 UPMEM에서 Session 수명과 Layer 실행을 검증한다.
-Session 테스트와 장비 예제에는 설정된 SDK와 8개 이상의 사용 가능한 DPU가 필요하다.
+장비 예제에는 설정된 SDK와 8개 이상의 사용 가능한 DPU가 필요하다.
 
 **근거**
-- Session 테스트는 실제 backend를 사용하며 자원 확보 후 config 전달, 다음 Layer 입력 연결과 GEMM 결과를 확인한다.
 - Device compile/load/launch 횟수는 다른 사건이므로 `session.stats()`에서 구분한다.
 - 여러 M/N/K round의 GEMM 정확성과 2048-DPU 대규모 성능 측정은 별도 장비 검증이 남아 있다.
 
@@ -361,10 +359,6 @@ Session 테스트와 장비 예제에는 설정된 SDK와 8개 이상의 사용 
 ```bash
 cmake --build triton/build/cmake.linux-x86_64-cpython-3.12 \
   --target triton-shared-opt triton-shared-translate
-
-python -m pytest triton_shared/pim_backend/torch_backend/tests/test_layer_bmm.py -q
-
-python -m pytest triton_shared/pim_backend/torch_backend/tests/test_model_session.py -q
 
 python triton_shared/pim_backend/torch_backend/examples/upmem/torch_model_session.py
 ```

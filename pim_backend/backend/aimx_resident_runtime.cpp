@@ -342,6 +342,31 @@ extern "C" void aimx_model_push(size_t count, aimx_model_region *const *regions,
     thread.join();
 }
 
+// region 안 [offset, offset + bytes) 구간을 host shadow 에서 같은 offset 의 device 로 보낸다.
+// key/value cache 쓰기가 shadow 에 새 위치를 조립한 뒤 부른다.
+extern "C" void aimx_model_push_ranges(size_t count, aimx_model_region *const *regions,
+                                       const int64_t *offsets, const int64_t *bytes) {
+  std::map<int, std::vector<size_t>> byFpga;
+  for (size_t i = 0; i < count; ++i) {
+    aimx_require(offsets[i] >= 0 && bytes[i] > 0 && offsets[i] + bytes[i] <= regions[i]->bytes,
+                 "push range exceeds its region");
+    byFpga[regions[i]->fpga].push_back(i);
+  }
+  std::vector<std::thread> threads;
+  for (const auto &entry : byFpga) {
+    int fpga = entry.first;
+    const std::vector<size_t> &items = entry.second;
+    threads.emplace_back([regions, offsets, bytes, fpga, &items] {
+      for (size_t i : items)
+        aimx_require(aimx_copy_to_pim((char *)regions[i]->va + offsets[i],
+                                      (char *)regions[i]->host + offsets[i], (size_t)bytes[i], fpga) >= 0,
+                     "key/value push failed");
+    });
+  }
+  for (auto &thread : threads)
+    thread.join();
+}
+
 extern "C" aimx_resident_context *aimx_model_create(int fpga, size_t slots, const uint64_t *va,
                                                     const int64_t *capacity, void *const *host) {
   Registry &r = registry();

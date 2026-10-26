@@ -8,7 +8,10 @@ extern "C" {
 #endif
 
 // upmem_model_arguments의 upload_weights 값. PACK은 weight를 pool에 배치만 하고 보내지 않는다.
+// KV_PACK은 upmem_model_kv_select로 고른 job의 key/value cache operand만 pool에 배치한다
+// (host 배치식을 생성 pack과 대조할 때 쓴다).
 #define UPMEM_MODEL_PACK 2
+#define UPMEM_MODEL_KV_PACK 3
 
 struct upmem_model_kernel {
     struct dpu_set_t set;
@@ -33,6 +36,8 @@ struct upmem_model_kernel {
     uint32_t metadata_bytes;
     void **arguments;
     uint32_t argument_count;
+    // [batch_size * logical_units], KV_PACK에서 pack할 job
+    uint8_t *kv_jobs;
     struct upmem_resident_stats stats;
 };
 
@@ -60,7 +65,11 @@ struct upmem_model_kernel *upmem_model_create(
     uint32_t argument_count);
 void upmem_model_arguments(struct upmem_model_kernel *kernel, void **arguments,
                            uint32_t upload_weights);
-int upmem_model_wants(struct upmem_model_kernel *kernel, uint32_t binding);
+int upmem_model_wants(struct upmem_model_kernel *kernel, uint32_t binding, uint32_t job);
+void upmem_model_kv_select(struct upmem_model_kernel *kernel, const uint32_t *jobs, uint32_t count);
+void upmem_model_kv_gather(struct upmem_model_kernel *kernel, uint32_t binding, uint8_t *images);
+void upmem_model_kv_push_region(struct upmem_model_kernel *kernel, uint32_t address,
+                                const uint8_t *images, uint32_t length);
 void upmem_model_transfer(struct upmem_model_kernel *kernel, uint32_t binding,
                           int output);
 void upmem_model_metadata(struct upmem_model_kernel *kernel, const char *symbol);

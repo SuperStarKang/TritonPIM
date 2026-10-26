@@ -183,7 +183,8 @@ workspace/Experiment/Autotuner/upmem_gemm/
 `autotuner/gemv.py`의 INT32 GEMV 커널을 profiling과 autotuning에서 함께 사용한다.
 `profile_gemv(target, output_dir=...)`는 target 정보로 측정 대상을 구성하고,
 일반 실행은 `ensure_gemv_profile` callback으로 자료가 없을 때 먼저 측정한다.
-완료된 tuning cache가 있으면 profiling을 생략한다. 현재 GEMV의 이 경로는 UPMEM만 지원한다.
+완료된 tuning cache가 있으면 profiling을 생략한다. AiMX GEMV는 같은 커널을 FP32 누산으로
+쓰며 `examples/silent_pim/autotune_gemv.py`가 진입점이다([Silent-PIM 설계](../../design/Silent-PIM_Design.md) §9).
 
 `UPMEMModel.gemv_profile_spec`은 활성 tasklet마다 출력 한 행을 주는 행 눈금과
 기존 GEMV 커널의 누산 크기 64를 출발점으로 삼는다. 행 크기 1·2·4배와 누산 크기
@@ -223,16 +224,6 @@ GEMM 예제 자료와 섞지 않는다.
 
 새 PIM은 target adapter에 `gemm_profile_spec`, 자원·mapping 제약,
 `launch_timing_name`을 제공하고 공통 GEMM을 lowering하면 같은 profiler를 사용한다.
-
-회귀 테스트는 사용자가 저장소 루트에서 실행한다. 하드웨어를 사용하지 않고 합성 자료로
-검사하며, 테스트 임시 파일도 프로젝트 결과 디렉터리 안에 만든다.
-
-```bash
-cd /home/dlrkdals/TritonPIM/triton_shared
-python -m unittest pim_backend.autotuner.test_saturation_seeds \
-  pim_backend.autotuner.test_gemv_saturation pim_backend.autotuner.test_seed_frontier \
-  pim_backend.autotuner.test_aimx_capacity
-```
 
 ## 탐색 흐름
 
@@ -282,12 +273,6 @@ fusion에 필요한 전체 descriptor는 lowering에서 모두 합산해 최종 
 측정 결과의 `physical_allocations`에는 lowering이 생성한 device별 전체 할당 목록을
 기록하고, 측정된 후보의 `unit_memory_pressure`에는 이 목록을 사용한다.
 배치가 달라졌으므로 이전 버전의 컴파일·autotuning cache는 새 키로 구분한다.
-
-관련 Python 회귀 테스트는 저장소 루트에서 다음과 같이 실행한다.
-
-```sh
-python -m unittest pim_backend.autotuner.test_aimx_capacity
-```
 
 `PIMProblem`은 연산별 policy를 갖지 않는다. `compute_kind`는 PIM compute op의
 종류를 식별하는 의미 값이고, 각 `PIMAccess`는 unique buffer의 direction, dtype,

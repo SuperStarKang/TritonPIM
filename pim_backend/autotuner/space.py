@@ -76,6 +76,7 @@ def axis_values(problem, spec, kind, axis):
 
 def build_config_space(problem, target, **overrides):
     fields = {
+        "block_values": target_model(target).block(problem),
         "partition_values": _powers_of_two(
             target.common_profile.num_units),
         "instance_units": target.common_profile.num_units,
@@ -383,9 +384,10 @@ def _safe_initial_schedule(problem, target, config, spec):
 
     scheduled_compute = scheduled_tiles * target_model(
         target).scheduled_compute(problem, config)
-    useful_compute = prod(problem.axis_extents)
+    # target 연산 폭이 만드는 padding은 어떤 config로도 줄지 않으므로 뺀다.
+    minimum_compute = target_model(target).minimum_compute(problem)
     padding_ratio = (
-        scheduled_compute - useful_compute) / scheduled_compute
+        scheduled_compute - minimum_compute) / scheduled_compute
     if padding_ratio > spec.max_initial_padding_ratio:
         return False
 

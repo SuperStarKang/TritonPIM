@@ -113,7 +113,10 @@ B operand가 **같은 FX node**인 GEMM들을 쌓는다(`_stack_shared_rights`).
 ### 2.4 ② n 잇기 (q/k/v, gate/up)
 
 같은 입력 x를 쓰는 weight GEMM은 weight를 n 방향으로 이어 GEMM 하나로 만들고, 출력을 열
-방향으로 나눈다. weight는 상수이므로 이어 붙이기는 freeze 때 한 번이다.
+방향으로 나눈다. host에는 이어 붙인 행렬을 만들지 않는다: packed B는 원래 frozen weight들의
+`fx_packing.ConcatenatedWeight`이고, 연속 행렬은 weight를 장치에 올리는 동안(또는 reference
+계산)에만 `tensor()`로 만든다. 다른 weight도 checkpoint tensor(또는 그 전치 view)를 복사 없이
+stage가 그 stride대로 읽는다(`_LayerGemm.prepare`). stage 인자로는 weight를 넘기지 않는다.
 
 ```text
                 ┌──────────┬──────┬──────┐       ┌──────────┬──────┬──────┐
@@ -168,6 +171,56 @@ p* = argmin (bytes(p), −p)     단, compute(p) ≤ compute(1)
 
 AiMX에서 ③은 계산이 같고 instance가 줄어 빨라진다. Llama-2-7B layer 하나에서 QKᵀ
 invoke는 77.9 → 62.2 ms, PV invoke는 115.3 → 86.7 ms, activation GEMM 전체는 −35%였다.
+
+### 2.6.1 key/value cache를 읽는 GEMM: ④ k-window, ⑤ n-window
+
+**내용**
+host key/value cache는 layer마다 `[kv_heads, positions, head_dim]`이다(Hugging Face cache와 같은
+배치). B가 KV head 하나 `cache[h]`(또는 그 전치)인 GEMM에는 ①~③을 적용하지 않는다. cache는 장치에
+그대로 있어야 하므로 B를 잇거나 대각으로 만들 수 없다. 대신 cache stage는 instance마다 unit 하나
+이상을 쓰고 모든 instance가 한 round에 돌아야 한다. 그래서 한 묶음의 GEMM 수가 unit 수보다 많을
+때만, 이어진 KV head를 읽는 GEMM끼리 묶어 B를 그 head들을 나란히 둔 합집합 window(`cat(cache[h],
+dim=1)`)로 만든다. 묶음 수는 unit 수 이하의 가장 큰 약수다. window는 token-row view
+`[positions, kv_heads·head_dim]`의 열 범위로 적는다(`stage.kv_windows`, `residency.token_rows`).
+stage는 cache operand 자리에 host cache 자체를 받으므로, 합집합 window는 host에서 만들지 않는다
+(장치 영역을 읽는다; reference만 만든다).
+
+**근거**
+- `fx_packing._pack_cache_windows`, `cache_window`. 묶은 GEMM의 origin은 None이라 member로
+  나눠 재지 않는다(나누면 한 round 조건을 어긴다).
+- 같은 KV head를 읽는 query head(GQA)는 CSE 뒤 같은 window를 읽으므로, 같은 묶음 안의 행이 된다.
+
+**예시**
+
+| 규칙 | window가 놓인 B 축 | 묶은 GEMM | 버리는 것 | 나오는 곳 |
+|---|---|---|---|---|
+| ④ k-window | k (B = windowᵀ) | `[A₁ 0; 0 A₂] @ [W₁ \| W₂]ᵀ` | A의 0 | QK (`q_h @ K_jᵀ`) |
+| ⑤ n-window | n (B = window) | `[A₁; A₂] @ [W₁ \| W₂]` → 행마다 자기 열 | 교차 항 | PV (`p_h @ V_j`) |
+
+| target (Llama-2, head 32) | unit | 묶음 | 결과 |
+|---|---|---|---|
+| UPMEM | DPU 2048 | 32 ≤ 2048 → 묶지 않음 | head마다 GEMV, 0 없음 |
+| AiMX | FPGA 2 | 32 → FPGA당 16 head | QK `(16, C, 2048)`, PV `(16, 2048, C)` ×2 |
+
+두 target의 decode layer는 같은 graph다: query head h마다 `q_h @ K[h // g]ᵀ`, `p_h @ V[h // g]`,
+cache는 오른쪽 operand(`examples/aimx/llama_decode.py`, `examples/upmem/e2e/llama_workloads.py`).
+host cache의 위치는 토큰 위치 그대로이고 `write_kv(layer, kind, cache, start, stop)`로 위치 범위를
+알린다. 물리 배치는 adapter가 각자 정한다.
+
+```text
+공통 host KV   K[h, t, f], V[h, t, f]  ── write_kv(t0, t1) ──┬── AiMX adapter : B = Kᵀ / V panel, 위치 → (FPGA, 행)
+                                                               └── UPMEM adapter: matvec 행렬 K / Vᵀ tile, 위치 → (DPU, local 행)
+```
+
+UPMEM의 head별 GEMV는 matvec이라 QK의 행렬이 `(K[h]ᵀ)ᵀ` = K[h] 그대로(행 = 위치)이고, PV의 행렬은
+V[h]ᵀ(열 = 위치)다(`upmem_model._positions_on_rows`). unit c는 위치 `[c·S, (c+1)·S)`를 가지므로
+장치 출력 순서가 토큰 순서와 같다.
+
+두 target의 생성 loop는 쓰기 주기도 같다. 장치는 위치 `[0, flushed)`를 가지고, 그 뒤 decode 위치
+`[flushed, position)`(최대 TAIL − 1 = 15개)과 새 token 자신은 decode layer가 host cache에서 읽어 CPU에서
+attention에 합친다. tail이 TAIL개가 되면 그 위치를 `write_kv`로 한 번에 보낸다. UPMEM adapter는 대기
+위치를 host image에 반영한 뒤 cache 영역 `[kv_base, capacity)` 전체를 모든 DPU에 같은 offset으로 한 번
+전송한다(prefill 위치도 같은 경로).
 
 ### 2.7 config 대응
 
@@ -420,7 +473,7 @@ AiMX FPGA)를 한 번만 연다. 후보마다 다음을 반복한다.
 |---|---|
 | 측정값 | E(weight 상주 후 실행의 중앙값), 첫 업로드 시간(`weight_upload`), 실측 footprint(`physical_allocations`) |
 | 실패 | 결과를 보내기 전에 측정 프로세스가 끝나면(`wait([connection, sentinel])`) 그 후보를 `correctness=False`, `exit_code`로 기록하고 선택에서 제외한다. 다음 후보는 새 측정 프로세스에서 잰다 |
-| 제약 | `stage_constraint`: weight stage는 M/N/K round 1, activation stage는 round ≤ `max_initial_scheduling_rounds`(4). p_k는 target이 정한다(AiMX는 `mapping_reason`이 p_k = 1만 허용) |
+| 제약 | `stage_constraint`: weight stage는 M/N/K round 1, activation stage는 round ≤ `max_initial_scheduling_rounds`(4). p_k는 target의 `mapping_reason`이 정한다 |
 | seed 공간 | `partition_axes`: target이 k를 나눌 수 없으면 k partition은 1뿐이다. `instance_units = units / instances`: instance 하나가 채울 unit 수 |
 | 초기 round 패턴 | weight stage는 (1, 1, 1)만 |
 | budget | class마다 `max_benchmarks`(기본 20), `max_generations`(기본 10) |

@@ -7,9 +7,28 @@ operand allows:
   (1) shared B             [A1; A2] @ B                -> [C1; C2]    m axis, no zeros
   (3) nothing shared       [A1 | A2] @ blockdiag(B1, B2) -> [C1 | C2]  zeros off the diagonal
 
-(1) and (2) never add computation and always apply. (3) packs p GEMMs only when
+(1) and (2) never add computation and always apply. (2) does not build [W1 | W2] on the
+host: the packed B is a ConcatenatedWeight of the frozen weights, built only for an upload. (3) packs p GEMMs only when
 the target model schedules no more computation than p separate GEMMs, which
 holds when the zero blocks fill padding the target computes anyway.
+
+GEMMs whose B reads a key/value cache input take none of these: the cache must stay in
+place. A host cache is [kv_heads, positions, head_dim]; B is one KV head of it, cache[h]
+([positions, head_dim]), or its transpose. Its window is the columns [h·head_dim,
+(h+1)·head_dim) of the token-row view [positions, kv_heads·head_dim]
+(residency.token_rows). A stage reading the cache runs all its instances in one round,
+one unit or more each, so when a group has more GEMMs than the target has units,
+consecutive windows are packed until it fits, the B becoming their union window, the
+heads side by side (cat of cache[h] along the columns; the stage reads the device region,
+so this B is never built on the host):
+  (4) transposed windows (B = window^T, window on B's k): rows of A stacked, each
+      row zero outside its own window's columns  -> [A1 0; 0 A2] @ [W1 | W2]^T
+  (5) windows on B's n: rows of A stacked, each output row keeps its own window's
+      columns (the other columns are cross terms)  -> [A1; A2] @ [W1 | W2]
+A target with as many units as GEMMs (UPMEM) packs nothing and keeps one GEMM per
+head without zeros; one with fewer (AiMX FPGAs) packs, its zeros and cross terms
+being the price of one instance per unit. Query heads sharing a KV head (GQA) read
+the same window and simply become more rows of the same packed GEMM.
 
 gemms maps a GEMM node name to a PackedGemm. Packed nodes take a member's mapping
 and the members' sources, and record their origin so that tuning can start from
@@ -25,13 +44,36 @@ from torch import fx
 from torch.fx.operator_schemas import normalize_function
 
 from ._autotuner import (
-    ConstraintEngine, PIMProblem, best_partitions, build_config_space, legal_partitions,
+    ConstraintEngine, best_partitions, build_config_space, legal_partitions,
     make_config, pim_hierarchy, rank_block_groups, target_model, tile_ladder,
 )
+from .execution import gemm_problem
 from .fx_normalization import GemmNormalization
 
 
 aten = torch.ops.aten
+
+
+@dataclass(frozen=True)
+class ConcatenatedWeight:
+    """Weights [k, n_i] side by side along the columns, the B of rule (2).
+
+    The parts stay the frozen weights they are; the [k, sum n_i] matrix is built only by
+    tensor(), for the time of one weight upload or reference computation.
+    """
+
+    parts: tuple
+
+    @property
+    def shape(self):
+        return torch.Size((self.parts[0].shape[0], sum(part.shape[1] for part in self.parts)))
+
+    @property
+    def dtype(self):
+        return self.parts[0].dtype
+
+    def tensor(self):
+        return torch.cat(self.parts, dim=1)
 
 
 @dataclass(frozen=True)
@@ -55,15 +97,55 @@ def gemm_operands(node):
     return arguments.kwargs["input"], arguments.kwargs["mat2"]
 
 
-def pack_gemms(graph_module, frozen, gemms, spec, separate):
+def _cache_head(node, caches):
+    """(cache placeholder, h) if node is cache[h] of a cache input; else None."""
+    if (node.op == "call_function" and node.target == aten.select.int
+            and node.args[0].op == "placeholder" and node.args[0].name in caches):
+        if node.args[1] != 0:
+            raise ValueError(f"{node.name}: a cache operand must be one KV head cache[h]")
+        return node.args[0], node.args[2]
+    return None
+
+
+def cache_window(node, caches):
+    """(cache placeholder, transposed, start, stop) if node reads KV heads [h0, h1) of a cache
+    input, as one head cache[h] or consecutive heads side by side (cat along the columns), or
+    its transpose; start and stop are the token-row view columns h0·head_dim, h1·head_dim.
+    Else None."""
+    # 정규화(run_decompositions)는 2차원 전치를 permute [1, 0]으로 바꾼다.
+    transposed = (node.op == "call_function"
+                  and (node.target == aten.t.default
+                       or (node.target == aten.permute.default and list(node.args[1]) == [1, 0])))
+    if transposed:
+        node = node.args[0]
+    if (node.op == "call_function" and node.target == aten.cat.default
+            and len(node.args) > 1 and node.args[1] == 1):
+        heads = [_cache_head(part, caches) for part in node.args[0]]
+    else:
+        heads = [_cache_head(node, caches)]
+    if None in heads or len({cache for cache, _ in heads}) != 1:
+        return None
+    cache = heads[0][0]
+    indices = [index for _, index in heads]
+    if indices != list(range(indices[0], indices[0] + len(indices))):
+        raise ValueError(f"{node.name}: packed cache heads {indices} must be consecutive")
+    head_dim = cache.meta["val"].shape[2]
+    return cache, transposed, indices[0] * head_dim, (indices[-1] + 1) * head_dim
+
+
+def pack_gemms(graph_module, frozen, gemms, spec, separate, caches=frozenset()):
+    """caches: names of the placeholders that are key/value cache inputs."""
     graph = graph_module.graph
     _eliminate_common_subexpressions(graph, gemms)
     _concatenate_weights(graph_module, frozen, gemms, separate)
     _reorder(graph)
     for transform in (_stack_shared_rights, _block_diagonal):
-        for members in _instance_groups(graph, frozen, gemms, separate):
+        for members in _instance_groups(graph, frozen, gemms, separate, caches, False):
             transform(graph, gemms, members, spec)
         _reorder(graph)
+    for members in _instance_groups(graph, frozen, gemms, separate, caches, True):
+        _pack_cache_windows(graph, gemms, members, spec, caches)
+    _reorder(graph)
     graph.lint()
     graph_module.recompile()
     return gemms
@@ -174,25 +256,20 @@ def _concatenate_weights(graph_module, frozen, gemms, separate):
         shapes = tuple(gemms[member.name].mapping.normalized.mnk for member in members)
         sizes = [n for _, n, _ in shapes]
         targets = "+".join(gemms[member.name].mapping.normalized.right.weight_target for member in members)
-        name = "resident_packed_" + members[0].name
-        graph_module.register_buffer(name, torch.cat([frozen[right] for right in rights], dim=1).contiguous())
+        # host에 [W1 | W2 | ...]를 만들지 않는다. cat node는 graph 위의 표시이고 실행되지 않는다
+        # (model.build_layer_plan은 weight operand를 stage 인자로 넘기지 않는다).
         with graph.inserting_before(members[-1]):
-            weight = graph.get_attr(name)
+            weight = graph.call_function(aten.cat.default, (rights, 1))
             packed = graph.call_function(target, (left, weight))
-        frozen[weight] = getattr(graph_module, name)
+        frozen[weight] = ConcatenatedWeight(tuple(frozen[right] for right in rights))
         _packed_entry(gemms, members, packed, (shapes[0][0], sum(sizes), k), left, weight, targets,
                       ("n", shapes, 1))
         _replace_outputs(graph, packed, members, 1, sizes)
-        # 합친 weight만 남긴다. 원래 weight 상수는 쓰는 곳이 없어졌다.
-        for right in rights:
-            if not right.users:
-                frozen.pop(right)
-                delattr(graph_module, right.target)
-                graph.erase_node(right)
 
 
-def _instance_groups(graph, frozen, gemms, separate):
-    """Independent activation GEMMs of the same depth, shape and dtype (build_layer_plan groups)."""
+def _instance_groups(graph, frozen, gemms, separate, caches, reading):
+    """Independent activation GEMMs of the same depth, shape and dtype (build_layer_plan groups),
+    those that read a key/value cache if reading, the others if not."""
     depths = {}
     groups = {}
     for node in graph.nodes:
@@ -200,8 +277,9 @@ def _instance_groups(graph, frozen, gemms, separate):
         if node.name in gemms:
             depth += 1
             left, right = gemm_operands(node)
+            reads = cache_window(left, caches) is not None or cache_window(right, caches) is not None
             if (node.target != aten.bmm.default and left not in frozen and right not in frozen
-                    and not separate.intersection(gemms[node.name].sources)):
+                    and reads == reading and not separate.intersection(gemms[node.name].sources)):
                 info = gemms[node.name].mapping.normalized
                 groups.setdefault((depth, node.target, info.mnk, info.left.dtype, info.right.dtype),
                                   []).append(node)
@@ -231,6 +309,8 @@ def _stack_shared_rights(graph, gemms, members, spec):
 @cache
 def _cost(spec, problem):
     """Static packing cost at the most parallel frontier point; no execution seed is selected."""
+    # 묶은 GEMM이 실제로 compile될 target(AiMX GEMM batch)으로 잰다.
+    spec = target_model(spec).stage_target(problem)
     engine = ConstraintEngine(problem, spec)
     model = target_model(spec)
     space = build_config_space(problem, spec)
@@ -255,9 +335,9 @@ def _block_diagonal(graph, gemms, members, spec):
     for count in range(1, len(members) + 1):
         if len(members) % count:
             continue
-        cost = _cost(spec, PIMProblem(m, count * n, count * k,
-                                      input_dtype=str(info.left.dtype).removeprefix("torch."),
-                                      output_dtype=str(info.output_dtype).removeprefix("torch.")))
+        cost = _cost(spec, gemm_problem(m, count * n, count * k,
+                                        input_dtype=str(info.left.dtype).removeprefix("torch."),
+                                        output_dtype=str(info.output_dtype).removeprefix("torch.")))
         if cost is not None:
             # 묶음 하나의 비용 × 묶음 수
             costs[count] = (cost[0] * len(members) // count, cost[1] * len(members) // count)
@@ -280,3 +360,57 @@ def _block_diagonal(graph, gemms, members, spec):
             packed = graph.call_function(group[0].target, (left, right))
         _packed_entry(gemms, group, packed, (m, count * n, count * k), left, right, None, None)
         _replace_outputs(graph, packed, group, 1, [n] * count)
+
+
+def _pack_cache_windows(graph, gemms, members, spec, caches):
+    """(4)/(5): pack consecutive cache windows until the group has no more GEMMs than units."""
+    windows = [cache_window(gemm_operands(member)[1], caches) for member in members]
+    # B가 cache window인 GEMM만 묶는다. 왼쪽 operand가 cache면 그대로 둔다.
+    if None in windows or len({window[:2] for window in windows}) != 1:
+        return
+    cache, transposed = windows[0][:2]
+    head_dim = cache.meta["val"].shape[2]
+    # instance 하나가 unit 하나 이상을 쓰고 한 round에 모두 돈다: unit 수 이하의 가장 큰 약수
+    instances = max(count for count in range(1, min(len(members), spec.common_profile.num_units) + 1)
+                    if len(members) % count == 0)
+    if instances == len(members):
+        return
+    size = len(members) // instances
+    m, n, k = gemms[members[0].name].mapping.normalized.mnk
+    order = sorted(range(len(members)), key=lambda index: windows[index][2])
+    position = {node: index for index, node in enumerate(graph.nodes)}
+    for first in range(0, len(members), size):
+        group = [members[index] for index in order[first:first + size]]
+        group_windows = [windows[index] for index in order[first:first + size]]
+        start = min(window[2] for window in group_windows)
+        stop = max(window[3] for window in group_windows)
+        lefts = [gemm_operands(member)[0] for member in group]
+        with graph.inserting_before(max(group, key=position.get)):
+            union = graph.call_function(aten.cat.default, ([
+                graph.call_function(aten.select.int, (cache, 0, head))
+                for head in range(start // head_dim, stop // head_dim)], 1))
+            if transposed:
+                # (4) B = union^T: 행마다 자기 window 열 자리에만 A를 두고 나머지는 0이다.
+                right = graph.call_function(aten.permute.default, (union, [1, 0]))
+                left = graph.call_function(aten.cat.default, ([
+                    graph.call_function(aten.constant_pad_nd.default,
+                                        (operand, [window[2] - start, stop - window[3]], 0.0))
+                    for operand, window in zip(lefts, group_windows)], 0))
+                mnk = (size * m, n, stop - start)
+            else:
+                # (5) B = union: A 행을 쌓고, 결과 행마다 자기 window 열만 쓴다.
+                right = union
+                left = graph.call_function(aten.cat.default, (lefts, 0))
+                mnk = (size * m, stop - start, k)
+            packed = graph.call_function(group[0].target, (left, right))
+        _packed_entry(gemms, group, packed, mnk, left, right, None, None)
+        with graph.inserting_after(packed):
+            for index, (member, window) in enumerate(zip(group, group_windows)):
+                piece = graph.call_function(aten.slice.Tensor, (packed, 0, index * m, (index + 1) * m))
+                if not transposed:
+                    piece = graph.call_function(aten.slice.Tensor,
+                                                (piece, 1, window[2] - start, window[2] - start + n))
+                member.replace_all_uses_with(graph.call_function(
+                    aten.clone.default, (piece,), {"memory_format": torch.contiguous_format}))
+        for member in group:
+            graph.erase_node(member)

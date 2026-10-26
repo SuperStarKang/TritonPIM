@@ -8,7 +8,8 @@ from dataclasses import dataclass
 
 import torch
 
-from ._autotuner import PIMProblem, build_config_space, pim_hierarchy
+from ._autotuner import build_config_space, pim_hierarchy, target_model
+from .execution import gemm_problem
 from .config import PIMTorchConfig
 from .fx_analysis import analyze_fx_gemms
 from .model import build_layer_plan
@@ -24,17 +25,25 @@ class StageKey:
     op: str
     weight_mask: tuple
     instances: int
+    # operand마다 장치의 key/value cache 영역을 그대로 읽는지
+    kv_mask: tuple
+    # cache operand가 cache window의 전치인지 (AiMX QK의 B = Kᵀ)
+    kv_transposed: bool
 
     @property
     def problem(self):
-        return PIMProblem(*self.mnk, input_dtype=self.input_dtype, output_dtype=self.output_dtype)
+        return gemm_problem(*self.mnk, input_dtype=self.input_dtype, output_dtype=self.output_dtype)
 
     @property
     def has_weights(self):
         return any(self.weight_mask)
 
+    @property
+    def has_kv(self):
+        return any(self.kv_mask)
+
     def label(self):
-        kind = "weight" if self.has_weights else "activation"
+        kind = "weight" if self.has_weights else "kv" if self.has_kv else "activation"
         return f"{kind} {self.op} {self.mnk} x{self.instances} {self.input_dtype}"
 
 
@@ -59,6 +68,8 @@ class Footprint:
     state: int
     input: int
     output: int
+    # stage가 그대로 읽는 key/value cache 영역 (layer마다 하나씩 놓인다)
+    kv: int
 
 
 def stage_key(stage):
@@ -69,14 +80,17 @@ def stage_key(stage):
         op=stage.gemms[0].op,
         weight_mask=tuple(stage.weight_mask),
         instances=stage.instance_count,
+        kv_mask=tuple(stage.kv is not None and stage.kv[0] == operand for operand in range(2)),
+        kv_transposed=stage.kv is not None and stage.kv[2],
     )
 
 
-def analyze_layer(layer, example_inputs, spec):
+def analyze_layer(layer, example_inputs, spec, kv):
     """Stage classes of one layer and its original GEMM name -> StageKey.
 
     Every GEMM gets the same placeholder config, so build_layer_plan packs and
-    groups exactly as it will once each class has its own config.
+    groups exactly as it will once each class has its own config. kv is the
+    layer's {KEY/VALUE: cache input} (build_layer_plan) or None.
     """
     placeholder = PIMTorchConfig()
     classes = {}
@@ -85,7 +99,8 @@ def analyze_layer(layer, example_inputs, spec):
         exported = torch.export.export(layer, example_inputs)
         gemms = analyze_fx_gemms(exported, allow_bmm=True)
         plan = build_layer_plan(exported, example_inputs,
-                                configs={gemm.node: placeholder for gemm in gemms}, index=0, spec=spec)
+                                configs={gemm.node: placeholder for gemm in gemms}, index=0, spec=spec,
+                                kv=kv)
         for stage in plan.stages:
             key = stage_key(stage)
             if key not in classes:
@@ -97,18 +112,32 @@ def analyze_layer(layer, example_inputs, spec):
     return list(classes.values()), assignment
 
 
-def stage_constraint(key, max_rounds):
+def stage_constraint(key, max_rounds, spec):
     """Static model-stage conditions.
 
     max_rounds bounds an activation stage's M/N/K scheduling rounds; without it
     the search would also measure one Block Group per round, thousands of rounds.
-    p_k is left to the target (AiMX rejects p_k > 1 in its mapping_reason).
+    A stage reading the key/value cache in place keeps every instance's part in
+    memory, so all its instances run in one batch round on the units.
+    p_k is left to the target's mapping_reason. The resident cache operand must not be
+    padded beyond its own extent (target resident_operand_reason).
     """
+    units = spec.common_profile.num_units
+    model = target_model(spec)
 
     def check(problem, config):
         rounds = pim_hierarchy(problem, config).scheduling_rounds
         if key.has_weights and rounds != 1:
             return "weight stages require one M/N/K round"
+        if key.has_kv and rounds != 1:
+            return "key/value cache stages require one M/N/K round"
+        if key.has_kv and key.instances * config.p_m * config.p_n * config.p_k > units:
+            return (f"key/value cache stages run all {key.instances} instances in one batch round; "
+                    f"{config.p_m * config.p_n * config.p_k} units per instance exceed {units} units")
+        if key.has_kv:
+            reason = model.resident_operand_reason(problem, config)
+            if reason is not None:
+                return reason
         if rounds > max_rounds:
             return f"model stages allow at most {max_rounds} M/N/K rounds; got {rounds}"
         return None

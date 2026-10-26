@@ -1,393 +1,583 @@
-# PIM Common IR 설계와 변환 근거
+# PIM Common IR 설계
 
-이 문서는 현재 PIM Common → UPMEM 경로를 설명한다. 먼저 표현을 둔 이유를 정리하고,
-그 표현을 만드는 패턴과 Target이 소비하는 계약을 설명한다. 지원되는 IR과 앞으로
-지원할 수 있는 연산을 구분한다. 아래 `text` 예시는 타입·상수·access 선언을 생략한
-의사 코드이며 그대로 파싱하는 MLIR이 아니다.
+이 문서는 TTShared IR을 PIM Common IR로 바꾸는 pass들과, Target이 소비하는 Common
+계약을 설명한다. Target별 lowering은 [UPMEM Target 설계](UPMEMTarget_Implementation.md)와
+[Silent-PIM (AiMX) Target 설계](Silent-PIM_Design.md)가 다룬다. 아래 `text` 예시는 타입·상수·access
+선언을 생략한 의사 코드이며 그대로 파싱되는 MLIR이 아니다.
 
-## 1. 무엇을 Common에서 결정하는가
+## 1. Common이 결정하는 것
 
 **내용**
 
-Common은 계산 의미, 원본 메모리 접근, 논리 분할, 전송할 영역과 부분합 결합을 정한다.
-UPMEM은 이 정보를 MRAM/WRAM, tasklet, SDK 전송과 실제 DPU 배정으로 옮긴다.
-Common을 입력으로 받은 Target이 원본 Triton 코드의 GEMM/GEMV 이름을 다시 찾을
-필요가 없도록 한다.
+Common은 계산 의미, 원본 메모리 접근, 4단계 tiling 계층, 논리 Device 분할, Device별
+상주 영역, 입력 공유 축, K 부분합 결합을 확정한다. Target은 이 사실을 자기 메모리
+계층, 실행 단위, 전송 API로 옮기며 분할 수나 K 범위를 다시 정하지 않는다.
 
 **근거**
 
-- 같은 주소를 사용한다는 사실만으로 덧셈 reduction인지 판단할 수 없다. 계산 의미는
-  Linalg의 scalar region과 SCF 누산기에서 읽어야 한다.
-- 같은 입력을 받는 논리 Device가 실제 SDK 전송 묶음에 인접하는지는 별도 문제다.
-  Common은 공유 관계를 기록하고 물리 배정은 UPMEM이 결정한다.
-- 실행 순서와 전송 범위가 IR에 있으면 Host와 Device가 같은 의미를 공유한다.
-  Target에서 새로운 K window나 별도의 출력 plane을 추측해 만들지 않는다.
+- 덧셈 reduction 여부는 주소가 아니라 Linalg scalar region과 SCF 누산기에서만 판정할
+  수 있다.
+- 같은 입력을 받는 논리 Device가 물리적으로 인접한지는 Target topology의 문제다.
+  Common은 공유 관계(`shared_over`)만 기록한다.
+- 실행 순서와 전송 범위가 IR에 명시되어야 Host와 Device 코드가 같은 의미를 공유한다.
 
 **예시**
 
 ```text
-Common                                  UPMEM
-계산: linalg + scf                    →  WRAM 계산과 tasklet 분할
-주소: pim.access                     →  로컬 MRAM 타일 주소
-상주 범위: pim.place                  →  고정 MRAM 공간과 Host pool
-공유 축: shared_over                  →  공유 pool 주소와 물리 DPU 묶음
-부분합: pim.combine                   →  MRAM 부분합 저장 + Host 합산
-입력 전송 → launch → gather           →  prepare/push → 실행 → 회수
+Common                               Target(UPMEM)
+계산: linalg + scf                 →  WRAM 계산, tasklet 분할
+주소: pim.access                  →  로컬 MRAM tile 주소
+상주 범위: pim.place               →  고정 MRAM slot, Host pool
+공유 축: shared_over               →  공유 pool 주소, 물리 DPU 묶음
+부분합: pim.combine                →  Host add 결합
+broadcast/scatter → launch → gather →  prepare/push → 실행 → 회수
 ```
 
-연산마다 `pim.gemm`, `pim.gemv`, `pim.elementwise`를 추가하지 않는다. 기존 Linalg가
-계산을 표현하고 PIM Op는 배치·이동·결합 중 기존 계산 IR에 없는 의미를 표현한다.
+연산마다 `pim.gemm`, `pim.gemv`를 두지 않는다. 계산은 Linalg가 표현하고 PIM Op는
+배치·이동·결합처럼 기존 계산 IR에 없는 의미만 표현한다.
 
-## 2. 남기는 Op와 각각의 이유
+## 2. Op와 각각의 이유
 
 정의: [PIMDialect.td](../include/triton-shared/Dialect/PIM/IR/PIMDialect.td).
 
-| Op | 표현하는 사실 | 필요한 이유와 소비자 |
+**내용**
+
+PIM dialect는 주소 명세, 입출력, 계획 형성 중의 Device 영역, 최종 실행 계획을 표현하는
+Op만 가진다. `pim.device`는 계획 형성 중간 표현이고 `pim-form-host-plan`이
+`pim.partition`으로 교체한다.
+
+**근거**
+
+- 최종 IR에 `pim.device`가 남으면 Target이 진단한다
+  ([PIMToUPMEMPass.cpp](../lib/Conversion/PIMToUPMEM/PIMToUPMEMPass.cpp) 진입부).
+- `PartitionOp::verify`가 입력별 전송 1회, 출력별 회수 1회, launch 1개, 전송 순서를
+  검사한다([PIMDialect.cpp](../lib/Dialect/PIM/IR/PIMDialect.cpp)).
+
+**예시**
+
+| Op | 표현하는 사실 | 소비자 |
 |---|---|---|
-| `pim.access` | 원본 buffer, offset, origin, sizes, strides, valid, pad, id | 주소와 데이터 이동을 분리한다. Group 형성·placement·DMA가 같은 주소 명세를 사용한다. |
-| `pim.load` | access에서 계산용 tensor를 읽음 | 실제 입력 소비 위치다. UPMEM은 이 위치에 MRAM→WRAM DMA를 만든다. |
-| `pim.store` | 최종 결과를 access에 저장 | elementwise처럼 partial 결합이 없는 출력을 나타낸다. |
-| `pim.combine` | partial과 최종 destination, combiner | split-K/여러 K round의 결과를 덮어쓰지 않도록 결합 의미를 보존한다. 현재 UPMEM combiner는 add다. |
-| `pim.device` | 계획 형성 중의 논리 좌표와 계산 영역 | 기존 분석 pass들이 배치와 계산을 함께 다루는 중간 표현이다. 최종 Target 입력에는 남지 않는다. |
-| `pim.partition` | 논리 `[pm,pn,pk]`와 완성된 실행 계획 | 논리 분할을 실제 DPU 열거 순서와 분리한다. |
-| `pim.place` | access 하나의 Execution Tile 범위와 고정 할당량 | Group 하나의 access만으로 전체 H2D 영역을 알 수 없으므로 필요하다. |
-| `pim.broadcast` | 고유 입력별 공유 수신자들에게 배포 | `shared_over`의 동치 그룹 전체에 입력이 필요함을 실행 계획에 나타낸다. |
-| `pim.scatter` | 입력 placement를 Device별로 배포 | 공유 없는 입력의 전송 시점을 명시한다. |
-| `pim.launch` | Device에서 실행할 계산 본문 | Host 주소·전송 계산과 Device 계산을 구조적으로 분리한다. |
-| `pim.gather` | 출력 placement의 회수 | Host가 결과를 사용할 수 있는 시점을 명시한다. partial 결합 의미는 combine에서 온다. |
+| `pim.access` | buffer, offset, origin, sizes, strides, valid, pad, id | Group 형성, placement, Target DMA 주소 |
+| `pim.load` | access에서 계산용 tensor를 읽음 | Target의 입력 DMA 위치 |
+| `pim.store` | partial 결합이 없는 최종 결과 저장 | Target 출력 DMA, Host 대입 |
+| `pim.combine` | K partial과 최종 destination, combiner(`add`) | Target 출력 DMA, Host 누산 |
+| `pim.device` | 계획 형성 중의 `[m,n,k]` 논리 좌표와 계산 영역 | placement·재사용 pass |
+| `pim.partition` | 논리 분할 `[Pm,Pn,Pk]`와 완성된 실행 계획 | Target lowering 진입점 |
+| `pim.place` | access 하나의 Execution Tile 영역과 고정 할당량 | Target 고정 slot, Host pool |
+| `pim.broadcast` | `shared_over`가 있는 입력의 배포 | Target 공유 주소 전송 |
+| `pim.scatter` | 공유 없는 입력의 배포 | Target 전송 |
+| `pim.launch` | Device에서 실행할 계산 본문 | Target device 함수 |
+| `pim.gather` | 출력 placement의 회수 | Target D2H |
 
-`broadcast`/`scatter`는 수신 관계가 다르지만 UPMEM에서는 둘 다 `stage + to_mram`으로
-내린다. Common 이름이 특정 SDK API를 강제하지 않는다. `broadcast`의 입력은 여러
-고유 타일일 수 있다. 전송 Op의 정수 access id는 같은 partition의 place를 참조하며
-새 buffer handle을 추가하지 않는다.
+전송 Op는 정수 access id로 같은 partition의 `pim.place`를 참조하며 새 buffer handle을
+만들지 않는다. `broadcast`와 `scatter`는 수신 관계만 다르고 특정 SDK API를 강제하지
+않는다.
 
-`pim.device`를 `pim.partition`으로 바꾸는 단계는 중간 표현을 끝내는 경계다. 최종 IR에
-두 Op를 겹쳐 두지 않는다. Target은 미변환 `pim.device`를 진단한다.
+## 3. 속성
 
-## 3. 속성에 저장하는 정보와 저장하지 않는 정보
+### 3.1 4단계 tiling 계층과 논리 좌표
 
-### 3.1 세 계층과 논리 좌표
+**내용**
 
-| 표현 | 단위 | 사용 이유 |
+모든 계층 벡터는 고정 순서 `[m,n,k]`이고 없는 축은 1이다. 각 계층은 바로 아래 계층의
+개수로 지정한다. GEMV는 n이 없으므로 `Bn=Gn=Tn=Pn=1`이다.
+
+**근거**
+
+- `BlockAttr`, `BlockGroupAttr`, `ExecutionTileAttr`, `DeviceMappingAttr`의 verifier가
+  rank 3과 양수를 요구한다([PIMDialect.cpp](../lib/Dialect/PIM/IR/PIMDialect.cpp)).
+- `pim-verify`는 존재하지 않는 축의 Group·Execution Tile 크기가 1인지 검사한다.
+
+**예시**
+
+| 표현 | 단위 | 의미 |
 |---|---|---|
-| `#pim.block<shape=[Bm,Bn,Bk]>` | 원소 | source의 기본 계산 눈금 |
-| `#pim.block_group<blocks=[Gm,Gn,Gk]>` | Block 개수 | 한 번의 local 계산에서 사용할 tile 크기 |
-| `#pim.execution_tile<groups=[Tm,Tn,Tk]>` | Group 개수 | Device 한 번 실행에 상주시킬 범위 |
-| `#pim.device_mapping<partitions=[Pm,Pn,Pk]>` | 논리 Device 수 | 동일 round에서 각 축을 병렬 분할하는 수 |
+| `#pim.block<shape=[Bm,Bn,Bk]>` | 원소 | Triton `BLOCK_M/N/K` |
+| `#pim.block_group<blocks=[Gm,Gn,Gk]>` | Block 개수 | Device가 한 번의 local 계산에 쓰는 tile |
+| `#pim.execution_tile<groups=[Tm,Tn,Tk]>` | Group 개수 | Device 한 번 실행에 상주시키는 범위 |
+| `#pim.device_mapping<partitions=[Pm,Pn,Pk]>` | 논리 Device 수 | 한 round에서 축별 병렬 분할 수 |
 
 ```text
-Group 원소 크기          = Block × Group의 Block 개수
-Execution Tile 원소 크기 = Group 원소 크기 × Tile의 Group 개수
-Device 수               = Pm × Pn × Pk
+Group 원소 크기          = Block × [Gm,Gn,Gk]
+Execution Tile 원소 크기 = Group 원소 크기 × [Tm,Tn,Tk]
+논리 Device 수           = Pm × Pn × Pk  (≤ profile.num_units)
+canonical 논리 번호      = ((pm*Pn)+pn)*Pk+pk
 ```
 
-벡터 순서는 `[m,n,k]`이며 없는 축은 1이다. GEMV는 일반적으로 n이 없으므로 `Pn=1`,
-`Bn=Gn=Tn=1`이다. Device 좌표 `pm,pn,pk`는 각 축의 위치이고 `Pm,Pn,Pk`는 개수다.
-Target에서도 같은 좌표 의미를 이어받는다.
+Common pass는 전달받은 Group·Tile·partition 값을 그대로 IR에 기록한다. 용량을 채우거나
+비용식으로 크기를 고르지 않는다. 값 선정은 [AutoTuner 설계](AutoTuner_Design.md)의 몫이다.
 
-현재 Common pass들은 전달된 Group/Tile/partition 값을 materialize한다. Host cache
-크기로 Triton Block을 자동 선정하거나 비용식으로 scheduling loop 순서를 고르지 않는다.
-Group을 확대하는 것과 Device 한 번 실행에 여러 Group을 넣는 것은 다른 변환이다.
+### 3.2 Target profile
 
-### 3.2 Profile
+**내용**
 
-`pim.target_profile`은 `target`, `num_units`, `banks_per_unit`, `cores_per_bank`,
+`#pim.target_profile`은 `target`, `num_units`, `banks_per_unit`, `cores_per_bank`,
 `lanes_per_core`, `bank_capacity_limit_bytes`, `local_capacity_limit_bytes`를 가진다.
-Common은 분할 수와 resident/local tile 바이트를 이 예산과 비교한다. UPMEM은 다시
-자신의 topology와 DMA 제약을 검사한다. Profile은 Host L1/L2/L3 용량 모델이 아니다.
+Common verifier는 partition 곱, Device당 고정 할당 바이트, local tile 바이트를 이 예산과
+비교한다.
 
-### 3.3 공유 사실과 수명
+**근거**
 
-`shared_over`는 같은 round에서 어떤 논리 좌표만 달라져도 동일 입력 영역인지 나타낸다.
-GEMM의 `A[m,k]`에는 n, `B[k,n]`에는 m, GEMV의 `x[k]`에는 m이 공유 축이다.
+- `pim-map-devices`: `Pm×Pn×Pk > num_units`이면 진단한다.
+- `pim-verify`: Device의 `allocation_shape` 바이트 합이 unit 용량을 넘거나, local tile
+  바이트(`pim::localTileBytes`)가 `local_capacity_limit_bytes`를 넘으면 진단한다.
 
-이 정보는 UPMEM의 고유 Host pool slot과 물리 DPU 묶음을 정하는 직접적인 근거다.
-입력 이름이나 A/B 순서로 공유를 결정하지 않는다.
+**예시**
 
-모든 scheduling round에서 입력을 준비하고 전송한다. Host pool의 **공간**은 여러
-round가 재사용하지만 이전 round의 **내용**을 믿고 전송을 생략하는 속성이나 pass는 없다.
-따라서 Host 입출력 간 alias 증명을 실행 계획에 추가하지 않는다.
+[target.py](../pim_backend/backend/target.py)의 UPMEM 기본값:
+
+| 필드 | 값 |
+|---|---|
+| `num_units` | 2048 |
+| `banks_per_unit`, `cores_per_bank` | 1, 1 |
+| `lanes_per_core` | 16 |
+| `bank_capacity_limit_bytes` | 60 MiB |
+| `local_capacity_limit_bytes` | 46680 |
+
+### 3.3 공유 축 `shared_over`
+
+**내용**
+
+`shared_over`는 입력 placement가 같은 round에서 어떤 논리 좌표에만 달라질 때 같은 영역을
+가리킨다는 사실이다. 입력 이름이나 A/B 순서로 판정하지 않고 origin·stride·valid·pad의
+loop 의존성으로 판정한다.
+
+**근거**
+
+- [PIMPlaceDataPass.cpp](../lib/Conversion/TTSharedToPIM/PIMPlaceDataPass.cpp)
+  `placeAccess`는 origin, strides, valid, pad를 움직이는 loop를 모으고, 계층 축 중
+  사용되지 않은 축을 `shared_over`에 넣는다. 출력에는 붙이지 않는다.
+
+**예시**
+
+```text
+GEMM A[m,k]: n에 불변 → shared_over=[n]
+GEMM B[k,n]: m에 불변 → shared_over=[m]
+GEMV x[k]  : m에 불변 → shared_over=[m]
+GEMV A[m,k]: 공유 없음
+```
+
+모든 scheduling round에서 입력을 다시 준비하고 전송한다. `shared_over`는 같은 round
+안의 Device 간 공유이며 round 사이의 H2D 생략을 뜻하지 않는다.
 
 ### 3.4 Loop 표식
 
-| 표식 | 생성 근거와 소비 |
-|---|---|
-| `pim.axis="m"/"n"` | source grid에서 복원한 출력 parallel loop. Group·배치·Target 로컬화에 사용 |
-| `pim.reduction="add"` | Linalg가 SCF 누산기를 add로 갱신하는 관계. K 분할과 combine의 근거 |
-| `pim.scheduling_axis` | Host의 m/n/reduction_k round. 실행 영역과 자원 수명의 경계 |
-| `pim.temporal_reduction` | 한 Device가 현재 round에 맡는 local K loop |
-| `pim.device_origin` | local IV를 전역 Group 좌표로 복원하는 산술. UPMEM이 MRAM 로컬 좌표로 바꾸는 지점 |
-| `pim.min_trip_count` | partition=1인 축의 진입한 round는 비어 있지 않다는 근거. local load 이동에서 사용 |
-| `pim.reused_input` | local loop 밖으로 이동한 load의 주소를 `origin-place.start`로 로컬화하기 위한 표식 |
+**내용**
 
-마지막 두 표식은 아래의 Device 내부 load 이동에 쓰인다. Host H2D 생략을 뜻하지 않는다.
+loop의 역할은 속성으로 명시하고 뒤 pass는 이 속성만 읽는다. 주소를 움직이는 loop를
+보고 reduction 여부를 추측하지 않는다.
 
-## 4. 전체 변환 순서
+**근거**
 
-실제 pipeline: [compiler.py](../pim_backend/backend/compiler.py)의 `PIM_COMMON_PASSES`.
+- `pim.reduction`은 `pim-form-compute`만 붙이고 `pim-form-block-groups`,
+  `pim-form-execution-tiles`, `pim-map-devices`는 이 속성으로 K loop를 찾는다.
+
+**예시**
+
+| 표식 | 붙이는 pass | 의미 |
+|---|---|---|
+| `pim.axis="m"/"n"` | build-logical-grid | source grid에서 복원한 출력 병렬 축 |
+| `pim.reduction="add"` | form-compute | Linalg가 SCF 누산기를 add로 갱신 |
+| `pim.scheduling_axis` | map-devices | Host round loop(`n`, `m`, `reduction_k`) |
+| `pim.temporal_reduction` | map-devices | Device가 현재 round에 도는 local K loop |
+| `pim.device_origin` | map-devices | local IV → 전역 Group 좌표 복원 산술 |
+| `pim.min_trip_count` | map-devices | partition=1 축의 진입한 round는 비어 있지 않음 |
+| `pim.reused_input` | reuse-execution-tile-inputs | loop 밖으로 이동한 load. Target이 로컬화 |
+
+## 4. 변환 순서
+
+**내용**
+
+[compiler.py](../pim_backend/backend/compiler.py)의 `PIM_COMMON_PASSES`가 순서를 정한다.
+각 pass는 다음 pass가 소비할 사실을 확정하고, 패턴에 맞지 않는 계산은 진단한다.
+
+**근거**
+
+- AiMX target에서는 `--pim-reuse-execution-tile-inputs`를 제거하고 마지막
+  `-canonicalize`를 붙이지 않는다. AiMX `pim.load`는 상주 panel의 view이고, SCF
+  canonicalize가 단일 반복 loop와 축 속성을 지울 수 있기 때문이다(`compiler.py` 주석).
+
+**예시**
 
 ```text
 TTShared IR
-  pim-normalize-address → cse / LICM / canonicalize
+  pim-normalize-address → cse → LICM → canonicalize
   pim-form-compute
   convert-ttshared-to-pim
   pim-build-logical-grid
   pim-recover-access-origin
   pim-set-target-profile
-  pim-form-block-groups
-  pim-form-execution-tiles
-  pim-map-devices
+  pim-form-block-groups       (group-m/n/k)
+  pim-form-execution-tiles    (tile-m/n/k)
+  pim-map-devices             (p-m/p-n/p-k)
   pim-place-data → pim-verify
-  pim-reuse-execution-tile-inputs → pim-verify
-  pim-form-host-plan → pim-verify → cse / canonicalize
-UPMEM lowering
+  pim-reuse-execution-tile-inputs → pim-verify     (UPMEM만)
+  pim-form-host-plan → pim-verify → cse → canonicalize(UPMEM만)
+Target lowering
 ```
 
-각 단계는 다음 단계가 소비할 사실을 확정한다. 패턴에 맞지 않는 계산을 임의의 다른
-연산으로 치환하거나 지원하지 않는 메모리 접근을 숨기는 경로는 두지 않는다.
-
-## 5. 계산 패턴을 어떻게 찾는가
+## 5. 계산 패턴 인식 (`pim-form-compute`)
 
 구현: [PIMFormComputePass.cpp](../lib/Conversion/TTSharedToPIM/PIMFormComputePass.cpp).
 
 ### 5.1 누산기 정규화
 
-**찾는 패턴**: `compute(outs=zero)`의 결과를 기존 누산기에 더하는 identity-map
-`linalg.generic(add)`이며, 결과가 같은 SCF iter_arg로 yield된다.
+**내용**
 
-**변환**: 계산의 outs를 기존 누산기로 연결한다. 그 후 Linalg scalar body의 최종 add가
-누산기와 독립 contribution을 더하는지 확인한다. 하나의 tensor 누산기/result와 zero
-초기값이어야 `pim.reduction="add"`로 표시한다.
+`compute(outs=zero)` 결과를 identity-map `linalg.generic(add)`로 누산기에 더하고 그
+결과를 같은 iter_arg로 yield하는 형태를 `compute(outs=acc)`로 바꾼다. 그 다음 누산기
+loop를 `pim.reduction="add"`로 표시하고, 누산기 초기화 chain을 loop 바로 앞으로 옮긴다.
 
-**이유**: 임시 결과와 별도 덧셈을 없애면서 K partial의 의미를 확정한다. contribution이
-이전 누산기에 의존하면 K를 독립적으로 나눌 수 없으므로 진단한다. 초기화 chain은 해당
-loop 바로 앞으로 이동해 bufferization 후에도 출력 instance마다 초기화되게 한다.
+**근거**
 
-```text
-기존: partial = compute(A, B, zero)
-      next    = acc + partial
-변환: next    = compute(A, B, acc)
-```
+- `classifyAddCompute`: scalar body의 최종 add가 누산기와 독립 contribution을 더해야
+  한다. contribution이 이전 누산기에 의존하면 K를 나눌 수 없으므로 진단한다.
+- `markReduction`: 초기값이 0 fill이 아니거나 iter_arg가 둘 이상이면 진단한다.
+- `sinkInit`: bufferization 뒤에도 출력 instance마다 초기화가 실행되게 한다.
 
-### 5.2 GEMV 정규화의 현재 범위
-
-**찾는 패턴**:
+**예시**
 
 ```text
-x[K] → expand_shape[1,K] → broadcast[M,K]
-                                   × A[M,K]
-                                   ↓
-                 reduce(dim=1), 또는 transpose[1,0] → reduce(dim=0)
+변환 전: partial = matmul(A, B, zero);  next = acc + partial
+변환 후: next    = matmul(A, B, acc)          // scf.for {pim.reduction="add"}
 ```
 
-- broadcast 입력 map은 `(m,k)->(0,k)`, 출력 map은 identity여야 한다.
-- broadcast region은 입력을 그대로 yield해야 한다.
-- 곱셈은 두 직접 입력을 곱하는 identity/all-parallel generic이어야 한다.
-- reduction은 input과 accumulator를 직접 더하는 sum이어야 한다.
-- 곱셈 tensor와 reduction 결과의 원소 타입이 같아야 한다.
+### 5.2 GEMV 정규화
 
-**변환**: `linalg.matvec(A,x,init)`를 만들고 더 이상 사용하지 않는 broadcast/mul/
-transpose/reduce chain만 지운다. 다른 사용자가 있는 중간 결과는 보존한다.
+**내용**
 
-**이유**: 벡터를 M행으로 확장한 임시 계산을 없애며, Target이 indexing map만으로
-A/y의 행 분할과 x 공유를 읽을 수 있다. 이미 named matvec이면 이 인식은 필요 없다.
+TTShared가 내는 두 GEMV 배치를 `linalg.matvec(A, x, init)`로 바꾼다. 곱셈 앞의
+extension(INT8 → INT32 `extsi`, BF16/F16 → F32 `extf`)은 벗겨 내고 좁은 원래 값을
+matvec 입력으로 쓴다.
 
-### 5.3 현재 INT8 gemv.py가 실패하는 이유
+**근거**
 
-`gemv.py` 예제(저장소에 포함되지 않는 로컬 예제)는 다음 식을 사용한다.
+- `formMatvec`: reduce는 input + accumulator의 sum, 곱셈은 두 직접 입력의 identity/
+  all-parallel 곱, broadcast map은 정확히 `(m,k)->(0,k)`여야 한다.
+- `stripExtension`: `arith.extsi`/`arith.extf`이거나 body가 그 하나인 identity generic만
+  벗긴다. `linalg.matvec`는 입력을 출력 타입으로 넓혀 곱하므로 의미가 같다. 넓힌 사본
+  tile이 남지 않으므로 Block Group 형성 때 shape를 정할 수 없는 tile root도 생기지 않는다.
+- 곱셈 tensor와 reduce 결과의 원소 타입이 같아야 한다. 곱셈 **후** 확장(INT8 곱 →
+  INT32)은 곱셈 결과 타입이 달라 이 패턴에 해당하지 않는다.
+- 다른 사용자가 없는 broadcast/expand_shape/extension/mul/transpose/reduce만 지운다.
+
+**예시**
+
+```text
+x_i8[K] → expand_shape[1,K] → broadcast[M,K] → extsi → x_i32[M,K] ┐
+A_i8[M,K] ─────────────────────────────────── extsi → A_i32[M,K] ┴→ mul_i32
+    → reduce(dim=1)                       또는 transpose[1,0] → reduce(dim=0)
+⇒ linalg.matvec(A_i8, x_i8, acc_i32)
+```
+
+Triton 소스에서는 곱하기 전에 넓혀야 이 형태가 된다.
 
 ```python
-acc += tl.sum(a * x[None, :], axis=1)
+acc += tl.sum(a.to(tl.int32) * x.to(tl.int32)[None, :], axis=1)      # INT8 입력
+acc += tl.sum(a.to(tl.float32) * x.to(tl.float32)[None, :], axis=1)  # BF16/F16 입력
 ```
 
-설치된 Triton [semantic.py](../../triton/python/triton/language/semantic.py)의
-`integer_promote_impl`/`mul`은 두 INT8 tensor의 곱을 INT8로 만든다.
-[standard.py](../../triton/python/triton/language/standard.py)의
-`_pick_sum_dtype`/`sum`은 이 곱셈 결과를 INT32로 넓힌 뒤
-합산한다. 따라서 예상 dataflow에는 다음 폭 변환이 있다.
+### 5.3 출력 float 변환 흡수 (`convert-ttshared-to-pim`)
+
+**내용**
+
+저장 값이 원소 타입만 바꾸는 identity generic(`truncf` 또는 `extf` 하나)이면 그 generic을
+지우고 변환 전 값을 `pim.store`에 연결한다.
+
+**근거**
+
+- [TTSharedToPIMPass.cpp](../lib/Conversion/TTSharedToPIM/TTSharedToPIMPass.cpp)
+  `foldFloatConversion`: `pim.store`/`pim.combine`은 목적지 buffer 원소 타입으로 쓴다.
+  변환을 흡수하면 K partial 결합 앞에 epilogue가 끼지 않는다.
+
+**예시**
 
 ```text
-A_i8 × broadcast(x_i8) → product_i8 → signed extension_i32 → sum_i32
+acc_f32 → generic{truncf} → bf16 → store C_bf16
+⇒ store(acc_f32 → C_bf16)       // 타입 변환은 저장 시점에 수행
 ```
 
-현재 `formMatvec`는 reduction 입력에서 바로 곱셈 generic을 찾는다. 중간 cast를
-통과하지 않으며, 곱셈 결과 타입과 reduction 결과 타입도 같아야 한다. 이 표현은 그
-패턴의 범위 밖이다. 보고된 오류는 INT8 broadcast가 UPMEM 변환까지 남았고, UPMEM의
-identity-only generic 검사에서 거부되었음을 보여준다. 오류의 임시 전체 IR 파일은
-점검 시점에 남아 있지 않아 cast/transpose의 정확한 Op 배치는 재현 확인하지 않았다.
+## 6. 메모리 접근과 논리 grid
 
-타입 검사를 지우거나 cast를 무조건 건너뛰면 안 된다.
+### 6.1 메모리 접근 끌어올리기 (`convert-ttshared-to-pim`)
 
-```text
-INT8(100) × INT8(2), 곱셈 후 확장:  INT8(200) = -56 → INT32(-56)
-INT32(100) × INT32(2):                              INT32(200)
-```
+**내용**
 
-표준적인 INT8 입력·INT32 곱셈/누산 GEMV를 의도한다면 source에서 곱셈 전에 확장하는
-의미가 명시되어야 한다. 향후 matcher는 이 선행 확장의 signedness·폭·shape를 증명한
-경우에만 mixed-type matvec로 바꿔야 한다. 곱셈 후 확장은 같은 변환 대상이 아니다.
-현재 예제와 matcher에 이 수정은 적용하지 않았다.
+TTShared의 load/store 패턴을 `pim.access` + `pim.load/store`로 바꾸고 staging buffer를
+없앤다. 변환되지 않은 memref 접근이 남으면 진단한다.
 
-기존 [form_compute_matvec.mlir](../test/Conversion/TTSharedToPIM/form_compute_matvec.mlir)는
-f32 패턴을 다룬다. 그 테스트가 존재한다는 사실로 INT8 예제 지원까지 주장할 수 없다.
+**근거**
 
-## 6. 메모리 접근과 논리 grid 패턴
+- 같은 alloc을 두 copy가 채우는 wrap-around load는 하나의 access로 표현할 수 없어
+  진단한다.
+- 같은 reinterpret_cast를 load와 store가 함께 쓰면 하나의 access를 공유한다.
 
-### 6.1 메모리 접근 올리기
+**예시**
 
-구현: [TTSharedToPIMPass.cpp](../lib/Conversion/TTSharedToPIM/TTSharedToPIMPass.cpp).
+| TTShared 표현 | 변환 결과 |
+|---|---|
+| reinterpret_cast → copy to alloc → to_tensor | access + load |
+| reinterpret_cast/subview → (fill) padded alloc/subview로 copy | valid/pad를 가진 access + load |
+| materialize_in_destination(dest=reinterpret_cast) | access + store |
+| materialize_in_destination(dest=subview) | valid를 가진 access + store |
 
-| 찾는 TTShared 표현 | 변환 | 근거 |
-|---|---|---|
-| reinterpret_cast → copy to alloc → to_tensor | access + load | 임시 Host형 tile buffer가 아니라 명시적 읽기 의미로 유지 |
-| reinterpret_cast/subview → padded alloc/subview로 copy | valid/pad를 가진 access + load | mask의 유효 영역과 채움값 보존 |
-| materialize_in_destination | access + store | 실제 출력 목적지를 보존 |
-| extract_slice → subview destination | valid를 가진 access + store | tail 밖에는 쓰지 않음 |
+### 6.2 주소 정규화와 origin 복원
 
-주소 정규화는 loop-carried pointer 식을 후속 origin 분석이 읽을 수 있는 식으로
-정리한다. wrap-around처럼 두 개의 떨어진 영역을 하나의 access로 표현할 수 없는
-load와 변환되지 않은 memref/bufferization 접근은 진단한다.
+**내용**
 
-### 6.2 논리 축 복원과 origin
+`pim-normalize-address`는 주소를 나르는 iter_arg를 `initial + i*advance`로 다시 쓴다.
+`pim-recover-access-origin`은 선형 offset을 stride와 대조해 축별 origin을 복원한다.
 
-[PIMBuildLogicalGridPass.cpp](../lib/Conversion/TTSharedToPIM/PIMBuildLogicalGridPass.cpp)는
-TTShared의 grid ABI에서 program_id 사용을 찾는다. 직접 pid, div/rem으로 평탄화된
-좌표, 인식 가능한 grouped order를 m/n SCF loop로 복원한다. 별도의 source split-K
-축은 허용하지 않는다. K는 5절에서 확정한 semantic reduction이다.
+**근거**
 
-[PIMRecoverAccessOriginPass.cpp](../lib/Conversion/TTSharedToPIM/PIMRecoverAccessOriginPass.cpp)는
-선형 offset을 stride와 대조해 다음 식의 origin을 복원한다.
+- [PIMNormalizeAddressPass.cpp](../lib/Conversion/TTSharedToPIM/PIMNormalizeAddressPass.cpp):
+  닫힌 형태가 아니면 뒤의 origin 복원이 실패한다.
+- [PIMRecoverAccessOriginPass.cpp](../lib/Conversion/TTSharedToPIM/PIMRecoverAccessOriginPass.cpp):
+  `valid`가 알려 주는 축 시작점을 먼저 대조한다. stride 배수만으로는 `N ≤ BLOCK_N`인 열
+  시작을 행 축과 구별할 수 없기 때문이다. tile에 없는 원본 축은 크기 1로 앞에 붙인다.
+
+**예시**
 
 ```text
 offset = Σ origin[d] × stride[d]
+A: offset = (pid_m*BM)*stride_am + (k*BK)*stride_ak
+   → origin = [pid_m*BM, k*BK]
 ```
 
-이유는 offset만으로는 어느 logical 축이 buffer의 어느 차원을 움직이는지 알기 어렵기
-때문이다. origin은 Group 크기 확대, placement, 공유 축 분석에 같은 근거를 제공한다.
+### 6.3 논리 grid 복원 (`pim-build-logical-grid`)
 
-## 7. Group, Execution Tile, scheduling 생성
+**내용**
 
-### 7.1 Group 형성
+triton-shared ABI의 마지막 6개 인자(num_programs×3, program_id×3)에서 program_id 사용을
+찾아 m/n `scf.for`로 바꾸고 program_id 인자를 시그니처에서 지운다.
 
-[PIMFormBlockGroupsPass.cpp](../lib/Conversion/TTSharedToPIM/PIMFormBlockGroupsPass.cpp)는
-`pim.axis`와 semantic reduction loop를 찾아 요청된 Group factor를 적용한다.
-`collectDrivers`로 각 access 차원을 움직이는 축을 찾고 그 차원의 tile 크기를 키운다.
-Linalg/tensor shape도 이에 맞춰 갱신한다.
+**근거**
+
+- 직접 pid, `pid / d`와 `pid % d` 쌍, GROUP_M 순회 순서를 인식한다.
+- source에 별도 split-K 축은 허용하지 않는다. K는 5절의 semantic reduction이다.
+
+**예시**
 
 ```text
-기존 Block valid를 그대로 두지 않고:
+pid_m = program_id(0); pid_n = program_id(1)
+⇒ scf.for %m {pim.axis="m"} { scf.for %n {pim.axis="n"} { body } }
+```
+
+## 7. Group, Execution Tile, scheduling
+
+### 7.1 Block Group 형성 (`pim-form-block-groups`)
+
+**내용**
+
+`pim.axis` loop와 `pim.reduction` loop에 Group factor를 적용한다. loop 상한을
+`ceildiv(tiles, g)`로 바꾸고, 해당 loop가 origin을 움직이는 access 차원의 크기를 g배로
+키우며, Linalg/tensor shape도 맞춘다.
+
+**근거**
+
+- [PIMFormBlockGroupsPass.cpp](../lib/Conversion/TTSharedToPIM/PIMFormBlockGroupsPass.cpp):
+  상한이 g로 나누어떨어지지 않거나 runtime 값이면, 그 축을 쓰는 access는 원본 extent를
+  복원할 dynamic valid를 가져야 한다. 없으면 존재하지 않는 Block을 읽으므로 진단한다.
+- Block shape는 regroup 뒤 Group 원소 shape를 Block 개수로 나눠 기록한다.
+
+**예시**
+
+```text
 Group valid = min(max(original_extent - group_origin, 0), group_size)
 ```
 
-이유는 mask를 Block 크기에 남겨 두면 Group으로 확대된 뒷부분을 읽지 못하기 때문이다.
+### 7.2 Execution Tile 기록 (`pim-form-execution-tiles`)
 
-### 7.2 Execution Tile과 round
+**내용**
 
-[PIMFormExecutionTilesPass.cpp](../lib/Conversion/TTSharedToPIM/PIMFormExecutionTilesPass.cpp)는
-주어진 Group 개수를 기록한다. 용량을 채우거나 비용으로 크기를 탐색하는 pass가 아니다.
-[PIMMapDevicesPass.cpp](../lib/Conversion/TTSharedToPIM/PIMMapDevicesPass.cpp)는 각 축에
-다음 식을 적용한다.
+주어진 `tile-m/n/k`(Group 개수)를 `#pim.execution_tile<groups=[Tm,Tn,Tk]>`로 기록한다.
+0은 Group 하나다.
 
-```text
-rounds = ceildiv(ceildiv(total_groups, groups_per_tile), partitions)
-first  = (round * partitions + device_coordinate) * groups_per_tile
-trips  = min(groups_per_tile, max(total_groups - first, 0))
-```
+**근거**
 
-M/N은 출력 Group 영역, K는 같은 reduction domain의 부분 범위다. `Pk>1`과 K round는
-각각 공간과 시간 분할이며 별도의 중복 K domain이 아니다.
+- [PIMFormExecutionTilesPass.cpp](../lib/Conversion/TTSharedToPIM/PIMFormExecutionTilesPass.cpp):
+  해당 loop가 없는 축에 2 이상을 주면 진단한다. semantic reduction loop가 둘 이상이면
+  진단한다.
 
-현재 Host round 생성 순서는 존재하는 축에 대해 n → m → reduction_k로 고정되어 있다.
-비용 기반 loop interchange는 구현하지 않았다. canonical 논리 Device 번호
-`((pm*Pn)+pn)*Pk+pk`, Host round 순서, 실제 물리 DPU 배정은 서로 다른 개념이다.
-
-### 7.3 부분합을 명시하는 이유
-
-K를 나누면 매 `(round,pk)`가 zero에서 시작한 partial을 만든다. 원래 reduction 결과를
-저장하던 store를 `pim.combine ... kind "add"`로 바꾼다. `Pk=1`이어도 K round가 여러
-개일 수 있으므로 같은 표현을 쓴다. partial에 비선형 epilogue를 먼저 적용하면 최종
-결과에 적용하는 것과 달라지므로 이 단계는 그러한 epilogue를 거부한다.
-
-## 8. Placement와 shared_over 분석
-
-구현: [PIMPlaceDataPass.cpp](../lib/Conversion/TTSharedToPIM/PIMPlaceDataPass.cpp).
-
-1. access의 origin/stride를 현재 Device의 첫 Group 좌표로 다시 만든다.
-2. 해당 buffer 차원을 움직이는 local loop들의 범위에서 `size`를 구한다.
-3. 실제 trip 수 대신 계층의 고정 Group 개수로 `allocation_shape`를 구한다.
-4. 원본 extent를 사용해 tail의 유효 크기를 자른다.
-5. 입력 origin/stride/valid/pad의 loop 의존성을 모아 사용하지 않는 축을 `shared_over`로 둔다.
+**예시**
 
 ```text
-GEMM A: origin[m,k], stride/valid/pad가 n에 불변 → shared_over=[n]
-GEMM B: origin[k,n], stride/valid/pad가 m에 불변 → shared_over=[m]
-GEMV x: origin[k],   stride/valid/pad가 m에 불변 → shared_over=[m]
+tile-m=4 tile-n=4 tile-k=14 → #pim.execution_tile<groups=[4,4,14]>
 ```
 
-`size`는 이번 round에서 의미 있는 원소 수이고 `allocation_shape`는 모든 round에서
-유지할 고정 공간이다. tail 때문에 두 값이 달라질 수 있다. UPMEM은 고정 공간으로
-전송하고 `size`로 유효한 패킹/출력 복원을 제한한다.
+### 7.3 Device 분할과 round (`pim-map-devices`)
 
-계층에 없는 runtime loop가 resident extent를 결정하거나 partition된 여러 축이 한
-buffer 차원을 함께 움직여 단일 영역으로 표현할 수 없으면 진단한다. 현재 access/
-placement 구현을 임의의 불규칙 gather/scatter 지원으로 해석하면 안 된다.
+**내용**
+
+축마다 Group 개수를 Execution Tile로 묶고, Tile을 `(round, device 좌표)`에 round-major로
+배정한다. Host round loop는 존재하는 축에 대해 `n → m → reduction_k` 순서로 고정된다.
+K는 `Pk`(공간)와 `reduction_k` round(시간)로 나뉘며 둘은 같은 reduction domain의 부분
+범위다. local loop는 `0..trips`로 바뀌고 몸체 첫머리에 `pim.device_origin` 산술이 생긴다.
+
+**근거**
+
+- [PIMMapDevicesPass.cpp](../lib/Conversion/TTSharedToPIM/PIMMapDevicesPass.cpp)
+  `scheduleLoop`, `mapFunc`.
+- source `pim.axis="k"`, 존재하지 않는 축의 partition > 1, `Pm×Pn×Pk > num_units`는
+  진단한다.
+- M/N이 없는 K-only reduction은 누산기 초기화 chain과 직접 store를 함께 `pim.device`
+  안으로 옮긴다. 그렇지 않으면 초기화가 round 밖에서 한 번만 실행된다.
+
+**예시**
+
+```text
+axis 하나 (G=전체 Group 수, T=Tile당 Group 수, P=partition 수)
+exec_tiles = ceildiv(G, T)
+rounds     = ceildiv(exec_tiles, P)
+tile 번호  = round*P + p
+first      = tile 번호 * T
+trips      = min(T, max(G - first, 0))
+
+G=10, T=2, P=2:
+           p=0            p=1
+round 0:   tile0 (g0,g1)  tile1 (g2,g3)
+round 1:   tile2 (g4,g5)  tile3 (g6,g7)
+round 2:   tile4 (g8,g9)  tile5 (trips=0)
+```
+
+```text
+for n_round { for m_round { for k_round {
+  pim.device(pm, pn, pk) {
+    scf.for m_local in [0, trips_m) { m = start_m + m_local   // pim.device_origin
+      scf.for n_local ... { scf.for k_local {pim.temporal_reduction} ... }
+} } } }
+```
+
+### 7.4 부분합 명시
+
+**내용**
+
+K를 나누면 `(reduction_k round, pk)`마다 0에서 시작한 partial이 생긴다. 원래 reduction
+결과를 저장하던 `pim.store`를 `pim.combine ... kind "add"`로 바꾼다. `Pk=1`이어도 K
+round가 여러 개일 수 있으므로 reduction이 있으면 항상 combine을 쓴다.
+
+**근거**
+
+- `mapFunc`: reduction 결과를 직접 저장하지 않고 다른 연산을 거친 store(epilogue)는
+  진단한다. partial마다 비선형 epilogue를 적용하면 최종 결과와 다르기 때문이다.
+- reduction 결과 하나에 최종 store가 정확히 하나여야 한다.
+
+**예시**
+
+```text
+C[m,n] = Σ_{k_round} Σ_{pk} partial(m, n, pk, k_round)
+```
+
+## 8. Placement (`pim-place-data`)
+
+**내용**
+
+access마다 현재 Device의 첫 Group 좌표에서 `pim.place`를 만든다. `size`는 이번 round의
+유효 원소 수이고 `allocation_shape`는 모든 round에 공통인 고정 공간이다.
+
+**근거**
+
+- [PIMPlaceDataPass.cpp](../lib/Conversion/TTSharedToPIM/PIMPlaceDataPass.cpp):
+  `capacityTiles`는 계층 Group 개수(`Tm/Tn/Tk`)이고 runtime trip 수가 아니다.
+- valid에서 원본 extent를 복원해 `size = min(max(extent - origin, 0), span)`으로 자른다.
+- 계층 밖 loop가 buffer 축을 움직이거나, 분할된 축이 다른 loop와 함께 한 buffer 축을
+  움직이면 연속 영역 하나로 표현할 수 없어 진단한다.
+
+**예시**
+
+```text
+start[d]            = 첫 Group 좌표에서 다시 만든 origin[d]
+size[d]             = min(max(extent[d] - start[d], 0), trips × access.sizes[d])
+allocation_shape[d] = (그 축을 모는 계층 loop의 Group 개수) × access.sizes[d]
+direction           = "in" | "out"
+shared_over         = 입력 주소가 의존하지 않는 계층 축 (3.3절)
+
+A[1024,28672], Group [64,128], Tile [4,·,14]
+→ allocation_shape = [256, 1792], shared_over=[n]
+```
 
 ## 9. Device 내부 load 이동과 Host 계획
 
-### 9.1 기존 local load 재사용
+### 9.1 입력 load 이동 (`pim-reuse-execution-tile-inputs`)
 
-[PIMReuseExecutionTileInputsPass.cpp](../lib/Conversion/TTSharedToPIM/PIMReuseExecutionTileInputsPass.cpp)는
-입력 access의 모든 operand가 M/N Group loop에 불변이고, 결과가 읽기 전용으로만
-사용되는 경우 access/load를 그 loop 앞으로 옮긴다. 알 수 없는 memory effect나 입력
-slot 쓰기가 있으면 이동하지 않는다. 넘는 중간 loop는 singleton이어야 한다.
+**내용**
 
-이유는 같은 Device의 동일 resident 입력을 매 Group마다 WRAM에 다시 읽지 않기
-위함이다. 실행 여부가 불명확한 loop는 SCF 보호 loop로 빈 실행을 보존한다. 이동된
-access의 전역 origin은 유지하며 Target이 `origin-place.start`로 로컬화한다.
+M/N Group loop에 불변인 읽기 전용 입력의 access/load를 그 loop 앞으로 옮긴다. 같은
+Device가 같은 상주 입력을 Group마다 local memory로 다시 읽지 않게 하기 위함이다.
 
-이 pass는 Host round, H2D payload, 물리 배정, Group 크기나 계산 loop 순서를 바꾸지
-않는다. Host pool 공유, MRAM→WRAM 읽기 재사용, 이전 round의 H2D 생략을 구분한다.
+**근거**
 
-### 9.2 명시적인 실행 계획 생성
+- [PIMReuseExecutionTileInputsPass.cpp](../lib/Conversion/TTSharedToPIM/PIMReuseExecutionTileInputsPass.cpp):
+  load와 대상 loop 사이의 loop는 모두 singleton(Tile Group 수 1)이어야 한다. load 결과는
+  Linalg DPS 입력으로만 쓰여야 하고, Device 안에 그 access id로 쓰는 store/combine이나
+  알 수 없는 memory effect가 없어야 한다.
+- 대상 loop가 비어 있을 수 있으면 0/1회 도는 보호 `scf.for`로 감싼다.
+- 이동한 access의 origin은 전역 값으로 남기고 `pim.reused_input`을 붙인다. Target이
+  `origin - place.start`로 로컬화한다.
 
-[PIMFormHostPlanPass.cpp](../lib/Conversion/TTSharedToPIM/PIMFormHostPlanPass.cpp)는
-placement와 부수 효과 없는 scalar 설정을 Host 쪽에 둔다. 나머지 계산 및 그 계산에
-의존하는 Op를 launch로 옮긴다. 계산 결과에 placement가 의존하면 진단한다.
+**예시**
 
 ```text
-pim.device                         pim.partition
-  scalar setup                       scalar setup + place
-  place                    →         입력마다 broadcast(shared) 또는 scatter
-  compute                            launch { compute }
-                                     출력마다 gather
+변환 전: for m { for k(singleton) { x = load(X[k]); y = matvec(A[m,k], x, y) } }
+변환 후: x = load(X[k0]) {pim.reused_input};  for m { for k { y = matvec(..., x, y) } }
 ```
 
-Host buffer alloc/dealloc은 UPMEM이 scheduling loop 밖에 만들며 입력 패킹/전송은
-round 안에 둔다. 최종 계획에는 round를 넘는 전송 생략 지시를 두지 않는다.
+이 pass는 Host round, H2D 양, Group 크기, loop 순서를 바꾸지 않는다.
 
-## 10. 검증 범위와 현재 지원 한계
+### 9.2 실행 계획 생성 (`pim-form-host-plan`)
 
-[PIMVerifyPass.cpp](../lib/Conversion/TTSharedToPIM/PIMVerifyPass.cpp)는 계층 크기,
-access/place id·rank 대응, 고정 allocation과 메모리 예산, zero padding,
-semantic/local K와 scheduling marker의 대응, final output의 K 독립성,
-partial 결과의 combine 연결을 검사한다.
+**내용**
 
-`PartitionOp::verify`와 전송 verifier는 입력별 전송/출력별 회수의 누락·중복,
-launch 개수와 전송 순서, broadcast의 공유 축 존재를 검사한다.
+`pim.device` 본문을 placement, Host scalar 설정, 입력 전송, launch, 출력 회수로 나누고
+`pim.partition`으로 교체한다.
 
-현재 verifier는 scheduling 산술 전체가 위 수식과 동치인지 증명하는 분석기가 아니다.
-정확한 first/trips 생성은 생성 pass와 그 테스트가 담당한다. Common verifier 통과도
-Target의 모든 계산 연산 지원을 보장하지 않는다.
+**근거**
 
-| 경우 | 현재 UPMEM 연결 상태 |
+- [PIMFormHostPlanPass.cpp](../lib/Conversion/TTSharedToPIM/PIMFormHostPlanPass.cpp):
+  부수 효과 없는 int/index/float 산술 중 계산 결과에 의존하지 않는 것만 Host에 남긴다.
+  placement가 계산 결과에 의존하면 진단한다.
+- `shared_over`가 비어 있지 않은 입력은 `broadcast`, 나머지는 `scatter`가 된다.
+
+**예시**
+
+```text
+pim.device {                      pim.partition {
+  scalar setup                      scalar setup
+  place A, B, C          →          place A, B, C
+  compute                           broadcast A; broadcast B
+}                                   launch { compute }
+                                    gather C
+                                  }
+```
+
+## 10. 검증과 지원 범위
+
+**내용**
+
+`pim-verify`는 Target 진입 전에 Common 계약을 검사한다. verifier 통과는 Common 계약
+충족을 뜻하며, Target이 모든 계산 leaf를 지원한다는 뜻은 아니다.
+
+**근거**
+
+- [PIMVerifyPass.cpp](../lib/Conversion/TTSharedToPIM/PIMVerifyPass.cpp) 검사 항목:
+  profile·계층 속성 존재, 비활성 축 크기 1, local tile 원소 수와 Group 크기 일치,
+  local tile 바이트 ≤ local 용량, K는 하나의 temporal reduction과 하나의 `reduction_k`
+  round, `p_m/p_n/p_k > 1`에 대응 축 존재, zero padding만 허용, access id 중복 금지,
+  access–placement 일대일, `allocation_shape[d]` = access 크기 × 그 축을 모는 계층의
+  Execution Tile Group 수, 정적 `size[d]`는 `[0, allocation_shape[d]]` 범위, Device 할당
+  바이트 ≤ unit 용량, 최종 출력의 K 독립성, K partial은 `pim.combine`만 사용.
+- scheduling 산술 전체가 7.3절 식과 같은지 증명하지는 않는다. 그 식은 생성 pass가
+  보장한다.
+
+**예시**
+
+| 경우 | 상태 |
 |---|---|
-| named `linalg.matmul`, `linalg.matvec` | 지원되는 shape/type/계층 계약에서 lowering 경로 존재 |
-| 위 5.2절 GEMV 패턴 | Common이 matvec로 정규화 |
-| INT8 곱셈 뒤 INT32 sum인 현재 gemv.py | cast가 끼는 패턴 미지원; broadcast가 남아 실패 |
-| identity/all-parallel elementwise | scalar C emitter 지원 범위에서 가능 |
-| arbitrary broadcast/transpose generic | 일반 계산 경로에서 미지원 |
-| K-only reduce | 현재 UPMEM은 tasklet 1개 요구 |
-| 임의 convolution/불규칙 gather/fused epilogue | Common 표식 일부를 분석할 수 있어도 전체 지원을 뜻하지 않음 |
-
-다음 [UPMEM Target 설계](UPMEMTarget_Implementation.md)는 이 Common 계약이 실제
-Host/Device 코드와 물리 배정으로 변환되는 근거를 설명한다.
+| named `linalg.matmul`, `linalg.matvec` | 지원 |
+| 5.2절 GEMV 패턴(곱셈 전 sign extension 포함) | `linalg.matvec`로 정규화 |
+| 곱셈 후 INT32 확장하는 GEMV | 정규화 대상 아님 |
+| identity/all-parallel elementwise | Target scalar emitter 범위에서 지원 |
+| 임의 broadcast/transpose generic | 미지원 |
+| K-only `linalg.reduce` | Common 지원, UPMEM은 tasklet 1개 요구 |
+| reduction 결과 앞의 epilogue | 진단 (float 변환 하나는 5.3절로 흡수) |
+| wrap-around load, 불규칙 gather/scatter | 진단 |

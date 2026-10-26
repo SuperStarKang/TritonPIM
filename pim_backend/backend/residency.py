@@ -4,17 +4,28 @@ Adapters report only numbers: their actual units, the capacity of one unit and
 the per-unit bytes of every stage operand. The planner never sees vendor handles.
 
 Every unit has the same layout, so one table of offsets from the unit's memory
-base serves all units. One slot holds the weights and state of one layer's
-stages; layer i takes slot i mod slots and belongs to group i // slots. If every
-layer fits there is one group; otherwise the layers of one group fill every slot
-and are uploaded together, overwriting only the weights of the previous group
-while buffers and instructions stay in place.
+base serves all units. Phase areas grow up from offset 0 and the key/value cache
+grows down from the capacity: layer by layer, the key then the value region, each
+below the previous one. A stage operand of kind KEY or VALUE reads that region in
+place; its per-unit bytes, and which token positions a unit holds there, come
+from the stage that reads it (its config and the adapter's operand layout), so
+every stage reading one region must need the same bytes. Every phase of a
+request (prefill, decode) lays its own area out from offset 0, and the phases
+overlay one another: only the phase that runs holds the area, so its weights
+overwrite those of the previous phase. The cache is written to the device only
+right before the first phase that reads it, so the phases that run before that
+one may use the whole unit, the cache's range included; the later phases end
+below the cache.
 
-The unit is laid out as three areas: the weights of every slot, then the state
-of every slot, then the input and output scratch. The weights of one group are
-therefore one contiguous range from the unit base, so a group upload is one
-transfer per unit. Every stage uses the scratch from its start, so each scratch
-part is as large as its largest stage.
+One slot holds the weights and state of one layer's stages; layer i takes slot
+i mod slots and belongs to group i // slots. If every layer fits there is one
+group; otherwise the layers of one group fill every slot and are uploaded
+together, overwriting only the weights of the previous group while buffers and
+instructions stay in place. A phase area holds the weights of every slot, then
+the state of every slot, then the input and output scratch. The weights of one
+group are therefore one contiguous range, so a group upload is one transfer per
+unit. Every stage uses the scratch from its start, so each scratch part is as
+large as its largest stage.
 """
 
 from dataclasses import dataclass
@@ -25,6 +36,22 @@ WEIGHT = "weight"
 STATE = "state"
 INPUT = "input"
 OUTPUT = "output"
+# key/value cache 항목, 그리고 그 영역을 그대로 읽는 stage operand
+KEY = "key"
+VALUE = "value"
+
+
+def token_rows(cache, positions, start, stop):
+    """Columns [start, stop) of the token-row view of a host key/value cache, at positions.
+
+    The host cache of a layer is [kv_heads, positions, head_dim], one KV head after another.
+    A cache stage names the KV heads it reads as columns of the view [positions, kv_heads *
+    head_dim] (stage.kv_windows); start and stop fall on head boundaries. positions is an
+    index tensor or a slice. Returns a copy, [len(positions), stop - start].
+    """
+    head_dim = cache.shape[2]
+    heads = cache[start // head_dim:stop // head_dim, positions]
+    return heads.permute(1, 0, 2).reshape(heads.shape[1], stop - start)
 
 
 @dataclass(frozen=True)
@@ -67,16 +94,26 @@ class StageRequirement:
     def output_bytes(self):
         return self._bytes(OUTPUT)
 
+    @property
+    def kv_bytes(self):
+        return self._bytes(KEY) + self._bytes(VALUE)
+
 
 @dataclass(frozen=True)
 class MemoryEntry:
-    """One operand region; offset is from the memory base of every unit."""
+    """One region; offset is from the memory base of every unit.
+
+    Stage operands belong to a phase. Key/value cache entries have no phase, stage
+    or operand: they stay at the same offset through every phase. A KEY/VALUE stage
+    operand entry has the offset of the cache entry it reads.
+    """
 
     kind: str
+    phase: str | None
     layer: int
-    stage: str
-    operand: int
-    # weight/state는 slot과 group에 속한다. scratch(input/output)는 None이다.
+    stage: str | None
+    operand: int | None
+    # weight/state는 slot과 group에 속한다. scratch(input/output)와 key/value cache는 None이다.
     slot: int | None
     group: int | None
     offset: int
@@ -84,9 +121,9 @@ class MemoryEntry:
 
 
 @dataclass(frozen=True)
-class MemoryTable:
-    units: int
-    capacity_bytes: int
+class PhaseLayout:
+    """The area of one phase, from offset 0."""
+
     # slot 수와 layer group 수. layer i는 slot i mod slots, group i // slots에 놓인다.
     slots: int
     groups: int
@@ -96,21 +133,31 @@ class MemoryTable:
     group_of_layer: dict
     # slot마다 weight + state bytes
     slot_bytes: tuple
-    # slot마다 weight bytes와 state bytes. weight 영역은 unit 시작, state 영역은 그 뒤다.
+    # slot마다 weight bytes와 state bytes. weight 영역은 phase 시작, state 영역은 그 뒤다.
     slot_weight_bytes: tuple
     slot_state_bytes: tuple
     scratch_bytes: int
+    # phase 영역 전체 bytes
+    bytes: int
+
+
+@dataclass(frozen=True)
+class MemoryTable:
+    units: int
+    capacity_bytes: int
+    # key/value cache bytes와 그 시작 offset. cache는 [kv_base, capacity_bytes)를 차지한다.
+    kv_bytes: int
+    kv_base: int
+    # 한 시점에 unit이 담는 최대 bytes: cache 전 phase 영역, 또는 cache + 그 뒤 phase 영역
     bytes_per_unit: int
-    # (layer, stage, operand) -> MemoryEntry
+    # phase -> PhaseLayout (실행 순서)
+    phases: dict
+    # (phase, layer, stage, operand) 또는 ("kv", layer, KEY/VALUE) -> MemoryEntry
     entries: dict
 
 
-def plan_memory(resources, requirements):
-    """The memory table that fits one unit.
-
-    Every stage is assumed to occupy the first unit, so stage sums bound the
-    most loaded unit.
-    """
+def _plan_phase(phase, requirements, base, capacity_bytes, entries):
+    """Slots, groups and operand offsets of one phase area that starts at base."""
     layers = sorted({requirement.layer for requirement in requirements})
     stages = {layer: [requirement for requirement in requirements if requirement.layer == layer]
               for layer in layers}
@@ -121,7 +168,7 @@ def plan_memory(resources, requirements):
     input_bytes = max(requirement.input_bytes for requirement in requirements)
     output_bytes = max(requirement.output_bytes for requirement in requirements)
     scratch = input_bytes + output_bytes
-    if sum(layer_weight.values()) + sum(layer_state.values()) + scratch <= resources.capacity_bytes:
+    if sum(layer_weight.values()) + sum(layer_state.values()) + scratch <= capacity_bytes:
         slot_weight_bytes = tuple(layer_weight[layer] for layer in layers)
         slot_state_bytes = tuple(layer_state[layer] for layer in layers)
     else:
@@ -132,14 +179,14 @@ def plan_memory(resources, requirements):
         for layer in layers[1:]:
             if layouts[layer] != layouts[layers[0]]:
                 raise ValueError(
-                    f"layers share a slot; layer {layer} operands need {layouts[layer]} bytes, "
+                    f"{phase}: layers share a slot; layer {layer} operands need {layouts[layer]} bytes, "
                     f"layer {layers[0]} operands {layouts[layers[0]]}")
         layer_bytes = layer_weight[layers[0]] + layer_state[layers[0]]
-        slots = (resources.capacity_bytes - scratch) // layer_bytes
+        slots = (capacity_bytes - scratch) // layer_bytes
         if slots < 1:
             raise ValueError(
-                f"one layer does not fit one unit: it needs {layer_bytes} bytes "
-                f"and scratch {scratch}, capacity is {resources.capacity_bytes}")
+                f"{phase}: one layer does not fit one unit: it needs {layer_bytes} bytes "
+                f"and scratch {scratch}, the phase area has {capacity_bytes}")
         slot_weight_bytes = (layer_weight[layers[0]],) * slots
         slot_state_bytes = (layer_state[layers[0]],) * slots
     slot_bytes = tuple(weight + state for weight, state in zip(slot_weight_bytes, slot_state_bytes))
@@ -147,25 +194,77 @@ def plan_memory(resources, requirements):
     slot_of_layer = {layer: position % slots for position, layer in enumerate(layers)}
     group_of_layer = {layer: position // slots for position, layer in enumerate(layers)}
 
-    weight_end = sum(slot_weight_bytes)
+    weight_end = base + sum(slot_weight_bytes)
     state_end = weight_end + sum(slot_state_bytes)
-    entries = {}
     for layer in layers:
         slot = slot_of_layer[layer]
         # 같은 slot의 layer는 같은 offset을 받는다. weight는 weight 영역, state는 state 영역의
         # 앞 slot들 바로 뒤에서 시작한다.
-        offsets = {WEIGHT: sum(slot_weight_bytes[:slot]), STATE: weight_end + sum(slot_state_bytes[:slot])}
+        offsets = {WEIGHT: base + sum(slot_weight_bytes[:slot]),
+                   STATE: weight_end + sum(slot_state_bytes[:slot])}
         for requirement in stages[layer]:
             offsets[INPUT] = state_end
             offsets[OUTPUT] = state_end + input_bytes
             for operand in requirement.operands:
+                if operand.kind in (KEY, VALUE):
+                    # phase 영역을 쓰지 않고 key/value cache 영역을 그대로 읽는다.
+                    entries[(phase, layer, requirement.stage, operand.operand)] = MemoryEntry(
+                        operand.kind, phase, layer, requirement.stage, operand.operand, None, None,
+                        entries[("kv", layer, operand.kind)].offset, operand.bytes)
+                    continue
                 resident = operand.kind in (WEIGHT, STATE)
-                entries[(layer, requirement.stage, operand.operand)] = MemoryEntry(
-                    operand.kind, layer, requirement.stage, operand.operand,
+                entries[(phase, layer, requirement.stage, operand.operand)] = MemoryEntry(
+                    operand.kind, phase, layer, requirement.stage, operand.operand,
                     slot if resident else None, group_of_layer[layer] if resident else None,
                     offsets[operand.kind], operand.bytes)
                 offsets[operand.kind] += operand.bytes
-    return MemoryTable(resources.units, resources.capacity_bytes, slots,
-                       max(group_of_layer.values()) + 1, slot_of_layer, group_of_layer,
+    return PhaseLayout(slots, max(group_of_layer.values()) + 1, slot_of_layer, group_of_layer,
                        slot_bytes, slot_weight_bytes, slot_state_bytes, scratch,
-                       state_end + scratch, entries)
+                       state_end + scratch - base)
+
+
+def plan_memory(resources, requirements):
+    """The memory table that fits one unit.
+
+    requirements maps each phase, in execution order, to its stage requirements.
+    The key/value cache regions are those the KEY/VALUE stage operands read; a
+    model without them has no cache on the device. The phases before the first one
+    that reads the cache may use the whole unit. Every stage is assumed to occupy
+    the first unit, so stage sums bound the most loaded unit.
+    """
+    # (layer, KEY/VALUE) -> unit당 bytes. 같은 영역을 읽는 stage는 모두 같은 bytes여야 한다.
+    regions = {}
+    # cache를 처음 읽는 phase의 순서. 읽는 phase가 없으면 모든 phase가 그 앞이다.
+    first_reader = len(requirements)
+    for index, (phase, phase_requirements) in enumerate(requirements.items()):
+        for requirement in phase_requirements:
+            for operand in requirement.operands:
+                if operand.kind not in (KEY, VALUE):
+                    continue
+                first_reader = min(first_reader, index)
+                region = (requirement.layer, operand.kind)
+                if regions.setdefault(region, operand.bytes) != operand.bytes:
+                    raise ValueError(
+                        f"{phase} layer {requirement.layer} {requirement.stage} reads the {operand.kind} "
+                        f"cache with {operand.bytes} bytes per unit; another stage reads it with "
+                        f"{regions[region]}")
+    entries = {}
+    kv_base = resources.capacity_bytes
+    # capacity에서 아래로 layer마다 key, value 순서로 놓는다.
+    for layer, kind in sorted(regions, key=lambda region: (region[0], region[1] != KEY)):
+        kv_base -= regions[layer, kind]
+        entries[("kv", layer, kind)] = MemoryEntry(
+            kind, None, layer, None, None, None, None, kv_base, regions[layer, kind])
+    kv_bytes = resources.capacity_bytes - kv_base
+    if kv_base < 0:
+        raise ValueError(f"the key/value cache needs {kv_bytes} bytes per unit; "
+                         f"capacity is {resources.capacity_bytes}")
+    # 모든 phase가 offset 0부터 같은 영역을 번갈아 쓴다. cache를 처음 읽는 phase부터는 cache 아래에서 끝난다.
+    phases = {phase: _plan_phase(phase, phase_requirements, 0,
+                                 kv_base if index >= first_reader else resources.capacity_bytes, entries)
+              for index, (phase, phase_requirements) in enumerate(requirements.items())}
+    # cache 전 phase는 자기 영역만, 그 뒤 phase는 cache와 함께 담긴다.
+    held = [layout.bytes + (kv_bytes if index >= first_reader else 0)
+            for index, layout in enumerate(phases.values())]
+    return MemoryTable(resources.units, resources.capacity_bytes, kv_bytes, kv_base,
+                       max(held), phases, entries)

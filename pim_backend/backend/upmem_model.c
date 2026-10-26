@@ -32,6 +32,7 @@ struct upmem_model_kernel *upmem_model_create(
     kernel->mapping = model_allocate(kernel->units * sizeof(*kernel->mapping));
     kernel->active = model_allocate(kernel->units * sizeof(*kernel->active));
     kernel->metadata = model_allocate((size_t)batch_size * kernel->logical_units * metadata_bytes);
+    kernel->kv_jobs = model_allocate((size_t)batch_size * kernel->logical_units);
     upmem_bind_instances(kernel->set, 3, partitions, device_mapping, batch_size, kernel->mapping);
     struct dpu_set_t dpu;
     uint32_t index;
@@ -83,9 +84,39 @@ void upmem_model_arguments(struct upmem_model_kernel *kernel, void **arguments,
     kernel->upload_weights = upload_weights;
 }
 
-int upmem_model_wants(struct upmem_model_kernel *kernel, uint32_t binding) {
+static int model_binding_sent(struct upmem_model_kernel *kernel, uint32_t binding) {
     return kernel->roles[binding] == (kernel->upload_weights
         ? UPMEM_RESIDENT_WEIGHT : UPMEM_RESIDENT_INPUT);
+}
+
+int upmem_model_wants(struct upmem_model_kernel *kernel, uint32_t binding, uint32_t job) {
+    if (kernel->upload_weights == UPMEM_MODEL_KV_PACK)
+        return kernel->roles[binding] == UPMEM_RESIDENT_KV && kernel->kv_jobs[job];
+    return model_binding_sent(kernel, binding);
+}
+
+void upmem_model_kv_select(struct upmem_model_kernel *kernel, const uint32_t *jobs, uint32_t count) {
+    memset(kernel->kv_jobs, 0, (size_t)kernel->batch_size * kernel->logical_units);
+    for (uint32_t index = 0; index < count; ++index)
+        kernel->kv_jobs[jobs[index]] = 1;
+}
+
+void upmem_model_kv_gather(struct upmem_model_kernel *kernel, uint32_t binding, uint8_t *images) {
+    // KV_PACK이 job마다 채운 cache operand 배치를 job 순서로 복사한다.
+    uint32_t jobs = kernel->batch_size * kernel->logical_units;
+    for (uint32_t job = 0; job < jobs; ++job)
+        memcpy(images + (size_t)job * kernel->sizes[binding], kernel->pointers[binding][job],
+               kernel->sizes[binding]);
+}
+
+void upmem_model_kv_push_region(struct upmem_model_kernel *kernel, uint32_t address,
+                                const uint8_t *images, uint32_t length) {
+    // MRAM [address, address + length)를 session의 모든 DPU에 같은 위치로 쓴다. images는 DPU마다 length bytes다.
+    struct dpu_symbol_t symbol = {address, length};
+    for (uint32_t physical = 0; physical < kernel->units; ++physical)
+        DPU_ASSERT(dpu_prepare_xfer(kernel->dpus[physical], (void *)(images + (size_t)physical * length)));
+    DPU_ASSERT(dpu_push_xfer_symbol(kernel->set, DPU_XFER_TO_DPU, symbol, 0, length, DPU_XFER_DEFAULT));
+    kernel->stats.kv_bytes += (uint64_t)kernel->units * length;
 }
 
 static int model_active(struct upmem_model_kernel *kernel, uint32_t physical) {
@@ -97,9 +128,10 @@ static int model_active(struct upmem_model_kernel *kernel, uint32_t physical) {
 void upmem_model_transfer(struct upmem_model_kernel *kernel, uint32_t binding,
                           int output) {
     // PACK은 prepare 시점에 pool만 채운다. 전송은 layer group 단위로 한다.
-    if (kernel->upload_weights == UPMEM_MODEL_PACK)
+    // KV_PACK도 pool만 채운다 (배치식 대조용).
+    if (kernel->upload_weights == UPMEM_MODEL_PACK || kernel->upload_weights == UPMEM_MODEL_KV_PACK)
         return;
-    if (output ? kernel->upload_weights : !upmem_model_wants(kernel, binding))
+    if (output ? kernel->upload_weights : !model_binding_sent(kernel, binding))
         return;
     struct dpu_symbol_t symbol = {kernel->addresses[binding], kernel->sizes[binding]};
     dpu_xfer_t direction = output ? DPU_XFER_FROM_DPU : DPU_XFER_TO_DPU;
@@ -183,6 +215,7 @@ void upmem_model_close(struct upmem_model_kernel *kernel) {
     free(kernel->pools);
     free(kernel->pool_bytes);
     free(kernel->metadata);
+    free(kernel->kv_jobs);
     free(kernel->mapping);
     free(kernel->active);
     free(kernel->dpus);
