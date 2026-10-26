@@ -1,14 +1,16 @@
 # Torch → PIM integration
 
-Torch 모델을 PIM에서 실행하는 경로의 Torch 쪽 설계를 다룬다. 범위는 두 가지다.
+Torch 모델을 PIM에서 실행하는 경로의 Torch 쪽 설계를 다룬다. 범위는 세 가지다.
 
 1. **Torch FX graph 분석**: layer 하나의 FX graph에서 GEMM을 찾고, 독립 GEMM들을 더 큰
    GEMM으로 합치는 packing 변환(규칙 ①~⑤)을 적용한다.
 2. **Torch runtime memory management**: 요청 단계(phase)마다 layer를 slot과 group에 대응시키고,
    key/value cache를 장치에 상주시키는 메모리 table과 그 실행 규칙.
+3. **단일 GEMM `torch.compile` 경로** (§6): Inductor의 `aten.mm`/`aten._int_mm`을 PIM GEMM/GEMV
+   template으로 바꾸는 lowering, config 선택, offline autotuning. 모델 경로의 stage도 이 경로로 compile한다.
 
-TritonPIM의 compile과 lowering(Triton → TTIR → TTShared → PIM Common IR → Target IR,
-stub·descriptor·program 생성)은 이 문서의 범위 밖이다. 대상 코드는 `torch_backend/`와 session
+template 이후의 compile과 lowering(TTIR → TTShared → PIM Common IR → Target IR, stub·descriptor·program
+생성)은 이 문서의 범위 밖이다. 대상 코드는 `torch_backend/`와 session
 runtime(`backend/runtime.py`, `backend/residency.py`, `backend/*_model.py`)이다.
 target별 차이는 autotuner의 target model(`autotuner/model.py`)이 공개하는 값과 adapter가 보고하는
 숫자로만 들어온다.
@@ -500,7 +502,126 @@ AiMX는 slot 첫 layer의 stage 항목마다 FPGA별 `slot, layers, stage, unit,
 
 ---
 
-## 6. 제한
+## 6. 단일 GEMM `torch.compile` 경로
+
+### 6.1 흐름
+
+**내용**
+tensor는 계속 CPU에 있다. PIM은 tensor device가 아니라 GEMM template의 compile·실행 backend다.
+`PIMInductorBackend`가 `compile_fx` 호출 하나 동안 GEMM lowering과 scheduling을 바꾸고, 나가면서 되돌린다.
+GEMM은 PIM template(Triton 소스 → PIMBackend)으로, 나머지 node는 stock Inductor C++(`cpu_backend="cpp"`)로 간다.
+
+**근거**
+- `torch_backend/backend.py` (`PIMInductorBackend`, `_inductor_overrides`), `lowering.py` (`PIMGemmLowering`),
+  `scheduling.py` (`PIMCombinedScheduling`: PIM template → TritonScheduling, 그 밖 → CppScheduling)
+
+**예시**
+```text
+torch.compile(fn, backend=PIMInductorBackend(PIMTorchConfig(...)), fullgraph=True, dynamic=False)
+  aten.mm (FP32 → FP32, BF16 → BF16) / aten._int_mm (INT8 → INT32)
+    → validate_pim_gemm      rank 2, dtype, CPU, static 양의 M/N/K
+    → gemm_problem           M = 1 또는 N = 1이면 matvec, 아니면 matmul
+    → resolve_execution      stage_target spec, config 선택 (§6.3), ConstraintEngine 검사
+    → matmul: require_contiguous(A, B) → pim_gemm_template
+      matvec: stride 그대로 → pim_gemv_template
+    → Triton source → TTIR → TTShared → PIM Common IR → UPMEM | AiMX
+  출력 C[M, N] (CPU tensor)
+```
+
+### 6.2 template
+
+**내용**
+source grid는 출력 block(M, N)만 나눈다. K는 한 번의 완전한 reduction으로 적고, K를 나누는 `tile_k`와
+`p_k`는 backend option으로만 Common IR에 전달한다. 그래서 source grid, constexpr, 출력 ABI에는 나타나지
+않는다. 서로 다른 K 조각의 결합은 Common `pim.combine`과 target lowering이 맡는다.
+
+**근거**
+- `torch_backend/template.py`: `pim_gemm_grid`("independent M/N output blocks"), `pim_gemv_grid`(출력 행 block),
+  누산 dtype `ACC_TYPE`(INT8은 `tl.int32`), `TORCH_GEMM_TEMPLATE_VERSION = "torch-gemm-semantic-k-v2"`
+- Block 크기와 `ACC_TYPE`은 template constexpr, `group_*`/`tile_*`/`p_*`는 backend option이다 (`execution.py`).
+
+### 6.3 config 선택
+
+**내용**
+`PIMTorchConfig`가 config를 정하는 방법은 우선순위 순서로 셋이다. 어느 경로든 결과는 `ConstraintEngine`을
+통과해야 하고, lowering이 값을 보정하지 않는다.
+
+**근거**
+- `torch_backend/config.py` (`PIMTorchConfig`), `execution.resolve_execution`
+
+**예시**
+
+| 순서 | 필드 | 동작 |
+|---|---|---|
+| 1 | `config=PIMConfig(...)` | 그대로 쓴다. autotuner가 후보를 잴 때 쓰는 통로 |
+| 2 | `autotune_cache_path=...` | 그 cache의 best. 없으면 예외 (seed로 넘어가지 않음) |
+| 3 | (둘 다 없음) | `heuristic_seeds`의 첫 후보 |
+
+| 그 밖의 필드 | 내용 |
+|---|---|
+| `spec` | target spec. None이면 기본 UPMEM spec (`backend/target.py`) |
+| `pack` | False면 `fx_packing`이 이 GEMM을 묶지 않는다 (model compile의 분리 선택) |
+| `num_warps`, `num_stages` | triton.compile 옵션 스키마를 채우는 값 (PIM에는 의미 없음) |
+| `force_single_compile_thread`, `disable_fx_graph_cache` | compile worker subprocess에는 runtime patch가 없고, FX graph cache는 lowering 교체를 key에 넣지 않으므로 둘 다 막는다 |
+
+backend option key는 `config.PIM_OPTION_KEYS`에 있는 것만 받는다(`validate_pim_options`). 모르는 key는
+`PIMBackend.parse_options`가 조용히 버리기 때문이다.
+
+### 6.4 runtime 연결
+
+**내용**
+tensor device는 CPU인데 compile target은 PIM이므로 Torch runtime의 driver 선택 두 곳을 monkeypatch한다.
+PIM backend를 import하지 않은 프로세스는 stock torch 그대로다.
+
+**근거**
+- `torch_backend/runtime_compat.py`
+  - `set_driver_to_backend(name)`: backend를 이름으로 고른다. `PIMDriver.is_active()`는 항상 False라 자동 선택되지 않는다.
+  - `CachingAutotuner._precompile_config`: tensor device 대신 `triton_meta`의 compile backend로 driver를 고른다.
+
+### 6.5 offline autotuning
+
+**내용**
+Inductor lowering 안에는 fake tensor뿐이라 잴 입력이 없다. `examples/autotune_torch.py`가 config 후보마다
+`torch.compile`을 새로 만들어 Torch 경로 전체(Inductor wrapper, layout 처리 포함)를 재고, 그 결과를 autotuner
+cache에 남긴다. cache context에 Torch template version이 들어가므로, 같은 cache 파일을 직접 Triton 예제와
+함께 써도 서로 덮어쓰지 않는다.
+
+**근거**
+- `examples/autotune_torch.py` (`--target upmem|aimx`, `--num-units`, `--dtype int8|float32|bfloat16`, `--m/--n/--k`, `--retune`)
+- 기본 cache 경로: `autotuner/artifacts.py` `DEFAULT_CACHE_PATH` (`workspace/Experiment/Autotuner/autotune_cache.json`)
+- 모델 경로는 이 측정이 아니라 stage class마다 weight 상주 상태로 따로 잰다 (§4.1).
+
+**예시**
+```bash
+python examples/autotune_torch.py --m 1024 --n 4096 --k 4096                          # UPMEM, INT8
+python examples/autotune_torch.py --target aimx --num-units 1 --dtype bfloat16 --m 1024 --n 4096 --k 4096
+```
+
+### 6.6 지원 범위
+
+| 항목 | 범위 | 근거 |
+|---|---|---|
+| op와 dtype | `aten.mm`: FP32 → FP32, BF16 → BF16. `aten._int_mm`: INT8 → INT32 | `PIMGemmLowering.__enter__` |
+| 입력 | rank 2, CPU tensor, 두 입력 dtype이 같음 | `validate_pim_gemm` |
+| shape | static 양의 정수 M/N/K (`dynamic=False`) | `_static_int` |
+| layout | GEMM은 row-major 연속이 아니면 복사를 끼움. GEMV는 stride 그대로 | `make_pim_gemm_lowering` |
+| fusion | template 주변 prologue/epilogue fusion 없음 | `scheduling.py` |
+| 실패 | 지원 범위 밖이면 `UnsupportedPIMGemm`. CPU fallback 없음 | `config.py` |
+
+| 모듈 | 역할 |
+|---|---|
+| `torch_backend/backend.py` | `torch.compile` backend entry, Inductor 설정 override |
+| `torch_backend/config.py` | `PIMTorchConfig`, backend option key 검사 |
+| `torch_backend/lowering.py` | `mm`/`_int_mm` → PIM GEMM/GEMV template |
+| `torch_backend/template.py` | GEMM/GEMV template과 version |
+| `torch_backend/scheduling.py` | PIM template은 Triton, 나머지는 C++ scheduling |
+| `torch_backend/runtime_compat.py` | driver 선택 monkeypatch |
+| `torch_backend/execution.py` | `gemm_problem`, `resolve_execution`, `select_layer_config` |
+| `torch_backend/_autotuner.py` | autotuner 객체의 import 지점 |
+
+---
+
+## 7. 제한
 
 - 한 phase의 모든 layer는 분석한 첫 layer와 stage 구성이 같아야 한다. 같은 class의 stage는 같은 config를 쓴다.
 - slot을 공유하는(groups > 1) layer는 operand별 종류와 bytes가 같아야 한다.
