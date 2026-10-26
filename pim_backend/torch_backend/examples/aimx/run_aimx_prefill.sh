@@ -13,7 +13,7 @@ cd "$(dirname "$0")"
 FPGAS=2
 BASE_FPGA=0
 REPEAT=3
-MAX_BENCHMARKS=20
+MAX_BENCHMARKS=50
 declare -A CHECKPOINTS=(
     [llama2]=/home/yonsei_park/models/Llama-2-7b-hf
     [llama3]=/home/yonsei_park/models/Meta-Llama-3-8B

@@ -61,7 +61,7 @@ def add_device_arguments(parser, cache_path):
     parser.add_argument("--fpgas", type=int, default=2)
     parser.add_argument("--base-fpga", type=int, default=0)
     parser.add_argument("--cache", default=cache_path, help="autotune cache JSON")
-    parser.add_argument("--max-benchmarks", type=int, default=20, help="autotune: per GEMM or stage class")
+    parser.add_argument("--max-benchmarks", type=int, default=50, help="autotune: per GEMM or stage class")
 
 
 def stage_records(plan):

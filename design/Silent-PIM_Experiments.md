@@ -25,7 +25,7 @@ target 구현은 [Silent-PIM 설계](Silent-PIM_Design.md), 모델 session과 �
 | CPU 부분 | FP32 (RMSNorm, RoPE, softmax, SwiGLU, residual) | `llama_workloads.py` |
 | head packing | 컴파일러가 결정 (`--qk-heads 1 --pv-heads 1` 기본) | `torch_backend/fx_packing.py` 규칙 (1)(3), decode는 (4)(5) |
 | KV 공유 | `--kv share` (query head h가 KV head h // group을 읽음) | `llama_workloads.py` |
-| autotune | stage class마다 최대 `--max-benchmarks`(20)회, 실행마다 `--cache` | `experiment_common.compile_session`, `scripts/experiments/*.sh` |
+| autotune | stage class마다 최대 `--max-benchmarks`(50)회, 실행마다 `--cache` | `experiment_common.compile_session`, `scripts/experiments/*.sh` |
 | CPU thread | 8 | `torch.set_num_threads(8)` |
 | lm_head | 마지막 행만 CPU FP32 | `benchmark_e2e.py`, `benchmark_decode.py` |
 | prompt | `examples/upmem/e2e/prompt.txt` 앞에서 N token | 실험 스크립트 |
