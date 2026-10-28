@@ -8,6 +8,10 @@
 set -eo pipefail
 [ $# -gt 0 ] || { echo "usage: $0 <fpgas...>  (예: $0 4 8)" >&2; exit 1; }
 source "$(dirname "$0")/../env.sh"
+# torch CPU thread와 OpenMP pool 크기를 고정한다. autotuning 측정 프로세스도 같은 값을 쓴다.
+# FPGA job thread는 stub이 FPGA 수만큼 연다 (같은 pool의 worker를 다시 쓴다).
+export OMP_NUM_THREADS=8
+export OMP_DYNAMIC=false
 EXAMPLES=$ROOT/triton_shared/pim_backend/torch_backend/examples
 
 for fpgas in "$@"; do
