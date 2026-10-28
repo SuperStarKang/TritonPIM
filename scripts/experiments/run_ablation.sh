@@ -6,7 +6,7 @@
 #   P     S off, P on    FX packing(①②③)과 instance 묶음 후의 stage마다 호출, 매번 보낸다
 #   all   S on,  P on    run_prefill.sh / run_decode.sh와 같다
 # 환경 변수로 범위를 줄일 수 있다 (기본값은 괄호):
-#   VARIANTS ("base S P all")  MODELS ("llama2 llama3")  SEQS ("128 256 512 1024")  NEW_TOKENS (128, decode)
+#   VARIANTS ("base S P all")  MODELS ("llama2 llama3")  SEQS ("1024")  NEW_TOKENS (128, decode)
 # 결과: $ROOT/results/ablation/<phase>/<model>/f<N>/s<seq>/<variant>/
 #   prefill  report.json, forward_breakdown.csv, gemm.csv, attention.csv, autotune_cache.json, log.txt
 #   decode   step_breakdown.csv, gemm.csv, attention.csv, autotune_cache.json, log.txt
@@ -25,7 +25,7 @@ export OMP_NUM_THREADS=8
 export OMP_DYNAMIC=false
 VARIANTS=${VARIANTS:-"base S P all"}
 MODELS=${MODELS:-"llama2 llama3"}
-SEQS=${SEQS:-"128 256 512 1024"}
+SEQS=${SEQS:-"1024"}
 NEW_TOKENS=${NEW_TOKENS:-128}
 
 for fpgas in "$@"; do
