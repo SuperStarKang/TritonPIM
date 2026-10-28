@@ -254,8 +254,9 @@ class AiMXModelRuntime:
                 "scratch_bytes": self.layout.scratch_bytes,
                 "bytes_per_unit": memory.bytes_per_unit,
             }
+        # 상주가 없는 배치(shared_slot)는 layer마다 그 자리에서 pack하고 올린다.
         self.loader = GroupLoader(group_order(memory), self._pack_group, self._push_group,
-                                  self._release_group)
+                                  self._release_group, prefetch=not memory.shared_slot)
         # slot의 weight, slot의 state, scratch 순서로 이어진 조각을 region 상한까지 묶는다.
         # 조각 하나는 나누지 않으므로 한 slot의 weight는 언제나 한 region 안에 있다.
         start = 0

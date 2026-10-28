@@ -226,7 +226,7 @@ def cache_version(key):
     return version
 
 
-def select_configs(classes, candidates, capacity_bytes, *, layers, repeats):
+def select_configs(classes, candidates, capacity_bytes, *, layers, repeats, stationary=True):
     """One measured candidate per class with the smallest time of one layer in one request.
 
     classes maps a stage class key to its stage count in the layer; one request runs
@@ -237,14 +237,16 @@ def select_configs(classes, candidates, capacity_bytes, *, layers, repeats):
       resident  every layer keeps its own slot, so the weights are uploaded once:
                 repeats * E + U; all layers have to fit one unit with the scratch
     With one run both times are E + U, and the reloaded plan, which fits more choices,
-    is kept. The slot bytes add up over the stages, the scratch is the largest input
+    is kept. stationary False allows only the reloaded plan (one slot that every layer
+    takes in turn). The slot bytes add up over the stages, the scratch is the largest input
     plus the largest output, so the search keeps every partial choice that no other
     choice beats in slot bytes, input, output and time together (multiple-choice knapsack).
     Returns (time_ms, slot_bytes, scratch_bytes, {key: candidate}) or None.
     """
     best = None
     # (unit 하나에 함께 놓이는 layer 수, upload 횟수): reloaded, resident 순서
-    for resident_layers, uploads in ((1, repeats), (layers, 1)):
+    plans = ((1, repeats), (layers, 1)) if stationary else ((1, repeats),)
+    for resident_layers, uploads in plans:
         # (slot bytes, 최대 input, 최대 output, 시간, 고른 후보)
         frontier = [(0, 0, 0, 0.0, {})]
         for key, count in classes.items():
@@ -412,13 +414,13 @@ class CompiledModel:
 
 
 def tune_phase(phase, layers, example_inputs, spec, kv, *, cache_path, search_budget, warmup, repeat,
-               seed):
+               seed, packing):
     """Stage classes of the first layer of one phase and the measured candidates of every class.
 
     kv is the first layer's {KEY/VALUE: cache input} or None (build_layer_plan).
     """
     start = time.perf_counter_ns()
-    classes, assignment = analyze_layer(layers[0], example_inputs, spec, kv)
+    classes, assignment = analyze_layer(layers[0], example_inputs, spec, kv, packing)
     analysis_ms = (time.perf_counter_ns() - start) / 1e6
     print(f"[model compile] {phase}: stage_classes={len(classes)}", flush=True)
 
@@ -454,7 +456,7 @@ def kv_bytes_bound(tuned, layers):
         for stage_class in tuned["classes"] if stage_class.key.has_kv)
 
 
-def select_phase(phase, tuned, capacity_bytes, *, layers, repeats):
+def select_phase(phase, tuned, capacity_bytes, *, layers, repeats, stationary):
     """Packing and one config per class for the layers of one phase.
 
     capacity_bytes is what one unit has for the phase area (below the key/value cache
@@ -480,7 +482,7 @@ def select_phase(phase, tuned, capacity_bytes, *, layers, repeats):
                 parts.setdefault(part.key, []).append(part)
         counts = {key: sum(part.count for part in group) for key, group in parts.items()}
         selection = select_configs(counts, candidates, capacity_bytes,
-                                   layers=layers, repeats=repeats)
+                                   layers=layers, repeats=repeats, stationary=stationary)
         packing.append({"separated": [key.label() for key in separated],
                         "layer_ms": None if selection is None else selection[0],
                         "slot_bytes": None if selection is None else selection[1],
@@ -511,7 +513,7 @@ def select_phase(phase, tuned, capacity_bytes, *, layers, repeats):
 
 def compile_model(phases, *, target, units, kv_inputs=None, repeats=None, runtime_options=None,
                   cache_path=DEFAULT_CACHE_PATH, max_benchmarks=20, max_generations=10,
-                  warmup=1, repeat=3, seed=0):
+                  warmup=1, repeat=3, seed=0, packing=True, stationary=True):
     """Compile time of a model whose layers share one structure in every phase; the session runs it.
 
     phases maps each phase name, in execution order, to (layers, example_inputs). kv_inputs
@@ -531,7 +533,12 @@ def compile_model(phases, *, target, units, kv_inputs=None, repeats=None, runtim
        candidate per class; the choice with the smallest time of one layer in one
        request wins (E and U weighed by the repeats)
     5. compile every layer of every phase with those configs; plan_memory places them
+    packing False compiles every GEMM as its own stage (PIMSession.compile). stationary False
+    uploads every layer's weights each time it runs (one shared slot, reloaded plan only) and
+    keeps the cache on the host, so it takes no kv_inputs.
     """
+    if not stationary and kv_inputs is not None:
+        raise ValueError("stationary=False keeps the key/value cache on the host; pass no kv_inputs")
     spec = target_spec(target, num_units=units, **(runtime_options or {}))
     print(f"[model compile] target={target} units={units} phases={list(phases)}", flush=True)
     search_budget = SearchBudget(max_generations=max_generations, max_benchmarks=max_benchmarks)
@@ -539,7 +546,7 @@ def compile_model(phases, *, target, units, kv_inputs=None, repeats=None, runtim
                                None if kv_inputs is None or phase not in kv_inputs
                                else kv_inputs[phase](0, example_inputs),
                                cache_path=cache_path, search_budget=search_budget,
-                               warmup=warmup, repeat=repeat, seed=seed)
+                               warmup=warmup, repeat=repeat, seed=seed, packing=packing)
              for phase, (layers, example_inputs) in phases.items()}
     kv_bounds = {phase: kv_bytes_bound(tuned[phase], len(tuple(layers))) for phase, (layers, _) in phases.items()}
     kv_bytes = max(kv_bounds.values())
@@ -551,7 +558,7 @@ def compile_model(phases, *, target, units, kv_inputs=None, repeats=None, runtim
     print(f"[model compile] key/value cache bound {kv_bytes} bytes per unit; phase areas "
           f"{capacity_bytes}", flush=True)
     choices = {phase: select_phase(phase, tuned[phase], capacity_bytes[phase], layers=len(tuple(layers)),
-                                   repeats=1 if repeats is None else repeats[phase])
+                                   repeats=1 if repeats is None else repeats[phase], stationary=stationary)
                for phase, (layers, _) in phases.items()}
 
     def configure_with(choice):
@@ -567,7 +574,8 @@ def compile_model(phases, *, target, units, kv_inputs=None, repeats=None, runtim
     session = PIMSession(spec)
     torch._dynamo.reset()
     session.compile({phase: (layers, example_inputs, configure_with(choices[phase]))
-                     for phase, (layers, example_inputs) in phases.items()}, kv_inputs=kv_inputs)
+                     for phase, (layers, example_inputs) in phases.items()}, kv_inputs=kv_inputs,
+                    packing=packing, stationary=stationary)
     for phase, plans in session.plans.items():
         classes = choices[phase]["classes"]
         # packing 판단을 반영한 layer가 측정한 class와 같은 stage들로 나뉘었는지 확인한다.
@@ -622,6 +630,7 @@ def compile_model(phases, *, target, units, kv_inputs=None, repeats=None, runtim
 
     report = {
         "target": target, "units": units, "spec": asdict(spec),
+        "packing": packing, "stationary": stationary,
         "memory": {"kv_bytes": memory.kv_bytes, "kv_base": memory.kv_base, "kv_bytes_bound": kv_bytes,
                    "phase_capacity_bytes": capacity_bytes,
                    "kv_regions": [{"layer": entry.layer, "kind": entry.kind, "offset": entry.offset,

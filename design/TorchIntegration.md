@@ -450,6 +450,11 @@ compiled = compile_model(
     kv_inputs={"decode": decode_kv_inputs},          # kv(index, inputs) -> {KEY: cache, VALUE: cache}
     repeats={"prefill": 1, "decode": new_tokens - 1},
     runtime_options={"nr_tasklets": 16}, cache_path=..., max_benchmarks=20,
+    # False: FX packing ①②③과 instance 묶음 없이 GEMM마다 stage 하나 (cache 묶음 ④⑤는 유지)
+    packing=True,
+    # False: slot 하나를 모든 layer가 차례로 씀 (layer마다 weight 재업로드, prefetch 없음),
+    #        reloaded 계획만 선택, kv_inputs 없이 cache는 host
+    stationary=True,
 )
 compiled.report   # target, units, spec, memory, compile_ms, phases
 with compiled.session as session:

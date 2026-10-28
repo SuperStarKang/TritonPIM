@@ -30,6 +30,10 @@ SLOT_GROUPS = {
     "compute": ("invoke",),
     "setup": ("alloc", "build"),
 }
+# ablation 구성 -> (stationary, packing). base는 GEMM마다 호출 하나에 weight·activation(·KV)을 매번 보낸다.
+#   stationary  weight를 slot에 남기고 KV cache를 장치에 둔다
+#   packing     FX packing (①②③)과 같은 모양 GEMM의 instance 묶음
+VARIANTS = {"base": (False, False), "S": (True, False), "P": (False, True), "all": (True, True)}
 
 
 def analytical_config(problem, spec, space):
@@ -40,12 +44,13 @@ def analytical_config(problem, spec, space):
     raise ValueError(f"({problem.M},{problem.N},{problem.K}): no heuristic seed passes the constraints")
 
 
-def compile_session(layers, example_inputs, args):
+def compile_session(layers, example_inputs, args, *, stationary=True, packing=True):
     """compile_model on the experiment's FPGAs: the unopened session and its config report."""
     compiled = compile_model(
         {"prefill": (layers, example_inputs)}, target="aimx", units=args.fpgas,
         runtime_options={"base_fpga": args.base_fpga},
         cache_path=args.cache, max_benchmarks=args.max_benchmarks,
+        stationary=stationary, packing=packing,
     )
     return compiled.session, compiled.report
 

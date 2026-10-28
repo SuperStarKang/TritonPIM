@@ -154,10 +154,14 @@ class MemoryTable:
     phases: dict
     # (phase, layer, stage, operand) 또는 ("kv", layer, KEY/VALUE) -> MemoryEntry
     entries: dict
+    # True면 모든 layer가 slot 하나를 나눠 쓰고 layer에 들어갈 때마다 weight를 올린다 (상주 없음).
+    shared_slot: bool = False
 
 
-def _plan_phase(phase, requirements, base, capacity_bytes, entries):
-    """Slots, groups and operand offsets of one phase area that starts at base."""
+def _plan_phase(phase, requirements, base, capacity_bytes, entries, shared_slot):
+    """Slots, groups and operand offsets of one phase area that starts at base.
+
+    shared_slot puts every layer in one slot (groups = layers) even when all would fit."""
     layers = sorted({requirement.layer for requirement in requirements})
     stages = {layer: [requirement for requirement in requirements if requirement.layer == layer]
               for layer in layers}
@@ -168,7 +172,7 @@ def _plan_phase(phase, requirements, base, capacity_bytes, entries):
     input_bytes = max(requirement.input_bytes for requirement in requirements)
     output_bytes = max(requirement.output_bytes for requirement in requirements)
     scratch = input_bytes + output_bytes
-    if sum(layer_weight.values()) + sum(layer_state.values()) + scratch <= capacity_bytes:
+    if not shared_slot and sum(layer_weight.values()) + sum(layer_state.values()) + scratch <= capacity_bytes:
         slot_weight_bytes = tuple(layer_weight[layer] for layer in layers)
         slot_state_bytes = tuple(layer_state[layer] for layer in layers)
     else:
@@ -187,6 +191,8 @@ def _plan_phase(phase, requirements, base, capacity_bytes, entries):
             raise ValueError(
                 f"{phase}: one layer does not fit one unit: it needs {layer_bytes} bytes "
                 f"and scratch {scratch}, the phase area has {capacity_bytes}")
+        if shared_slot:
+            slots = 1
         slot_weight_bytes = (layer_weight[layers[0]],) * slots
         slot_state_bytes = (layer_state[layers[0]],) * slots
     slot_bytes = tuple(weight + state for weight, state in zip(slot_weight_bytes, slot_state_bytes))
@@ -223,10 +229,11 @@ def _plan_phase(phase, requirements, base, capacity_bytes, entries):
                        state_end + scratch - base)
 
 
-def plan_memory(resources, requirements):
+def plan_memory(resources, requirements, *, shared_slot=False):
     """The memory table that fits one unit.
 
     requirements maps each phase, in execution order, to its stage requirements.
+    shared_slot gives every phase one slot that all its layers take in turn.
     The key/value cache regions are those the KEY/VALUE stage operands read; a
     model without them has no cache on the device. The phases before the first one
     that reads the cache may use the whole unit. Every stage is assumed to occupy
@@ -261,10 +268,11 @@ def plan_memory(resources, requirements):
                          f"capacity is {resources.capacity_bytes}")
     # 모든 phase가 offset 0부터 같은 영역을 번갈아 쓴다. cache를 처음 읽는 phase부터는 cache 아래에서 끝난다.
     phases = {phase: _plan_phase(phase, phase_requirements, 0,
-                                 kv_base if index >= first_reader else resources.capacity_bytes, entries)
+                                 kv_base if index >= first_reader else resources.capacity_bytes, entries,
+                                 shared_slot)
               for index, (phase, phase_requirements) in enumerate(requirements.items())}
     # cache 전 phase는 자기 영역만, 그 뒤 phase는 cache와 함께 담긴다.
     held = [layout.bytes + (kv_bytes if index >= first_reader else 0)
             for index, layout in enumerate(phases.values())]
     return MemoryTable(resources.units, resources.capacity_bytes, kv_bytes, kv_base,
-                       max(held), phases, entries)
+                       max(held), phases, entries, shared_slot)

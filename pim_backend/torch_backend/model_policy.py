@@ -85,12 +85,12 @@ def stage_key(stage):
     )
 
 
-def analyze_layer(layer, example_inputs, spec, kv):
+def analyze_layer(layer, example_inputs, spec, kv, packing=True):
     """Stage classes of one layer and its original GEMM name -> StageKey.
 
     Every GEMM gets the same placeholder config, so build_layer_plan packs and
     groups exactly as it will once each class has its own config. kv is the
-    layer's {KEY/VALUE: cache input} (build_layer_plan) or None.
+    layer's {KEY/VALUE: cache input} (build_layer_plan) or None; packing as in build_layer_plan.
     """
     placeholder = PIMTorchConfig()
     classes = {}
@@ -100,7 +100,7 @@ def analyze_layer(layer, example_inputs, spec, kv):
         gemms = analyze_fx_gemms(exported, allow_bmm=True)
         plan = build_layer_plan(exported, example_inputs,
                                 configs={gemm.node: placeholder for gemm in gemms}, index=0, spec=spec,
-                                kv=kv)
+                                kv=kv, packing=packing)
         for stage in plan.stages:
             key = stage_key(stage)
             if key not in classes:

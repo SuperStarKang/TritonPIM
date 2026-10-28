@@ -48,6 +48,7 @@ prefill 토큰 수는 1024. 첫 인자로 모델(`llama2` = Llama-2-7b-hf, `llam
 | 5 | e2e prefill | `experiments/run_e2e_prefill.sh` | `summary.ttft_ms`, `per_layer_ms` |
 | 6 | prefill (128/256/512/1024 token) | `experiments/run_prefill.sh` | `forward_breakdown.csv` warm_median `ttft_without_group0_load_ms`, `gemm.csv`, `attention.csv` |
 | 7 | decode (128/256/512/1024 token 뒤) | `experiments/run_decode.sh` | `step_breakdown.csv` mean_after_first `step_ms`, `gemm.csv`, `attention.csv` |
+| 8 | ablation: 상주(S)·FX packing(P) 켜고 끄기 | `experiments/run_ablation.sh` | 구성(`base`/`S`/`P`/`all`)별 위 6, 7의 결과 |
 
 ```bash
 for model in llama2 llama3; do
@@ -62,6 +63,15 @@ done
 ```bash
 ./triton_shared/scripts/experiments/run_prefill.sh 4 8
 ./triton_shared/scripts/experiments/run_decode.sh 4 8
+```
+
+8은 첫 인자로 `prefill` 또는 `decode`, 그 뒤에 FPGA 개수들을 받는다. 결과는
+`results/ablation/<phase>/<model>/f<N>/s<seq>/<variant>/`. 환경 변수 `VARIANTS`, `MODELS`, `SEQS`,
+`NEW_TOKENS`로 범위를 줄일 수 있다.
+
+```bash
+./triton_shared/scripts/experiments/run_ablation.sh prefill 4 8
+VARIANTS="base all" SEQS="128 1024" NEW_TOKENS=17 ./triton_shared/scripts/experiments/run_ablation.sh decode 8
 ```
 
 autotune cache가 결과 폴더에 저장되므로, 같은 폴더로 다시 돌리면 탐색 없이 측정만 한다. 수렴 곡선을 다시 얻으려면 폴더를 지우고 실행한다.

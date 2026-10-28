@@ -11,6 +11,10 @@ feed every step). With few layers the logits are nearly flat, so one small diffe
 the argmax and a free run diverges for good; the forced run compares every step on the same
 inputs: argmax agreement and the relative L2 of the logits.
 
+--variant turns residency and FX packing on or off (experiment_common.VARIANTS). Without
+residency (base, P) every layer uploads its weights at every step and the cache stays on the
+host, sent with the GEMMs that read it.
+
 Every step of the free run is split as a UPMEM benchmark_model_llama_generate.py step into
 <report-dir>/step_breakdown.csv: one row per step and mean_after_first (the first step also
 sends the prompt cache and checks the cache layout once), step_ms in PIM-LLM's items h2d
@@ -32,7 +36,9 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from experiment_common import SLOTS, add_device_arguments, slot_totals, stage_records, stage_rows, write_csv
+from experiment_common import (
+    SLOTS, VARIANTS, add_device_arguments, slot_totals, stage_records, stage_rows, write_csv,
+)
 from llama_decode import LlamaAimxDecodeLayer, decode_inputs, decode_kv_inputs, generate, prefill_caches
 from llama_workloads import load_llama
 
@@ -59,6 +65,8 @@ def main():
     parser.add_argument("--new-tokens", type=int, default=33, help="generated tokens, the prefill's included")
     parser.add_argument("--layers", type=int, default=0, help="first decoder layers to run (0: all)")
     parser.add_argument("--report-dir", type=Path, required=True)
+    parser.add_argument("--variant", choices=tuple(VARIANTS), default="all",
+                        help="base | S (weights and key/value cache resident) | P (FX packing) | all")
     args = parser.parse_args()
     if args.new_tokens < 3:
         parser.error("--new-tokens must include at least two decode steps: the first is reported apart")
@@ -92,11 +100,15 @@ def main():
     print(f"layers={len(layers)} capacity={capacity} cpu tokens={reference_tokens} "
           f"cpu step ms median={statistics.median(reference_ms):.1f}", flush=True)
 
+    # stationary가 아니면 cache는 host에 남고, decode layer가 매 step 그 cache를 operand로 보낸다.
+    stationary, packing = VARIANTS[args.variant]
     compiled = compile_model(
         {"decode": (layers, example)}, target="aimx", units=args.fpgas,
-        kv_inputs={"decode": decode_kv_inputs}, repeats={"decode": args.new_tokens - 1},
+        kv_inputs={"decode": decode_kv_inputs} if stationary else None,
+        repeats={"decode": args.new_tokens - 1},
         runtime_options={"base_fpga": args.base_fpga},
         cache_path=args.cache, max_benchmarks=args.max_benchmarks,
+        stationary=stationary, packing=packing,
     )
     memory = compiled.session.memory
     print(f"kv_bytes_per_fpga={memory.kv_bytes} bytes_per_fpga={memory.bytes_per_unit} "
@@ -106,13 +118,15 @@ def main():
               f"p_b={stage.p_b} rounds={stage.batch_rounds} config={stage.config.key()}", flush=True)
 
     with compiled.session as session:
-        for layer, (key_cache, value_cache) in enumerate(caches):
-            session.write_kv(layer, KEY, key_cache, 0, args.prompt_tokens)
-            session.write_kv(layer, VALUE, value_cache, 0, args.prompt_tokens)
+        if stationary:
+            for layer, (key_cache, value_cache) in enumerate(caches):
+                session.write_kv(layer, KEY, key_cache, 0, args.prompt_tokens)
+                session.write_kv(layer, VALUE, value_cache, 0, args.prompt_tokens)
 
         def store(layer, cache, start, stop):
-            session.write_kv(layer, KEY, cache[0], start, stop)
-            session.write_kv(layer, VALUE, cache[1], start, stop)
+            if stationary:
+                session.write_kv(layer, KEY, cache[0], start, stop)
+                session.write_kv(layer, VALUE, cache[1], start, stop)
 
         stages = stage_records(session.plans["decode"][0])
         runtime = session.backend.model
@@ -146,9 +160,10 @@ def main():
                 model, token, caches, args.prompt_tokens, args.new_tokens, run_decode, store, head)
         totals = dict(session.backend.model.totals)
         # 같은 session으로 처음부터 다시: prompt 위치만 다시 보내고 CPU 토큰을 입력으로 쓴다.
-        for layer, (key_cache, value_cache) in enumerate(prompt_caches):
-            session.write_kv(layer, KEY, key_cache, 0, capacity)
-            session.write_kv(layer, VALUE, value_cache, 0, capacity)
+        if stationary:
+            for layer, (key_cache, value_cache) in enumerate(prompt_caches):
+                session.write_kv(layer, KEY, key_cache, 0, capacity)
+                session.write_kv(layer, VALUE, value_cache, 0, capacity)
         with torch.no_grad():
             forced_tokens, forced_logits, _ = generate(
                 model, token, prompt_caches, args.prompt_tokens, args.new_tokens,

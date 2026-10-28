@@ -246,7 +246,7 @@ class CompileModelCPU(fx.Interpreter):
         return compiled(*args, **kwargs)
 
 
-def build_layer_plan(exported_program, example_inputs, *, configs, index, spec, kv=None):
+def build_layer_plan(exported_program, example_inputs, *, configs, index, spec, kv=None, packing=True):
     """Analyze one exported block without compiling it or acquiring hardware.
 
     configs maps original GEMM names to PIMTorchConfig. GEMMs are first packed on
@@ -258,6 +258,8 @@ def build_layer_plan(exported_program, example_inputs, *, configs, index, spec, 
     key/value cache, [kv_heads, positions, head_dim]; a GEMM operand that is one KV head of
     it, cache[h], or its transpose then reads the device cache region (stage.kv,
     stage.kv_windows); the stage takes the cache input itself in that operand's place.
+    packing False skips packing rules (1)-(3) and instance grouping: every GEMM is its own
+    stage, except the GEMMs that read the device cache, which stay grouped (rules (4)/(5)).
     """
     leaves, specification = _pytree.tree_flatten((example_inputs, {}))
     if specification != exported_program.call_spec.in_spec:
@@ -280,7 +282,8 @@ def build_layer_plan(exported_program, example_inputs, *, configs, index, spec, 
     frozen_graph, frozen = _freeze_graph(normalized)
     gemms = pack_gemms(frozen_graph, frozen, {
         mapping.normalized.node: PackedGemm(mapping, (mapping.original.node,), None) for mapping in mappings
-    }, spec, frozenset(name for name, config in configs.items() if not config.pack), frozenset(kv_inputs))
+    }, spec, frozenset(name for name, config in configs.items() if not config.pack), frozenset(kv_inputs),
+                       packing)
     for entry in gemms.values():
         if len({configs[source] for source in entry.sources}) != 1:
             raise ValueError(f"packed GEMMs {entry.sources} must share one config")
@@ -303,12 +306,13 @@ def build_layer_plan(exported_program, example_inputs, *, configs, index, spec, 
             gemm = mapping.normalized
             depth += 1
             operands = gemm_operands(node)
-            if any(operand in frozen for operand in operands) or gemm.op == "aten.bmm.default":
+            sources = [kv_source(operand) for operand in operands]
+            if (any(operand in frozen for operand in operands) or gemm.op == "aten.bmm.default"
+                    or not (packing or any(sources))):
                 key = (node.name,)
             else:
                 # 같은 cache(KEY/VALUE, 전치 여부)를 같은 operand로 읽는 GEMM끼리만 한 stage가 된다.
                 # 모양이 같은 QK와 PV(MHA)가 한 stage로 묶이지 않게 한다.
-                sources = [kv_source(operand) for operand in operands]
                 key = (depth, gemm.op, gemm.mnk, gemm.left.dtype, configs[mapping.original.node],
                        tuple(None if source is None else source[:2] for source in sources))
             if key not in groups:

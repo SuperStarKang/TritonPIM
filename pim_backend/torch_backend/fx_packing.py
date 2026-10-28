@@ -133,16 +133,18 @@ def cache_window(node, caches):
     return cache, transposed, indices[0] * head_dim, (indices[-1] + 1) * head_dim
 
 
-def pack_gemms(graph_module, frozen, gemms, spec, separate, caches=frozenset()):
-    """caches: names of the placeholders that are key/value cache inputs."""
+def pack_gemms(graph_module, frozen, gemms, spec, separate, caches=frozenset(), packing=True):
+    """caches: names of the placeholders that are key/value cache inputs. packing False applies
+    only rules (4)/(5), which the cache stages need."""
     graph = graph_module.graph
     _eliminate_common_subexpressions(graph, gemms)
-    _concatenate_weights(graph_module, frozen, gemms, separate)
-    _reorder(graph)
-    for transform in (_stack_shared_rights, _block_diagonal):
-        for members in _instance_groups(graph, frozen, gemms, separate, caches, False):
-            transform(graph, gemms, members, spec)
+    if packing:
+        _concatenate_weights(graph_module, frozen, gemms, separate)
         _reorder(graph)
+        for transform in (_stack_shared_rights, _block_diagonal):
+            for members in _instance_groups(graph, frozen, gemms, separate, caches, False):
+                transform(graph, gemms, members, spec)
+            _reorder(graph)
     for members in _instance_groups(graph, frozen, gemms, separate, caches, True):
         _pack_cache_windows(graph, gemms, members, spec, caches)
     _reorder(graph)

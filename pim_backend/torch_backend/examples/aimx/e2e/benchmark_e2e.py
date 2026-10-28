@@ -5,7 +5,8 @@ runs the same layers in HF FP32, so the first token is compared for any --layers
 compile_model tunes one layer and compiles every layer with its configs: P-1 if every layer
 fits, otherwise the first slots keep one layer each and the rest share the last slot.
 --qk-heads/--pv-heads/--kv as
-layer/benchmark_layer.py. --seq is the prompt length in tokens.
+layer/benchmark_layer.py. --seq is the prompt length in tokens. --variant turns weight
+residency and FX packing on or off (experiment_common.VARIANTS; all = both on).
 
 Besides report.json, <report-dir>/forward_breakdown.csv has one row per request (iter 0 is the
 first request), warm_mean and warm_median (per column) of the later requests, with
@@ -31,8 +32,8 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from experiment_common import (
-    SLOTS, add_device_arguments, compile_session, memory_record, print_request, request_breakdown, stage_records,
-    stage_rows, write_csv,
+    SLOTS, VARIANTS, add_device_arguments, compile_session, memory_record, print_request, request_breakdown,
+    stage_records, stage_rows, write_csv,
 )
 from llama_workloads import (
     KV_MODES, SEQUENCE, LlamaAimxLayer, load_llama, position_embeddings, prompt_ids, reference_layer,
@@ -54,12 +55,14 @@ def main():
     parser.add_argument("--qk-heads", type=int, default=1)
     parser.add_argument("--pv-heads", type=int, default=1)
     parser.add_argument("--kv", choices=KV_MODES, default="share")
+    parser.add_argument("--variant", choices=tuple(VARIANTS), default="all",
+                        help="base | S (weights resident) | P (FX packing) | all")
     parser.add_argument("--repeat", type=int, default=3, help="requests after the first")
     parser.add_argument("--report-dir", type=Path, default=None)
     args = parser.parse_args()
     report_dir = args.report_dir or Path(__file__).resolve().with_name(
         f"report_{args.checkpoint.name}_l{args.layers}_s{args.seq}_{args.kv}"
-        f"_qk{args.qk_heads}_pv{args.pv_heads}_f{args.fpgas}")
+        f"_qk{args.qk_heads}_pv{args.pv_heads}_f{args.fpgas}_{args.variant}")
     report_dir.mkdir(parents=True, exist_ok=True)
     prompt = args.prompt_file.read_text(encoding="utf-8")
 
@@ -89,8 +92,10 @@ def main():
             model.model.layers[index] = torch.nn.Identity()
 
         start = time.perf_counter_ns()
+        stationary, packing = VARIANTS[args.variant]
         session, config_report = compile_session(
-            blocks, (torch.zeros(1, args.seq, model.config.hidden_size),), args)
+            blocks, (torch.zeros(1, args.seq, model.config.hidden_size),), args,
+            stationary=stationary, packing=packing)
         compile_ms = (time.perf_counter_ns() - start) / 1e6
         # plan이 필요한 weight를 직접 참조한다. packing으로 대체된 원본(q/k/v, gate/up)을 해제한다.
         del blocks
@@ -168,6 +173,7 @@ def main():
         "checkpoint": str(args.checkpoint), "layers": args.layers, "fpgas": args.fpgas,
         "base_fpga": args.base_fpga, "sequence": args.seq, "config_source": "autotune",
         "qk_heads": args.qk_heads, "pv_heads": args.pv_heads, "kv": args.kv,
+        "variant": args.variant, "stationary": stationary, "packing": packing,
         "reference": {"token": reference_token, "token_text": tokenizer.decode([reference_token])},
         "compile_ms": compile_ms, "session_open_ms": session.open_ms, "session_close_ms": session.close_ms,
         "chain_build_ms": chain_build_ms,

@@ -45,6 +45,7 @@ AiMX SW 경로). `scripts/experiments/*.sh`는 이 파일을 직접 불러오며
 | 5 | e2e prefill (1024 token) | `experiments/run_e2e_prefill.sh <model> <fpgas…>` | 32 layer | `e2e_prefill/<model>/f<N>/report.json` |
 | 6 | prefill (128/256/512/1024) | `experiments/run_prefill.sh <fpgas…>` | llama2/3 × 4 길이, 32 layer | `prefill/<model>/f<N>/s<seq>/` |
 | 7 | decode (128/256/512/1024 뒤) | `experiments/run_decode.sh <fpgas…>` | llama2/3 × 4 길이, 128 token 생성 | `decode/<model>/f<N>/s<seq>/` |
+| 8 | ablation: 상주(S)와 FX packing(P) | `experiments/run_ablation.sh <prefill\|decode> <fpgas…>` | 구성 base/S/P/all × 모델 × 길이 | `ablation/<phase>/<model>/f<N>/s<seq>/<variant>/` |
 
 모든 실험이 결과 폴더에 `autotune_cache.json`과 `log.txt`를 함께 둔다.
 
@@ -146,7 +147,47 @@ PIM-LLM 항목은 UPMEM과 같은 규칙이다: `h2d` = weight upload + `desc_h2
 
 ---
 
-## 5. 실행 순서 (FPGA 4/8장 서버)
+## 5. 실험 8: ablation (`run_ablation.sh` → `benchmark_e2e.py` / `benchmark_decode.py --variant`)
+
+**내용**
+CPU + Silent-PIM 구조는 그대로 두고 두 최적화를 켜고 끈다. 구성마다 그 실행 방식으로 autotuning한
+config를 쓴다. S off는 상주 없이 slot 하나를 모든 layer가 차례로 쓰므로 layer에 들어갈 때마다 그 layer의
+weight를 다시 올리고(다음 layer의 background pack도 없음), cost는 reloaded(E + U)로만 고른다. KV cache는
+host에 두고 GEMM이 operand로 보낸다. P off는 FX packing(①②③)과 instance 묶음을 하지 않아 GEMM 하나가
+PIM 호출 하나가 된다. 장치 KV를 읽는 GEMM의 묶음(④⑤)은 KV 상주의 조건이므로 S에 속한다.
+
+**근거**
+- `experiment_common.VARIANTS`, `compile_model(stationary=, packing=)`, `PIMSession.compile`
+- S: `residency.plan_memory(shared_slot=)`, `runtime.GroupLoader(prefetch=)`, `model_compile.select_configs(stationary=)`
+- P: `fx_packing.pack_gemms(packing=)`, `model.build_layer_plan(packing=)`
+
+**예시**
+
+| 구성 | S | P | 실행 |
+|---|---|---|---|
+| `base` | off | off | GEMM마다 호출 하나, weight·activation(·KV)을 매번 보냄 |
+| `S` | on | off | GEMM마다 호출 하나, weight·KV 상주 |
+| `P` | off | on | packing·묶음 후 stage마다 호출, 매번 보냄 |
+| `all` | on | on | 실험 6, 7과 같음 |
+
+```bash
+./triton_shared/scripts/experiments/run_ablation.sh prefill 4 8
+./triton_shared/scripts/experiments/run_ablation.sh decode 4 8
+# 범위 줄이기
+VARIANTS="base all" MODELS=llama2 SEQS="128 1024" NEW_TOKENS=17 \
+  ./triton_shared/scripts/experiments/run_ablation.sh decode 8
+```
+
+| 비교 값 | prefill | decode |
+|---|---|---|
+| 시간 | `forward_breakdown.csv` `warm_median` `ttft_ms` (모든 전송 포함) | `step_breakdown.csv` `mean_after_first` `step_ms` |
+| 원인 | `gemm.csv` + `attention.csv` 행 수와 `calls`, `h2d_ms`, `pim_ms`, `detail_weight_upload_ms` | 같음 + `detail_kv_push_ms` |
+
+S off 구성의 `group0_load_ms`는 layer 0 하나의 업로드이므로, 구성끼리 비교할 때는 `ttft_ms`를 쓴다.
+
+---
+
+## 6. 실행 순서 (FPGA 4/8장 서버)
 
 ```bash
 # 1) 코드
@@ -165,7 +206,7 @@ rm -rf results/prefill results/decode
 
 ---
 
-## 6. 제약과 확인할 것
+## 7. 제약과 확인할 것
 
 | 항목 | 내용 | 근거 |
 | --- | --- | --- |
@@ -179,7 +220,7 @@ rm -rf results/prefill results/decode
 
 ---
 
-## 7. UPMEM과 비교할 때
+## 8. UPMEM과 비교할 때
 
 | 항목 | Silent-PIM | UPMEM ([UPMEM 실험](UPMEM_Experiments.md)) |
 | --- | --- | --- |

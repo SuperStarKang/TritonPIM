@@ -72,16 +72,18 @@ class GroupLoader:
     last phase runs again and again (one decode step per generated token), so its last
     group is followed by its own first group. The first key has nothing to hide behind,
     so its pack and push are also accumulated apart (group0_*), to be subtracted from a
-    request time.
+    request time. prefetch False packs every group when it is entered, with nothing in the
+    background.
     """
 
-    def __init__(self, order, pack, push, release):
+    def __init__(self, order, pack, push, release, prefetch=True):
         self.order = order
         # 마지막 phase의 첫 group. 마지막 phase의 마지막 group 다음에 다시 들어간다.
         self.repeat_from = next(key for key in order if key[0] == order[-1][0])
         self.pack = pack
         self.push = push
         self.release = release
+        self.prefetch_next = prefetch
         self.loaded = None
         # 다음 group을 pack하는 background 작업: (group, thread, 결과)
         self.prefetch = None
@@ -135,6 +137,8 @@ class GroupLoader:
             self.totals["group0_pack_ms"] += pack_ms
             self.totals["group0_upload_ms"] += upload_ms
         self.loaded = key
+        if not self.prefetch_next:
+            return
         # 이 group이 실행되는 동안 실행 순서의 다음 group을 host에서 미리 pack한다.
         position = self.order.index(key)
         if position + 1 < len(self.order):
@@ -218,7 +222,7 @@ class PIMSession:
         self.open_ms = (time.perf_counter_ns() - start) / 1e6
         return self
 
-    def compile(self, phases, *, kv_inputs=None):
+    def compile(self, phases, *, kv_inputs=None, packing=True, stationary=True):
         """Compile time: prepare the Torch blocks of every phase without allocating device resources.
 
         phases maps each phase name, in execution order, to (layers, example_inputs,
@@ -226,14 +230,17 @@ class PIMSession:
         the inputs of layer index that are its host key/value cache, [kv_heads, positions,
         head_dim]; a GEMM operand that is one KV head of it, cache[h], or its transpose reads
         the device cache region in place instead of being sent (write_kv fills the region).
-        The session keeps the
+        packing False compiles every GEMM as its own stage (no FX packing, no instance
+        batching; GEMMs that read the device cache stay grouped). stationary False puts all
+        layers of a phase in one slot, so every layer uploads its weights when it is entered,
+        and the cache must stay on the host (no kv_inputs). The session keeps the
         compiled plans; entering it allocates the units, checks their count against
         the spec and binds the compiled stages.
         """
         if self.phase != "new" or self.backend is not None:
             raise RuntimeError("compile a PIMSession once, before opening it")
         self.backend = create_runtime(self.spec)
-        self._build(phases, kv_inputs)
+        self._build(phases, kv_inputs, packing, stationary)
         self.phase = "compiled"
         return self.plans
 
@@ -245,13 +252,15 @@ class PIMSession:
         kv_inputs is as in compile().
         """
         self._check_owner()
-        self._build(phases, kv_inputs)
+        self._build(phases, kv_inputs, True, True)
         self.backend.bind_model(self._all_plans())
         self.weight_table = self.backend.weight_table(self._all_plans())
         return self.plans
 
-    def _build(self, phases, kv_inputs):
+    def _build(self, phases, kv_inputs, packing, stationary):
         """Export, configure, compile and place the layers of every phase; no device access."""
+        if not stationary and kv_inputs is not None:
+            raise ValueError("stationary=False keeps the key/value cache on the host; pass no kv_inputs")
         import torch
 
         from torch_backend.fx_analysis import analyze_fx_gemms
@@ -270,7 +279,7 @@ class PIMSession:
                     plan = build_layer_plan(
                         exported, example_inputs,
                         configs=configure(analyze_fx_gemms(exported, allow_bmm=True), self.spec),
-                        index=index, spec=self.spec,
+                        index=index, spec=self.spec, packing=packing,
                         kv=(None if kv_inputs is None or phase not in kv_inputs
                             else kv_inputs[phase](index, example_inputs)),
                     )
@@ -283,7 +292,8 @@ class PIMSession:
 
         self.memory = plan_memory(
             self.backend.resources(),
-            {phase: self.backend.requirements(plans) for phase, plans in self.plans.items()})
+            {phase: self.backend.requirements(plans) for phase, plans in self.plans.items()},
+            shared_slot=not stationary)
         self.backend.prepare_model(self._all_plans(), self.memory)
 
     def run_model(self, phase, *inputs, after_layer=None):

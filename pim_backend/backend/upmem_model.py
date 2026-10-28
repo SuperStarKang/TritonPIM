@@ -188,8 +188,9 @@ class UPMEMModelRuntime:
         group of the next phase overwrites the previous phase.
         """
         self.memory = memory
+        # 상주가 없는 배치(shared_slot)는 layer마다 그 자리에서 pack하고 올린다.
         self.loader = GroupLoader(group_order(memory), self._pack_group, self._push_group,
-                                  self._release_group)
+                                  self._release_group, prefetch=not memory.shared_slot)
         for plan in plans:
             layout = memory.phases[plan.phase]
             self.plans_of_group.setdefault((plan.phase, layout.group_of_layer[plan.index]), []).append(plan)
