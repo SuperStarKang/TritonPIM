@@ -207,8 +207,9 @@ class AiMXModelRuntime:
         # group 업로드 순서와 background pack (runtime.GroupLoader). place가 만든다.
         self.loader = None
         # chain_build_ms는 bind에서 slot마다 descriptor chain을 만들어 올린 시간이다 (요청 밖).
+        # concat_ms는 pack 안에서 ConcatenatedWeight(규칙 ②)를 torch.cat으로 만든 시간이다 (pack_wall_ms 안).
         self.totals = {"weight_bytes": 0, "invocations": 0, "run_wall_ms": 0.0, "chain_build_ms": 0.0,
-                       "kv_bytes": 0, "kv_push_ms": 0.0, "kv_layout_check_ms": 0.0}
+                       "kv_bytes": 0, "kv_push_ms": 0.0, "kv_layout_check_ms": 0.0, "concat_ms": 0.0}
         # stage -> [(cache, start, stop)]: 다음 cache stage 실행 전에 보낼 위치
         self.kv_pending = {}
         # "run:mm" 처럼 stage 이름마다 layer를 합친 호출 수, wall time, native 칸별 시간.
@@ -413,7 +414,10 @@ class AiMXModelRuntime:
                 *(self._address(entry, fpga, "va") - entry.offset + start for fpga in stage.fpgas))
             stage.call.pack_hosts = ctypes.cast(stage.pack_hosts, ctypes.POINTER(ctypes.c_void_p))
             stage.call.pack_vas = ctypes.cast(stage.pack_vas, ctypes.POINTER(ctypes.c_uint64))
-            self._call(stage, stage.preparation_matrices, stage.preparation_output, upload=2)
+            concat_start = time.perf_counter_ns()
+            matrices = stage.preparation_matrices
+            self.totals["concat_ms"] += (time.perf_counter_ns() - concat_start) / 1e6
+            self._call(stage, matrices, stage.preparation_output, upload=2)
         # 이 thread의 host 조립 buffer를 돌려준다. 다른 thread는 계속 stage를 실행하고 있을 수 있다.
         self.library.aimx_host_cache_clear_thread()
         return images, start, stop

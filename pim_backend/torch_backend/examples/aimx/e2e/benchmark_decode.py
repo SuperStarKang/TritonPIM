@@ -147,7 +147,7 @@ def main():
             # kv_push_ms: 이전 step 끝에 store한 위치를 이 step의 첫 cache stage 앞에서 보낸 시간
             step_counters.append({
                 **{name: after[name] - before[name]
-                   for name in ("pack_wall_ms", "upload_wall_ms", "kv_push_ms", "run_wall_ms")},
+                   for name in ("pack_wall_ms", "upload_wall_ms", "kv_push_ms", "run_wall_ms", "concat_ms")},
                 "breakdown": {key: {field: value - before["breakdown"][key][field]
                                     for field, value in record.items() if field != "jobs"}
                               for key, record in after["breakdown"].items()},
@@ -203,7 +203,9 @@ def main():
         items["cpu_ms"] = ms - sum(items.values())
         items.update({name.replace("_ms", "_pct"): 100 * value / ms for name, value in list(items.items())})
         rows.append({"step": index, "position": args.prompt_tokens + index, "step_ms": ms, "layers_ms": layers_ms,
-                     **items, **{"detail_" + name: value for name, value in detail.items()}})
+                     **items, **{"detail_" + name: value for name, value in detail.items()},
+                     # detail_weight_upload_ms 안의 torch.cat 시간이라 detail 합에는 따로 더하지 않는다
+                     "weight_concat_ms": counter["concat_ms"]})
     names = [name for name in rows[0] if name not in ("step", "position")]
     rows.append({"step": "mean_after_first", "position": "",
                  **{name: statistics.mean(row[name] for row in rows[1:]) for name in names}})
