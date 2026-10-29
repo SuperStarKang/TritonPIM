@@ -48,6 +48,8 @@ def compile_session(layers, example_inputs, args, *, stationary=True, packing=Tr
     """compile_model on the experiment's FPGAs: the unopened session and its config report."""
     compiled = compile_model(
         {"prefill": (layers, example_inputs)}, target="aimx", units=args.fpgas,
+        # config 선택에서 prefill을 3회 실행하는 것으로 보고 E와 U의 비중을 정한다
+        repeats={"prefill": 3},
         runtime_options={"base_fpga": args.base_fpga},
         cache_path=args.cache, max_benchmarks=args.max_benchmarks,
         stationary=stationary, packing=packing,
